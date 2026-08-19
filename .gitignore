@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+dist/
+# What a wheel build (`uv build`, `pip wheel .`) leaves in the tree when run
+# in-tree; the published tree carries pyproject.toml, so this can happen there.
+build/
+*.egg-info/
+# Written into every extracted candidate so the extractor can recognise a tree
+# it generated before replacing it (round 1 F5). Ignored so it never becomes a
+# travelling file, and so `git ls-files` in the candidate is still exactly the
+# travels set.
+.loupe-generated
+*.loupe-staging/
+*.loupe-previous/
+# loupe working files: the claim an author writes, and the envelopes the tool
+# emits. The record lives in ~/.local/state/loupe/, never in the tree.
+# Anchored to the root on purpose — unanchored, `verdict*.md` also swallows
+# review/tests/fixtures/verdict-with-closures.md and silently drops it from
+# the extraction candidate.
+/claim*.json
+/*.claim.json
+/request*.md
+/verdict*.md
+/disposition*.md

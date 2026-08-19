@@ -1,0 +1,65 @@
+<!-- BEGIN GENERATED: loupe adapter — do not edit; `loupe render-adapters` regenerates, `--check` guards -->
+# loupe — review procedure (instruction block, GENERATED)
+
+For a project instruction file (AGENTS.md / CLAUDE.md region) on a surface that reads no skill directory. Tool version 0.3.0.
+
+## What this is
+
+`loupe` is a deterministic review tool: request → verdict → disposition envelopes bound to SHAs, a gate manifest the tool runs itself, fingerprinted findings, an append-only ledger with breakers. No model runs inside it. You are either the **author** or the **reviewer** of a given envelope — the envelope's stamp (`author=… reviewer=…`) says which, per invocation, and this text does not.
+
+## Rules that hold on both sides
+
+- Exit codes mean exactly one thing: 0 ok, 1 findings or refusal, 2 usage. Every non-zero exit carries `next_kind`: when it is `command`, run the `next` command verbatim; when it is `blocked`, `next` is null — stop, give the human the `remedy` field, and wait. Either way, do not diagnose and do not improvise a flag or a fix.
+- Output is JSON when stdout is not a TTY. Read fields; never parse prose.
+- Never hand-type an envelope, never edit the ledger, never paste gate output into Evidence — the tool runs gates and attests them.
+- The human sets a review round in motion. Whichever side you hold, you stop where the procedure says stop; you do not invoke the other side by any mechanism (CLI, subagent, hook, API).
+- Boundary closure. When a finding is about a parser, a grammar, or a lifecycle seam, the answer partitions the COMPLETE admitted domain: every input kind the boundary accepts, every declared field and nested shape, every ordering the seam can be reached by — with paired VALID controls proving the check is live, and a mutation per bypass proving it can fail. Making the named reproducer green is not an answer, it is one point of a domain, and the next unpartitioned point is the next round. This binds both sides: an acceptance and a closure are judged by whether the domain is closed, never by whether the example passes.
+- Every request and every verdict result carries TWO fields, and they are two different kinds of text. `brief` is the plain-language account of what is being asked or ruled — give it to the human as readable prose, never inside a code block. `relay` is the literal commands to run — give it as a verbatim block the human can copy, and nothing else. Emit them in that order, both, every time, and do not merge, reorder, summarise or paraphrase either: both are derived from the envelope and yours would not be. Never put your own prose inside the relay block and never bury a command inside the brief. `loupe brief` reproduces both at any time, and with no argument it finds the open request itself.
+
+## If you hold the author stamp
+
+1. **write the claim**
+   A JSON claim file, and a closed grammar: its members are `access_note`, `commit_subject`, `contract`, `deliberately_not`, `evidence_not_captured`, `hand_back`, `objective`, `references`, `relay`, `review_scope`, `risk`, `stop_conditions` — `references` is a list of objects carrying a non-empty `path` (the reviewer must read it; the tool digests it) and optionally `required` and `note`; `deliberately_not`, `evidence_not_captured`, `stop_conditions`, `hand_back`, `contract` are lists of strings; the rest are strings; `objective` is required. Malformed JSON, a top-level value that is not an object, a repeated member at any depth, a wrong type, and an unknown member are each refused by name before the tool reads the ledger, touches Git, runs a gate or records anything — an unknown member is never ignored, so a misspelling cannot silently erase what it meant to declare. So are the states that are not in the JSON: the file must be UTF-8, every string must be encodable (a lone surrogate is valid JSON and not a value an envelope can carry), and `--claim-file ""` is refused rather than treated as an omitted option. Supplying no claim at all stays legal and is recorded as its own state. It is your judgment; the tool carries it and never invents it.
+2. **hand off** — `loupe handoff --claim-file <claim.json> [--base <sha>]`
+   Commits outstanding tracked work, pushes the reviewed branch, runs the gate manifest, emits and validates the request, records it, keeps the bytes under the state directory, and prints the reviewer's command. `--base` is needed only for round 1 of a lineage. Re-running on an unchanged tip is a no-op that returns the same envelope. THEN STOP: give the kept path (or its bytes) to the human. Refusals (untracked files, detached HEAD, unreachable remote, unassigned roles, no taxonomy) name the fix.
+3. **close the round** — `loupe close --verdict <verdict.md>`
+   Validates and records the verdict. `changes requested` → the lineage stays open and the next command is `respond`; `clean to advance` → the lineage is closed at the exact reviewed SHA. Merge authority is the account allowlist and the standing rules you operate under, not this tool.
+4. **respond** — `loupe respond --verdict <verdict.md> --from-json <d.json> --out <disposition.md>`
+   Exactly one disposition per finding — accepted / refuted / deferred / preference / escalated — each with its mandatory payload; a blocking finding cannot be deferred or preferred. An `accepted` disposition for a finding that names a falsification test also records the run of THAT test, in `payload.falsification`: `status` (pass | fail | cannot_execute) on the head you hand back, and `mutation` — the same test with the defect reintroduced (fails_without_fix | passes_without_fix | not_run), which is the proof the test can fail at all. A test that still fails, or one that passes without the fix, is refused as an acceptance; `cannot_execute` and `not_run` need a `note` saying why. Do the mutation before you write the record, not after. `--out` records and keeps it. Then make the changes and hand off again: the next request carries the disposition ledger.
+5. **close a lineage by decision** — `loupe close --lineage --reason "<why>"`
+   Only when the human decides a review is over without a clean verdict. Recorded with the reason; the next handoff opens round 1 with the repository's default cap.
+
+## If you hold the reviewer stamp
+
+1. **take** — `loupe take <request.md> --as <your id>   # or `-` for stdin`
+   `--as` is MANDATORY and names you: the tool cannot observe who is running it, so it records the identity you declare and refuses rather than assume one. Declaring an identity that is not yours puts a false actor in an append-only record. Validates the request, checks that you are the stamped reviewer, fetches the target and resolves base and head in this clone, labels every reference checked / mismatch / unavailable, records the take, and prints the envelope with the exact diff command. If it refuses, return its output to the human — never review a defective or unreachable envelope.
+2. **rule**
+   Read the diff with the printed command and rule by the declared taxonomy only. Findings ordered by severity, atomic (one claim per ID), each with every required field and a FALSIFICATION. Prior dispositions are answered under `## closures` by fingerprint. Material you could not retrieve goes under `## unavailable references` and forbids a clean verdict.
+3. **validate, then stop** — `loupe validate <verdict.md>`
+   Repeat until it exits 0. Then STOP: hand the verdict to the human. You do not start the next round, do not send it back for fix-and-resubmit, and do not decide whether it enters the record.
+
+## Verbs (from the CLI itself)
+
+| verb | what |
+|---|---|
+| `loupe validate` | validate an envelope |
+| `loupe fingerprint` | stable finding ids for a verdict |
+| `loupe respond` | emit a disposition envelope |
+| `loupe ledger` | ledger operations |
+| `loupe import-legacy` | ingest pre-derived legacy events (JSONL, or - for stdin) into the ledger — the §5.2 legacy import mechanism; the derivation from a given corpus is that corpus owner's script |
+| `loupe migrate-state` | move state/config written under a former tool name, digests verified (§10.1) |
+| `loupe emit-request` | emit the next review request (the lower-level half of handoff: no ledger record, no exchange copy) |
+| `loupe handoff` | author: emit, record, keep, stop (§9bis.3) |
+| `loupe take` | reviewer: fetch and probe the target, validate against the target's own config, check every reference from the target tree, record, print the envelope and diff command; --as <identity> is required |
+| `loupe brief` | say in plain language what an envelope asks or rules, and print the exact command or bytes to carry it; finds the open request with no argument |
+| `loupe waive` | record that a commit was deliberately NOT reviewed, with the reason |
+| `loupe close` | author: ingest the verdict and close the round; --lineage closes a lineage by recorded decision |
+| `loupe render-adapters` | render the per-agent adapters (Claude skill, Codex skill, instruction block) from one source; --check is a drift gate, --install deploys them where the agents read them, --check-install reports drift there (§6.3) |
+
+## Where things are
+
+- Config: `review.toml` at the repo root (taxonomy, roles, limits, gates). Absent taxonomy → the tool refuses to emit and the reviewer refuses to rule.
+- State: `~/.local/state/loupe/<repo-id>/` — the ledger, gate output, and `exchange/` with every kept envelope. Override with `--ledger-dir` or `LOUPE_STATE_DIR`.
+- The reviewed SHA is pushed before emission and stamped with the observed remote ref; `take` verifies it. A SHA that cannot be fetched is not a review target.
+
+<!-- END GENERATED: loupe adapter -->

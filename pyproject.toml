@@ -1,0 +1,37 @@
+# Packaging metadata for the published tree. This file backs exactly one of
+# the three advertised install paths — `uvx --from git+<repo> loupe` — which
+# builds a wheel from the checkout and needs a console entry point to find.
+# The other two paths (vendor `review/` + `bin/loupe`; copy the shim onto
+# PATH) do not read it.
+#
+# The distribution is `loupe`; the importable package it installs is `review`.
+# That is the vendored name the tool has always carried (`bin/loupe` runs
+# `python3 -m review`), kept so the two copy-based install paths and this one
+# load the same code. In a shared environment a top-level `review` package
+# collides with anything else claiming that name; `uvx` runs in an isolated
+# environment, which is why the claim is scoped to it.
+#
+# The version is read from `review.TOOL_VERSION`, the single name and version
+# authority (see review/__init__.py); it is not restated here.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loupe"
+description = "Deterministic, agent-neutral code-review handoff: envelopes, gates, ledger, breakers"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = []
+dynamic = ["version"]
+
+[project.scripts]
+loupe = "review.cli:main"
+
+[tool.setuptools]
+packages = ["review"]
+
+[tool.setuptools.dynamic]
+version = { attr = "review.TOOL_VERSION" }

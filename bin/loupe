@@ -1,0 +1,27 @@
+#!/bin/sh
+# Entry point only (design §10.1: renamed rvw -> loupe 2026-08-14). All
+# behaviour lives in the review/ package; the name lives in review/__init__.py.
+#
+# The adapters hand agents a bare `loupe <verb>`, run from whatever directory
+# the repository under review happens to be (§6.3), so this shim must hold two
+# properties the naive form did not:
+#
+#   1. It survives being symlinked onto PATH. `$0` is the symlink, not its
+#      target, so ROOT must be derived after walking the link chain.
+#   2. It loads THIS checkout's `review` package and no other. `python3 -m`
+#      puts the caller's cwd ahead of PYTHONPATH, so a cwd that happens to
+#      contain a `review/` directory silently wins — which is exactly the
+#      shape of this workbench and its extraction candidate side by side.
+#      PYTHONSAFEPATH (3.11+) drops cwd from sys.path, leaving ROOT
+#      authoritative.
+SELF=$0
+while [ -L "$SELF" ]; do
+    LINK=$(readlink "$SELF")
+    case $LINK in
+        /*) SELF=$LINK ;;
+        *)  SELF=$(dirname "$SELF")/$LINK ;;
+    esac
+done
+ROOT=$(cd "$(dirname "$SELF")/.." && pwd)
+PYTHONSAFEPATH=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    exec python3 -m review "$@"

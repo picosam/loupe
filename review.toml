@@ -1,0 +1,88 @@
+# loupe — repository review configuration (design: docs/design.md §Ownership).
+#
+# This file is the CONFIG layer: taxonomy, roles, limits and the gate
+# manifest. The tool hardcodes none of it — it unifies the grammar and treats
+# the vocabulary as required, per-repository configuration. Copy this file to
+# the root of a repository you want reviewed (or to
+# ~/.config/loupe/<repo-id>.toml to keep the repository's tree untouched),
+# then edit every value below to say what YOUR repository means.
+#
+# Absent a declared taxonomy the tool refuses to emit a request and the
+# reviewer must refuse to rule: a taxonomy is decision vocabulary, and a tool
+# that supplies its own has authored your judgment scale.
+
+[taxonomy]
+# Severities, ordered from most to least serious. `blocking` names the ones
+# whose findings must carry a falsification test and may not be deferred or
+# preferred away without escalation.
+severities = ["Blocker", "High", "Medium", "Low", "Info"]
+blocking = ["Blocker", "High"]
+# Classifications: what KIND of defect a finding is. These are examples; a
+# repository that reviews prose, data or infrastructure declares its own.
+classifications = [
+    "factual_error",
+    "internal_contradiction",
+    "design_gap",
+    "unsupported_claim",
+    "process_defect",
+]
+
+[taxonomy.classification_notes]
+factual_error = "a claim about tools/systems that is false"
+internal_contradiction = "the artifact contradicts itself"
+design_gap = "a mechanism named but not provided"
+unsupported_claim = "asserted without evidence, not yet false"
+process_defect = "the author's own execution failed a gate"
+
+# The gate manifest. `loupe handoff` RUNS these itself and records exit codes
+# as machine attestations in the request's Evidence block — nothing is taken
+# on the author's word, a gate that did not run is recorded as not run, and a
+# failing blocking gate blocks. It also makes the deterministic-preventable
+# metric computable: a finding counts as preventable only if its falsification
+# names a gate id that exists here.
+[[gates]]
+id = "tests"
+command = ["python3", "-m", "unittest", "discover", "-s", "review/tests", "-t", "."]
+blocking = true
+
+[[gates]]
+id = "adapters"
+command = ["./bin/loupe", "render-adapters", "--check"]
+blocking = true
+
+[[gates]]
+id = "whitespace"
+command = ["git", "diff", "--check"]
+blocking = true
+
+[roles]
+# Default direction for this repository's loop. A per-invocation stamp on the
+# envelope (author=… reviewer=…) overrides it for that artifact only, and the
+# tool refuses to emit when neither says who holds which side.
+author = "claude"
+reviewer = "codex"
+# What carries the envelope between the two sides — a truthful description of
+# the transport (a person pasting, a shared file path), never decoration.
+relay = "user"
+# Which identities the repository permits in each role. Flags select WITHIN
+# these; stepping outside needs an explicit, reason-bearing override.
+permitted_authors = ["claude", "codex"]
+permitted_reviewers = ["claude", "codex"]
+# Identities the validator rejects as reviewer outright — for example agents
+# whose surface cannot write their own verdict bytes to a file, which reopens
+# the transcription gap the tool exists to close.
+rejected_reviewers = ["gemini", "antigravity"]
+
+[limits]
+# Round cap: the budget breaker fires when a lineage exceeds it. Raise ONE
+# lineage past it with `loupe ledger authorize-cap --to N --reason "..."` —
+# recorded, auditable, scoped to that review — never by editing this number
+# because a breaker keeps tripping.
+round_cap = 3
+# Cumulative token budget per lineage. The tool has no model in any code path
+# and cannot count tokens; counts enter via `loupe ledger add --tokens N` /
+# `loupe close --tokens N`, supplied by whoever ran the model. A round without
+# a count is UNCOUNTED, which is not zero — the report says which of the four
+# states it is in (no budget / no counts / partial / live). Delete this line
+# to declare no budget, which is also a recorded state.
+token_budget = 200000
