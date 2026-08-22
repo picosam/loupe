@@ -23,5 +23,37 @@ while [ -L "$SELF" ]; do
     esac
 done
 ROOT=$(cd "$(dirname "$SELF")/.." && pwd)
-PYTHONSAFEPATH=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+# Both overrides below are ENVIRONMENT variables, so without care every
+# subprocess the tool spawns inherits them — and the gate manifest is
+# subprocesses. On the first per-project onboarding (2026-08-19) that
+# failed twelve of sixteen gates on import errors: PYTHONSAFEPATH strips the script directory
+# and cwd from sys.path, which is exactly what ad-hoc check scripts rely on,
+# and the leaked PYTHONPATH let any gate import this tool's own package by
+# accident. A gate must run in the environment the CALLER of loupe had, so
+# the caller's values are stashed here — presence of the stash variable
+# distinguishes "caller had it set (to this value)" from "caller had it
+# unset"; LOUPE_SHIM marks that the stash protocol ran at all, so the
+# emitter can tell "shim, caller had nothing" from "no shim, unknown
+# caller". review/emit.py restores from these for each gate subprocess.
+# The LOUPE_ prefix is literal because this shim cannot import the package
+# that owns the name; a tool rename must update it here too (§10.1).
+# Round-1 F2: each invocation establishes a FRESH stash state. A stash
+# variable already present in the caller's environment — leaked from an
+# outer invocation or exported by accident — would otherwise survive here
+# and be restored into the gates as a value the caller never set, so an
+# unset caller variable must CLEAR any pre-existing stash, not merely
+# decline to overwrite it.
+if [ "${PYTHONSAFEPATH+set}" = set ]; then
+    LOUPE_CALLER_PYTHONSAFEPATH=$PYTHONSAFEPATH
+    export LOUPE_CALLER_PYTHONSAFEPATH
+else
+    unset LOUPE_CALLER_PYTHONSAFEPATH
+fi
+if [ "${PYTHONPATH+set}" = set ]; then
+    LOUPE_CALLER_PYTHONPATH=$PYTHONPATH
+    export LOUPE_CALLER_PYTHONPATH
+else
+    unset LOUPE_CALLER_PYTHONPATH
+fi
+LOUPE_SHIM=1 PYTHONSAFEPATH=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     exec python3 -m review "$@"

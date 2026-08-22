@@ -253,6 +253,69 @@ def _retain_output(cfg: Config, executed_sha: str, gate_id: str,
     return record
 
 
+def _caller_env() -> dict:
+    """The environment the CALLER of the tool had, for gate subprocesses.
+
+    Found on the first per-project onboarding (2026-08-19): the bin/ shim
+    hardens the tool's own interpreter with PYTHONSAFEPATH=1 and
+    PYTHONPATH=<tool root>, both
+    environment variables, so every gate subprocess inherited them — and
+    twelve of that repo's sixteen gates failed on ModuleNotFoundError under
+    `handoff` while passing by hand. PYTHONSAFEPATH strips the script
+    directory and cwd from sys.path, which is precisely what a repository's
+    ad-hoc check scripts rely on; the leaked PYTHONPATH additionally let any
+    gate import this package by accident. It failed closed (A-FAILED, a
+    refusal), but a manifest that can only attest red for repositories the
+    tool never met is a manifest nobody declares.
+
+    A gate is the REPOSITORY's command and must run in the environment the
+    caller of loupe had, not the one the shim made for the tool. The shim
+    stashes the caller's values (LOUPE_CALLER_PYTHONSAFEPATH /
+    LOUPE_CALLER_PYTHONPATH — presence distinguishes set-to-anything from
+    unset) and marks itself with LOUPE_SHIM; this restores exactly those.
+    Invoked without the shim (python3 -m review) there is no stash and no
+    exact answer, so the best available approximation is applied and named
+    as such: drop PYTHONSAFEPATH, and drop this package's own root from
+    PYTHONPATH, leaving everything else the caller set. The stash and marker
+    variables themselves stay out of the gate environment either way; the
+    re-entrancy marker is added by the caller of this helper.
+    """
+    env = dict(os.environ)
+    ran_via_shim = env.pop(env_var("SHIM"), None)
+    stash_safe = env.pop(env_var("CALLER_PYTHONSAFEPATH"), None)
+    stash_path = env.pop(env_var("CALLER_PYTHONPATH"), None)
+    if ran_via_shim:
+        if stash_safe is None:
+            env.pop("PYTHONSAFEPATH", None)
+        else:
+            env["PYTHONSAFEPATH"] = stash_safe
+        if stash_path is None:
+            env.pop("PYTHONPATH", None)
+        else:
+            env["PYTHONPATH"] = stash_path
+        return env
+    env.pop("PYTHONSAFEPATH", None)
+    # Round-1 F1: only components EXACTLY equal to the tool root are
+    # removed; everything else keeps its value and its ordering — empty
+    # components included, because an empty PYTHONPATH component is not
+    # inert filler, it is the current working directory. The earlier
+    # truthiness filter (`if p and ...`) deleted them, which could recreate
+    # in the fallback the very gate-only import failure this function
+    # exists to end. An untouched value is not split and rejoined at all;
+    # a value that was nothing but the tool root becomes unset, since no
+    # component of the caller's remains to carry.
+    own_root = str(Path(__file__).resolve().parent.parent)
+    if "PYTHONPATH" in env:
+        parts = env["PYTHONPATH"].split(os.pathsep)
+        if own_root in parts:
+            kept = [p for p in parts if p != own_root]
+            if kept:
+                env["PYTHONPATH"] = os.pathsep.join(kept)
+            else:
+                env.pop("PYTHONPATH")
+    return env
+
+
 def run_gates(cfg: Config, target_sha: str) -> list[dict]:
     """Execute the declared gate manifest and return attestations (§5.1).
 
@@ -298,7 +361,7 @@ def run_gates(cfg: Config, target_sha: str) -> list[dict]:
     else:
         binding = "bound"
 
-    env = {**os.environ, env_var("IN_GATE_RUN"): "1"}
+    env = {**_caller_env(), env_var("IN_GATE_RUN"): "1"}
     attestations = []
     for gate in cfg.gates:
         started = time.monotonic()
