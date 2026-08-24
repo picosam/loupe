@@ -74,8 +74,11 @@ LINEAGE_KINDS = ("rename", "anchor_change", "invariant_introduced",
 # into distinct children and `semantic_repeat` records a judgment; neither merges.
 LINEAGE_MERGING = ("rename", "anchor_change", "invariant_introduced", "alias")
 
-# Breakers (§5.3d). Names only — the logic lives in ledger.py.
-BREAKERS = ("repetition", "stale", "no-progress", "unverifiable", "budget")
+# Breakers (§5.3d). Names only — the logic lives in ledger.py. `orphan`
+# (round 3 F1): a disposition companion event that binds no recorded
+# emission — it certifies nothing, feeds no other breaker, and escalates.
+BREAKERS = ("repetition", "stale", "no-progress", "unverifiable", "budget",
+            "orphan")
 
 # --------------------------------------------------------------- the claim
 
@@ -138,3 +141,132 @@ CLAIM_REQUIRED = ("objective",)
 
 # Members whose string value may not be empty or blank.
 CLAIM_NONEMPTY = ("objective",)
+
+
+# ------------------------------------------------------------- transport
+
+# How the two ends of one round exchange bytes (§5.2, RVW-T11). Closed, and
+# it is a TOPOLOGY rather than a carrier menu: `path` says the two sides read
+# the same filesystem, so a kept path is a thing the other end can open;
+# `paste` says they do not, so bytes are the only thing that crosses. The
+# §5.2 decision is unchanged by this enum — paste is still the only carrier
+# provided for the second case, and no third value adds one.
+#
+# It is declared, never observed. A process can see where IT runs; it cannot
+# see where the other side runs, and the relay text on each leg is about the
+# OTHER side. Inferring it from what is visible locally — an environment
+# variable, `take -` on stdin, a missing path — fails open in the direction
+# that hurts: it reads "same machine" when nobody said so, which is exactly
+# the state that prints a path the far end cannot open. So silence means the
+# default, and the default is stated on the envelope's face rather than
+# assumed by each reader.
+TRANSPORT_PATH = "path"
+TRANSPORT_PASTE = "paste"
+TRANSPORTS = (TRANSPORT_PATH, TRANSPORT_PASTE)
+# What an UNSTAMPED envelope or a legacy ledger record READS as: every
+# envelope and record written before the attribute existed came from a
+# same-filesystem loop, and reading that silence as anything else would
+# make the historical record unreadable (RVW-T11).
+TRANSPORT_DEFAULT = TRANSPORT_PATH
+# What a NEW emission resolves to when NO declaration reaches it (round 3
+# F2, settling the lineage-6-round-2 incident policy): `path`, the
+# workflow's declared steady case — the user operates author and reviewer
+# on one machine, and pricing every ordinary local round at the paste
+# carrier answered the incident by taxing the case that never caused it.
+# The cross-machine case is covered not by the silent default but by an
+# ENVIRONMENT-BOUND declaration the cloud side carries: a cloud-authored
+# session sets `LOUPE_TRANSPORT=paste` (TRANSPORT_ENV, configured in the
+# cloud environment's own settings), or is recognized by a documented
+# provider signal (TRANSPORT_PROVIDER_SIGNALS). Both rank above this
+# default and below the repository's `[roles] transport` and the explicit
+# `--transport` flag — a human declaration always outranks an environment
+# one, which outranks an inference, which outranks silence.
+TRANSPORT_EMISSION_DEFAULT = TRANSPORT_PATH
+
+# The Loupe-specific environment declaration (round 3 F2). Set by the
+# ENVIRONMENT a session runs in — a cloud sandbox's configuration writes
+# `LOUPE_TRANSPORT=paste` because bytes are the only carrier that reaches
+# the operator's machine from there. It is a declaration like the config
+# key: empty or outside the vocabulary is refused, never folded to a
+# default.
+TRANSPORT_ENV = "LOUPE_TRANSPORT"
+
+# Documented provider signals: (variable, exact value) -> the transport it
+# entails, under ONE stated workflow assumption: the OTHER endpoint — the
+# reviewer relay the operator drives — is on the operator's local machine,
+# so an author endpoint known to be a cloud sandbox does not share its
+# filesystem. The matrix is closed and exact-match: any other value of the
+# variable is NOT a signal (a process that half-matches an env var is
+# inferring, which §5.2 rejects).
+#
+#   CLAUDE_CODE_REMOTE == "true" — Claude Code cloud sessions set it
+#   (recorded evidence, 2026-08-11: cloud provisioning scripts gate on
+#   exactly this variable and value). It identifies the AUTHOR endpoint
+#   only.
+#
+# Codex cloud is deliberately absent: current official OpenAI
+# documentation guarantees user-configured environment variables persist
+# through a cloud chat and documents no intrinsic cloud/topology marker —
+# so a Codex cloud environment declares TRANSPORT_ENV instead of being
+# sniffed.
+TRANSPORT_PROVIDER_SIGNALS = (
+    ("CLAUDE_CODE_REMOTE", "true", TRANSPORT_PASTE),
+)
+
+
+class TransportDeclarationError(RuntimeError):
+    """A transport declaration outside the closed grammar, refused by the
+    one reader every source and consumer goes through (R1-F2)."""
+
+    def __init__(self, message: str, remedy: str):
+        super().__init__(message)
+        self.remedy = remedy
+
+
+def transport_or_default(value, where: str) -> str:
+    """THE transport lifecycle boundary: every admitted source — config,
+    author flag, reviewer correction, wrapper stamp, ledger record — and
+    every reader resolve a declared value through this one function
+    (R1-F2).
+
+    Exactly four input states, schema-derived, nothing else:
+
+      * absent (None)   — the default. A real declaration, not an unknown:
+                          every envelope, config and ledger event written
+                          before the attribute existed came from a loop
+                          with one topology, and reading that silence as
+                          unknown would make the historical record
+                          unreadable (RVW-T11).
+      * empty ("")      — refused. Stating a value emptily is a different
+                          act from stating none — the same rule the claim
+                          boundary applies to `--claim-file ""` — and an
+                          `or` that folds it to the default is the exact
+                          fail-open direction §5.2 names: `path` selected
+                          when nobody declared the shared filesystem.
+      * outside the     — refused, by value, before anything downstream
+        vocabulary        acts: an unrecognised carrier stamped on an
+                          envelope, recorded in an append-only ledger, or
+                          used to select a relay would mean both ends
+                          acting on a topology neither can name.
+      * in the          — returned as declared.
+        vocabulary
+
+    Refusal happens HERE, in the reader, because a closed lifecycle cannot
+    rely on every caller remembering to route through one validating verb:
+    the round-1 evidence was three admitted routes (an explicitly empty
+    config, a repeated reviewer correction, a defective wrapper read by
+    `brief`) that each selected `path` without anyone declaring it.
+    """
+    if value is None:
+        return TRANSPORT_DEFAULT
+    if value not in TRANSPORTS:
+        stated = "explicitly empty" if value == "" else repr(value)
+        raise TransportDeclarationError(
+            f"{where} declares a transport that is {stated}, not one of "
+            f"{list(TRANSPORTS)}: the transport is a closed vocabulary, "
+            f"and a value outside it names no topology either side can "
+            f"act on (§5.2)",
+            remedy=f"a person declares one of {list(TRANSPORTS)} — "
+                   f"`path` when both sides read the same filesystem, "
+                   f"`paste` when they do not")
+    return value

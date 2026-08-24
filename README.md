@@ -72,7 +72,9 @@ its own vocabulary has authored your judgment scale.
 
 State lives outside the reviewed tree at `~/.local/state/loupe/<repo-id>/`
 (ledger, gate output, kept envelopes); override with `--ledger-dir` or
-`LOUPE_STATE_DIR`.
+`LOUPE_STATE_DIR`. `loupe prune` removes retained gate output for commits
+no ledger event references — the ledger and the kept envelopes are the
+record and are never pruned.
 
 ## Agent adapters
 
@@ -102,10 +104,14 @@ working with nothing installed.
 
 ## Status
 
-Version 0.3.0. Implemented and tested: the envelopes and validators, the
-gate manifest and attestation checks, roles and stamps, fingerprints with
+Version 0.5.0 — the version is bumped inside the reviewed round of any
+change that will be published, so `--version` discriminates publishes.
+Implemented and tested: the envelopes and validators, the
+gate manifest and attestation checks, roles and stamps (including
+per-invocation selection within the permitted lists), fingerprints with
 alias lineage, the ledger with lineage scoping, the five breakers, honest
-metrics, reachability, the transport verbs, dialect migration, generated
+metrics, reachability, the transport verbs, retention with `prune`, dialect
+migration, generated
 adapters. Designed but not implemented: risk tiering, path-scoped contract
 invariants, auto-execution of falsification tests, a git-notes carrier, an
 MCP facade. See design §9.

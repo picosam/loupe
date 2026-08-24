@@ -15,7 +15,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from review import TOOL_NAME, adapters, cli, config
+from review import TOOL_NAME, TOOL_VERSION, adapters, cli, config
 from review.digest import sha256_text
 from review.tests.util import REPO_ROOT, public_path, spec_path
 
@@ -47,6 +47,16 @@ class TestOneSource(unittest.TestCase):
             text = adapters.render(kind)
             self.assertTrue(text.startswith("---\nname: " + TOOL_NAME + "\n"))
             self.assertIn("\ndescription: ", text.split("---")[1])
+
+    def test_the_trigger_covers_zero_footprint_repositories(self):
+        # The trigger named only an in-tree review.toml, and a zero-footprint
+        # onboarding (user-level config, §4) declares nothing in-tree — so
+        # the one configuration the ownership model exists to protect was
+        # the one the skill would not fire on (found by the first pilot).
+        for kind in ("claude-skill", "codex-skill"):
+            description = adapters.render(kind).split("---")[1]
+            self.assertIn(f"~/.config/{TOOL_NAME}/", description)
+            self.assertIn("review.toml", description)
 
     def test_verb_table_matches_the_parser_both_ways(self):
         parser_verbs = {name for name, _ in adapters.verb_table()}
@@ -186,6 +196,53 @@ class TestPublicCommandParity(unittest.TestCase):
                 seen += 1
                 self.assertIn("--as", inv, f"{kind}: {inv!r}")
         self.assertTrue(seen, "the adapters show the reviewer's command")
+
+
+class TestAdvertisedVersionParity(unittest.TestCase):
+    """Lineage 6 round 5 F1 (Medium): the shipped README advertises the
+    version the executable reports.
+
+    `review.TOOL_VERSION` is the one authority — `--version`, the
+    generated adapters and pyproject all read it — and the README Status
+    line is a second surface stating the same fact by hand. The 0.4.0 ->
+    0.5.0 bump moved the authority and left the advertisement behind, so
+    the candidate a clean close would publish claimed two current
+    versions at once. A hand-kept copy of a machine-known fact needs a
+    gate or it drifts at the next bump, and this is that gate: it runs in
+    the candidate's own standalone suite, which is where the defect was
+    publishable from.
+    """
+
+    STATUS = re.compile(r"^Version (\S+) ", re.M)
+
+    def _advertised(self):
+        readme = public_path("README.md")
+        if readme is None:
+            self.skipTest("no README shipped in this tree")
+        found = self.STATUS.search(readme.read_text(encoding="utf-8"))
+        self.assertIsNotNone(found, "the README Status line names no version")
+        return found.group(1)
+
+    def test_the_readme_advertises_the_executable_version(self):
+        """FALSIFICATION for round-5 F1. Mutation: restore `Version 0.4.0`
+        in the README Status line, or move TOOL_VERSION without it, and
+        this fails naming both values."""
+        advertised = self._advertised()
+        self.assertEqual(
+            advertised, TOOL_VERSION,
+            f"the README advertises {advertised} and the executable "
+            f"reports {TOOL_VERSION}: the bump reached the authority and "
+            f"not the advertisement")
+
+    def test_the_cli_reports_the_same_version(self):
+        """The paired control, through the surface a reader actually runs:
+        `--version` is the authority the README is checked against, so the
+        test cannot pass by comparing a constant with itself."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.main(["--version"])
+        self.assertEqual(code, 0)
+        self.assertEqual(buf.getvalue().strip(), self._advertised())
 
 
 class TestInstall(unittest.TestCase):
@@ -513,10 +570,16 @@ class TestInstall(unittest.TestCase):
                 code = cli._blocked("", "must stop", **kw)
             return code, json.loads(buf.getvalue())
 
+        # Round 5 F1: `next` takes a rendered command, so the fixture
+        # renders one — and the forgery below still arrives as a raw
+        # string through `extra`, which is the thing this test is about.
+        from review import paths
+        handoff = paths.command(*paths.lits(TOOL_NAME, "handoff"))
+
         def command(**kw):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                code = cli._blocked(f"{TOOL_NAME} handoff", "try again", **kw)
+                code = cli._blocked(handoff, "try again", **kw)
             return code, json.loads(buf.getvalue())
 
         for label, recovery, expect in (("blocked", call, ("blocked", None)),

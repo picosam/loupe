@@ -291,7 +291,19 @@ authorize-breaker --breaker <name> --reason … --by <who>`), which binds by
 identity to the firings of that breaker that are fired and unauthorized when
 it is recorded — a firing that did not exist then (a run event arriving
 after the verdict, say) is not covered, and a breaker that is not firing
-cannot be authorized ahead of time. An empty or whitespace reason or actor
+cannot be authorized ahead of time. A firing's identity is its breaker, its
+round, the fingerprint or limit it fired on, **and the content identity of
+the material it fired on** — the companion events of one orphan batch, the
+one unexecutable run, the measured token spend. The key alone is not an
+identity wherever the evaluation admits more than one firing per key, or the
+same key over changed material: a decision on the first unmatched companion
+would take every later one, a decision on one unexecutable run would take
+the next, a decision at 400 tokens over budget would take 10 000. Identity
+is what the human read, so the same facts re-read stay decided and any
+further material is a new firing that stops the loop again. An older
+ledger's coverage string, written before the material half existed, no
+longer matches — which fails closed: the breaker fires again and the human
+decides again. An empty or whitespace reason or actor
 is refused before anything is appended: a required flag proves a token was
 supplied, not that a decision was taken. A breaker that only appears inside
 an exit-0 request does not break the circuit; this one does.
@@ -303,6 +315,7 @@ an exit-0 request does not break the circuit; this one does.
 | **no-progress** | a completed round adds zero new fingerprints, zero disposition changes, zero new material evidence and no changed falsification outcome |
 | **unverifiable** | a blocking finding's falsification test cannot be executed — *blocking* judged per finding (the run event carries its finding's effective blocking state), so a Medium finding's unexecutable test is reported in the record but fires nothing |
 | **budget** | round count > cap (default 3), or cumulative counted tokens > declared budget — a partial count is a lower bound; a breach by the bound is real, silence means nothing |
+| **orphan** | a disposition companion event (a falsification run, refutation evidence) binds no recorded emission — its batch stamp matches no row, or no row exists for its key. An orphan is kept on the audit surface, is never a standing answer, feeds no other breaker and certifies no acceptance; it fires until a human decides what it is |
 
 Progress breakers read *completed* rounds only: a round with a request and
 no verdict yet is in flight, not spinning. Rejected: "do not repeat
@@ -391,20 +404,123 @@ behind a two-clone prototype), committing the envelope on the branch
 forge into a review bus — rejected). Today the envelope crosses by whatever
 `relay` the repository declares — a kept file path on one machine, a paste
 between two — and each verb records what it did, so neither end is manual.
+Both legs read a paste: the request leg through `take -`, the verdict leg
+through `close --verdict -` and `respond --verdict -`.
+
+**The topology is declared, not detected (RVW-T11).** Which of the two cases
+a round runs in is a fact about the pair of machines, and no process can
+observe it: each side can see where IT runs, while the commands each side
+prints are about where the OTHER side runs. So `transport` joins the role
+stamp as a declared, closed-vocabulary input — `path` when both ends read the
+same filesystem, `paste` when they do not — defaulting to `[roles] transport`
+and selected per round by `--transport`. It is stamped on the envelope's
+wrapper, recorded in the ledger by every verb that files the round, and it is
+what decides the carrier each relay prints: `path` renders the kept-path
+command and nothing beside it, `paste` renders `take -` and `close --verdict -`
+with the bytes. The reviewer may correct an author's stamp with `take
+--transport`, and the correction is recorded beside the value it corrects
+rather than replacing it.
+
+The declaration is ONE lifecycle boundary over every source and reader
+(R1-F2): config value, author flag, environment declaration, reviewer
+correction, wrapper stamp and ledger record all resolve through a single
+schema-derived reader. On the READING side absence is the historical
+default, `path`: a config without the key, an unstamped envelope, a record
+that predates the attribute — every silent artifact written before the
+attribute existed came from the same-machine loop, and reading that
+silence as anything else would make the historical record unreadable. An
+explicitly empty value, a value outside the vocabulary, a repeated or
+conflicting selector, and a defective recorded value are refused BEFORE
+anything downstream acts — before a ledger write, a git call, a gate run,
+a cache serve or a runnable relay — because each of those failure shapes
+used to fall open to `path`, the exact direction §5.2 names as harmful: a
+pointer printed for a far end that cannot open it. Refusal lives in the
+reader itself, not in one validating verb a caller has to remember:
+`brief` is as much an official relay reader as `take`, and a closed
+lifecycle holds at every entry or at none.
+
+On the EMISSION side a new round resolves through one stated order,
+strongest declaration first: the explicit `--transport` flag; `[roles]
+transport` in the governing config; the environment's own declaration,
+`LOUPE_TRANSPORT` — a cloud environment's configuration sets it to
+`paste`, because bytes are the only carrier that reaches the operator's
+machine from a sandbox; a documented provider signal (below); the `path`
+entailed by `--local-only`; and finally `path`, the undeclared steady
+case — this workflow's declared topology is the operator's machine
+running both sides, and the lineage-6 incident (a silent `path` emitted
+to a cross-machine reviewer) is answered by the cloud side CARRYING a
+declaration, not by pricing every ordinary local round at the
+cross-machine carrier, which is what the first repair did and what left
+the executable default, the CLI help and this document contradicting one
+another (round 3 F2).
+
+The provider signal is deliberately narrow. Open-ended inference stays
+rejected — `take -` on stdin, a path that does not resolve, an env var
+read for what it might mean: each reports the local side only and fails
+open. What is admitted is a CLOSED matrix of documented (variable, exact
+value) pairs in `vocab.TRANSPORT_PROVIDER_SIGNALS`, under one stated
+workflow assumption: the other endpoint — the relay the operator drives —
+is the operator's local machine, so an author endpoint known to be a
+cloud sandbox does not share its filesystem. Today the matrix holds
+exactly `CLAUDE_CODE_REMOTE == "true"` → `paste` (Claude Code cloud;
+repository evidence, recorded 2026-08-11). Codex cloud is deliberately
+absent: current official OpenAI documentation guarantees user-configured
+environment variables persist through a cloud chat and documents no
+intrinsic cloud/topology marker, so a Codex cloud environment declares
+`LOUPE_TRANSPORT=paste` in its own configuration instead of being
+sniffed. A signal ranks below every human declaration and above only the
+silence it disambiguates.
+
+Three consequences follow from having the fact rather than guessing it. The
+same-machine round — the steady case — pays nothing: one line, no
+alternative, no prose for a relaying agent to reword. The cross-machine
+round gets exact commands instead of a hedge, and its envelope bytes ride
+INSIDE the printed fence on both legs — the request under `take -`, the
+verdict under `close --verdict -` — because a chat surface preserves a
+fenced region verbatim and rewrites everything else (round 3, live: a
+validated verdict lost its markdown headings crossing a chat as loose
+prose). And the reachability leg stays refusable: `--local-only` and
+`transport = "paste"` are a contradiction — a SHA fetchable from nowhere
+handed to a reviewer with no access to this filesystem — so emission
+refuses it before the commit, whichever source resolved the `paste`,
+rather than stamping it for the reviewer to discover at `take`.
+
+**Decided: paste is the transport, and there is no other.** A carrier that
+reaches a party with no access to the other's filesystem — a session
+fetching the bytes itself, a forge-mediated transport — is deliberately
+NOT provided. Not "not yet": providing one means either teaching the tool
+to fetch from somewhere, which makes it a client of a service the review
+does not control, or routing envelopes through a forge, which is the
+review bus this section already rejects. A person moving bytes is a
+transport that works everywhere, needs no credential, and cannot fail
+open. The cost is stated rather than hidden: an author and a reviewer on
+different machines each need a human paste per leg, and the two-machine
+flow has never been exercised end to end. If that cost ever becomes the
+wrong one, the decision — not the code — is what changes first.
 
 ### 5.3 One verb per phase, no flag the agent must decide
 
 Every decision the agent makes is a token cost and a drift risk; the tool
 decides everything derivable and the agent runs one command.
 
-One flag is required, and it is required precisely because it is *not*
-derivable: `take --as <identity>`. The tool cannot observe who is at the
+Two flags are required, and both are required precisely because they are
+*not* derivable. The first is `take --as <identity>`. The tool cannot observe who is at the
 keyboard, and the repository's `[roles] reviewer` names the permitted
 direction of review, not the actor — inferring one from the other is how a
 review gets recorded against someone who never ran it. So the reviewer
 identity is declared, never defaulted, and silence is refused rather than
 filled in. The agent still decides nothing: the relay line printed by
 `handoff` carries the literal `--as` the reviewer is to run.
+
+The second is `--transport` (§5.2). Nothing a process can read tells it
+whether the other side shares this filesystem, and unlike the identity
+there IS a safe silence: the repository declares its standing case in
+`[roles] transport`, a cloud environment declares its own in
+`LOUPE_TRANSPORT`, and with neither the tool resolves the workflow's
+steady case, `path` — so the flag is the exception a human names when they
+know this round is different. The agent decides nothing here either — it
+passes what it was told or nothing at all, and the relay it hands over
+carries the one carrier the round declared.
 
 - **`handoff`** (author): a lifecycle preflight first — every finding of
   the just-closed verdict has exactly one recorded disposition, and no fired
@@ -458,8 +574,143 @@ filled in. The agent still decides nothing: the relay line printed by
   against the cap in force before recording it, and records the same
   request-plus-evidence shape `handoff` and `take` record), **`emit-request`**
   (the lower-level half of `handoff`), **`import-legacy`**,
-  **`migrate-state`**, **`render-adapters`**. Every `--by` is required where
-  it appears: who authorized is carried, never inferred.
+  **`migrate-state`**, **`render-adapters`**, **`prune`**. Every `--by` is
+  required where it appears: who authorized is carried, never inferred.
+
+The emitting verbs take an optional `--author` / `--reviewer` — the §4
+per-invocation stamp, selecting WITHIN the config's permitted lists.
+Outside them it is refused, and so is a flag against a repository that
+declares no list: with nothing declared there is no permission to select
+within, and an unconstrained flag would put arbitrary identities into an
+append-only record. A repeated selector — same value or conflicting,
+either order — is refused naming both occurrences, never collapsed to the
+last writer. Every invariant binds the EFFECTIVE identity whatever its
+source: an UNASSIGNED side refuses at resolution (empty is a domain
+member, and a malformed permitted list carrying the empty string cannot
+admit it as a selection), a config-defaulted rejected or unpermitted
+identity refuses exactly as a flagged one does — `rejected_reviewers`
+outranks the permitted list, self-review is refused for every pair — and
+resolution precedes the ledger, the cache, the commit, the push and the
+gate run. The effective stamp is part of what makes a kept envelope warm:
+a cached handoff emitted under one direction never answers an invocation
+that selected another.
+
+A REQUIRED reference must be target-bound, judged at the same boundary,
+in three layers — an unavailable or unrecognised required reference
+forbids the clean verdict the round seeks, so every one of them refuses
+before the ledger, the push, the gates and emission.
+
+*The path*, as the wire can carry it — checked for EVERY reference,
+required or advisory, at the preflight and again at the render boundary.
+A manifest line is whitespace-delimited, so the admitted grammar is
+deliberately restricted rather than quoted: ordinary relative paths,
+including non-ASCII names, are carried; whitespace, control and invisible
+characters, a leading `-`, a trailing `/`, `.` and `..` segments, doubled
+separators and absolute paths are refused, each by its own name. One
+character class defines what the emitter may render and what the
+reviewer's parser recognises, so the two cannot drift apart.
+Requiredness decides a policy — whether unavailable evidence blocks a
+clean verdict — and never the syntax the line needs to carry a row.
+
+*The tracking state.* `take` reads references from the target tree, so a
+required reference that is ignored, untracked, missing, deleted-though-
+tracked, or escaping the repository root is refused: a digest over bytes
+no commit carries binds nothing.
+
+*The object mode*, read from the index and an lstat BEFORE anything
+follows the final component — target-following checks decide only the
+states whose policy depends on the referent, or a dangling link reports
+as a deleted file and a link pointing outside the root as an escaping
+path. A regular file, executable or not, and a directory prefix are
+readable the same way by both sides. A tracked SYMLINK and a
+GITLINK are not — the emitter would digest the bytes a link points at
+while `take` digests the link, and a submodule's bytes live in another
+repository — so both refuse, and a regular file replaced by a link since
+the last commit refuses with them, because the handoff commits what the
+disk carries.
+
+Kind and digest are derived from the TARGET TREE by one shared pair of
+functions, so the manifest the author renders and the states the reviewer
+computes cannot describe an object differently. Material the target tree
+does not carry is declared UNAVAILABLE at emission rather than digested
+from local bytes. Advisory references keep the three-state rendering
+(file-with-digest, directory, declared UNAVAILABLE): declared-unavailable
+is the author's honesty mechanism for material that genuinely cannot
+travel, and that state is the reviewer's to weigh.
+
+Commands are BUILT ONE WAY, and the fields that carry them check it.
+Every command the tool prints — relay lines, typed `next` recoveries, the
+reachability stamp's `Verify:` line, the diff commands both sides print —
+comes from one renderer that takes the command's words, each word a
+validated type that cannot cross into another: a shell-inert literal (a
+verb, a flag — nothing a shell acts on can be spelled in its grammar), one
+of the two operators the tool writes deliberately (`&&`, `<`), or a
+`<placeholder>` a person fills in, whose quotes and brackets exist only in
+balanced pairs the grammar itself writes. Every other word is a dynamic
+value quoted as it is built, so no later moment exists at which it could
+still be unrendered. A third form covers the surfaces where a quote would
+corrupt the artifact rather than protect it — a generated verb table, a
+usage hint: the value is PROVED shell-inert and refused if it is not.
+Nothing is exempt for not being a path: a reviewer identity and a Git ref
+are dynamic words like any other, and Git accepts a ref name carrying a
+semicolon.
+
+The boundary is STRUCTURAL, not the shape of the source. A rendered
+command is its own type carrying its construction record, and the fields
+an agent executes accept that type and refuse both a bare string and a
+type-forged instance without the record. A command containing a
+placeholder is a TEMPLATE — a distinct type those fields refuse by name —
+so a line a person must finish travels only as prose or a `#` comment,
+never as a field an agent runs verbatim. What the executable fields carry
+is therefore, by construction: inert words, intentional operators, and
+quoted single arguments. Reading the source remains a drift detector
+beside the boundary, over every module of the package recursively, and it
+fails closed — but it is best-effort evidence, not the invariant: Python
+admits indefinitely many spellings of a call, and the guarantee does not
+rest on enumerating them. A deliberately malicious in-process author who
+forges private objects is outside this threat model; the boundary closes
+every ordinary construction route, and the claim stops there.
+
+**Retention.** The state directory's layers are not equal. The ledger is
+append-only and is never pruned; `exchange/` — the kept envelopes — is the
+review record itself and is never pruned; retained gate output is the one
+designed-pruneable layer, because every attestation carries the sha256 and
+byte count of its output, so a missing retained copy degrades the pointer
+without losing the identity. `prune` executes exactly that policy: it
+removes plain gate-output directories for commits no ledger event
+references — the common orphan is a refused emission attempt, which
+retains gate output and records nothing — and keeps everything else,
+NAMED by class in the result: referenced directories, symlinks (live or
+broken, never dereferenced — on a deletion boundary the filesystem object
+type is authority, so classification never follows a link and nothing
+outside the layer is read or written even when a crafted or stale link
+points elsewhere), non-directories, non-SHA names, and entries whose type
+cannot be read. That rule starts at the CONTAINER: `gate-output/` itself
+is opened no-follow, directory-only, and enumeration, accounting and
+deletion are all anchored to that one descriptor — a linked,
+non-directory or unreadable container refuses at the open. For a container
+RENAMED, REPLACED OR REMOVED after that, the enforceable invariant is
+stated as what it is: prune refuses a replacement OBSERVABLE AT ITS
+COMPARISON POINTS, and descriptor anchoring keeps a replacement made at
+any other moment from redirecting traversal, accounting or deletion. The
+opened identity is compared with the one the path names at four points —
+at the open, before each entry's decision, after that entry's accounting
+and before its removal or dry-run record, and once more before the run
+reports success — so dry-run and act refuse on identical states, and a run
+with one entry or none refuses like a run with many.
+
+Two intervals remain irreducible, and both are part of the contract rather
+than excluded from it. Between the last comparison and the removal
+syscall, a replacement is not detected and the deletion still runs against
+the verified inode inside the state root. Between the final comparison and
+the successful return, a replacement is not detected either, so a run can
+report success while the state directory already names something else —
+nothing outside the layer has been read or written, and nothing further
+has been deleted. No check can close either interval; only an atomic
+ownership mechanism could, and the tool does not claim one.
+Removal deletes nested links rather than their targets,
+the freed-bytes accounting walks without following either, and
+`--dry-run` reports the identical decision without acting on it.
 
 Exit codes mean exactly one thing — 0 ok, 1 findings or refusal, 2 usage —
 and every non-zero exit prints **a typed recovery, not a diagnosis**. The
@@ -545,12 +796,14 @@ claims about its own history are made where that history lives.
 
 Implemented and tested (standard-library unit tests, plus a real two-clone
 loop over a bare path remote): the three envelopes and their validators; the
-gate manifest with field-by-field attestation validation; roles and stamps;
+gate manifest with field-by-field attestation validation; roles and stamps,
+including per-invocation selection within the permitted lists (§4);
 fingerprints v2 with declared anchors and citations, alias lineage and
 fail-closed resolution; the ledger with lineage scoping; the five breakers;
 the metrics with honest token states; reachability (push, observe, stamp,
-verify); `handoff` / `take` / `respond` / `close`; the former-name dialect
-acceptance and state migration; adapters rendered from one source.
+verify); `handoff` / `take` / `respond` / `close`; state retention with
+`prune` (§5.3); the former-name dialect acceptance and state migration;
+adapters rendered from one source.
 
 Designed, not implemented: risk tiering (reach × depth); path-scoped
 contract invariants; automatic execution of runnable falsification tests and

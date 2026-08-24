@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+from collections import Counter
 import json
 import os
 import re
@@ -22,9 +23,9 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
-from . import TOOL_NAME, TOOL_VERSION, env_var, vocab, wire
+from . import TOOL_NAME, TOOL_VERSION, env_var, paths, refs, vocab, wire
 from .config import Config
-from .digest import sha256_file, sha256_text
+from .digest import sha256_text
 from .ledger import Ledger, render_report_md
 
 
@@ -35,8 +36,25 @@ def _git(repo_root: Path, *args: str) -> str:
     out = subprocess.run(["git", "-C", str(repo_root), *args],
                          capture_output=True, text=True, timeout=120)
     if out.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)}: {out.stderr.strip()}")
+        raise RuntimeError(
+            f"a `git` subprocess failed: "
+            f"`{paths.command(paths.Lit('git'), *args)}` — "
+            f"{out.stderr.strip()}")
     return out.stdout.strip()
+
+
+def _git_bytes(repo_root: Path, *args: str) -> bytes:
+    """Raw stdout, for content that must be digested as BYTES rather than
+    decoded first — `git show <sha>:<path>` over a file this process has no
+    business assuming is UTF-8 (round 3 F1)."""
+    out = subprocess.run(["git", "-C", str(repo_root), *args],
+                         capture_output=True, timeout=120)
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"a `git` subprocess failed: "
+            f"`{paths.command(paths.Lit('git'), *args)}` — "
+            f"{out.stderr.decode('utf-8', 'replace').strip()}")
+    return out.stdout
 
 
 def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
@@ -67,7 +85,8 @@ def next_round(ledger: Ledger) -> int:
 def ensure_pushed(cfg: Config, head: str | None = None,
                   local_only: bool = False,
                   commit_subject: str | None = None,
-                  round_no: int | None = None, git=None) -> dict:
+                  round_no: int | None = None, git=None,
+                  transport: str | None = None) -> dict:
     """Make the review target fetchable BEFORE emission (§9bis.4, RVW-T7).
 
     Commits outstanding tracked work, pushes the reviewed branch, and returns
@@ -83,6 +102,23 @@ def ensure_pushed(cfg: Config, head: str | None = None,
     """
     repo = cfg.repo_root
     run = git or (lambda *a: _git(repo, *a))
+
+    # RVW-T11 leg 2, and the one place the two declarations can contradict
+    # each other. `--local-only` says review is genuinely same-clone;
+    # `transport = paste` says the reviewer has no access to this filesystem.
+    # Both cannot hold: the reviewer would receive bytes naming a SHA no
+    # clone of theirs can fetch, and would discover it at `take`, after the
+    # human has already carried the envelope. Refused here, before the
+    # commit, because it needs no git state to be false — this is the leg
+    # RVW-T11 called unsolved-but-visible, now enforced rather than stamped.
+    if local_only and transport == vocab.TRANSPORT_PASTE:
+        raise RuntimeError(
+            f"--local-only declares the target fetchable from no remote, "
+            f"while transport={vocab.TRANSPORT_PASTE!r} declares a reviewer "
+            f"with no access to this filesystem: the two cannot both be true, "
+            f"and the envelope would bind a SHA that reviewer can never reach "
+            f"(§9bis.4, RVW-T11). Push the branch to a remote both sides can "
+            f"fetch, or declare transport={vocab.TRANSPORT_PATH!r}")
 
     branch = run("rev-parse", "--abbrev-ref", "HEAD")
     if branch == "HEAD":
@@ -152,7 +188,8 @@ def ensure_pushed(cfg: Config, head: str | None = None,
                 f"{branch} has no upstream and {len(remotes)} remotes exist "
                 f"({', '.join(remotes)}): the destination is not derivable, "
                 f"and the tool never invents a decision (§9bis.3). Set one "
-                f"with `git push -u <remote> {branch}`, then re-run")
+                f"with `{paths.command(*paths.lits('git', 'push', '-u'), paths.Ph('<remote>'), branch)}`, "
+                f"then re-run")
         remote, merge_ref = remotes[0], f"refs/heads/{branch}"
 
     url = _scrub_url(run("remote", "get-url", remote))
@@ -469,12 +506,30 @@ def _verdict_shape_block(cfg: Config, sha: str) -> str:
 
 
 def _dispositions_block(ledger: Ledger, round_no: int) -> str:
-    events = [e for e in ledger.current()
-              if e.get("event") == "disposition" and e.get("round") == round_no]
-    if not events:
-        return f"(no round-{round_no} dispositions in the ledger)"
-    lines = []
-    for e in events:
+    # Round 2 F1: the reviewer is shown the STANDING answer per finding,
+    # once — the live round-2 request printed each answer three times,
+    # because this block read raw events while the preflight read the
+    # standing selector. Superseded emissions are marked by count, never
+    # presented as co-standing answers; the raw rows stay in the ledger
+    # file, which is the audit surface.
+    every = ledger.disposition_batches(round_no=round_no)
+    batches = [b for b in every if b["disposition"] is not None]
+    standing = [b for b in batches if b["standing"]]
+    # Round 3 F1: orphan companions are named to the reviewer, never
+    # rendered as answers and never silently dropped — the anomaly is the
+    # reviewer's business exactly because it certifies nothing above.
+    orphans = [b for b in every if b["orphan"]]
+    orphan_note = (f"- ANOMALY: {len(orphans)} orphan companion batch(es) "
+                   f"bind no recorded emission and certify nothing (the "
+                   f"`orphan` breaker fires; see the ledger report)"
+                   if orphans else "")
+    if not standing:
+        base = f"(no round-{round_no} dispositions in the ledger)"
+        return f"{base}\n{orphan_note}" if orphan_note else base
+    superseded = Counter(b["key"] for b in batches if not b["standing"])
+    lines = [orphan_note] if orphan_note else []
+    for b in standing:
+        e = b["disposition"]
         sub = f"({e['subtype']})" if e.get("subtype") else ""
         payload = e.get("payload", {})
         detail = payload.get("verification") or payload.get("destination") or ""
@@ -485,36 +540,440 @@ def _dispositions_block(ledger: Ledger, round_no: int) -> str:
         if isinstance(run, dict) and run.get("status"):
             detail = (f"{detail} [falsification: {run.get('status')}; "
                       f"mutation: {run.get('mutation')}]").strip()
-        lines.append(f"- {e['finding_id']} `{e['fp']}` — "
-                     f"**{e['disposition']}{sub}** {detail}".rstrip())
+        line = (f"- {e['finding_id']} `{e['fp']}` — "
+                f"**{e['disposition']}{sub}** {detail}".rstrip())
+        earlier = superseded.get(b["key"], 0)
+        if earlier:
+            line += (f" — standing answer; supersedes {earlier} earlier "
+                     f"emission(s) kept as audit history")
+        lines.append(line)
     return "\n".join(lines)
 
 
-def _reference_block(repo_root: Path, references: list[dict]) -> str:
+def _reference_block(repo_root: Path, references: list[dict],
+                     sha: str, git=None, git_bytes=None) -> str:
     """Immutable reference manifest (§5.1 F4): digest, access, status.
     A pointer without a digest is a rumour; an unreadable reference is
     labelled unavailable, not dropped (absent != none).
+
+    Round 3 F1: kind and digest come from the TARGET TREE at `sha`, through
+    the same `refs` derivation `take` uses — never from the working tree.
+    The manifest is a promise about bytes the reviewer will fetch, and the
+    reviewer fetches the commit; a digest over worktree bytes was the same
+    promise about a state only this machine can see. For a regular file the
+    two agreed by construction (the handoff commits before it emits); for a
+    symlink they never did, and the difference arrived as a `mismatch` the
+    author could not reproduce. Emission now cannot describe an object
+    differently from the side that checks it.
+
+    A reference the target tree does not carry renders UNAVAILABLE here —
+    which is what `take` would report anyway. Advisory material that cannot
+    travel keeps its declared-unavailable state; it is now declared at
+    emission rather than discovered by the reviewer.
     """
+    run = git or (lambda *a: _git(repo_root, *a))
+    run_bytes = git_bytes or (lambda *a: _git_bytes(repo_root, *a))
     lines = []
     for ref in references:
-        path = repo_root / ref["path"]
+        path = str(ref["path"])
+        # Round 4 F4: the render boundary refuses too, not only the
+        # preflight upstream of it. A caller reaching this function
+        # directly — a library user, a test, a future verb — cannot
+        # produce a manifest line the reviewer's parser will not
+        # recognise, whatever the row's `required` value says.
+        grammar = refs.path_error(path)
+        if grammar is not None:
+            raise ReferenceUnbound(
+                f"reference {path!r} is {grammar}",
+                remedy="a person points the reference at a path the "
+                       "manifest line can carry")
         req = "required" if ref.get("required", True) else "advisory"
-        if path.is_file():
-            lines.append(f"  {ref['path']}  sha256:{sha256_file(path)}  "
-                         f"[{req}] {ref.get('note', '')}".rstrip())
-        elif path.is_dir():
-            lines.append(f"  {ref['path']}/  (directory; per-file digests via "
-                         f"git) [{req}] {ref.get('note', '')}".rstrip())
+        note = ref.get("note", "")
+        kind = refs.target_kind(run, sha, path)
+        if kind == "blob":
+            digest = refs.target_digest(run_bytes, sha, path)
+            lines.append(f"  {path}  sha256:{digest}  "
+                         f"[{req}] {note}".rstrip())
+        elif kind == "tree":
+            lines.append(f"  {path}/  (directory; per-file digests via "
+                         f"git) [{req}] {note}".rstrip())
         else:
-            lines.append(f"  {ref['path']}  UNAVAILABLE from this surface — "
+            lines.append(f"  {path}  UNAVAILABLE from this surface — "
                          f"mark findings that depend on it `unavailable` "
-                         f"[{req}] {ref.get('note', '')}".rstrip())
+                         f"[{req}] {note}".rstrip())
     return "\n".join(lines)
+
+
+class RoleSelectionError(RuntimeError):
+    """A per-invocation role selection the repository's config does not
+    permit. The recovery is always a person's — the config gains the
+    identity, or the flag is dropped — so the CLI maps this to `blocked`
+    and `remedy` carries what that person must do."""
+
+    def __init__(self, message: str, remedy: str):
+        super().__init__(message)
+        self.remedy = remedy
+
+
+# One class, two names: the boundary and its error live in vocab (R1-F2) —
+# a transport declared outside the closed grammar, or one that contradicts
+# the target's reachability. Like a role selection, the recovery is a
+# person's, so the CLI maps it to `blocked`. This module's historical name
+# stays importable; the callers that catch it name the selection act, not
+# the module that refuses.
+TransportSelectionError = vocab.TransportDeclarationError
+
+
+def resolve_transport(cfg: Config, transport: str | None = None,
+                      local_only: bool = False,
+                      env=None) -> str:
+    """The effective transport for one emission (RVW-T11, round 3 F2).
+
+    The same precedence shape as `resolve_roles`, and for the same reason:
+    the tool cannot observe the value, so it is declared, and a per-invocation
+    flag selects within what the repository declares rather than widening it.
+    The difference is that the vocabulary here is the tool's own closed enum
+    rather than a per-repo list — `path` and `paste` are the only two states
+    the grammar has — so the permission being selected within is `TRANSPORTS`
+    itself, and an unknown value is refused rather than carried into an
+    append-only record.
+
+    ONE precedence order, strongest declaration first (round 3 F2 restored
+    a single policy after the incident repair left the executable default,
+    the CLI help and the canonical design contradicting each other):
+
+      1. `--transport`                — this invocation's explicit human word
+      2. `[roles] transport`          — the repository's standing declaration
+      3. `LOUPE_TRANSPORT` in `env`   — the ENVIRONMENT's declaration: a
+                                        cloud sandbox's configuration sets
+                                        `paste` because bytes are the only
+                                        carrier that reaches the operator's
+                                        machine from there
+      4. a documented provider signal — `vocab.TRANSPORT_PROVIDER_SIGNALS`,
+                                        exact variable and exact value; an
+                                        inference ranks below every human
+                                        declaration and is admitted only
+                                        with its provider/value matrix and
+                                        the other-endpoint-is-local
+                                        assumption stated in vocab
+      5. `--local-only`               — entailed `path`: a target fetchable
+                                        from no remote is reviewable only on
+                                        this filesystem
+      6. `vocab.TRANSPORT_EMISSION_DEFAULT` (`path`) — the workflow's
+                                        declared steady case: author and
+                                        reviewer on the operator's machine
+
+    A signal-resolved or environment-resolved `paste` beside `--local-only`
+    still reaches `ensure_pushed`'s contradiction refusal — the check stays
+    closed because resolution here never silently reconciles the two.
+
+    Historical READING is unchanged (`vocab.TRANSPORT_DEFAULT`): every
+    envelope and record written before the attribute existed came from a
+    same-filesystem loop. An EXPLICITLY empty value — config key or
+    environment variable — is neither silence nor a declaration (R1-F2:
+    the `or` that used to fold it to the default was the fail-open route)
+    and the one lifecycle boundary refuses it by state.
+    """
+    if transport is not None:
+        return vocab.transport_or_default(transport, "--transport")
+    declared = cfg.roles.get("transport")
+    if declared is not None:
+        return vocab.transport_or_default(
+            declared,
+            f"[roles] transport in the governing config ({cfg.source})")
+    env = os.environ if env is None else env
+    if vocab.TRANSPORT_ENV in env:
+        return vocab.transport_or_default(
+            env[vocab.TRANSPORT_ENV],
+            f"the {vocab.TRANSPORT_ENV} environment declaration")
+    for variable, value, entailed in vocab.TRANSPORT_PROVIDER_SIGNALS:
+        if env.get(variable) == value:
+            return entailed
+    return (vocab.TRANSPORT_PATH if local_only
+            else vocab.TRANSPORT_EMISSION_DEFAULT)
+
+
+class ReferenceUnbound(RuntimeError):
+    """A REQUIRED reference the reviewer could never retrieve from the
+    target tree (round-2 F3). Required means the reviewer must read it,
+    and `take` reads references from the target commit — so a digest over
+    ignored or untracked worktree bytes binds nothing any fetchable commit
+    carries: it produces a manifest entry only the emitting machine can
+    satisfy, and an unavailable required reference forbids the clean
+    verdict the round exists to seek. The CLI maps this to `blocked`."""
+
+    def __init__(self, message: str, remedy: str):
+        super().__init__(message)
+        self.remedy = remedy
+
+
+def _reference_object_state(repo: Path, run, raw: str,
+                            candidate: Path) -> str | None:
+    """Why the object at a tracked, present reference cannot be read the
+    same way by both sides — or None when it can (round 3 F1).
+
+    Two authorities, because the seam can be reached in two orders. The
+    INDEX says what the target tree will carry, and is the authority for a
+    path whose worktree state is ordinary. The WORKTREE overrides it for
+    the one ordering the index cannot describe yet: `handoff` commits what
+    the disk carries, so a regular file replaced by a link since the last
+    commit reaches the target as a link while `ls-files --stage` still
+    reports 100644.
+
+    A directory prefix — tracked entries below `raw`, no entry AT it — is
+    valid and needs no mode: a directory reference is never digested, and
+    `take` labels it present or absent from the target tree.
+    """
+    if (repo / candidate).is_symlink():
+        return refs.object_error(refs.MODE_SYMLINK)
+    # `-z`: NUL-separated and never quoted, so a non-ASCII path compares
+    # equal to the path the claim declared instead of arriving as git's
+    # `"caf\303\251.md"` escaping.
+    raw_entries = run("ls-files", "--stage", "-z", "--", raw)
+    for entry in raw_entries.split("\0"):
+        if not entry or "\t" not in entry:
+            continue
+        meta, listed = entry.split("\t", 1)
+        if listed != raw:
+            continue                   # an entry BELOW a directory prefix
+        return refs.object_error(meta.split()[0])
+    return None
+
+
+def check_references(cfg: Config, references, git=None) -> None:
+    """Refuse, before the ledger, the push, the gates and emission, every
+    reference the wire cannot carry — and every REQUIRED one the target
+    tree cannot supply.
+
+    Two layers with different reach, because requiredness decides a policy
+    and not a syntax (round 4 F4):
+
+    THE PATH, checked for EVERY reference (`refs.path_error`). Ordinary
+    relative paths and non-ASCII names are valid; whitespace, control and
+    invisible characters, a leading `-`, a trailing `/`, `.` and `..`
+    segments, doubled separators and absolute paths are refused. The
+    manifest line is whitespace-delimited and the reviewer's parser reads
+    what the emitter renders: an advisory row with a space in its path came
+    back `unrecognised`, which is no advisory state at all. Requiredness
+    cannot change what the line can carry.
+
+    THE BINDING, checked for REQUIRED references only, in the order a
+    filesystem allows the question to be asked (round 4 F5):
+
+    * the OBJECT MODE first, from the index and an lstat — never following
+      the final component. A tracked SYMLINK and a GITLINK are refused,
+      because emission and `take` cannot derive the same bytes from
+      either. Following first meant a dangling link was reported as a
+      deleted file and a link pointing outside the root as an escaping
+      path: fail-closed, but under a name that was false and a remedy that
+      did not describe the fix.
+    * then the states that genuinely depend on the referent: escaping the
+      repository root through a resolved path, tracked (the handoff's own
+      commit carries the worktree bytes to the target tree), present,
+      IGNORED (round-2 F3's state: a digest over bytes `.gitignore`
+      guarantees no commit will ever carry), untracked, or missing — a
+      deleted tracked file included, since the auto commit would carry the
+      deletion.
+
+    ADVISORY references keep the §5.1 three-state rendering — file-with-
+    digest, directory, declared UNAVAILABLE — because declared-unavailable
+    is the author's honesty mechanism for material that genuinely cannot
+    travel, and that state is the reviewer's to weigh, not this boundary's
+    to forbid. Only their PATH is constrained.
+    """
+    repo = cfg.repo_root
+    run = git or (lambda *a: _git(repo, *a))
+    for i, ref in enumerate(references or []):
+        raw = str(ref.get("path", ""))
+        required = ref.get("required", True)
+        where = f"references[{i}] ({raw!r}, " \
+                f"{'required' if required else 'advisory'})"
+
+        grammar = refs.path_error(raw)
+        if grammar is not None:
+            raise ReferenceUnbound(
+                f"{where} is {grammar}",
+                remedy=f"a person renames the referenced file, points the "
+                       f"reference at a path the manifest line can carry, "
+                       f"or drops the reference where the envelope's own "
+                       f"content already carries the evidence")
+        if not required:
+            continue
+
+        def refuse(state: str) -> "ReferenceUnbound":
+            return ReferenceUnbound(
+                f"{where} is {state}: the reviewer's `take` reads "
+                f"references from the target tree, so this required "
+                f"reference could never be retrieved or digest-checked "
+                f"there (round-2 F3)",
+                remedy=f"a person tracks {raw or 'the referenced path'} in "
+                       f"the repository, points the reference at a tracked "
+                       f"path, or drops it where the envelope's own content "
+                       f"already carries the evidence")
+
+        candidate = Path(raw)
+        if candidate.is_absolute():
+            raise refuse("an absolute path, which no repository tree "
+                         "carries")
+        # The object's own mode, before anything follows the link: what the
+        # target tree carries is decided by the index and an lstat, and
+        # both are answers about the reference itself rather than about
+        # whatever it points at.
+        object_state = _reference_object_state(repo, run, raw, candidate)
+        if object_state is not None:
+            raise refuse(object_state)
+        try:
+            inside = (repo / candidate).resolve().is_relative_to(
+                repo.resolve())
+        except OSError:
+            inside = False
+        if not inside:
+            raise refuse("a path escaping the repository root")
+        tracked = bool(run("ls-files", "--", raw))
+        exists = (repo / candidate).exists()
+        if tracked and exists:
+            continue
+        if not exists:
+            raise refuse(
+                "tracked but missing from the working tree — the commit "
+                "this handoff makes would carry its deletion" if tracked
+                else "missing entirely")
+        try:
+            run("check-ignore", "-q", "--", raw)
+            ignored = True
+        except RuntimeError:
+            ignored = False
+        raise refuse(
+            "ignored — a digest over bytes only this machine holds"
+            if ignored else "untracked, so no commit carries it yet")
+
+
+# The former name, kept so a caller that learned it does not silently get
+# the old two-layer behaviour from a stale import.
+check_required_references = check_references
+
+
+def resolve_roles(cfg: Config, author: str | None = None,
+                  reviewer: str | None = None) -> tuple[str, str]:
+    """The effective (author, reviewer) for one emission — design §4's
+    precedence, which the published specification has stated since the first
+    extraction and the CLI never shipped (the first per-project onboarding
+    hit the absence): the repo config says what assignments are PERMITTED at
+    all, a per-invocation stamp selects WITHIN that permission, and
+    unassigned refuses.
+
+    A flag selects; it never widens. An identity outside the declared
+    permitted list is refused, and so is a flag against a repo that declares
+    no list — with nothing declared there is no permission to select within,
+    and an unconstrained flag would let any string into an append-only
+    record. That a flag names the same identity the config defaults to does
+    not exempt it: the license for per-invocation selection is the declared
+    list, not the harmlessness of one value. `rejected_reviewers` outranks
+    the permitted list. Every invariant — NON-EMPTY on both sides (round-2
+    F2: unassigned refuses here, not in the emitter downstream of the
+    ledger and the push, and a malformed permitted list carrying "" cannot
+    admit emptiness as a selection), rejection, permission where a list is
+    declared, self-review — binds the EFFECTIVE identity, flagged or
+    config-defaulted alike (round-1 F1): each is invalid in every
+    envelope, and refusing before the commit, the push and the gate run is
+    the boundary's promise, not an optimisation for one input source.
+    """
+    roles = cfg.roles
+
+    def _selected(side: str, value: str | None, permitted_key: str) -> str:
+        if value is None:
+            return roles.get(side) or ""
+        permitted = [x.lower() for x in roles.get(permitted_key) or []]
+        if not permitted:
+            raise RoleSelectionError(
+                f"--{side} {value!r} selects a per-invocation {side}, but "
+                f"the repo config declares no {permitted_key}: there is no "
+                f"permitted list to select within (§4)",
+                remedy=f"a person declares {permitted_key} in the governing "
+                       f"config ({cfg.source}), or the flag is dropped")
+        if value.lower() not in permitted:
+            raise RoleSelectionError(
+                f"--{side} {value!r} is not in {permitted_key} "
+                f"{permitted}: a flag selects within the declared "
+                f"permission, it does not widen it (§4)",
+                remedy=f"a person adds {value!r} to {permitted_key} in the "
+                       f"governing config ({cfg.source}), or the flag "
+                       f"names a permitted identity")
+        return value
+
+    effective_author = _selected("author", author, "permitted_authors")
+    effective_reviewer = _selected("reviewer", reviewer, "permitted_reviewers")
+
+    # Round-1 F1: the invariants bind the EFFECTIVE identity, whatever its
+    # source. The first version checked `rejected_reviewers` only when the
+    # flag was present, so a config whose DEFAULT reviewer was rejected
+    # resolved cleanly and the refusal arrived from the request validator —
+    # after the commit, the push and the gate run this boundary exists to
+    # precede. Flag-selected and config-defaulted identities pass the same
+    # checks; only the remedy differs, because only the recovery does.
+    def _source(side: str, flagged: str | None) -> str:
+        return (f"--{side} {flagged!r}" if flagged is not None
+                else f"the config's default {side} ({cfg.source})")
+
+    # Round-2 F2: empty is a member of the domain, and it refuses HERE.
+    # The first version returned ('', '') and left "unassigned refuses" to
+    # the emitter — downstream of the ledger and of the commit/push this
+    # boundary promises to precede — and a malformed permitted list
+    # containing "" could even admit the empty string as a selection. No
+    # effective identity, from any source, past this point.
+    for side, value, flagged in (("author", effective_author, author),
+                                 ("reviewer", effective_reviewer, reviewer)):
+        if not value:
+            raise RoleSelectionError(
+                f"{_source(side, flagged)} resolves to no {side} at all: "
+                f"unassigned refuses at resolution, before the ledger, the "
+                f"commit, the push and the gate run (§7 — silence must not "
+                f"pick a direction)",
+                remedy=f"a person assigns {side} in the governing config "
+                       f"({cfg.source}), or selects one with --{side} from "
+                       f"a declared permitted list")
+
+    rejected = [x.lower() for x in roles.get("rejected_reviewers") or []]
+    if effective_reviewer.lower() in rejected:
+        raise RoleSelectionError(
+            f"{_source('reviewer', reviewer)} resolves to "
+            f"{effective_reviewer!r}, which is rejected pending a role "
+            f"decision (§7, §10.7), whatever list also carries it",
+            remedy="a person reopens the rejected-reviewer decision in the "
+                   "governing config, or names another identity"
+                   + ("" if reviewer is not None
+                      else " as the config's default reviewer"))
+    for side, value, key, flagged in (
+            ("author", effective_author, "permitted_authors", author),
+            ("reviewer", effective_reviewer, "permitted_reviewers", reviewer)):
+        permitted = [x.lower() for x in roles.get(key) or []]
+        if permitted and value and value.lower() not in permitted:
+            # A flagged non-member was already refused in _selected; this
+            # reaches only the defaulted source, mirroring the validator's
+            # R-AUTHOR-UNPERMITTED / R-REVIEWER-UNPERMITTED before any
+            # side effect instead of after emission.
+            raise RoleSelectionError(
+                f"{_source(side, flagged)} resolves to {value!r}, which is "
+                f"not in {key} {permitted}",
+                remedy=f"a person repairs the governing config "
+                       f"({cfg.source}): its default {side} is outside its "
+                       f"own {key}")
+    if (effective_author and effective_reviewer
+            and effective_author.lower() == effective_reviewer.lower()):
+        raise RoleSelectionError(
+            f"author and reviewer both resolve to "
+            f"{effective_author!r}: an agent never reviews its own diff",
+            remedy="a person assigns two different identities — by flag or "
+                   "in the governing config — before anything is emitted")
+    return effective_author, effective_reviewer
 
 
 def emit_request(cfg: Config, ledger: Ledger, claim: dict,
                  base: str | None = None, head: str | None = None,
-                 reachability: dict | None = None) -> str:
+                 reachability: dict | None = None,
+                 author: str | None = None,
+                 reviewer: str | None = None,
+                 transport: str | None = None) -> str:
     if not cfg.taxonomy_declared:
         raise RuntimeError(
             "no taxonomy declared for this repo: refusing to emit an envelope "
@@ -550,12 +1009,17 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
         raise RuntimeError(
             f"base {base} is not an ancestor of head {head}: pushing the "
             f"branch does not make the base fetchable, so the reviewer "
-            f"could not compute `git diff {base[:12]}...{head[:12]}` "
+            f"could not compute "
+            f"`{paths.command(*paths.lits('git', 'diff'), f'{base[:12]}...{head[:12]}')}` "
             f"(§9bis.4)")
     round_no = max((e["round"] for e in verdicts), default=0) + 1
 
-    author = cfg.roles.get("author") or ""
-    reviewer = cfg.roles.get("reviewer") or ""
+    # Explicit values are the CLI's resolved per-invocation selection (§4);
+    # None means no selection was made and the config's default direction
+    # holds — the pre-flag behaviour, byte for byte.
+    author = author if author is not None else (cfg.roles.get("author") or "")
+    reviewer = (reviewer if reviewer is not None
+                else (cfg.roles.get("reviewer") or ""))
     # What actually carried the envelope. Until 2026-08-13 this was the
     # literal string "user", which became false the moment the author process
     # began invoking the reviewer directly: the stamp asserted a human relay
@@ -563,6 +1027,14 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
     # takes the value and refuses to invent one.
     relay = (claim.get("relay") or cfg.roles.get("relay")
              or "unrecorded (transport not declared)")
+    # RVW-T11. `relay` says WHO carries the envelope; this says whether the
+    # two ends share a filesystem, which is the other half of the same fact
+    # and the half the printed commands depend on. Resolved rather than read
+    # straight from config so an unknown value is refused here — at the
+    # boundary that stamps it — and not at whichever reader trips on it
+    # first. The CLI resolves it earlier for the cache key and passes the
+    # result; a direct caller that names none gets the same answer.
+    transport = resolve_transport(cfg, transport)
     if not author or not reviewer:
         raise RuntimeError("roles unassigned and no config assigns them: "
                            "refusing to emit (§7 — silence must not pick a "
@@ -593,14 +1065,16 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
 
     parts = [
         f'<{cfg.wrapper_tag}-review-request sha="{head}" branch="{branch}" '
-        f'author="{author}" reviewer="{reviewer}" round="{round_no}">',
-        f"Roles: author={author} · reviewer={reviewer} · relay={relay}. "
+        f'author="{author}" reviewer="{reviewer}" round="{round_no}" '
+        f'transport="{transport}">',
+        f"Roles: author={author} · reviewer={reviewer} · relay={relay} · "
+        f"transport={transport}. "
         f"Per-invocation stamp, overriding the default direction for this "
         f"artifact only (the agents' standing instructions).",
         "",
         f"Target: {head}",
         f"Base:   {base}   (the SHA ruled on in round {round_no - 1})",
-        f"Diff:   git -C {repo} diff {base}...{head}",
+        wire.executable_stamp("Diff", paths.diff_command(repo, base, head)),
         f"Tree:   {tree_state}",
         *wire.render_push_lines(reachability),
         f"Access: {claim.get('access_note', 'see reference manifest below')}",
@@ -653,7 +1127,7 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
         "",
         "## Reference",
         "",
-        _reference_block(repo, claim.get("references", [])),
+        _reference_block(repo, claim.get("references", []), head),
         "",
         "## Review scope",
         "",

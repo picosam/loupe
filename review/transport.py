@@ -30,15 +30,22 @@ manual `ledger add` afterwards is a no-op, never a duplicate.
 from __future__ import annotations
 
 import dataclasses
+import json
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
-from . import TOOL_NAME, validate, vocab, wire
+from . import TOOL_NAME, paths, refs, validate, vocab, wire
 from .config import Config
 from .digest import sha256_file, sha256_text
 from .fingerprint import alias_event
-from .ledger import Ledger
+# `firing_id` is defined beside the code that MAKES the firings
+# (round-4 F1: identity travels with the thing it identifies);
+# it stays reachable here because this is the module that owns
+# the authorization boundary reading it.
+from .ledger import Ledger, firing_id
 
 EXCHANGE_DIR = "exchange"
 
@@ -50,8 +57,11 @@ _BASE_LINE_RE = re.compile(r"^Base:\s+([0-9a-f]{40})\b", re.MULTILINE)
 # promising it — the branch was unreachable, because the alternation below was
 # mandatory. A state the code describes and the grammar cannot express is a
 # state the reader is told exists and never sees.
+# Round 3 F1: the path half is BUILT from the one grammar the preflight
+# enforces (`refs.PATH_CHARS`), so what the emitter may render and what this
+# parser may recognise cannot drift into two rules again.
 _REF_LINE_RE = re.compile(
-    r"^\s*(?P<path>\S+?)(?P<dir>/)?\s+"
+    rf"^\s*(?P<path>{refs.PATH_CHARS}+?)(?P<dir>/)?\s+"
     r"(?:sha256:(?P<digest>[0-9a-f]{64})|(?P<unavailable>UNAVAILABLE)"
     r"|\((?P<note>directory[^)]*)\)"
     r"|\[(?P<marker>required|advisory)\])")
@@ -70,18 +80,27 @@ NO_CLAIM = vocab.NO_CLAIM
 
 
 class Refusal(RuntimeError):
-    """A refusal that carries the next command (§9bis.3 rule 3)."""
+    """A refusal that carries the next command (§9bis.3 rule 3).
+
+    Round 5 F1: `next_cmd` is a field agents run verbatim, so it accepts a
+    rendered `paths.Command` or the empty string ("no command applies")
+    and refuses anything else. A command built by string construction
+    cannot reach an agent through this door by being unanalysable.
+    """
 
     def __init__(self, why: str, next_cmd: str):
         super().__init__(why)
-        self.next_cmd = next_cmd
+        self.next_cmd = paths.executable(next_cmd, "Refusal.next_cmd")
 
 
 def _git(repo_root: Path, *args: str, timeout: int = 120) -> str:
     out = subprocess.run(["git", "-C", str(repo_root), *args],
                          capture_output=True, text=True, timeout=timeout)
     if out.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)}: {out.stderr.strip()}")
+        raise RuntimeError(
+            f"a `git` subprocess failed: "
+            f"`{paths.command(paths.Lit('git'), *args)}` — "
+            f"{out.stderr.strip()}")
     return out.stdout.strip()
 
 
@@ -97,6 +116,21 @@ def exchange_dir(cfg: Config) -> Path | None:
 def exchange_path(cfg: Config, round_no: int, kind: str) -> Path | None:
     d = exchange_dir(cfg)
     return d / f"round-{round_no}-{kind}.md" if d else None
+
+
+def _runnable(record: dict, *fields: str) -> dict:
+    """Check every JSON field agents execute through the one door.
+
+    Round 5 F1 typed `Refusal.next_cmd`, the CLI's `next` and the fenced
+    relay lines. These are the same kind of field on the RESULT side —
+    `reviewer_next` is the line the human hands over verbatim, `next` is
+    what the author runs, `diff` is what the reviewer runs — so they are
+    checked at the same door rather than trusted for being nearby.
+    """
+    for field in fields:
+        if record.get(field) is not None:
+            paths.executable(record[field], f"the `{field}` field")
+    return record
 
 
 def keep_bytes(cfg: Config, round_no: int, kind: str, text: str) -> str:
@@ -117,7 +151,323 @@ def keep_bytes(cfg: Config, round_no: int, kind: str, text: str) -> str:
         return f"not kept ({exc.strerror})"
 
 
+# ------------------------------------------------------------------- prune
+
+GATE_OUTPUT_DIR = "gate-output"
+_SHA40 = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _referenced_shas(events: list[dict]) -> set[str]:
+    """Every 40-hex string anywhere in any ledger event, at any depth.
+
+    Deliberately broader than the keys known to carry SHAs today (`sha`,
+    `base`): a key added later must widen retention by default, never narrow
+    it. Over-collection keeps a directory that could have gone; the inverse
+    deletes evidence a record still points at.
+    """
+    found: set[str] = set()
+
+    def walk(value):
+        if isinstance(value, str):
+            if _SHA40.fullmatch(value):
+                found.add(value)
+        elif isinstance(value, dict):
+            for v in value.values():
+                walk(v)
+        elif isinstance(value, list):
+            for v in value:
+                walk(v)
+
+    for event in events:
+        walk(event)
+    return found
+
+
+def _entry_kind(entry) -> str:
+    """Filesystem object type of one gate-output child, WITHOUT following
+    links — on a deletion boundary the object type is authority, and every
+    classification here reads the entry itself, never its target (round-1
+    F2: `is_dir()` followed a SHA-named symlink out of the retention root,
+    then `rmtree` refused it and aborted the whole operation).
+
+    `entry` is an `os.DirEntry` from the anchored scandir, so the type
+    comes from the directory read itself (`follow_symlinks=False`
+    throughout). `symlink` covers live and broken links alike — a broken
+    link is still a link, and neither is ever dereferenced. `unreadable`
+    is an entry whose type cannot be read at all; unknown is kept, not
+    guessed at.
+    """
+    try:
+        if entry.is_symlink():
+            return "symlink"
+        if entry.is_dir(follow_symlinks=False):
+            return "dir"
+        return "not-a-directory"
+    except OSError:
+        return "unreadable"
+
+
+def _no_follow_size(anchor_fd: int, name: str) -> tuple[int, int]:
+    """(files, bytes) under child `name` of the anchored container, never
+    crossing a symlink: `fwalk` is anchored to the same descriptor the
+    deletion uses, does not descend into linked directories, and sizes
+    come from `follow_symlinks=False` stats — so the accounting of what a
+    removal frees cannot read anything outside the directory being
+    removed, whatever any path component is replaced with meanwhile."""
+    files = total = 0
+    for _dirpath, _dirs, names, dirfd in os.fwalk(name, dir_fd=anchor_fd,
+                                                  follow_symlinks=False):
+        for n in names:
+            try:
+                stat = os.stat(n, dir_fd=dirfd, follow_symlinks=False)
+            except OSError:
+                continue
+            files += 1
+            total += stat.st_size
+    return files, total
+
+
+def _open_gate_output(base: Path) -> int | None:
+    """A descriptor for the gate-output CONTAINER itself, or None when it
+    does not exist — and a Refusal for every other state.
+
+    Round-2 F1: the child-level no-follow checks established nothing while
+    the directory every child was resolved FROM could itself be a symlink
+    — `base.is_dir()` and `iterdir()` both followed it, and a container
+    link redirected enumeration, accounting and deletion outside the state
+    root entirely. So the container is opened `O_NOFOLLOW | O_DIRECTORY`
+    and every subsequent operation — scandir, fwalk, rmtree — is anchored
+    to that one descriptor: a symlink refuses at open (ELOOP), a
+    non-directory refuses (ENOTDIR), an unreadable one refuses (EACCES),
+    absent is the clean zero, and a replacement race after the open cannot
+    redirect anything because no later step resolves the container's path
+    again.
+    """
+    try:
+        return os.open(base, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Refusal(
+            f"gate-output at {base} could not be opened as a plain "
+            f"directory without following a link "
+            f"({exc.strerror or exc}): a container that is a symlink, a "
+            f"non-directory or unreadable is kept, never traversed — "
+            f"nothing was enumerated, accounted or deleted", "")
+
+
+def _require_container_named(base: Path, anchor: int,
+                             removed: int) -> None:
+    """Refuse when `gate-output/` no longer names the directory this run
+    opened (round 3 F2).
+
+    The contract says a container replaced after the open refuses, and the
+    implementation did not check: every operation was anchored to the
+    descriptor, so a rename-and-relink went unnoticed and prune carried on
+    deleting inside the directory that used to be the layer. Anchoring made
+    that SAFE — nothing outside the state root can be reached — but safe is
+    not what was promised, and a caller told that an identity change stops
+    the operation is entitled to have it stop.
+
+    The opened identity is compared with the path's at four points, which
+    is the partition of when a replacement becomes observable: at the open,
+    before each entry's decision, after that entry's accounting and before
+    its removal or dry-run record, and once more before the run reports
+    success. Round 4 F3 named the third: accounting can be long, and a
+    single-entry run had no next iteration to notice the change, so it
+    deleted and reported success after the identity had changed.
+
+    The enforceable invariant, stated as what it is (round 5 F2): prune
+    REFUSES a replacement observable at one of those comparison points, and
+    descriptor anchoring keeps a replacement made at any other moment from
+    redirecting traversal, accounting or deletion. It is not an
+    unconditional refusal, and no comparison can make it one — a check
+    describes the instant it ran.
+
+    Two intervals are therefore irreducible, and both are stated rather
+    than excluded. Between the last comparison and the `rmtree` syscall: a
+    replacement there is not detected, and the deletion still runs against
+    the verified inode inside the state root. Between the final comparison
+    and the successful return: a replacement there is not detected either,
+    so a run can report success while `gate-output/` already names
+    something else — nothing has been deleted outside the layer, and
+    nothing more has been deleted at all. What is NOT irreducible is the
+    accounting-to-removal interval, which round 5 F2 named and which the
+    third comparison point now covers.
+    """
+    try:
+        st = os.stat(base, follow_symlinks=False)
+        named = (st.st_dev, st.st_ino)
+    except OSError:
+        named = None
+    opened = os.fstat(anchor)
+    if named != (opened.st_dev, opened.st_ino):
+        raise Refusal(
+            f"gate-output at {base} is no longer the directory this run "
+            f"opened (it was renamed, replaced or removed while prune was "
+            f"running): the operation stops rather than continuing against "
+            f"a container the state directory no longer names"
+            + (f" — {removed} directory(ies) had already been removed "
+               f"through the opened descriptor, inside the state root"
+               if removed else " — nothing was removed"), "")
+
+
+def prune_gate_output(cfg: Config, ledger: Ledger,
+                      dry_run: bool = False) -> dict:
+    """Remove retained gate output for commits no ledger event references.
+
+    The retention policy this verb executes (decided 2026-08-22, measured
+    first: 1.8 MB after 13 rounds, growth linear in emission ATTEMPTS
+    because a refused handoff retains its gate output and records nothing):
+
+    - the ledger is append-only and is NEVER pruned;
+    - `exchange/` is the review record itself and is NEVER pruned;
+    - `gate-output/` is the one designed-pruneable layer — every attestation
+      carries the sha256 and byte count of its output, so a missing retained
+      copy degrades the pointer without losing the identity (§5.1).
+
+    Within that layer the rule is referenced-by-the-record, across ALL
+    lineages: a PLAIN directory named by a SHA that appears in any ledger
+    event stays; one that appears nowhere — a refused emission attempt is
+    the common producer — is removed. Everything else is kept and NAMED in
+    the result (`kept_unrecognised`): symlinks — live, broken, whatever
+    they point at — non-directories, non-SHA names, and entries whose type
+    cannot be read. Classification never follows a link (round-1 F2), and
+    that rule now starts at the CONTAINER (round-2 F1): `gate-output/`
+    itself is opened `O_NOFOLLOW | O_DIRECTORY` and enumeration,
+    accounting and deletion all run against that one descriptor, so a
+    linked or replaced container refuses instead of redirecting the
+    operation outside the state root. Nothing outside `gate-output/` is
+    read or written even when a crafted or stale link points elsewhere;
+    removal deletes nested links rather than their targets (`rmtree` does
+    not follow), and the freed-bytes accounting walks without following
+    either. `--dry-run` reports the identical decision — refusals
+    included — without acting on it.
+    """
+    if cfg.ledger_dir is None:
+        raise Refusal("no state directory is configured, so there is no "
+                      "retained gate output to prune", "")
+    base = Path(cfg.ledger_dir) / GATE_OUTPUT_DIR
+    referenced = _referenced_shas(ledger.events())
+    pruned, kept, unrecognised = [], 0, []
+    # Round-2 F1: the container FIRST, and by descriptor from then on. The
+    # refusal (symlink, non-directory, unreadable) is decided before the
+    # dry_run branch can matter, so dry-run and act refuse identically.
+    anchor = _open_gate_output(base)
+    if anchor is not None:
+        try:
+            # Round 3 F2: replaced between the open and the enumeration.
+            _require_container_named(base, anchor, len(pruned))
+            with os.scandir(anchor) as scan:
+                entries = sorted(scan, key=lambda e: e.name)
+            for entry in entries:
+                # …and replaced during enumeration, accounting or deletion.
+                # Before the DECISION, not before the removal, so `--dry-run`
+                # refuses on exactly the state the acting run refuses on.
+                _require_container_named(base, anchor, len(pruned))
+                kind = _entry_kind(entry)
+                if kind != "dir":
+                    kept += 1
+                    unrecognised.append({"entry": entry.name, "kind": kind})
+                    continue
+                if not _SHA40.fullmatch(entry.name):
+                    kept += 1
+                    unrecognised.append({"entry": entry.name,
+                                         "kind": "non-sha-name"})
+                    continue
+                if entry.name in referenced:
+                    kept += 1
+                    continue
+                files, size = _no_follow_size(anchor, entry.name)
+                # Round 4 F3: accounting can be long, and the replacement
+                # is observable immediately before the destructive act.
+                # Checking again HERE — after accounting, before the
+                # removal or the dry-run record — is what makes the
+                # one-entry and final-entry cases refuse like every other
+                # instead of relying on a next iteration that may not
+                # exist. Before the record, not just before the rmtree, so
+                # dry-run and act still decide identically.
+                _require_container_named(base, anchor, len(pruned))
+                record = {"sha": entry.name, "files": files, "bytes": size}
+                if not dry_run:
+                    shutil.rmtree(entry.name, dir_fd=anchor)
+                pruned.append(record)
+            # …and once more before reporting success, so a run whose last
+            # entry was the one replaced — or a run with no entries at all
+            # — cannot return a clean result computed against a container
+            # the state directory no longer names.
+            _require_container_named(base, anchor, len(pruned))
+        finally:
+            os.close(anchor)
+    return {"pruned": pruned, "kept": kept, "dry_run": dry_run,
+            "kept_unrecognised": unrecognised,
+            "bytes_freed": sum(e["bytes"] for e in pruned),
+            "referenced_shas": len(referenced),
+            "gate_output": str(base)}
+
+
 # ------------------------------------------------------------------- events
+
+def declared_transport(parsed) -> str:
+    """The transport an envelope declares, or the default when it declares
+    none (RVW-T11).
+
+    Absence is the default here, and deliberately not an unknown — the
+    opposite of the handoff cache's rule about claims. The two cases differ
+    in what a wrong answer costs: an unprovable claim state served warm hands
+    the reviewer an envelope nobody wrote, while an unstated transport is a
+    round emitted before the attribute existed, whose two ends did share a
+    filesystem because that was the only configuration the tool had. Reading
+    it as unknown would make every historical envelope unreadable to the
+    relay; reading it as the default reproduces exactly what those rounds did.
+
+    A value outside the vocabulary — or an explicitly empty one — is
+    refused HERE, not returned for someone else to judge (R1-F2). The old
+    contract returned it as-is on the theory that `validate`'s R-TRANSPORT
+    refuses it first, but `brief` is also an official relay reader and did
+    not validate, so a stamp the grammar refuses selected a live carrier
+    anyway; and the `or` that folded `transport=""` to the default was the
+    fail-open route §5.2 names. A closed lifecycle cannot rely on every
+    caller remembering the one validating verb, so the reader itself is
+    the boundary.
+    """
+    return vocab.transport_or_default(
+        (getattr(parsed, "attrs", {}) or {}).get("transport"),
+        "the envelope's transport stamp")
+
+
+def recorded_transport(ledger, sha: str) -> str:
+    """The transport recorded for the round that binds `sha`, on THIS
+    machine's ledger (RVW-T11).
+
+    The verdict leg needs the value at a point where no request envelope is
+    in hand: the reviewer runs `validate <verdict.md>`, which reads a document
+    the reviewer wrote. So the value is taken from the record the reviewer's
+    own `take` already wrote for this SHA — a recorded fact on this machine,
+    not an inference from the environment and not a field the verdict's author
+    could mis-transcribe.
+
+    It answers on both sides without a special case: the reviewer's ledger
+    carries `take`, the author's carries `request`, and each records what the
+    envelope declared. Neither present — a verdict for a SHA this ledger never
+    saw — is the default, which is what the leg did before it was declared.
+
+    R1-F2: the newest matching record DECIDES — a recorded value outside
+    the vocabulary is refused, not skipped. The old loop scanned past an
+    invalid record to whatever older one looked valid, and fell to the
+    default when none did: an invalid-record fallback, selecting a carrier
+    no record declared. A record with no transport key at all predates the
+    attribute and reads as the default, exactly like an unstamped envelope.
+    """
+    for e in reversed(ledger.current()):
+        if e.get("sha") != sha:
+            continue
+        if e.get("event") in ("take", "request"):
+            return vocab.transport_or_default(
+                e.get("transport"),
+                f"the recorded {e['event']} event for {sha[:12]}")
+    return vocab.TRANSPORT_DEFAULT
+
 
 def request_event(parsed: wire.Request, round_no: int, digest: str,
                   size: int, tokens: int | None = None,
@@ -126,6 +476,13 @@ def request_event(parsed: wire.Request, round_no: int, digest: str,
     event = {"event": "request", "round": round_no, "sha": parsed.sha,
              "author": parsed.attrs.get("author"),
              "reviewer": parsed.attrs.get("reviewer"),
+             # RVW-T11: read off the envelope, never off this machine's
+             # config — the recorded value must be what the ENVELOPE
+             # declared, so both ledgers agree about the round even when the
+             # two machines' configs do not. Absent on every envelope emitted
+             # before the attribute existed, and `declared_transport` reads
+             # that absence as the default rather than as an unknown.
+             "transport": declared_transport(parsed),
              "source_digest": digest, "bytes": size}
     if tokens is not None:
         event["tokens"] = tokens
@@ -434,6 +791,15 @@ def disposition_events(parsed: wire.Disposition,
     """
     round_no = int(parsed.data.get("round", 0))
     derived = _derived_identities(parsed, against)
+    # Round 2 F1: one recorded answer is up to THREE events, and the answer
+    # supersedes as a unit — so every event of one emission carries the same
+    # `batch` stamp, the content address of the emission itself. The ledger's
+    # batch projection binds companions to their disposition row by it;
+    # deterministic, so replaying the same envelope re-derives the same stamp
+    # and the uid dedup makes the replay a no-op.
+    batch = sha256_text(json.dumps(
+        {"attrs": dict(parsed.attrs), "data": parsed.data},
+        sort_keys=True, ensure_ascii=False))[:16]
     events = [{
         "event": "disposition",
         "round": round_no,
@@ -443,7 +809,8 @@ def disposition_events(parsed: wire.Disposition,
         "subtype": rec.get("subtype"),
         "payload": rec.get("payload", {}),
         "verdict_sha": parsed.attrs.get("verdict_sha"),
-        "head": parsed.attrs.get("head")}
+        "head": parsed.attrs.get("head"),
+        "batch": batch}
         for rec in parsed.data.get("dispositions", [])]
     for rec in parsed.data.get("dispositions", []):
         text = str(rec.get("payload", {}).get("evidence", "")).strip()
@@ -453,7 +820,8 @@ def disposition_events(parsed: wire.Disposition,
                        "fp": derived[rec.get("finding_id")][0],
                        "digest": sha256_text(text),
                        "source": "disposition",
-                       "of": rec.get("finding_id")})
+                       "of": rec.get("finding_id"),
+                       "batch": batch})
     # The falsification record of an `accepted` disposition (§5.3a) becomes
     # the `falsification_run` event the `stale` and `unverifiable` breakers
     # read. Until this was written, those breakers had no writer outside
@@ -479,7 +847,8 @@ def disposition_events(parsed: wire.Disposition,
                  "status": record.get("status"),
                  "mutation": record.get("mutation"),
                  "test_digest": sha256_text(test.strip()),
-                 "source": "disposition"}
+                 "source": "disposition",
+                 "batch": batch}
         if cfg is not None:
             # Sweep F12: the run is bound to the finding's EFFECTIVE blocking
             # state when it is recorded — the same rule the validator applies
@@ -510,19 +879,6 @@ def record_response(cfg: Config, ledger: Ledger, envelope: str,
 # ------------------------------------------------------------------- handoff
 
 BREAKER_OVERRIDE = "breaker_override"
-
-
-def firing_id(firing: dict) -> str:
-    """The stable identity of one breaker firing: breaker, round, and the
-    fingerprint (or limit) it fired on. Round-2 F3: an override that named
-    only a breaker and a round ceiling covered any LATER firing that
-    happened to share the name and round — a run event arriving after the
-    verdict could create an `unverifiable` firing in an already completed
-    round that a pre-recorded override already "covered". Identity is what
-    the human saw; a firing that did not exist when the decision was
-    recorded is not one the decision took."""
-    tail = firing.get("fp") or firing.get("limit") or ""
-    return f"{firing.get('breaker')}@{firing.get('round', '?')}:{tail}"
 
 
 def authorize_breaker(cfg: Config, ledger: Ledger, breaker: str,
@@ -565,7 +921,8 @@ def authorize_breaker(cfg: Config, ledger: Ledger, breaker: str,
                       f"cover, and an authorization recorded ahead of a "
                       f"firing would cover a fact the human has not seen "
                       f"(round-2 F3)",
-                      f"{TOOL_NAME} ledger report")
+                      paths.command(paths.Lit(TOOL_NAME), paths.Lit("ledger"),
+                                    paths.Lit("report")))
     covers = sorted(firing_id(f) for f in firing)
     event = {"event": BREAKER_OVERRIDE, "breaker": breaker,
              "covers": covers, "reason": reason.strip(),
@@ -596,8 +953,19 @@ def missing_dispositions(ledger: Ledger) -> dict | None:
     state rather than a defect. The contract is one disposition per finding
     and a finding never dies by omission. Returns None when nothing is
     owed: no verdict yet in this lineage (round 1), or the last verdict has
-    every finding answered exactly once. A clean verdict closes the lineage,
-    so a new lineage's round 1 is the clean-verdict control by construction.
+    every finding answered. A clean verdict closes the lineage, so a new
+    lineage's round 1 is the clean-verdict control by construction.
+
+    Lineage 6 round 2: "answered" means the finding HAS a standing answer —
+    the newest disposition event for its fingerprint — not that exactly one
+    event exists. The old count-based rule read the append-only ledger as
+    write-once, so a disposition that legitimately re-bound (the head moved
+    under it when a regenerated artifact was committed after the record)
+    dead-ended the lineage with no legal recovery: the ledger may not be
+    edited, and no decision verb covered the state. Recency supersedes,
+    exactly as `recorded_transport` reads its records; every event stays in
+    the file as audit history, and a duplicate WITHIN one envelope remains
+    the validation defect it always was (D-DUPLICATE).
     """
     verdicts = ledger._by("verdict")
     if not verdicts:
@@ -606,20 +974,17 @@ def missing_dispositions(ledger: Ledger) -> dict | None:
     findings = [e for e in ledger._by("finding") if e.get("round") == last]
     if not findings:
         return None
-    answered: dict[str, int] = {}
-    for d in ledger._by("disposition"):
-        if d.get("round") == last:
-            answered[d.get("fp")] = answered.get(d.get("fp"), 0) + 1
-    unanswered = [f for f in findings if answered.get(f.get("fp"), 0) == 0]
-    repeated = sorted(fp for fp, n in answered.items() if n > 1)
-    if not unanswered and not repeated:
+    answered = {ledger.resolve(d.get("fp"))
+                for d in ledger.standing_dispositions(round_no=last)}
+    unanswered = [f for f in findings
+                  if ledger.resolve(f.get("fp")) not in answered]
+    if not unanswered:
         return None
     return {"round": last,
             "findings": len(findings),
             "unanswered": [{"id": f.get("id"), "fp": f.get("fp"),
                             "severity": f.get("severity")}
-                           for f in unanswered],
-            "repeated": repeated}
+                           for f in unanswered]}
 
 
 def handoff_preflight(cfg: Config, ledger: Ledger) -> None:
@@ -637,43 +1002,47 @@ def handoff_preflight(cfg: Config, ledger: Ledger) -> None:
     owed = missing_dispositions(ledger)
     if owed is not None:
         ids = ", ".join(f"{u['id']} ({u['fp']})" for u in owed["unanswered"])
-        parts = []
-        if owed["unanswered"]:
-            parts.append(f"{len(owed['unanswered'])} of {owed['findings']} "
-                         f"finding(s) of the round-{owed['round']} verdict "
-                         f"have no disposition: {ids}")
-        if owed["repeated"]:
-            parts.append(f"answered more than once: "
-                         f"{', '.join(owed['repeated'])}")
+        parts = [f"{len(owed['unanswered'])} of {owed['findings']} "
+                 f"finding(s) of the round-{owed['round']} verdict "
+                 f"have no disposition: {ids}"]
+        # The placeholder is the tool's own word; the round it refers to
+        # is stated in the prose around the command rather than rendered
+        # into a slot no shell ever sees (round 5 F1).
+        answer_cmd = paths.command(
+            *paths.lits(TOOL_NAME, "respond", "--verdict"),
+            paths.Ph("<the recorded verdict>"), paths.Lit("--from-json"),
+            paths.Ph("<dispositions.json>"), paths.Lit("--out"),
+            paths.Ph("<disposition.md>"))
         raise Refusal(
             "; ".join(parts) + " — one disposition per finding, and a "
             "finding never dies by omission (§5.2); the next round is not "
-            "opened until every finding is answered. Answer them with "
-            f"`{TOOL_NAME} respond --verdict <the recorded round-"
-            f"{owed['round']} verdict> --from-json <dispositions.json> "
-            f"--out <disposition.md>`, then hand off",
+            f"opened until every finding is answered. Answer the recorded "
+            f"round-{owed['round']} verdict with `{answer_cmd}`, then hand "
+            f"off",
             "")
     fired = unauthorized_breakers(cfg, ledger)
     if fired:
         named = "; ".join(
             f"{f['breaker']} (round {f.get('round', '?')}"
-            + (f", {f['fp']}" if f.get("fp") else "") + f"): {f['rule']}"
+            + (f", {f['fp']}" if f.get("fp") else "")
+            + f") [{firing_id(f)}]: {f['rule']}"
             for f in fired)
         raise Refusal(
             f"a circuit breaker fired and no recorded decision covers it — "
             f"{named}. Any firing stops the loop and escalates to the "
             f"human, naming the rule and the decision required (§5.3d). "
             f"The decision is one of: close the lineage "
-            f"(`{TOOL_NAME} close --lineage --reason \"...\" --by <who>`), "
+            f"(`{paths.command(*paths.lits(TOOL_NAME, 'close', '--lineage', '--reason'), paths.qph('...'), paths.Lit('--by'), paths.Ph('<who>'))}`), "
             f"or continue past this firing by recorded authorization "
-            f"(`{TOOL_NAME} ledger authorize-breaker --breaker "
-            f"{fired[0]['breaker']} --reason \"...\" --by <who>`); the "
+            f"(`{paths.command(*paths.lits(TOOL_NAME, 'ledger', 'authorize-breaker', '--breaker'), fired[0]['breaker'], paths.Lit('--reason'), paths.qph('...'), paths.Lit('--by'), paths.Ph('<who>'))}`); the "
             f"tool takes neither on its own",
             "")
 
 
 def cached_handoff(cfg: Config, ledger: Ledger, round_no: int,
-                   git=None, claim_digest: str = "") -> dict | None:
+                   git=None, claim_digest: str = "",
+                   roles: tuple[str, str] | None = None,
+                   transport: str | None = None) -> dict | None:
     """§9bis.3 rule 5: re-running handoff on an unchanged tip with a warm
     request returns the same envelope without re-running gates or pushing.
 
@@ -759,8 +1128,87 @@ def cached_handoff(cfg: Config, ledger: Ledger, round_no: int,
     text = path.read_text(encoding="utf-8")
     if _digest_text(text) != request.get("source_digest"):
         return None
+    # The effective role stamp is part of the envelope's input (§4): a warm
+    # copy emitted under one (author, reviewer) must not answer an
+    # invocation that selected another — the stale artifact would carry the
+    # wrong stamp to the reviewer. Unlike the claim, roles are DERIVABLE
+    # when unstated: `None` means no per-invocation selection, which
+    # resolves to the config's default direction — a real state, not an
+    # unknown — so legacy warm behaviour is unchanged. The recorded side is
+    # read from the kept envelope itself, which has carried the stamp since
+    # the wire format existed.
+    want_author, want_reviewer = roles if roles is not None else (
+        cfg.roles.get("author") or "", cfg.roles.get("reviewer") or "")
+    kept_request = wire.parse_request(text)
+    attrs = kept_request.attrs
+    if (attrs.get("author", "").lower() != want_author.lower()
+            or attrs.get("reviewer", "").lower() != want_reviewer.lower()):
+        return None
+    # RVW-T11, and the same rule as the role stamp one line above: the
+    # declared transport is part of the envelope's input, so a copy emitted
+    # under one topology must not answer an invocation that declared the
+    # other. Warm here would be the sharp version of the defect — the human
+    # asks for the cross-machine round, the tool hands back the envelope that
+    # says `path`, and the reviewer's own relay then prints a path on a
+    # machine they cannot see. Derivable when unstated, exactly like roles.
+    # R1-F2: both sides of the comparison go through the one lifecycle
+    # boundary — the requested side refuses an explicitly empty or unknown
+    # config value instead of folding it to the default, and the declared
+    # side refuses a defective kept stamp BEFORE the cache can serve it.
+    want_transport = vocab.transport_or_default(
+        transport if transport is not None else cfg.roles.get("transport"),
+        "the transport this invocation resolved" if transport is not None
+        else "[roles] transport in the governing config")
+    if declared_transport(kept_request) != want_transport:
+        return None
     return {"envelope": text, "sha": head, "round": round_no,
             "kept": str(path), "digest": request["source_digest"]}
+
+
+def _reviewer_next(parsed, kept: str, reviewer: str):
+    """The one command the reviewer runs, in the topology this round declared.
+
+    Three states, and the transport decides between the first two rather than
+    the tool guessing from what it can see locally. `paste`: the reviewer is
+    not on this filesystem, so the kept path is not a thing they can open and
+    the only carrier is the bytes — `take -`, live, with the paste supplying
+    stdin. `path`: they read the same disk, so the kept path IS the carrier
+    and the command is one line with nothing to choose. The third state is
+    neither declaration's doing — the bytes were not kept at all — and it
+    falls to the paste form because that is the only carrier left.
+
+    RVW-T16's named residue was here: the not-kept fallback rendered
+    `take - --as <id> < <the envelope>`, a success-side placeholder in a
+    field agents run verbatim. F1 (lineage 6 round 1) closed that door for
+    the whole class: a placeholder-bearing line is a `Template`, and a
+    Template cannot satisfy `executable()` — so the not-kept state now
+    returns None here, and the record carries the template as prose in
+    `then`, where a person reads it. The paste branch does NOT reproduce
+    it — a declared paste round has real bytes at a real kept path, so the
+    redirect a person would have to fill in does not arise.
+    """
+    take = (paths.Lit(TOOL_NAME), paths.Lit("take"))
+    as_words = (paths.Lit("--as"), reviewer)
+    if kept.startswith("not kept"):
+        return None
+    if declared_transport(parsed) == vocab.TRANSPORT_PASTE:
+        return paths.command(*take, paths.Lit("-"), *as_words)
+    return paths.command(*take, kept, *as_words)
+
+
+def _reviewer_note(parsed, kept: str, reviewer: str) -> str | None:
+    """Prose for the one state `_reviewer_next` cannot answer with a
+    runnable line: the bytes were not kept, so the command needs a stdin a
+    person must supply, and the template travels as prose."""
+    if not kept.startswith("not kept"):
+        return None
+    template = paths.command(
+        paths.Lit(TOOL_NAME), paths.Lit("take"), paths.Lit("-"),
+        paths.Lit("--as"), reviewer, paths.Op("<"),
+        paths.Ph("<the envelope>"))
+    return (f"the bytes were not kept, so only the person holding the "
+            f"envelope can carry it: `{template}`, with the envelope "
+            f"supplied on stdin")
 
 
 def record_handoff(cfg: Config, ledger: Ledger, envelope: str,
@@ -775,20 +1223,24 @@ def record_handoff(cfg: Config, ledger: Ledger, envelope: str,
     added = ledger.add_all(request_events(parsed, round_no, digest, size,
                                           claim_digest=claim_digest))
     reviewer = parsed.attrs.get("reviewer", "")
-    return {"round": round_no, "sha": parsed.sha, "digest": digest,
+    return _runnable({"round": round_no, "sha": parsed.sha, "digest": digest,
             "bytes": size, "kept": kept, "recorded": bool(added),
             "reviewer": reviewer,
             # --as is part of the literal command, not an option to discover:
             # round 1 F4 made the declaration mandatory, and the adapters tell
             # agents to run what the tool printed without improvising flags.
-            "reviewer_next": f"{TOOL_NAME} take {kept} --as {reviewer}"
-            if not kept.startswith("not kept")
-            else f"{TOOL_NAME} take - --as {reviewer} < <the envelope>",
+            "reviewer_next": _reviewer_next(parsed, kept, reviewer),
+            # Prose for the not-kept state, where no runnable line exists
+            # (F1: a placeholder template may not ride a runnable field).
+            "then": _reviewer_note(parsed, kept, reviewer),
+            # Prose, not a command: it says STOP, and the command it
+            # mentions is the one that comes after the verdict arrives.
             "author_next": "stop: hand the envelope to the reviewer — the "
                            "human sets the round in motion (standing "
                            "instructions); nothing else runs on this side until "
-                           f"the verdict arrives, then `{TOOL_NAME} close "
-                           f"--verdict <file>`"}
+                           f"the verdict arrives, then "
+                           f"`{paths.command(*paths.lits(TOOL_NAME, 'close', '--verdict'), paths.Ph('<file>'))}`"},
+                     "reviewer_next")
 
 
 # ---------------------------------------------------------------------- take
@@ -855,16 +1307,21 @@ def probe_target(cfg: Config, push: dict | None, sha: str,
                       + ("" if can_fetch else "; a person fetches the "
                          "reviewed ref into this clone, or hands the "
                          "envelope back to the author"),
-                      (f"git -C {cfg.repo_root} fetch {push['url']} "
-                       f"{push['ref']} && {TOOL_NAME} take {retake[0]} "
-                       f"--as {retake[1]}") if can_fetch else "")
+                      paths.command(
+                          paths.Lit("git"), paths.Lit("-C"), cfg.repo_root,
+                          paths.Lit("fetch"), push["url"], push["ref"],
+                          paths.Op("&&"), paths.Lit(TOOL_NAME),
+                          paths.Lit("take"), retake[0], paths.Lit("--as"),
+                          retake[1])
+                      if can_fetch else "")
     result["target"] = "present"
     if base:
         if not present(base):
             raise Refusal(f"base {base} is not present in this clone: the "
                           f"diff `{base[:12]}...{sha[:12]}` cannot be "
                           f"computed (§9bis.4); a person deepens this clone "
-                          f"(`git fetch --unshallow`) or fetches the base "
+                          f"(`{paths.command(*paths.lits('git', 'fetch', '--unshallow'))}`) "
+                          f"or fetches the base "
                           f"ref, then re-runs the take",
                           "")
         try:
@@ -905,20 +1362,19 @@ def probe_references(cfg: Config, reference_section: str,
 
     def kind(path: str) -> str | None:
         """'blob' | 'tree' | None, at the target when `sha` is given, else
-        from the working tree."""
+        from the working tree. With a target, this is `refs.target_kind` —
+        the same call the emitter makes (round 3 F1)."""
         if sha is None:
             full = cfg.repo_root / path
             return "blob" if full.is_file() else "tree" if full.is_dir() \
                 else None
-        try:
-            return run("cat-file", "-t", f"{sha}:{path.rstrip('/')}")
-        except RuntimeError:
-            return None
+        return refs.target_kind(run, sha, path)
 
     def digest(path: str) -> str:
         if sha is None:
             return sha256_file(cfg.repo_root / path)
-        return _digest_bytes(run_bytes(cfg, git, "show", f"{sha}:{path}"))
+        return refs.target_digest(
+            lambda *a: run_bytes(cfg, git, *a), sha, path)
 
     where = "in the target tree" if sha is not None else "in this checkout"
     out = []
@@ -965,8 +1421,10 @@ def run_bytes(cfg: Config, git, *args: str) -> bytes:
     out = subprocess.run(["git", "-C", str(cfg.repo_root), *args],
                          capture_output=True, timeout=120)
     if out.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)}: "
-                           f"{out.stderr.decode('utf-8', 'replace').strip()}")
+        raise RuntimeError(
+            f"a `git` subprocess failed: "
+            f"`{paths.command(paths.Lit('git'), *args)}` — "
+            f"{out.stderr.decode('utf-8', 'replace').strip()}")
     return out.stdout
 
 
@@ -994,12 +1452,29 @@ def target_config(cfg: Config, sha: str, git=None) -> Config:
 
 def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
          reviewer: str | None = None, fetch: bool = True,
-         validate_items=None, git=None) -> dict:
-    """The reviewer's one command. Returns the record; raises Refusal."""
+         validate_items=None, git=None, transport: str | None = None) -> dict:
+    """The reviewer's one command. Returns the record; raises Refusal.
+
+    `transport` is the reviewer's correction of what the envelope declares,
+    and it exists because the author's declaration can be wrong in exactly
+    one direction that matters: an author who did not know the reviewer was
+    elsewhere stamps `path`, and the verdict leg would then print a command
+    naming a file on the REVIEWER's machine to an author who cannot open it —
+    round 4's F2, arriving through a mis-declaration instead of through
+    silence. The reviewer is the one party who knows, so the reviewer may
+    say so; the correction is recorded beside the envelope's own value rather
+    than replacing it, because a disagreement between the two ends about the
+    channel is a fact worth keeping, not one to overwrite.
+
+    It is a declaration, not a detection. `take -` is NOT read as evidence of
+    a paste — an agent may pipe a local file, and a carrier inferred from the
+    shape of an argument is the same fail-open guess `vocab` refuses.
+    """
     parsed = wire.parse_request(envelope)
     if not parsed.wrapped:
         raise Refusal(f"{source} is not a review request",
-                      f"{TOOL_NAME} validate {source}")
+                      paths.command(paths.Lit(TOOL_NAME),
+                                    paths.Lit("validate"), source))
 
     # Round 1 F4. The identity must be DECLARED, never defaulted. Falling back
     # to [roles] reviewer meant any process omitting --as permanently appended
@@ -1018,7 +1493,8 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
                       "repository's default DIRECTION, not who is at this "
                       "keyboard, so it is not an answer here (§7: silence "
                       "must not pick a side). Re-run as "
-                      f"`{TOOL_NAME} take {source} --as <your identity>`",
+                      f"`{TOOL_NAME} take {paths.shell_path(source)} "
+                      f"--as <your identity>`",
                       "")
     if me != addressed:
         raise Refusal(f"this envelope is addressed to reviewer "
@@ -1044,8 +1520,8 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
                       + ", ".join(i.code for i in errors) + "): a reviewer "
                       "does not rule on a defective envelope, and this "
                       "clone fetches nothing on its account",
-                      f"{TOOL_NAME} validate {source}  # then return it to "
-                      f"the author")
+                      paths.command(*paths.lits(TOOL_NAME, "validate"),
+                                    source))
 
     round_no = int(parsed.attrs.get("round", "0") or 0)
     sha = parsed.sha or ""
@@ -1071,8 +1547,8 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
         raise Refusal("the request fails validation ("
                       + ", ".join(i.code for i in errors) + "): a reviewer "
                       "does not rule on a defective envelope",
-                      f"{TOOL_NAME} validate {source}  # then return it to "
-                      f"the author")
+                      paths.command(*paths.lits(TOOL_NAME, "validate"),
+                                    source))
     reference = wire.section(parsed.sections, "reference")
     # References are read from the target tree as well: the manifest's
     # digests describe bytes at that commit, and this checkout — at another
@@ -1087,18 +1563,34 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
     for r in refs:
         key = r["status"].split(" ", 1)[0].rstrip(":")
         ref_summary[key] = ref_summary.get(key, 0) + 1
-    ledger.add({"event": "take", "round": round_no, "sha": sha,
-                "reviewer": me, "source_digest": digest,
-                "fetch": target.get("fetch"), "references": ref_summary})
-    diff_cmd = (f"git -C {cfg.repo_root} diff {base}...{sha}" if base
-                else f"git -C {cfg.repo_root} show {sha}")
-    return {"round": round_no, "sha": sha, "reviewer": me,
+    # RVW-T11. The envelope's declaration, corrected by the reviewer if the
+    # reviewer said so — and BOTH values recorded when they differ, so the
+    # ledger shows a disagreement about the channel rather than only its
+    # winner. `declared` is what the author stamped; `transport` is what this
+    # end will render its verdict leg for.
+    declared = declared_transport(parsed)
+    effective = transport if transport is not None else declared
+    take_event = {"event": "take", "round": round_no, "sha": sha,
+                  "reviewer": me, "source_digest": digest,
+                  "transport": effective,
+                  "fetch": target.get("fetch"), "references": ref_summary}
+    if effective != declared:
+        take_event["declared_transport"] = declared
+    ledger.add(take_event)
+    diff_cmd = (paths.diff_command(cfg.repo_root, base, sha) if base
+                else paths.command(
+                    paths.Lit("git"), paths.Lit("-C"), cfg.repo_root,
+                    paths.Lit("show"), sha))
+    return _runnable({"round": round_no, "sha": sha, "reviewer": me,
             "target": target, "references": refs, "kept": kept,
             "digest": digest, "diff": diff_cmd, "envelope": envelope,
+            "transport": effective,
             "then": f"write the verdict as <{parsed.tag}-review-verdict "
-                    f'sha="{sha}"> and run `{TOOL_NAME} validate '
-                    f"<verdict.md>`; then stop — do not start the next "
-                    f"round (standing instructions)"}
+                    f'sha="{sha}"> and run '
+                    f"`{paths.command(*paths.lits(TOOL_NAME, 'validate'), paths.Ph('<verdict.md>'))}`; "
+                    f"then stop — do not start the next round (standing "
+                    f"instructions)"},
+                     "diff")
 
 
 # --------------------------------------------------------------------- close
@@ -1108,14 +1600,17 @@ def close_round(cfg: Config, ledger: Ledger, verdict_text: str, source: str,
                 validate_items=None) -> dict:
     parsed = wire.parse_verdict(verdict_text)
     if not parsed.wrapped and parsed.verdict is None:
-        raise Refusal(f"{source} is not a verdict", f"{TOOL_NAME} validate {source}")
+        raise Refusal(f"{source} is not a verdict",
+                      paths.command(paths.Lit(TOOL_NAME),
+                                    paths.Lit("validate"), source))
     items = validate_items(parsed) if validate_items else []
     errors = [i for i in items if i.level == "error"]
     if errors:
         raise Refusal("the verdict fails validation ("
                       + ", ".join(i.code for i in errors) + "): it is "
                       "returned to the reviewer, not recorded",
-                      f"{TOOL_NAME} validate {source}")
+                      paths.command(paths.Lit(TOOL_NAME),
+                                    paths.Lit("validate"), source))
     # Round 1 F1 (Blocker). The SHA binding is the tool's central invariant and
     # a clean verdict is merge-authorizing evidence, so the round a verdict is
     # filed under may never be taken on the caller's word: `round_no or
@@ -1130,22 +1625,23 @@ def close_round(cfg: Config, ledger: Ledger, verdict_text: str, source: str,
             f"lineage (rounds {ambiguous}), so which round this verdict "
             f"answers cannot be derived and must not be guessed — a verdict "
             f"closes the request that asked for it (round 2 F1)",
-            f"{TOOL_NAME} brief  # identify the live round, then close the "
-            f"superseded ones by decision")
+            paths.command(*paths.lits(TOOL_NAME, "brief")))
     derived = ledger.round_for_sha(parsed.sha)
     if derived is None:
         raise Refusal(f"no request in the current lineage binds sha "
                       f"{parsed.sha}, so this verdict answers no round here — "
                       f"a verdict is closed against the request that asked for "
                       f"it, never against a round number supplied beside it",
-                      f"{TOOL_NAME} brief {source}  # then close in the "
-                      f"repository whose lineage requested this SHA")
+                      paths.command(*paths.lits(TOOL_NAME, "brief"),
+                                    source))
     if round_no is not None and round_no != derived:
         raise Refusal(f"--round {round_no} does not hold the request for sha "
                       f"{parsed.sha}; that request is round {derived}. The "
                       f"round is derived from the SHA and an explicit value "
                       f"may only agree with it (round 1 F1)",
-                      f"{TOOL_NAME} close --verdict {source}  # without --round")
+                      paths.command(
+                          *paths.lits(TOOL_NAME, "close", "--verdict"),
+                          source))
     round_no = derived
     digest = _digest_text(verdict_text)
     conflict = verdict_conflict(ledger, round_no, digest)
@@ -1155,7 +1651,8 @@ def close_round(cfg: Config, ledger: Ledger, verdict_text: str, source: str,
                       f"{conflict.get('source_digest', '?')[:16]}…); a round "
                       f"is ruled once, and a second ruling would let the "
                       f"author choose which one to answer (round-2 F1)",
-                      f"{TOOL_NAME} ledger report")
+                      paths.command(paths.Lit(TOOL_NAME), paths.Lit("ledger"),
+                                    paths.Lit("report")))
     size = len(verdict_text.encode("utf-8"))
     kept = keep_bytes(cfg, round_no, "verdict", verdict_text)
     added = ledger.add_all(verdict_events(parsed, round_no, digest, size,
@@ -1176,10 +1673,23 @@ def close_round(cfg: Config, ledger: Ledger, verdict_text: str, source: str,
         record["next"] = None
     else:
         record["lineage"] = "open"
-        record["next"] = (f"{TOOL_NAME} respond --verdict {source} "
-                          f"--from-json <dispositions.json> --out "
-                          f"<disposition.md>; then {TOOL_NAME} handoff")
-    return record
+        # F1 (lineage 6 round 1): the old value here was the finding's live
+        # exhibit — `respond … <dispositions.json> --out <disposition.md>;
+        # then loupe handoff` in the top-level runnable field, with `then`
+        # posing as a shell word and two files the author has not written
+        # yet. A `next` is a command an agent runs verbatim; a command with
+        # placeholders is a person's to finish, so it travels as prose and
+        # `next` is honestly empty until the dispositions exist.
+        record["next"] = None
+        respond_template = paths.command(
+            *paths.lits(TOOL_NAME, "respond", "--verdict"), source,
+            paths.Lit("--from-json"), paths.Ph("<dispositions.json>"),
+            paths.Lit("--out"), paths.Ph("<disposition.md>"))
+        record["then"] = (
+            f"write one disposition per finding, then "
+            f"`{respond_template}`, then "
+            f"`{paths.command(*paths.lits(TOOL_NAME, 'handoff'))}`")
+    return _runnable(record, "next")
 
 
 def waive(cfg: Config, ledger: Ledger, sha: str, reason: str, by: str,
@@ -1233,7 +1743,9 @@ def waive(cfg: Config, ledger: Ledger, sha: str, reason: str, by: str,
         raise Refusal(
             f"{sha} does not resolve to a commit in this repository, so the "
             f"waiver would name nothing",
-            f"git -C {cfg.repo_root} log --oneline -5") from exc
+            paths.command(paths.Lit("git"), paths.Lit("-C"),
+                          cfg.repo_root, paths.Lit("log"),
+                          paths.Lit("--oneline"), paths.Lit("-5"))) from exc
     # Sweep F10: reviewed and deliberately unreviewed are mutually exclusive
     # facts about a COMMIT, not lineage-local states — so the check reads
     # every request and verdict event in the ledger, closed lineages
@@ -1249,7 +1761,8 @@ def waive(cfg: Config, ledger: Ledger, sha: str, reason: str, by: str,
             f"{ledger.lineage_of(reviewed[0])}), so it is reviewed rather "
             f"than waived; a waiver may not overwrite a review that "
             f"happened, in this lineage or any closed one",
-            f"{TOOL_NAME} ledger report")
+            paths.command(paths.Lit(TOOL_NAME), paths.Lit("ledger"),
+                                    paths.Lit("report")))
     added = ledger.add({"event": "waiver", "sha": resolved, "reason": reason,
                         "authorized_by": by})
     return {"sha": resolved, "reason": reason, "authorized_by": by,
@@ -1261,7 +1774,7 @@ def close_lineage(ledger: Ledger, reason: str, by: str) -> dict:
     rounds = ledger.rounds()
     if not rounds:
         raise Refusal("the current lineage has no rounds: nothing to close",
-                      f"{TOOL_NAME} handoff  # opens round 1")
+                      paths.command(*paths.lits(TOOL_NAME, "handoff")))
     if not reason.strip():
         raise Refusal("a lineage is closed by a recorded, reason-bearing "
                       "decision — the reason is the record",
@@ -1276,7 +1789,16 @@ def close_lineage(ledger: Ledger, reason: str, by: str) -> dict:
     added = ledger.add({"event": Ledger.LINEAGE_CLOSED, "at_round": last,
                         "outcome": "decision", "reason": reason,
                         "authorized_by": by, "open_request": open_request})
-    return {"lineage_closed_at_round": last, "open_request": open_request,
-            "recorded": bool(added), "next_lineage": ledger.lineage_number(),
-            "next": f"{TOOL_NAME} handoff --base <sha>  # round 1 of "
-                    f"lineage {ledger.lineage_number()}, repo default cap"}
+    # Workshop (b): the only record-returning transport verb that was not
+    # checked here, while `record_handoff`, `take` and `close_round` all
+    # were. Its `next` was rendered correctly; nothing made it stay that way.
+    # F1 (lineage 6 round 1): `handoff --base <sha>` carries a placeholder
+    # only a person can fill — the base of a lineage that does not exist
+    # yet — so it is prose, and `next` is honestly empty.
+    return _runnable(
+        {"lineage_closed_at_round": last, "open_request": open_request,
+         "recorded": bool(added), "next_lineage": ledger.lineage_number(),
+         "next": None,
+         "then": f"the next handoff opens round 1 of the new lineage: "
+                 f"`{paths.command(*paths.lits(TOOL_NAME, 'handoff', '--base'), paths.Ph('<sha>'))}`"},
+        "next")

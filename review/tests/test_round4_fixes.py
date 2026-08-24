@@ -977,6 +977,18 @@ class TestF9EveryNonZeroExitIsStructured(unittest.TestCase):
 # --------------------------------------------------------------------- F10
 
 # ------------------------------------------------------------- sweep F11
+def _dotted(node) -> str:
+    """`paths.command` for an Attribute chain, `command` for a Name."""
+    import ast
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
 class TestEveryFailureExit(unittest.TestCase):
     """Sweep F11 (Medium): the transport refusal surface, enumerated.
 
@@ -1024,6 +1036,44 @@ class TestEveryFailureExit(unittest.TestCase):
                         for b in render(node.right)]
             if isinstance(node, ast.IfExp):
                 return render(node.body) + render(node.orelse)
+            # Round 5 F1: recoveries are built by `paths.command(...)` now,
+            # not spliced into f-strings. A `Lit` word renders as the
+            # literal the source states; every other word is a value, which
+            # this enumeration has always shown as ‹X›.
+            if (isinstance(node, ast.Call)
+                    and _dotted(node.func) in ("paths.command", "command")):
+                words = []
+                flat = []
+                for arg in node.args:
+                    if (isinstance(arg, ast.Starred)
+                            and isinstance(arg.value, ast.Call)
+                            and _dotted(arg.value.func) in ("paths.lits",
+                                                            "lits")):
+                        # `*paths.lits(a, b)` is several Lit words at once.
+                        flat.extend(
+                            ast.Call(func=ast.Name(id="Lit", ctx=ast.Load()),
+                                     args=[a], keywords=[])
+                            for a in arg.value.args)
+                    else:
+                        flat.append(arg)
+                for arg in flat:
+                    if (isinstance(arg, ast.Call)
+                            and _dotted(arg.func) in ("paths.Lit", "Lit")
+                            and len(arg.args) == 1):
+                        inner_node = arg.args[0]
+                        if (isinstance(inner_node, ast.Name)
+                                and inner_node.id == "TOOL_NAME"):
+                            words.append(TOOL_NAME)
+                            continue
+                        inner = render(inner_node)
+                        words.append(inner[0] if inner and inner[0]
+                                     is not None else "‹X›")
+                    elif (isinstance(arg, ast.Name)
+                          and arg.id == "TOOL_NAME"):
+                        words.append(TOOL_NAME)
+                    else:
+                        words.append("‹X›")
+                return [" ".join(words)]
             return [None]                      # not a literal: judged as such
 
         for node in ast.walk(tree):

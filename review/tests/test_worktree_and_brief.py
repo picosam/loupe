@@ -218,16 +218,173 @@ class TestPrecisIsDerived(unittest.TestCase):
         self.assertIn("1 with a digest to check", text)
         self.assertNotIn("declared unavailable", text)
 
-    def test_a_clean_verdict_says_nothing_is_blocking(self):
+    def test_the_heading_is_the_verdict_itself(self):
+        # User-directed 2026-08-22: the first thing the carrier reads is the
+        # ruling, not a label for it. A clean verdict's relay carries only
+        # the close command — respond answers findings a clean verdict does
+        # not have.
         v = wire.parse_verdict(
             '<loupe-review-verdict sha="abc">\n'
             "VERDICT: clean to advance\n\n## findings\n\nNone\n"
             "\n## evidence checked\n\n- the tree\n")
-        self.assertIn("clean to advance", brief.verdict_precis(v))
-        # The commands moved out of the précis and into their own field
-        # (round 3 relay split): the account says what was ruled, the relay
-        # says what to run, and neither contains the other.
-        self.assertIn("nothing is blocking", brief.verdict_relay(v).lower())
+        self.assertIn("## Clean to advance", brief.verdict_precis(v))
+        relay = brief.verdict_relay(v)
+        self.assertIn(f"{TOOL_NAME} close --verdict", relay)
+        self.assertNotIn("respond", relay)
+
+    def test_no_verdict_line_keeps_the_generic_heading(self):
+        # The heading never invents a ruling: absent a VERDICT line, the
+        # generic heading returns and the absence is stated as itself.
+        v = wire.parse_verdict(
+            '<loupe-review-verdict sha="abc">\n'
+            "\n## findings\n\nNone\n"
+            "\n## evidence checked\n\n- the tree\n")
+        precis = brief.verdict_precis(v)
+        self.assertIn("## What this rules", precis)
+        self.assertIn("no verdict line found", precis)
+
+    def test_both_legs_render_one_fence_whose_every_line_runs_as_printed(self):
+        """The relay convention, workshop (c) — one shape, both legs.
+
+        The rulings this replaces, in order. 2026-08-20: the verdict relay
+        carries the AUTHOR's commands and must say so, as a prose line in the
+        relay. 2026-08-22: a relaying agent mangled that prose, so the relay
+        became a bare fence and the statement moved to the brief. Neither
+        held, because both were arguing about where prose goes NEXT TO a
+        fence, and a person handed the fence alone still held commands naming
+        a path on someone else's machine.
+
+        The convention now: heading, one fence, and every line inside it
+        either a live command or a `#` comment. Prose is inside the block, so
+        it cannot be separated from what it qualifies or reworded in transit,
+        and the block keeps one promise a reader can rely on — paste it and
+        exactly the live lines run.
+        """
+        from review.tests.test_transport import request_text
+        legs = {}
+        # RVW-T11: the shape is the shape under EITHER declaration. A
+        # topology that changes which command is printed must not be able to
+        # change the promise the block makes about itself.
+        for declared in ("path", "paste"):
+            for verdict in ("clean to advance", "changes requested"):
+                v = wire.parse_verdict(
+                    f'<loupe-review-verdict sha="abc">\n'
+                    f"VERDICT: {verdict}\n\n## findings\n\nNone\n"
+                    f"\n## evidence checked\n\n- the tree\n")
+                legs[f"verdict/{declared}/{verdict}"] = (
+                    brief.verdict_relay(v, source="/tmp/v.md",
+                                        transport=declared),
+                    "## What to run next")
+            req = wire.parse_request(request_text(transport_attr=declared))
+            # `paste=False` on both: the declared-paste leg appends the bytes
+            # after the fence, and this gate is about the fence.
+            relay = brief.relay("/tmp/r.md", req, "bytes")
+            legs[f"request/{declared}"] = (
+                relay.split("\n\nThe envelope, to paste:")[0],
+                "## How to carry it")
+
+        for name, (relay, heading) in legs.items():
+            with self.subTest(leg=name):
+                lines = relay.splitlines()
+                self.assertEqual(lines[0], heading)
+                self.assertEqual(lines[1], "")
+                self.assertTrue(lines[2].startswith("```"))
+                self.assertTrue(lines[-1].startswith("```"))
+                self.assertEqual(relay.count("```"), 2,
+                                 "one fence, opened once and closed once")
+                body = lines[3:-1]
+                self.assertTrue(body, "the fence is empty")
+                for line in body:
+                    self.assertTrue(
+                        line.startswith(TOOL_NAME) or line.startswith("#"),
+                        f"neither a command nor a comment: {line!r}")
+                # Exactly one live line: a block is one action, and the
+                # alternatives beside it are alternatives, not steps.
+                live = [l for l in body if not l.startswith("#")]
+                self.assertEqual(len(live), 1, f"expected one live line: {body}")
+                # And no comment restates what the brief already carries: the
+                # request leg's audience is its precis's Direction line, so
+                # only the verdict leg — whose brief has no equivalent —
+                # names its audience here.
+                named = any("author's to run" in l for l in body)
+                self.assertEqual(named, name.startswith("verdict"),
+                                 f"{name}: audience line in the wrong leg")
+
+    def test_a_relay_block_is_valid_shell_and_runs_only_its_live_lines(self):
+        """The promise, checked by a shell rather than asserted.
+
+        This is what the old verdict fence could not do. Its second line was
+        `loupe respond ... --from-json <dispositions.json> --out
+        <disposition.md>`, and `<...>` is a REDIRECTION to a shell: the line
+        is a syntax error with a dangling `>`, so the block a person was told
+        to paste as-is did not parse. Not a matter of taste — the fence made
+        a promise the bytes broke.
+        """
+        import subprocess
+        v = wire.parse_verdict(
+            '<loupe-review-verdict sha="abc">\n'
+            "VERDICT: changes requested\n\n## findings\n\n- F1\n"
+            "\n## evidence checked\n\n- the tree\n")
+        from review.tests.test_transport import request_text
+        legs = []
+        for declared in ("path", "paste"):
+            req = wire.parse_request(request_text(transport_attr=declared))
+            legs.append((f"verdict/{declared}",
+                         brief.verdict_relay(v, source="/tmp/v.md",
+                                             transport=declared)))
+            legs.append((f"request/{declared}",
+                         brief.relay("/tmp/r.md", req, "bytes")))
+        for name, relay in legs:
+            with self.subTest(leg=name):
+                # The bash fence, and only it. A declared-paste request leg
+                # prints the envelope bytes below the block in a fence of
+                # their own, and those bytes are not shell — slicing to the
+                # last line of the section would hand this gate a document
+                # to parse instead of the commands it exists to check.
+                lines = relay.splitlines()
+                opened = lines.index("```bash")
+                closed = lines.index("```", opened + 1)
+                body = "\n".join(lines[opened + 1:closed])
+                syntax = subprocess.run(["bash", "-n"], input=body, text=True,
+                                        capture_output=True)
+                self.assertEqual(syntax.returncode, 0,
+                                 f"the block a person pastes does not parse: "
+                                 f"{syntax.stderr}")
+                # Only the live lines execute; the commented alternatives and
+                # the not-yet-runnable next step stay inert.
+                traced = subprocess.run(
+                    ["bash", "-c", body.replace(TOOL_NAME, "echo RAN:")],
+                    text=True, capture_output=True)
+                ran = [l for l in traced.stdout.splitlines()
+                       if l.startswith("RAN:")]
+                self.assertEqual(len(ran), 1,
+                                 f"expected exactly one live line, ran {ran}")
+
+    def test_headings_are_sentence_case_on_every_surface(self):
+        """Round-1 F4: the headings were hard-coded all-caps and the tests
+        froze the accident as protocol. They are presentation, consumed by
+        no validator or wire grammar, so they render in sentence case on
+        all four surfaces — request brief, request relay, verdict brief,
+        verdict relay — while the actual machine vocabulary (the VERDICT
+        line the wire grammar consumes) keeps its mandated casing."""
+        from review.tests.test_transport import request_text
+        req = wire.parse_request(request_text())
+        v = wire.parse_verdict(
+            '<loupe-review-verdict sha="abc">\n'
+            "VERDICT: clean to advance\n\n## findings\n\nNone\n"
+            "\n## evidence checked\n\n- the tree\n")
+        surfaces = {
+            "request brief": (brief.request_precis(req), "## What this asks"),
+            "request relay": (brief.relay("/tmp/r.md", req, "bytes"),
+                              "## How to carry it"),
+            "verdict brief": (brief.verdict_precis(v), "## Clean to advance"),
+            "verdict relay": (brief.verdict_relay(v), "## What to run next"),
+        }
+        for name, (text, heading) in surfaces.items():
+            self.assertIn(heading, text, name)
+            self.assertNotIn(heading.upper(), text, name)
+        # The machine identifier is not presentation and does not soften.
+        self.assertEqual(v.verdict, "clean to advance")
 
     def test_a_verdict_names_its_findings_rather_than_counting_them(self):
         """The user-reported gap: ten findings summarised as "1 Blocker, 4
@@ -346,8 +503,8 @@ class TestPrecisIsDerived(unittest.TestCase):
                               for ln in precis.splitlines())
         self.assertEqual(collapsed, precis,
                          "the précis must be unchanged by the collapse")
-        self.assertIn("## WHAT THIS RULES", precis)
-        self.assertIn("- **Verdict** —", precis)
+        self.assertIn("## Changes requested", precis)
+        self.assertIn("- **Findings** —", precis)
         self.assertIn("**F1**", precis)
 
     def test_the_relay_fences_its_commands(self):
@@ -359,9 +516,10 @@ class TestPrecisIsDerived(unittest.TestCase):
             "\n## evidence checked\n\n- the diff\n")
         relay = brief.verdict_relay(v, source="/tmp/v.md")
         self.assertIn("```bash", relay)
-        fenced = relay.split("```bash")[1].split("```")[0].strip()
-        self.assertEqual(fenced, f"{TOOL_NAME} close --verdict /tmp/v.md",
-                         "the fence holds the command and nothing else")
+        fenced = relay.split("```bash")[1].split("```")[0].strip().splitlines()
+        live = [l for l in fenced if not l.startswith("#")]
+        self.assertEqual(live, [f"{TOOL_NAME} close --verdict /tmp/v.md"],
+                         "the fence holds one live command and nothing else")
 
     def test_brief_and_relay_never_contain_each_other(self):
         """The user-reported gap, three sessions running.
@@ -402,12 +560,36 @@ class TestPrecisIsDerived(unittest.TestCase):
         out = brief.relay("/kept/path.md", None, envelope, paste=True)
         self.assertIn(envelope, out)
 
-    def test_without_paste_the_relay_offers_the_command_not_the_bytes(self):
+    def test_the_default_topology_relays_one_line_and_nothing_else(self):
+        """RVW-T11. A same-machine round prints the carrier that applies and
+        no account of the one that does not.
+
+        This is what the declaration bought. The relay used to carry, on
+        every round, a commented alternative for a reviewer elsewhere and a
+        hint about the flag that prints the bytes — true, and noise in the
+        only topology the loop had ever run. The round now says which it is,
+        so this shape is the whole block: heading, fence, one command.
+        """
         envelope = "x" * 500
-        out = brief.relay("/kept/path.md", None, envelope, paste=False)
-        self.assertIn("take /kept/path.md", out)
+        out = brief.relay("/kept/path.md", self._request(), envelope,
+                          paste=False)
+        self.assertIn(f"{TOOL_NAME} take /kept/path.md --as codex", out)
         self.assertNotIn(envelope, out)
-        self.assertIn("500 bytes", out)
+        self.assertNotIn("500 bytes", out)
+        # No second carrier, and no comment about one: inside the fence
+        # there is one line, and it is the command.
+        self.assertNotIn("take -", out)
+        body = [ln for ln in out.splitlines() if ln.strip()]
+        self.assertEqual(len(body), 4, out)   # heading, ```bash, command, ```
+        self.assertEqual([ln for ln in body[2:-1] if ln.startswith("#")], [])
+
+    def test_paste_still_appends_the_bytes_when_asked_for_them(self):
+        """`brief --paste` is unchanged by the topology: a person may always
+        ask for the bytes, whatever the round declared."""
+        envelope = "x" * 500
+        out = brief.relay("/kept/path.md", self._request(), envelope,
+                          paste=True)
+        self.assertIn(envelope, out)
 
     def test_the_relay_command_carries_the_mandatory_identity_flag(self):
         # Round 1 F4 made --as mandatory. A relay that prints a line the tool
@@ -417,9 +599,44 @@ class TestPrecisIsDerived(unittest.TestCase):
         self.assertIn("--as codex", out)
         self.assertIn("take /kept/path.md --as codex", out)
 
-    def test_the_stdin_route_carries_it_too(self):
-        out = brief.relay("/kept/path.md", self._request(), "e", paste=False)
-        self.assertIn("take - --as codex", out)
+    def test_a_declared_paste_round_relays_the_bytes_carrier(self):
+        """RVW-T11, the other half. When the round declares that the two ends
+        share no filesystem, the kept path is not a carrier at all — so it is
+        not printed, live or commented, and the bytes travel with the command
+        that consumes them rather than behind a flag."""
+        envelope = "x" * 500
+        out = brief.relay("/kept/path.md", self._request(transport_attr="paste"),
+                          envelope, paste=False)
+        self.assertIn(f"{TOOL_NAME} take - --as codex", out)
+        self.assertNotIn("/kept/path.md", out)
+        # The bytes come along uninvited: there is no second command for the
+        # human to run to obtain what they were just told to carry.
+        self.assertIn(envelope, out)
+
+    def test_the_paste_carrier_is_declared_never_inferred(self):
+        """The same kept path, the same call, the same everything except the
+        declaration — and that alone decides the carrier.
+
+        The rejected design was to guess: read `take -`, an environment
+        variable, or a path that does not resolve, and conclude the sides are
+        apart. Every such signal fails open toward `path`, which is the one
+        answer that prints a pointer the far end cannot follow.
+        """
+        args = ("/kept/path.md", None, "e")
+        local = brief.relay(*args, transport="path")
+        remote = brief.relay(*args, transport="paste")
+        self.assertIn("take /kept/path.md", local)
+        self.assertNotIn("take -", local)
+        self.assertIn("take -", remote)
+        self.assertNotIn("take /kept/path.md", remote)
+
+    def test_unkept_bytes_fall_to_paste_under_either_declaration(self):
+        """Not the topology's doing: with nothing kept there is no path to
+        offer, so both declarations reach the same carrier."""
+        for declared in ("path", "paste"):
+            out = brief.relay("not kept (…)", self._request(), "e",
+                              transport=declared)
+            self.assertIn(f"{TOOL_NAME} take - --as codex", out, declared)
 
     def test_an_unstamped_envelope_asks_for_the_identity(self):
         out = brief.relay("/kept/path.md", None, "e", paste=False)
@@ -488,9 +705,16 @@ class TestBrief(unittest.TestCase):
             block = brief._fence("x", "`" * run + " inside", "y", lang="")
             self.assertEqual(block[0], "`" * (run + 1))
             self.assertEqual(block[-1], "`" * (run + 1))
-        # No backticks inside: the ordinary three, tagged bash.
-        self.assertEqual(brief._fence("loupe take x --as codex"),
+        # No backticks inside: the ordinary three, tagged bash. A bash
+        # fence takes rendered Commands only (round 5 F1) — a bare string
+        # is refused rather than trusted.
+        from review import paths
+        rendered = paths.command(paths.Lit("loupe"), paths.Lit("take"), "x",
+                                 paths.Lit("--as"), "codex")
+        self.assertEqual(brief._fence(rendered),
                          ["```bash", "loupe take x --as codex", "```"])
+        with self.assertRaises(TypeError):
+            brief._fence("loupe take x --as codex")
 
     def test_the_first_bullet_of_a_section_is_counted(self):
         """Author-found during the sweep (not a reviewer finding, declared
@@ -525,8 +749,27 @@ class TestBrief(unittest.TestCase):
     def test_simple_command_fence_control(self):
         # The command relay is unchanged: one runnable line in a bash fence
         # that a chat renders as copyable.
+        from review.tests.test_transport import request_text
+        req = wire.parse_request(request_text())
+        out = brief.relay("/kept/r.md", req, "irrelevant", paste=False)
+        self.assertIn(f"```bash\n{TOOL_NAME} take /kept/r.md", out)
+
+    def test_an_unstamped_identity_leaves_no_live_line_to_break_on(self):
+        """Workshop (c), found by the shell check rather than by reading.
+
+        With no reviewer stamped, the `take` line renders `--as <your id>` —
+        and `<your id>` is a REDIRECTION, so the one live line in a block
+        headed "every live line below runs as printed" was a syntax error
+        that killed the paste. It predates the workshop; nothing tested the
+        promise, so nothing noticed. The fence's placeholder rule makes the
+        line a comment: the reader still gets the command to fill in, and
+        what remains live still parses.
+        """
         out = brief.relay("/kept/r.md", None, "irrelevant", paste=False)
-        self.assertIn("```bash\nloupe take /kept/r.md", out)
+        body = out.splitlines()[3:-1]
+        live = [l for l in body if not l.startswith("#")]
+        self.assertEqual(live, [], f"a line that cannot run is live: {live}")
+        self.assertIn("<your id>", out)
 
 
 class TestHandoffAlwaysCarriesTheBrief(unittest.TestCase):
@@ -585,8 +828,8 @@ class TestHandoffAlwaysCarriesTheBrief(unittest.TestCase):
         code, rec = self._run("handoff", "--claim-file", str(self.claim),
                               "--base", self.base, "--local-only")
         self.assertEqual(code, 0, rec)
-        self.assertIn("WHAT THIS ASKS", rec["brief"])
-        self.assertIn("HOW TO CARRY IT", rec["relay"])
+        self.assertIn("What this asks", rec["brief"])
+        self.assertIn("How to carry it", rec["relay"])
         # The relay must name the literal command, not describe it.
         self.assertIn(f"take {rec['kept']}", rec["relay"])
 
@@ -625,7 +868,7 @@ class TestHandoffAlwaysCarriesTheBrief(unittest.TestCase):
                          "hand the human a command to run")
         # The account still goes out: describing a broken envelope is how its
         # author learns what is broken. Only the instructions are withheld.
-        self.assertIn("WHAT THIS RULES", rec["brief"])
+        self.assertIn("Clean to advance", rec["brief"])
 
     def test_a_valid_verdict_still_gets_its_relay(self):
         # The control for the test above. Withholding the relay from every
@@ -639,7 +882,7 @@ class TestHandoffAlwaysCarriesTheBrief(unittest.TestCase):
             encoding="utf-8")
         code, rec = self._run("validate", str(valid))
         self.assertEqual(code, 0, rec)
-        self.assertIn("WHAT TO RUN NEXT", rec["relay"])
+        self.assertIn("What to run next", rec["relay"])
         self.assertIn(f"{TOOL_NAME} close --verdict", rec["relay"])
 
     def test_a_local_only_target_is_reported_as_unreachable(self):
@@ -685,6 +928,136 @@ class TestHandoffAlwaysCarriesTheBrief(unittest.TestCase):
         code, rec = self._run("brief", str(junk))
         self.assertEqual(code, 1)
         self.assertIn("next", rec)
+
+
+class TestVerdictCarrier(unittest.TestCase):
+    """Round 4 F2, the half the tool owns: the verdict leg's transport.
+
+    The request leg has always been a choice — a kept path on this machine,
+    or the bytes for `take -`. The verdict leg printed the REVIEWER's path
+    in both author commands and offered nothing else, and `respond` could
+    not read a paste even when the author had one: `close -` worked,
+    `respond -` looked for a file named `-`. An author on another machine
+    could carry the verdict in and then not answer it.
+
+    What remains of F2 — a carrier declared at the start of the round, a
+    forge-comment transport, a cloud author fetching bytes with no
+    reviewer-local path — is escalated, not closed: it is the user's
+    decision (see the disposition for round 4).
+    """
+
+    def _verdict_text(self):
+        from review.tests.synth import TAG
+        return (f'<{TAG}-review-verdict sha="{"a" * 40}">\n'
+                f"VERDICT: changes requested\n\n## findings\n\n### F1\n"
+                f"Severity: High\nClassification: correctness\n"
+                f"Title: t\nEvidence: e\nWhy: w\nRequired outcome: r\n"
+                f"FALSIFICATION: f\nPreventable-by: tests\n"
+                f"</{TAG}-review-verdict>\n")
+
+    def test_the_carrier_travels_with_the_commands_it_qualifies(self):
+        """Round 4 F2's substance, relocated by workshop (c).
+
+        The finding was that the verdict leg named the REVIEWER's own path
+        and offered the author nothing else. The answer was a `Carrier`
+        bullet in the brief — correct in content, one artifact away from the
+        commands it was about, and therefore absent from the fence a person
+        is told to hand over on its own. It is now a comment inside that
+        fence, which is where it is read.
+        """
+        parsed = wire.parse_verdict(self._verdict_text())
+        relay = brief.verdict_relay(parsed, source="/tmp/verdict.md",
+                                    transport="paste")
+        # The reviewer's own path is not named at all: under this declaration
+        # it is not a thing the author can open, so offering it — live or as
+        # a fallback — is offering a failure.
+        self.assertIn(f"{TOOL_NAME} close --verdict -", relay)
+        self.assertNotIn("/tmp/verdict.md", relay)
+        # Every line of it is still either a command or an inert comment.
+        for line in relay.splitlines()[3:-1]:
+            self.assertTrue(line.startswith(TOOL_NAME) or line.startswith("#"))
+
+    def test_the_same_machine_verdict_leg_states_one_fact(self):
+        """RVW-T11. F2's caveat was protection in a topology the loop had
+        never run and noise in the one it always ran. Declared same-machine,
+        the line names the path — which is openable — and says nothing about
+        a carrier, because there is no choice to describe.
+
+        The AUDIENCE line survives in both shapes, and deliberately: it
+        answers a 2026-08-20 report of a person running `loupe close` in the
+        reviewer's own terminal, and sharing one machine is exactly the
+        condition that makes that mistake easy.
+        """
+        parsed = wire.parse_verdict(self._verdict_text())
+        relay = brief.verdict_relay(parsed, source="/tmp/verdict.md")
+        self.assertIn(f"{TOOL_NAME} close --verdict /tmp/verdict.md", relay)
+        self.assertNotIn("--verdict -", relay)
+        self.assertIn("the author's to run", relay)
+        self.assertNotIn("shared filesystem", relay)
+
+    def test_the_relay_does_not_guess_the_step_close_computes(self):
+        """`respond` is `close`'s to emit, not the relay's to predict.
+
+        It rode here as a comment for one commit. `close_round` DERIVES the
+        next command as it records the round — `respond --verdict <the
+        recorded verdict>` on changes requested, nothing on clean — so the
+        relay's copy was a second source for one fact, and the one that
+        could be wrong: it named the reviewer's path where `close` names the
+        path the tool actually kept.
+        """
+        parsed = wire.parse_verdict(self._verdict_text())
+        relay = brief.verdict_relay(parsed, source="/tmp/verdict.md")
+        self.assertNotIn("respond", relay)
+        self.assertNotIn("dispositions.json", relay)
+
+    def test_respond_reads_the_verdict_from_stdin_like_close(self):
+        import argparse
+        import contextlib
+        import io
+        import sys
+        from review.tests.synth import CFG
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix="carrier-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            tmp, ignore_errors=True))
+        dispositions = tmp / "d.json"
+        dispositions.write_text(json.dumps({"head": "b" * 40,
+                                            "dispositions": []}),
+                                encoding="utf-8")
+        args = argparse.Namespace(verdict="-", from_json=str(dispositions),
+                                  out=None, ledger_dir=str(tmp),
+                                  command="respond")
+        buf = io.StringIO()
+        stdin = sys.stdin
+        sys.stdin = io.StringIO(self._verdict_text())
+        try:
+            with contextlib.redirect_stdout(buf):
+                code = cli.cmd_respond(args, CFG)
+        finally:
+            sys.stdin = stdin
+        # The verdict was READ — the run reaches validation and reports on
+        # the dispositions, rather than dying on a file named `-`.
+        self.assertNotIn("No such file", buf.getvalue())
+        self.assertIn("F1", buf.getvalue())
+        self.assertNotEqual(code, 2)
+
+    def test_one_stdin_cannot_carry_both_documents(self):
+        import argparse
+        import contextlib
+        import io
+        from review.tests.synth import CFG
+        args = argparse.Namespace(verdict="-", from_json="-", out=None,
+                                  ledger_dir=None, command="respond")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.cmd_respond(args, CFG)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["next_kind"], "blocked")
+        self.assertIn("one stdin cannot carry two documents",
+                      payload["error"])
+        self.assertNotEqual(code, 0)
 
 
 if __name__ == "__main__":

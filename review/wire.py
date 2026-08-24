@@ -15,7 +15,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from . import vocab
+from . import paths, vocab
 from .fingerprint import compute as fp_compute
 from .fingerprint import legacy_v1 as fp_legacy_v1
 
@@ -596,6 +596,27 @@ _PUSH_LOCAL_RE = re.compile(
     r"^Push:\s+" + PUSH_LOCAL_MARKER + r" — .*$", re.MULTILINE)
 
 
+
+def executable_stamp(label: str, cmd) -> str:
+    """An envelope line whose value is a command its reader RUNS.
+
+    Workshop (b): `paths.py` and the command-surface inventory both named
+    "the envelope's `Diff:` and `Verify:` lines" among the fields that
+    "accept this type and refuse a bare string". They did not. Both were
+    built by interpolating a rendered command into an f-string, and a
+    `Command` erodes to a plain `str` under f-string, `+` and every other
+    ordinary string operation — so the type was gone one character after it
+    was created, and no door stood behind either line. The inner values were
+    rendered, so nothing was unsafe; the published invariant was simply
+    wider than the code, which is the exact defect three rounds of this
+    lineage were spent closing elsewhere.
+
+    Now the label and the command are joined HERE, after the check, so the
+    erosion happens downstream of the door rather than upstream of it.
+    """
+    paths.executable(cmd, f"the envelope's `{label}:` line")
+    return f"{label + ':':<8}{cmd}"
+
 def render_push_lines(record: dict) -> list[str]:
     """The reachability stamp, from an ensure_pushed record.
 
@@ -610,8 +631,18 @@ def render_push_lines(record: dict) -> list[str]:
     return [
         f"Push:   {record['ref']} = {record['sha']} @ {record['remote']} "
         f"({record['url']}) — ls-remote observed after push",
-        f"Verify: git fetch {record['url']} {record['ref']} && "
-        f"git cat-file -e {record['sha']}",
+        # Round 3 F1's class on the reachability surface: this line IS a
+        # command (rule 7 — the reviewer copies, never improvises), so every
+        # field in it renders as one shell word. `take`'s own fetch recovery
+        # already did; the stamp it verifies did not.
+        # Round 5 F1: rendered by the one command renderer, like every
+        # other field an agent runs verbatim. The `&&` is one of the two
+        # operators the tool writes deliberately — an `Op`, the type that
+        # says so (lineage 6 round 1, F1).
+        executable_stamp("Verify", paths.command(
+            paths.Lit("git"), paths.Lit("fetch"), record["url"],
+            record["ref"], paths.Op("&&"), paths.Lit("git"),
+            paths.Lit("cat-file"), paths.Lit("-e"), record["sha"])),
     ]
 
 

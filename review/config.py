@@ -17,7 +17,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import FORMER_NAMES, TOOL_NAME, env_var
+from . import paths, vocab, FORMER_NAMES, TOOL_NAME, env_var
 
 CONFIG_BASENAME = "review.toml"
 
@@ -42,6 +42,18 @@ DEFAULTS = {
         # §7: Gemini reviewer stamps are rejected by the validator until §10.7
         # is decided — rejected, not merely discouraged.
         "rejected_reviewers": ["gemini", "antigravity"],
+        # RVW-T11 / round 3 F2: whether the two sides of a round share a
+        # filesystem. Deliberately NO default value here — "unstated" must
+        # stay observable at the one emission-side reader
+        # (`emit.resolve_transport`), because the undeclared state is
+        # where the environment gets its say: a cloud-authored session's
+        # own declaration (LOUPE_TRANSPORT) or a documented provider
+        # signal resolves it to `paste`, and only then does the steady
+        # case fall to `vocab.TRANSPORT_EMISSION_DEFAULT` (`path`, the
+        # local same-machine loop this workflow declares). A default
+        # written here would erase the difference between a repo that
+        # declared `path` and one that declared nothing — silencing the
+        # cloud declaration that exists precisely for the second.
     },
     # §10.5, provisional. `token_budget` has NO default on purpose: a budget
     # nobody declared is not a budget of zero and not a budget of infinity,
@@ -269,7 +281,10 @@ class ConfigError(RuntimeError):
     def __init__(self, message: str, next_cmd: str = "", code: int = 2,
                  remedy: str = ""):
         super().__init__(message)
-        self.next_cmd = next_cmd
+        # Workshop (b): symmetric with `transport.Refusal`, which has guarded
+        # at construction since round 5 F1. Both carry a `next_cmd` that
+        # becomes the CLI's `next`; only one checked it.
+        self.next_cmd = paths.executable(next_cmd, "ConfigError.next_cmd")
         self.code = code
         self.remedy = remedy
 
@@ -323,6 +338,7 @@ def load(repo_root: Path | None = None, ledger_dir: str | None = None,
                 f"ledger state for this repo exists under the tool's former "
                 f"name at {legacy}, and nothing exists at {base}: starting a "
                 f"fresh ledger would silently orphan that record (§10.1)",
-                f"{TOOL_NAME} migrate-state", code=1)
+                paths.command(*paths.lits(TOOL_NAME, "migrate-state")),
+                code=1)
     cfg.ledger_dir = base
     return cfg

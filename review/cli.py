@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from . import (FORMER_NAMES, TOOL_NAME, TOOL_VERSION, adapters, brief, config,
-               emit, transport, vocab, wire)
+               emit, paths, transport, vocab, wire)
 from .digest import sha256_file, sha256_text
 from .ledger import Ledger, render_report_md
 from .validate import (errors_in, validate_disposition, validate_request,
@@ -23,7 +23,85 @@ def _tty() -> bool:
     return sys.stdout.isatty()
 
 
+# The payload keys an agent RUNS rather than reads — the closed set, checked
+# at the one door every structured result leaves by (workshop (b)).
+#
+# The policy used to be enforced by whichever caller remembered it:
+# `_blocked` called `paths.executable`, `_finish` did not and wrote any
+# truthy `next_cmd` as `next_kind: command`, the success side of `respond`
+# and `close --lineage` reached `_out` through neither, and
+# `transport._runnable` held a hand-maintained field list per call site. Six
+# doors for one policy is five chances to add a seventh. Every current caller
+# passed a rendered command, so nothing was unsafe — the defect was that
+# nothing MADE them, and the next caller inherits no such habit.
+#
+# `test_round4_fixes.py` asserts that `print` appears in exactly `_out` and
+# three exit-0 artifact writers, so this door is the structured channel's
+# only exit. What it does not reach is stated where those surfaces are
+# enforced instead: envelope stamp lines (`wire.executable_stamp`), fenced
+# relay lines (`brief._fence`), and the adapters' command slots.
+RUNNABLE_KEYS = ("next", "reviewer_next", "diff")
+
+# Every top-level key a structured result may carry that an agent READS
+# rather than runs. Together with RUNNABLE_KEYS this is THE result schema,
+# and it lives at the egress that enforces it (R1-F3): a key is classified
+# runnable or prose at the moment it is introduced, or `_out` refuses the
+# payload — however the dict was built. The old closure was an AST scan
+# over three modules' dict literals; it missed subscript assignments,
+# updates, merges, helper returns and any fourth module, so eight keys the
+# egress already emitted were invisible to it. A lexical inventory cannot
+# close a set that arbitrary Python constructs; the egress can, because
+# every payload passes through it at runtime. The scan survives in
+# `test_command_boundary` as advisory drift evidence only.
+PROSE_KEYS = (
+    "absent", "anchor_path", "at_round", "attrs", "author", "author_next",
+    "authorized_by", "base",
+    # Round 2 F1: the emission stamp binding a disposition row to its
+    # companion events; an identity the agent reads, never a command.
+    "batch",
+    "blocking", "breaker", "brief", "bytes",
+    "bytes_freed", "cached", "checked", "cites", "claim_digest",
+    "classification", "classification_notes", "classifications", "closures",
+    "config", "covers", "data", "declared_transport", "default_cap", "digest",
+    "disposition", "dispositions", "dry_run",
+    "entry", "envelope", "error", "event", "events_added", "events_total",
+    "exit", "falsification", "fetch", "files", "finding_id", "finding_ids",
+    "findings", "fp", "from", "gate_output", "head", "id",
+    "ignored_control_fields", "install", "installed", "items", "kept",
+    "kept_unrecognised", "kind", "ledger", "ledgers", "limits", "lineage",
+    "lineage_closed_at_round", "moved", "mutation", "next_kind",
+    "next_lineage", "note", "of", "ok", "open_request", "out", "outcome",
+    "path", "payload", "permitted_authors", "permitted_reviewers",
+    "preventable_by", "pruned", "reason", "recorded", "referenced_shas",
+    "references", "rejected_reviewers", "relay", "remedy", "repeated",
+    "reviewer", "roles", "round", "round_cap", "severities", "severity",
+    "sha", "source", "source_digest", "status", "subtype", "superseded",
+    "tag", "target", "taxonomy", "test_digest", "then", "title", "to",
+    "token_budget", "tokens",
+    # RVW-T11: an enum the agent READS. It decides which command the tool
+    # renders, and is never itself a command — the relay it selects goes
+    # through the same runnable door as every other executable field.
+    "transport", "unanswered", "verdict", "verdict_sha", "wrapper", "written",
+)
+
+_CLASSIFIED_KEYS = frozenset(RUNNABLE_KEYS) | frozenset(PROSE_KEYS)
+
+
 def _out(payload: dict, tty_text: str | None = None):
+    # The schema door: refuse an unclassified top-level key BEFORE anything
+    # is printed, whatever construction route built the dict. This is what
+    # makes the inventory closed — not a scan's opinion of the source.
+    unclassified = sorted(k for k in payload if k not in _CLASSIFIED_KEYS)
+    if unclassified:
+        raise TypeError(
+            f"unclassified structured-result key(s) {unclassified}: every "
+            f"top-level key is declared RUNNABLE_KEYS (an agent runs it) or "
+            f"PROSE_KEYS (an agent reads it) at the egress, when the key is "
+            f"introduced — a result field is a decision about execution, "
+            f"never a side effect of building a dict")
+    for key in RUNNABLE_KEYS:
+        if payload.get(key) is not None:
+            paths.executable(payload[key], f"the `{key}` field")
     if _tty() and tty_text is not None:
         print(tty_text)
     else:
@@ -106,7 +184,14 @@ def _blocked(next_cmd: str, why: str, code: int = EXIT_FINDINGS,
     command: malformed TOML, a merge only a human can arbitrate, an envelope
     that must be authored. Naming it is what lets an agent stop and relay
     rather than improvise. Passing no `next_cmd` selects it.
+
+    Round 5 F1: `next` is the field the adapters tell agents to run
+    verbatim, so it takes a rendered `paths.Command` or nothing at all.
+    Three rounds tried to prove commands safe by reading the source that
+    built them; this door checks the type instead, and a string built any
+    other way cannot pass it by being unanalysable.
     """
+    next_cmd = paths.executable(next_cmd, "the `next` field")
     kind = "command" if next_cmd else "blocked"
     # Round-9 F2: a non-zero exit does not mean the command was
     # side-effect-free, and an operator recovering from a partial run needs
@@ -150,7 +235,10 @@ def _detect_and_parse(text: str):
 
 
 def cmd_validate(args, cfg) -> int:
-    text = Path(args.envelope).read_text(encoding="utf-8")
+    # `-` reads stdin like `take` and `close` do (round 3 relay fix): a
+    # refused `close --verdict -` names `validate -` as its next command,
+    # and a named next command must run as printed.
+    text = _read_envelope(args.envelope)
     kind, parsed = _detect_and_parse(text)
     if kind == "unknown":
         return _blocked(
@@ -199,12 +287,26 @@ def cmd_validate(args, cfg) -> int:
     is_verdict = kind == "verdict" and parsed.wrapped
     precis = (brief.verdict_precis(parsed, source=args.envelope)
               if is_verdict else None)
-    verdict_next = (brief.verdict_relay(parsed, source=args.envelope)
-                    if is_verdict and not errors_in(items) else None)
+    # RVW-T11. The verdict document cannot be trusted to carry the topology —
+    # its author is an agent writing prose, and a field it mis-transcribes
+    # would decide what the OTHER side is told to run. The value comes from
+    # this machine's own record of the round instead: the reviewer's `take`
+    # wrote it, and `recorded_transport` reads it back for this SHA.
+    verdict_next = (
+        brief.verdict_relay(
+            parsed, source=args.envelope,
+            transport=transport.recorded_transport(_ledger(cfg, args),
+                                                   parsed.sha),
+            # On a paste round the reviewer hands over ONE block: the
+            # command and, fenced beneath it, the verdict bytes it
+            # consumes — bytes outside a fence are bytes a chat surface
+            # may rewrite (round 3, live).
+            envelope=text)
+        if is_verdict and not errors_in(items) else None)
     return _finish(items, "", brief_text=precis, relay_text=verdict_next,
                    remedy=f"whoever authored {args.envelope} must correct the "
                           f"items above and re-run "
-                          f"`{TOOL_NAME} validate {args.envelope}`; envelopes "
+                          f"`{paths.command(*paths.lits(TOOL_NAME, 'validate'), args.envelope)}`; envelopes "
                           f"are edited by their author, not by this tool")
 
 
@@ -220,7 +322,20 @@ def cmd_fingerprint(args, cfg) -> int:
 
 
 def cmd_respond(args, cfg) -> int:
-    verdict_text = Path(args.verdict).read_text(encoding="utf-8")
+    # Round 4 F2, the half this verb owns: `close` has always accepted `-`
+    # and read the verdict from stdin, and this verb did not — so the relay
+    # printed a two-command sequence whose first half worked off a paste and
+    # whose second half looked for a file literally named `-`. An author on
+    # another machine could carry the verdict in and then not answer it.
+    # Both halves read the same way now.
+    if args.verdict == "-" and args.from_json == "-":
+        return _blocked(
+            "",
+            "both --verdict and --from-json were given as `-`, and one "
+            "stdin cannot carry two documents",
+            remedy="a person passes one of them as a path: the verdict the "
+                   "reviewer delivered, or the dispositions they wrote")
+    verdict_text = _read_envelope(args.verdict)
     verdict = wire.parse_verdict(verdict_text)
     ledger = _ledger(cfg, args)
     # Sweep F2: a disposition is an answer to a VALID, RECORDED verdict, not
@@ -232,10 +347,12 @@ def cmd_respond(args, cfg) -> int:
     items = validate_verdict(
         verdict, cfg, answering=_dispositions_answered(ledger, verdict))
     if errors_in(items):
-        return _finish(items, f"{TOOL_NAME} validate {args.verdict}",
-                       remedy=f"{args.verdict} is not a valid verdict, so "
-                              f"nothing can answer it; the reviewer must "
-                              f"correct and re-issue it")
+        return _finish(items,
+                       paths.command(*paths.lits(TOOL_NAME, "validate"),
+                                     args.verdict),
+                       remedy=f"{paths.display_path(args.verdict)} is not "
+                              f"a valid verdict, so nothing can answer it; "
+                              f"the reviewer must correct and re-issue it")
     # And with --out — the mode that writes bytes of record and appends to
     # the ledger — the verdict must resolve to exactly one recorded verdict
     # of the current lineage, its just-closed round, through the same
@@ -249,18 +366,21 @@ def cmd_respond(args, cfg) -> int:
         recorded = transport.recorded_verdict(
             ledger, digest=sha256_text(verdict_text))
         if recorded is None:
+            close_cmd = paths.command(
+                *paths.lits(TOOL_NAME, "close", "--verdict"), args.verdict)
+            report_cmd = paths.command(
+                *paths.lits(TOOL_NAME, "ledger", "report"))
             return _blocked(
                 "",
                 f"{args.verdict} does not resolve to exactly one recorded "
                 f"verdict of the current lineage's just-closed round: it is "
-                f"either not recorded (`{TOOL_NAME} close --verdict` first), "
+                f"either not recorded (`{paths.command(*paths.lits(TOOL_NAME, 'close', '--verdict'))}` first), "
                 f"recorded twice, from a closed lineage, or superseded by a "
                 f"later round — a response answers the ruling that is "
                 f"awaiting one, and nothing else is recorded",
-                remedy=f"record the verdict with `{TOOL_NAME} close "
-                       f"--verdict {args.verdict}` if it has not been, then "
-                       f"re-run this command; if it has, `{TOOL_NAME} ledger "
-                       f"report` shows which round is open")
+                remedy=f"record the verdict with `{close_cmd}` if it "
+                       f"has not been, then re-run this command; if it has, "
+                       f"`{report_cmd}` shows which round is open")
     # `-` reads the dispositions from stdin, so an agent can pipe them and a
     # read-only surface can exercise the command without writing a file.
     raw = (sys.stdin.read() if args.from_json == "-"
@@ -331,12 +451,14 @@ def cmd_respond(args, cfg) -> int:
     items = validate_disposition(wire.parse_disposition(envelope), cfg,
                                  against=verdict)
     if errors_in(items):
+        respond_cmd = paths.command(
+            *paths.lits(TOOL_NAME, "respond", "--verdict"), args.verdict,
+            paths.Lit("--from-json"), args.from_json)
         return _finish(items, "",
                        remedy=f"a person must correct the dispositions in "
-                              f"{args.from_json} and re-run `{TOOL_NAME} "
-                              f"respond --verdict {args.verdict} --from-json "
-                              f"{args.from_json}`; the tool will not edit the "
-                              f"author's own judgment file")
+                              f"{paths.display_path(args.from_json)} and "
+                              f"re-run `{respond_cmd}`; the tool will not "
+                              f"edit the author's own judgment file")
     if args.out:
         Path(args.out).write_text(envelope, encoding="utf-8")
         # RVW-T9: a written disposition is the author's half of the round;
@@ -345,9 +467,10 @@ def cmd_respond(args, cfg) -> int:
                                         against=verdict)
         _out({"ok": True, "out": args.out, "dispositions": len(records),
               "kept": rec["kept"], "events_added": rec["events_added"],
-              "next": f"{TOOL_NAME} handoff"},
+              "next": paths.command(*paths.lits(TOOL_NAME, "handoff"))},
              f"wrote {args.out}; {rec['events_added']} disposition event(s) "
-             f"recorded, kept at {rec['kept']}\nnext: {TOOL_NAME} handoff")
+             f"recorded, kept at {paths.display_path(rec['kept'])}\n"
+             f"next: {paths.command(*paths.lits(TOOL_NAME, 'handoff'))}")
     else:
         print(envelope, end="")
     return EXIT_OK
@@ -375,9 +498,11 @@ def _dispositions_answered(ledger: Ledger, verdict) -> list[dict] | None:
     if not bound:
         return None
     round_no = bound[-1]
-    return [e for e in ledger.current()
-            if e.get("event") == "disposition"
-            and e.get("round") == round_no - 1]
+    # The STANDING answer per finding — the newest event per fingerprint —
+    # not raw event multiplicity: a disposition legitimately re-binds when
+    # the head moves under it (lineage 6 round 2, with the ledger's
+    # standing_dispositions as the one authority for what "answered" means).
+    return ledger.standing_dispositions(round_no=round_no - 1)
 
 
 def cmd_ledger_add(args, cfg) -> int:
@@ -391,7 +516,9 @@ def cmd_ledger_add(args, cfg) -> int:
         items = validate_verdict(
             parsed, cfg, answering=_dispositions_answered(ledger, parsed))
         if errors_in(items):
-            return _finish(items, f"{TOOL_NAME} validate {args.envelope}")
+            return _finish(items,
+                           paths.command(*paths.lits(TOOL_NAME, "validate"),
+                                         args.envelope))
         round_no = args.round or ledger.round_for_sha(parsed.sha)
         if round_no is None:
             return _blocked(
@@ -437,7 +564,9 @@ def cmd_ledger_add(args, cfg) -> int:
             parsed, cfg,
             round_cap=ledger.effective_round_cap(cfg.round_cap))
         if errors_in(items):
-            return _finish(items, f"{TOOL_NAME} validate {args.envelope}")
+            return _finish(items,
+                           paths.command(*paths.lits(TOOL_NAME, "validate"),
+                                         args.envelope))
         round_no = args.round or int(parsed.attrs.get("round", 0)) or None
         if round_no is None:
             return _blocked(
@@ -467,19 +596,21 @@ def cmd_ledger_add(args, cfg) -> int:
                 f"retrievable as a RECORDED verdict: the ledger must hold "
                 f"exactly one verdict for this round and the kept bytes must "
                 f"reproduce its digest (round 2 F2, round 3 F2)",
-                remedy=f"a person records that verdict first — `{TOOL_NAME} "
-                       f"close --verdict <the reviewer's file>` — and then "
-                       f"re-emits the response with `{TOOL_NAME} respond`, "
+                remedy=f"a person records that verdict first — "
+                       f"`{paths.command(*paths.lits(TOOL_NAME, 'close', '--verdict'), paths.Ph("<the reviewer's file>"))}` — and then "
+                       f"re-emits the response with `{paths.command(*paths.lits(TOOL_NAME, 'respond'))}`, "
                        f"which binds it to the record; a disposition is an "
                        f"answer to a recorded ruling, never to a file")
         items = validate_disposition(parsed, cfg, against=against)
         if errors_in(items):
-            return _finish(items, f"{TOOL_NAME} validate {args.envelope}")
+            return _finish(items,
+                           paths.command(*paths.lits(TOOL_NAME, "validate"),
+                                         args.envelope))
         added += ledger.add_all(
             transport.disposition_events(parsed, against, cfg))
     else:
         return _blocked(
-            f"{TOOL_NAME} validate {args.envelope}",
+            paths.command(*paths.lits(TOOL_NAME, "validate"), args.envelope),
             f"{args.envelope} is not a recognizable request, verdict or "
             f"disposition envelope")
     _out({"ok": True, "events_added": added, "ledger": str(ledger.path)},
@@ -512,7 +643,7 @@ def cmd_authorize_breaker(args, cfg) -> int:
                         remedy="a person supplies the decision — a real "
                                "reason, a named human, a breaker that is "
                                "firing — or takes the other one, "
-                               f"`{TOOL_NAME} close --lineage`")
+                               f"`{paths.command(*paths.lits(TOOL_NAME, 'close', '--lineage'))}`")
     rec["ok"] = True
     rec["ledger"] = str(ledger.path)
     _out(rec, f"breaker {rec['breaker']}: continuing past "
@@ -567,9 +698,10 @@ def cmd_import_legacy(args, cfg) -> int:
     if bad:
         return _blocked("",
                         "undecodable event line(s): " + "; ".join(bad[:5]),
-                        remedy=f"a person must repair {args.events} so every "
+                        remedy=f"a person must repair "
+                               f"{paths.display_path(args.events)} so every "
                                f"line is one JSON event object, then re-run "
-                               f"`{TOOL_NAME} import-legacy {args.events}`")
+                               f"`{paths.command(*paths.lits(TOOL_NAME, 'import-legacy'), args.events)}`")
     ledger = _ledger(cfg, args)
     added = ledger.add_all(events)
     _out({"ok": True, "events_added": added, "events_total": len(events),
@@ -614,9 +746,15 @@ def _claim_defect_exit(exc: "emit.ClaimDefective") -> int:
     return _blocked("", f"the claim file {exc.detail}", remedy=remedy)
 
 
-def _emit(args, cfg, ledger, captured: "emit.CapturedClaim"):
+def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
+          roles: tuple[str, str], selected_transport: str):
     """emit-request's body, shared with handoff: push, emit, validate.
     Returns (envelope, parsed) or an int exit code.
+
+    `roles` is the effective (author, reviewer) the verb already resolved at
+    its boundary (`emit.resolve_roles`), passed explicitly like the captured
+    claim: both are authored inputs judged before anything is committed,
+    pushed, run or recorded, and neither is re-derived here.
 
     `captured` is the claim the verb already read and closed at the capture
     boundary, passed explicitly (lineage-3 round 7 F1). There is no fallback
@@ -634,9 +772,12 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim"):
     record = emit.ensure_pushed(cfg, head=args.head,
                                 local_only=args.local_only,
                                 commit_subject=claim.get("commit_subject"),
-                                round_no=emit.next_round(ledger))
+                                round_no=emit.next_round(ledger),
+                                transport=selected_transport)
     envelope = emit.emit_request(cfg, ledger, claim, base=args.base,
-                                 head=record["sha"], reachability=record)
+                                 head=record["sha"], reachability=record,
+                                 author=roles[0], reviewer=roles[1],
+                                 transport=selected_transport)
     parsed = wire.parse_request(envelope)
     base = args.base or max((e for e in ledger.current()
                              if e.get("event") == "verdict"),
@@ -652,7 +793,8 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim"):
         return _finish(items, "",
                        remedy=f"a person must correct review.toml or "
                               f"{args.claim_file} to satisfy the items above, "
-                              f"then re-run `{TOOL_NAME} {args.command}`")
+                              f"then re-run "
+                              f"`{paths.command(paths.Lit(TOOL_NAME), paths.token(args.command))}`")
     return envelope, parsed
 
 
@@ -668,8 +810,30 @@ def cmd_emit_request(args, cfg) -> int:
         return _claim_unreadable_exit(args, exc)
     except emit.ClaimDefective as exc:
         return _claim_defect_exit(exc)
+    # The other authored inputs, judged at the same boundary: before the
+    # ledger is consulted, before the push, gates or emission (§4;
+    # round-2 F3 for the references).
+    try:
+        roles = emit.resolve_roles(cfg,
+                                   author=getattr(args, "author", None),
+                                   reviewer=getattr(args, "reviewer", None))
+        # RVW-T11: the declared topology is an authored input like the role
+        # stamp, and it is resolved at the same boundary for the same two
+        # reasons — an unrecognised value is refused before anything is
+        # committed, pushed, run or recorded, and the EFFECTIVE value is what
+        # the cache must key on. Reading it later, at the emitter, would let a
+        # warm envelope stamped `path` answer an invocation that asked for
+        # `paste`.
+        selected_transport = emit.resolve_transport(
+            cfg, getattr(args, "transport", None),
+            local_only=bool(getattr(args, "local_only", False)))
+        emit.check_references(cfg, captured.claim.get("references"))
+    except (emit.RoleSelectionError, emit.TransportSelectionError,
+            emit.ReferenceUnbound) as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
     ledger = _ledger(cfg, args)
-    result = _emit(args, cfg, ledger, captured)
+    result = _emit(args, cfg, ledger, captured, roles,
+                   selected_transport)
     if isinstance(result, int):
         return result
     envelope, parsed = result
@@ -740,6 +904,28 @@ def cmd_handoff(args, cfg) -> int:
     except emit.ClaimDefective as exc:
         return _claim_defect_exit(exc)
     claim_digest = captured.digest
+    # Per-invocation role selection and the claim's required references are
+    # authored input like the claim itself, judged at the same boundary —
+    # before the ledger, the cache, Git, gates or emission (§4; round-2 F3
+    # for the references). Roles resolve before the cache is consulted
+    # because the effective stamp is part of what makes a kept envelope
+    # warm; references bind before it so a warm re-serve cannot re-record a
+    # request whose required evidence no commit carries.
+    try:
+        roles = emit.resolve_roles(cfg,
+                                   author=getattr(args, "author", None),
+                                   reviewer=getattr(args, "reviewer", None))
+        # RVW-T11: same boundary, same reason as the role stamp — the
+        # effective value is part of what makes a kept envelope warm, so it
+        # is resolved before the cache is consulted, not at the emitter the
+        # cache is meant to skip.
+        selected_transport = emit.resolve_transport(
+            cfg, getattr(args, "transport", None),
+            local_only=bool(getattr(args, "local_only", False)))
+        emit.check_references(cfg, captured.claim.get("references"))
+    except (emit.RoleSelectionError, emit.TransportSelectionError,
+            emit.ReferenceUnbound) as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
     ledger = _ledger(cfg, args)
     # Sweep F4 / F8: the lifecycle preflight, before the cache is consulted,
     # anything committed, pushed, run or emitted. Every finding of the
@@ -755,7 +941,9 @@ def cmd_handoff(args, cfg) -> int:
                                "then re-runs this command")
     round_no = emit.next_round(ledger)
     cached = transport.cached_handoff(cfg, ledger, round_no,
-                                      claim_digest=claim_digest)
+                                      claim_digest=claim_digest,
+                                      roles=roles,
+                                      transport=selected_transport)
     if cached is not None:
         rec = transport.record_handoff(cfg, ledger, cached["envelope"],
                                        round_no, claim_digest=claim_digest)
@@ -766,11 +954,12 @@ def cmd_handoff(args, cfg) -> int:
             rec["out"] = args.out
         _brief_into(rec, cached["envelope"], ledger)
         _out(rec, f"round {round_no} request for {rec['sha']} is already "
-                  f"recorded and kept at {rec['kept']} — gates not re-run "
+                  f"recorded and kept at {paths.display_path(rec['kept'])} — gates not re-run "
                   f"(§9bis.3 rule 5)\n\n{rec['brief']}\n\n{rec['relay']}\n\n"
                   f"author: {rec['author_next']}")
         return EXIT_OK
-    result = _emit(args, cfg, ledger, captured)
+    result = _emit(args, cfg, ledger, captured, roles,
+                   selected_transport)
     if isinstance(result, int):
         return result
     envelope, parsed = result
@@ -784,7 +973,8 @@ def cmd_handoff(args, cfg) -> int:
     _brief_into(rec, envelope, ledger)
     _out(rec, f"round {round_no} request emitted for {rec['sha']}, "
               f"recorded ({rec['bytes']} bytes, sha256 {rec['digest'][:16]}…), "
-              f"kept at {rec['kept']}\n\n{rec['brief']}\n\n{rec['relay']}\n\n"
+              f"kept at {paths.display_path(rec['kept'])}\n\n"
+              f"{rec['brief']}\n\n{rec['relay']}\n\n"
               f"author: {rec['author_next']}")
     return EXIT_OK
 
@@ -815,7 +1005,7 @@ def cmd_take(args, cfg) -> int:
     try:
         rec = transport.take(
             cfg, ledger, envelope, args.envelope, reviewer=args.as_,
-            fetch=not args.no_fetch,
+            fetch=not args.no_fetch, transport=args.transport,
             # Sweep F6: `governing` is the target commit's own config,
             # resolved by `take` after the fetch — not this checkout's.
             validate_items=lambda parsed, governing: validate_request(
@@ -871,12 +1061,22 @@ def cmd_close(args, cfg) -> int:
             return EXIT_OK
         if not args.verdict:
             return _usage_exit(
-                f"{TOOL_NAME} close --help",
+                paths.command(*paths.lits(TOOL_NAME, "close", "--help")),
                 "close needs --verdict or --lineage",
                 remedy="a person chooses which close this is — a verdict to "
                        "record, or a lineage to end by decision — and "
                        "supplies its flag")
         text = _read_envelope(args.verdict)
+        parsed_verdict = wire.parse_verdict(text)
+        # Round 2 F2: the recorded transport is resolved and validated
+        # BEFORE close_round writes anything. Resolved after, a defective
+        # record refused the round only once the verdict — and for a clean
+        # ruling the lineage closure — was already appended, and the
+        # refusal escaped as generic usage help that cannot repair an
+        # append-only ledger; and a CLEAN close emptied `current()` first,
+        # so a recorded `paste` silently became the default carrier. The
+        # value is read once, here, and carried across the closure.
+        carrier = transport.recorded_transport(ledger, parsed_verdict.sha)
         rec = transport.close_round(
             cfg, ledger, text, args.verdict, round_no=args.round,
             tokens=args.tokens,
@@ -886,13 +1086,38 @@ def cmd_close(args, cfg) -> int:
     except transport.Refusal as exc:
         return _blocked(exc.next_cmd, str(exc))
     rec["ok"] = True
-    parsed_verdict = wire.parse_verdict(text)
     rec["brief"] = brief.verdict_precis(parsed_verdict, source=args.verdict)
-    rec["relay"] = brief.verdict_relay(parsed_verdict, source=args.verdict)
+    rec["relay"] = brief.verdict_relay(
+        parsed_verdict, source=args.verdict, transport=carrier)
     _out(rec, f"round {rec['round']} closed: {rec['verdict']} on {rec['sha']} "
               f"({rec['findings']} findings, {rec['closures']} closures), "
-              f"kept at {rec['kept']}\nlineage: {rec['lineage']}\n\n"
+              f"kept at {paths.display_path(rec['kept'])}\n"
+              f"lineage: {rec['lineage']}\n\n"
               f"{rec['brief']}\n\n{rec['relay']}")
+    return EXIT_OK
+
+
+def cmd_prune(args, cfg) -> int:
+    """State maintenance, not lifecycle: executes the retention policy whose
+    hard lines are in `transport.prune_gate_output`'s docstring — the ledger
+    and `exchange/` are never touched, only gate output no ledger event
+    references is removed."""
+    ledger = _ledger(cfg, args)
+    try:
+        result = transport.prune_gate_output(cfg, ledger,
+                                             dry_run=args.dry_run)
+    except transport.Refusal as exc:
+        return _blocked(exc.next_cmd, str(exc),
+                        remedy="nothing is retained where no state "
+                               "directory exists; there is nothing a "
+                               "person needs to do")
+    result["ok"] = True
+    verb = "would remove" if result["dry_run"] else "removed"
+    _out(result,
+         f"{verb} {len(result['pruned'])} unreferenced gate-output "
+         f"director{'y' if len(result['pruned']) == 1 else 'ies'} "
+         f"({result['bytes_freed']} bytes); kept {result['kept']} — the "
+         f"ledger and exchange/ are never pruned")
     return EXIT_OK
 
 
@@ -915,8 +1140,8 @@ def cmd_brief(args, cfg) -> int:
                 "been emitted yet, or every emitted round already carries a "
                 "verdict",
                 remedy=f"a person writes the claim and emits a round with "
-                       f"`{TOOL_NAME} handoff --claim-file <their claim "
-                       f"file>`; there is nothing to summarise until one is "
+                       f"`{paths.command(*paths.lits(TOOL_NAME, 'handoff', '--claim-file'), paths.Ph('<their claim file>'))}`; "
+                       f"there is nothing to summarise until one is "
                        f"open, and the claim is the author's judgment, which "
                        f"this tool carries and never invents")
         path = transport.exchange_path(cfg, event["round"], "request")
@@ -925,8 +1150,8 @@ def cmd_brief(args, cfg) -> int:
                 "",
                 f"round {event['round']} is open but its bytes were not kept, "
                 f"so there is nothing to summarise",
-                remedy=f"a person passes the envelope itself — `{TOOL_NAME} "
-                       f"brief <the path they hold>` — since the copy this "
+                remedy=f"a person passes the envelope itself — "
+                       f"`{paths.command(*paths.lits(TOOL_NAME, 'brief'), paths.Ph('<the path they hold>'))}` — since the copy this "
                        f"tool kept is gone and only the person who has the "
                        f"bytes knows where they are")
         source = str(path)
@@ -934,6 +1159,19 @@ def cmd_brief(args, cfg) -> int:
     text = _read_envelope(source)
     as_request = wire.parse_request(text)
     if as_request.wrapped:
+        # R1-F2: `brief` is an official relay reader, so a wrapped-looking
+        # request is not yet a summarisable one — the structural grammar
+        # rules first, BEFORE any brief or relay is rendered. Without this,
+        # a defective wrapper (a transport stamp the grammar refuses, a
+        # missing role) still produced a live `take` command pointing at a
+        # kept path nobody declared reachable.
+        items = validate_request(as_request, cfg, structural_only=True)
+        if errors_in(items):
+            return _finish(
+                items, "",
+                remedy="the author re-emits the request: a brief cannot "
+                       "summarise, and a relay cannot carry, an envelope "
+                       "whose own grammar refuses it")
         rec = {"kind": "request", "source": source, "ok": True,
                "round": as_request.attrs.get("round"),
                "sha": as_request.sha, "superseded": superseded,
@@ -954,11 +1192,16 @@ def cmd_brief(args, cfg) -> int:
                "sha": as_verdict.sha,
                "brief": brief.verdict_precis(as_verdict, source=source,
                                              full=args.full),
-               "relay": brief.verdict_relay(as_verdict, source=source)}
+               "relay": brief.verdict_relay(
+                   as_verdict, source=source,
+                   transport=transport.recorded_transport(ledger,
+                                                          as_verdict.sha),
+                   envelope=text)}
         _out(rec, f"{rec['brief']}\n\n{rec['relay']}")
         return EXIT_OK
 
-    return _blocked(f"{TOOL_NAME} validate {source}",
+    return _blocked(paths.command(*paths.lits(TOOL_NAME, "validate"),
+                                  source),
                     f"{source} is neither a review request nor a verdict")
 
 
@@ -1030,7 +1273,8 @@ def cmd_render_adapters(args, cfg) -> int:
         drift = [r for r in rows if r["status"] != "in_sync"]
         if drift:
             return _blocked(
-                f"{TOOL_NAME} render-adapters --install",
+                paths.command(*paths.lits(TOOL_NAME, "render-adapters",
+                                          "--install")),
                 "installed adapter(s) differ from the rendered copies: "
                 + "; ".join(f"{r['kind']} {r['status']} at {r['target']}"
                             for r in drift))
@@ -1044,7 +1288,7 @@ def cmd_render_adapters(args, cfg) -> int:
         stale = adapters.check_all(directory)
         if stale:
             return _blocked(
-                f"{TOOL_NAME} render-adapters",
+                paths.command(*paths.lits(TOOL_NAME, "render-adapters")),
                 "refusing to install adapters that are themselves stale: "
                 + ", ".join(stale))
         keep = cfg.ledger_dir / "replaced-adapters" if cfg.ledger_dir else None
@@ -1077,8 +1321,9 @@ def cmd_render_adapters(args, cfg) -> int:
     if args.check:
         stale = adapters.check_all(directory)
         if stale:
-            return _blocked(f"{TOOL_NAME} render-adapters",
-                            "stale adapter(s): " + ", ".join(stale))
+            return _blocked(
+                paths.command(*paths.lits(TOOL_NAME, "render-adapters")),
+                "stale adapter(s): " + ", ".join(stale))
         _out({"ok": True, "checked": [str(directory / rel)
                                       for rel in adapters.OUTPUTS.values()]},
              f"adapters under {directory} are in sync with the source")
@@ -1122,6 +1367,28 @@ class _Parser(argparse.ArgumentParser):
         raise UsageError(message, self.prog)
 
 
+class _OnceAction(argparse.Action):
+    """Refuse a repeated option instead of applying last-write-wins.
+
+    Lineage-5 round-1 F1: `--author claude --author codex` was admitted as
+    the unambiguous stamp `codex` — argparse's ordinary store collapses
+    repetition, so neither the repetition nor the discarded actor ever
+    reached resolution. A role selector names an identity for an
+    append-only record; a repeated one — same value or conflicting, either
+    order — is a defect of the invocation, refused with both occurrences
+    named, never silently resolved to the last writer.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        current = getattr(namespace, self.dest, None)
+        if current is not None:
+            raise argparse.ArgumentError(
+                self, f"given more than once ({current!r}, then {values!r}): "
+                      f"a repeated role selector is refused, never collapsed "
+                      f"to the last value")
+        setattr(namespace, self.dest, values)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = _Parser(
         prog=TOOL_NAME,
@@ -1133,7 +1400,10 @@ def build_parser() -> argparse.ArgumentParser:
                            parser_class=_Parser)
 
     v = sub.add_parser("validate", help="validate an envelope")
-    v.add_argument("envelope")
+    v.add_argument("envelope", help="envelope file, or - for stdin — the "
+                                    "same forms `take` and `close` read, so "
+                                    "the `next` a refused stdin close names "
+                                    "is runnable as printed")
     v.add_argument("--against", help="verdict to check a disposition against")
     v.set_defaults(func=cmd_validate)
 
@@ -1203,6 +1473,31 @@ def build_parser() -> argparse.ArgumentParser:
                              "is fetchable from no other machine; stamped on "
                              "the envelope, and an error when a remote is "
                              "configured (§9bis.4)")
+        sp.add_argument("--transport", choices=list(vocab.TRANSPORTS),
+                        action=_OnceAction,
+                        help="whether the reviewer shares this filesystem: "
+                             "`path` means a kept path is a thing they can "
+                             "open, `paste` means bytes are the only carrier. "
+                             "Resolution order: this flag, then [roles] "
+                             "transport in the config, then the environment's "
+                             f"own declaration ({vocab.TRANSPORT_ENV}, set by "
+                             "a cloud environment's configuration) or a "
+                             "documented cloud provider signal, then the "
+                             "undeclared steady case, `path` — the local "
+                             "same-machine loop. It is stamped on the "
+                             "envelope, recorded, and decides what the "
+                             "printed relay says (RVW-T11)")
+        sp.add_argument("--author", action=_OnceAction,
+                        help="per-invocation author stamp, selecting WITHIN "
+                             "the config's permitted_authors — refused "
+                             "outside them, when no list is declared, and "
+                             "when the flag is repeated (§4)")
+        sp.add_argument("--reviewer", action=_OnceAction,
+                        help="per-invocation reviewer stamp, selecting "
+                             "WITHIN the config's permitted_reviewers — "
+                             "refused outside them, when no list is "
+                             "declared, when the flag is repeated, and for "
+                             "rejected reviewers (§4)")
         sp.add_argument("--out")
 
     e = sub.add_parser("emit-request",
@@ -1234,6 +1529,19 @@ def build_parser() -> argparse.ArgumentParser:
     tk.add_argument("--no-fetch", action="store_true",
                     help="do not run the stamped fetch; still requires the "
                          "target to be present in this clone")
+    tk.add_argument("--transport", choices=list(vocab.TRANSPORTS),
+                    # R1-F2: the reviewer's correction names a topology for
+                    # an append-only record, exactly like the author's
+                    # selector — repeated same or conflicting, either
+                    # order, is a defect of the invocation, refused with
+                    # both occurrences named, never last-write-wins.
+                    action=_OnceAction,
+                    help="correct what the envelope declares about this "
+                         "channel, when the author stamped it wrong: you are "
+                         "the side that knows whether you share their "
+                         "filesystem. Recorded beside the author's value, and "
+                         "it decides what your verdict's relay tells them to "
+                         "run (RVW-T11)")
     tk.set_defaults(func=cmd_take)
 
     br = sub.add_parser("brief",
@@ -1285,6 +1593,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "there, and not inferred from silence")
     c.set_defaults(func=cmd_close)
 
+    pr = sub.add_parser("prune",
+                        help="remove retained gate output for commits no "
+                             "ledger event references; the ledger and "
+                             "exchange/ are never pruned")
+    pr.add_argument("--dry-run", action="store_true",
+                    help="report exactly what would be removed, remove "
+                         "nothing")
+    pr.set_defaults(func=cmd_prune)
+
     ra = sub.add_parser("render-adapters",
                         help="render the per-agent adapters (Claude skill, "
                              "Codex skill, instruction block) from one "
@@ -1317,13 +1634,19 @@ def main(argv=None) -> int:
     try:
         args = parser.parse_args(argv)
     except UsageError as exc:
-        return _usage_exit(f"{exc.prog} --help", str(exc))
+        # `prog` is a command PREFIX ("loupe validate"), not one word:
+        # each of its words is proved shell-inert on its own.
+        return _usage_exit(
+            paths.command(*[paths.token(w) for w in exc.prog.split()],
+                          paths.Lit("--help")),
+            str(exc))
     except SystemExit as exc:
         # --help and --version exit 0 having already printed; keep that path.
         code = int(exc.code or 0)
         if code == 0:
             return 0
-        return _usage_exit(f"{TOOL_NAME} --help", "usage error")
+        return _usage_exit(
+            paths.command(*paths.lits(TOOL_NAME, "--help")), "usage error")
     # migrate-state must be reachable while only legacy state exists — it is
     # the command the legacy refusal points at.
     #
@@ -1340,18 +1663,32 @@ def main(argv=None) -> int:
         # payload from whether a command exists (round 2 F8).
         return _blocked(exc.next_cmd, str(exc), code=exc.code,
                         remedy=exc.remedy)
-    except (RuntimeError, ValueError, OSError, KeyError) as exc:
+    except (RuntimeError, ValueError, OSError, KeyError,
+            TypeError) as exc:
         # Anything config.load did not anticipate still owes a next command.
-        return _usage_exit(f"{TOOL_NAME} --help", str(exc))
+        return _usage_exit(
+            paths.command(*paths.lits(TOOL_NAME, "--help")), str(exc))
     try:
         return args.func(args, cfg)
-    except (RuntimeError, ValueError, OSError, KeyError) as exc:
+    except vocab.TransportDeclarationError as exc:
+        # Round 2 F2: a defective transport DECLARATION is a typed, blocked
+        # state, never generic usage — `<verb> --help` cannot repair a
+        # record or a config, and discarding the remedy left the agent an
+        # unrunnable dead end. The remedy names what a person declares; for
+        # a defective ledger record, a corrected `take`/`request` record
+        # supersedes it by recency.
+        return _blocked("", str(exc), remedy=exc.remedy)
+    except (RuntimeError, ValueError, OSError, KeyError,
+            TypeError) as exc:
         # OSError, not FileNotFoundError: round-5 fp2:9f8d9f3677f33f51 found
         # `validate <directory>` reaching an uncaught IsADirectoryError
         # traceback — a reachable filesystem failure bypassing the
         # structured-output contract. Permission and encoding failures are
         # the adjacent states (UnicodeDecodeError is a ValueError).
-        return _usage_exit(f"{TOOL_NAME} {args.command} --help", str(exc))
+        return _usage_exit(
+            paths.command(paths.Lit(TOOL_NAME),
+                          paths.token(args.command), paths.Lit("--help")),
+            str(exc))
 
 
 if __name__ == "__main__":

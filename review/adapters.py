@@ -27,7 +27,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from . import TOOL_NAME, TOOL_VERSION, vocab
+from . import TOOL_NAME, TOOL_VERSION, paths, vocab
 from .digest import sha256_text
 
 ADAPTERS_DIR = "adapters"
@@ -83,13 +83,46 @@ PROCEDURE = {
         "are two different kinds of text. `brief` is the plain-language "
         "account of what is being asked or ruled — give it to the human as "
         "readable prose, never inside a code block. `relay` is the literal "
-        "commands to run — give it as a verbatim block the human can copy, "
-        "and nothing else. Emit them in that order, both, every time, and do "
+        "commands to run — reproduce it EXACTLY as given, and nothing else. "
+        "The relay already carries its own code fences around each command; "
+        "wrapping the whole block in another fence breaks at the first "
+        "inner fence and everything after travels as prose, so never add "
+        "fencing of your own in either direction. Emit them in that order, "
+        "both, every time, and do "
         "not merge, reorder, summarise or paraphrase either: both are derived "
         "from the envelope and yours would not be. Never put your own prose "
         "inside the relay block and never bury a command inside the brief. "
-        "`loupe brief` reproduces both at any time, and with no argument it "
+        f"`{paths.command(*paths.lits(TOOL_NAME, 'brief'))}` reproduces "
+        f"both at any time, and with no argument it "
         "finds the open request itself.",
+        "The round declares whether the two sides share a filesystem, and "
+        "that is what decides which carrier the relay prints. You do not "
+        "decide it and you do not detect it: the tool resolves it from "
+        "declarations, strongest first — an explicit `--transport "
+        "path|paste`, then `[roles] transport` in the repository's config, "
+        f"then the environment's own declaration (`{vocab.TRANSPORT_ENV}`, "
+        "set by a cloud environment's configuration) or a documented cloud "
+        "provider signal, and with none of those a new emission carries "
+        "`path`, the workflow's steady case: author and reviewer on the "
+        "operator's machine. A cloud-authored round therefore reaches "
+        "`paste` through its environment's declaration, never through your "
+        "guess (a locally readable request file proves nothing about what "
+        "the other side can open). A human corrects a wrong stamp by an "
+        "explicit statement about THIS round's topology or an exact "
+        "command carrying `--transport` — to `handoff` if you are the "
+        "author, to `take` if you are the reviewer; a conversational "
+        "question is not a declaration, so ask rather than convert one "
+        "into an override. Never improvise the flag, and never substitute "
+        "a carrier the relay did not print: a round declared `path` whose "
+        "commands you rewrite for a paste is a round whose record no "
+        "longer describes it.",
+        "A paste-carried envelope travels INSIDE the fence the tool "
+        "printed, on both legs: the request bytes ride under `take -`, the "
+        "verdict bytes under `close --verdict -`. Hand the fenced block "
+        "over whole; never re-send envelope bytes as loose prose — a chat "
+        "surface preserves a fenced region verbatim and rewrites "
+        "everything else (markdown headings included), and a mangled "
+        "envelope refuses validation on the other side.",
     ],
     "author": [
         ("write the claim",
@@ -114,25 +147,35 @@ PROCEDURE = {
          f"recorded as its own state. It is your judgment; the tool carries "
          f"it and never invents it."),
         ("hand off",
-         f"{TOOL_NAME} handoff --claim-file <claim.json> [--base <sha>]",
+         paths.command(*paths.lits(TOOL_NAME, "handoff", "--claim-file"),
+                       paths.Ph("<claim.json>"),
+                       paths.opt(paths.Lit("--base"), paths.Ph("<sha>"))),
          "Commits outstanding tracked work, pushes the reviewed branch, runs "
          "the gate manifest, emits and validates the request, records it, "
          "keeps the bytes under the state directory, and prints the "
          "reviewer's command. `--base` is needed only for round 1 of a "
          "lineage. Re-running on an unchanged tip is a no-op that returns "
-         "the same envelope. THEN STOP: give the kept path (or its bytes) "
-         "to the human. Refusals (untracked files, detached HEAD, "
+         "the same envelope. THEN STOP: hand the human the fenced block "
+         "under `## How to carry it`, whole and unedited. It is "
+         "self-contained — every live line in it runs exactly as printed, "
+         "and it carries the ONE carrier this round declared, never a "
+         "choice for the reader to make. Add no prose of your own around "
+         "it: a relay that gets reworded in transit is the failure this "
+         "shape exists to end. Refusals (untracked files, detached HEAD, "
          "unreachable remote, unassigned roles, no taxonomy) name the fix."),
         ("close the round",
-         f"{TOOL_NAME} close --verdict <verdict.md>",
+         paths.command(*paths.lits(TOOL_NAME, "close", "--verdict"),
+                       paths.Ph("<verdict.md>")),
          "Validates and records the verdict. `changes requested` → the "
          "lineage stays open and the next command is `respond`; `clean to "
          "advance` → the lineage is closed at the exact reviewed SHA. Merge "
          "authority is the account allowlist and the standing rules you "
          "operate under, not this tool."),
         ("respond",
-         f"{TOOL_NAME} respond --verdict <verdict.md> --from-json <d.json> "
-         f"--out <disposition.md>",
+         paths.command(*paths.lits(TOOL_NAME, "respond", "--verdict"),
+                       paths.Ph("<verdict.md>"), paths.Lit("--from-json"),
+                       paths.Ph("<d.json>"), paths.Lit("--out"),
+                       paths.Ph("<disposition.md>")),
          "Exactly one disposition per finding — accepted / refuted / "
          "deferred / preference / escalated — each with its mandatory "
          "payload; a blocking finding cannot be deferred or preferred. "
@@ -148,14 +191,17 @@ PROCEDURE = {
          "after. `--out` records and keeps it. Then make the changes and "
          "hand off again: the next request carries the disposition ledger."),
         ("close a lineage by decision",
-         f"{TOOL_NAME} close --lineage --reason \"<why>\"",
+         paths.command(*paths.lits(TOOL_NAME, "close", "--lineage",
+                                   "--reason"), paths.qph("<why>")),
          "Only when the human decides a review is over without a clean "
          "verdict. Recorded with the reason; the next handoff opens round 1 "
          "with the repository's default cap."),
     ],
     "reviewer": [
         ("take",
-         f"{TOOL_NAME} take <request.md> --as <your id>   # or `-` for stdin",
+         paths.command(*paths.lits(TOOL_NAME, "take"),
+                       paths.Ph("<request.md>"), paths.Lit("--as"),
+                       paths.Ph("<your id>")),
          "`--as` is MANDATORY and names you: the tool cannot observe who is "
          "running it, so it records the identity you declare and refuses "
          "rather than assume one. Declaring an identity that is not yours "
@@ -175,10 +221,18 @@ PROCEDURE = {
          "Material you could not retrieve goes under `## unavailable "
          "references` and forbids a clean verdict."),
         ("validate, then stop",
-         f"{TOOL_NAME} validate <verdict.md>",
-         "Repeat until it exits 0. Then STOP: hand the verdict to the human. "
-         "You do not start the next round, do not send it back for "
-         "fix-and-resubmit, and do not decide whether it enters the record."),
+         paths.command(*paths.lits(TOOL_NAME, "validate"),
+                       paths.Ph("<verdict.md>")),
+         "Repeat until it exits 0. Then STOP: hand the human the block "
+         "under `## What to run next`, whole and unedited — it is the "
+         "author's to run, and it says so on its own first line. On a "
+         "paste round that block already carries the verdict bytes in "
+         "their own fence beneath the command; hand it over as one piece "
+         "and never restate the bytes as loose prose (a chat surface "
+         "rewrites unfenced text). On a path round hand the kept file's "
+         "path with it. Add no prose around it. You do not start the next "
+         "round, do not send it back for fix-and-resubmit, and do not "
+         "decide whether it enters the record."),
     ],
 }
 
@@ -233,7 +287,7 @@ def _body() -> list[str]:
     L.append("| verb | what |")
     L.append("|---|---|")
     for verb, help_ in verb_table():
-        L.append(f"| `{TOOL_NAME} {verb}` | {help_} |")
+        L.append(f"| `{paths.command(paths.Lit(TOOL_NAME), paths.token(verb))}` | {help_} |")
     L.append("")
     L.append("## Where things are")
     L.append("")
@@ -254,16 +308,19 @@ def _frontmatter(surface: str) -> list[str]:
     return [
         "---",
         f"name: {TOOL_NAME}",
-        f"description: Use when a repository declares a review.toml and you "
-        f"are asked to hand off work for review, take a review request, "
-        f"respond to a verdict, or close a round with `{TOOL_NAME}`. Carries "
-        f"the literal commands for the author and reviewer sides; the "
-        f"envelope stamp says which side you hold.",
+        f"description: Use when asked to hand off work for review, take a "
+        f"review request, respond to a verdict, or close a round with "
+        f"`{TOOL_NAME}`. The governing config is `review.toml` at the repo "
+        f"root OR a user-level `~/.config/{TOOL_NAME}/<repo-id>.toml` — a "
+        f"repository with nothing in-tree can still be under review, so do "
+        f"not require an in-tree file before acting. Carries the literal "
+        f"commands for the author and reviewer sides; the envelope stamp "
+        f"says which side you hold.",
         "---",
         "",
         f"# {TOOL_NAME} — review procedure ({surface} adapter, GENERATED)",
         "",
-        f"GENERATED by `{TOOL_NAME} render-adapters` from one source "
+        f"GENERATED by `{paths.command(*paths.lits(TOOL_NAME, 'render-adapters'))}` from one source "
         f"(review/adapters.py) at tool version {TOOL_VERSION} — do not edit; "
         f"regenerate. `{TOOL_NAME} render-adapters --check` guards it.",
         "",

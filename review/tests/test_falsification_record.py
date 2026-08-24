@@ -251,11 +251,16 @@ class TestBreakersReadTheProductPath(unittest.TestCase):
     def test_a_run_without_a_stamp_is_joined_through_its_finding(self):
         # Legacy or hand-seeded runs carry no `blocking`; the breaker joins
         # them to the finding event and judges against the supplied set.
+        # The run binds to its answer by legacy order (a preceding row for
+        # its identity) — a run with NO row is an orphan, judged below.
         led = Ledger.in_memory()
         v = verdict(fals="run x", sev="High")
         led.add({"event": "request", "round": 1, "sha": SHA, "bytes": 10})
         led.add_all(transport.verdict_events(v, 1, "sha256:v1", 10))
         fp = v.findings[0].fingerprint()
+        led.add({"event": "disposition", "round": 1, "finding_id": "F1",
+                 "fp": fp, "disposition": "accepted", "payload": {},
+                 "verdict_sha": SHA, "head": "b" * 40})
         led.add({"event": "falsification_run", "round": 1, "fp": fp,
                  "status": "cannot_execute"})
         self.assertIn("unverifiable", [
@@ -265,6 +270,24 @@ class TestBreakersReadTheProductPath(unittest.TestCase):
         # cannot establish.
         self.assertNotIn("unverifiable",
                          [b["breaker"] for b in led.breakers(round_cap=3)])
+
+    def test_a_rowless_run_escalates_as_an_orphan_not_as_a_verdict(self):
+        # Round 3 F1: a run that answers no recorded emission must neither
+        # certify nor impersonate one — it fires the `orphan` breaker,
+        # blocking set or none, and `unverifiable` (a claim about a
+        # recorded answer's test) stays silent.
+        led = Ledger.in_memory()
+        v = verdict(fals="run x", sev="High")
+        led.add({"event": "request", "round": 1, "sha": SHA, "bytes": 10})
+        led.add_all(transport.verdict_events(v, 1, "sha256:v1", 10))
+        led.add({"event": "falsification_run", "round": 1,
+                 "fp": v.findings[0].fingerprint(),
+                 "status": "cannot_execute"})
+        for severities in (CFG.blocking_severities, None):
+            names = [b["breaker"] for b in led.breakers(
+                round_cap=3, blocking_severities=severities)]
+            self.assertIn("orphan", names)
+            self.assertNotIn("unverifiable", names)
 
     def test_stale_fires_when_a_proven_fix_returns(self):
         led = Ledger.in_memory()

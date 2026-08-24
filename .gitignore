@@ -17,7 +17,17 @@ build/
 # Anchored to the root on purpose — unanchored, `verdict*.md` also swallows
 # review/tests/fixtures/verdict-with-closures.md and silently drops it from
 # the extraction candidate.
+# Convention (decided 2026-08-22): claims are written under /claims/ and old
+# root-level ones were archived there — they are working files with no record
+# value (the emitted envelope embeds the claim and its digest), kept only so
+# nothing is destroyed.
+/claims/
 /claim*.json
+# Harness-managed agent worktrees (isolated working copies of this repo,
+# created under .claude/ by the session runner). Never repo content: the
+# work they hold reaches the repo as commits on their branch, and the
+# extraction audit must not classify a scratch checkout of the whole tree.
+/.claude/worktrees/
 /*.claim.json
 /request*.md
 /verdict*.md

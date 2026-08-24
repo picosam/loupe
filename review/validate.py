@@ -16,7 +16,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from . import FORMER_NAMES, TOOL_NAME, vocab
+from . import FORMER_NAMES, TOOL_NAME, paths, vocab
 from .config import Config
 from .wire import (Disposition, DuplicateMember, Finding, Request, Verdict,
                    attestation_fence, load_json, parse_push_line)
@@ -711,6 +711,22 @@ def validate_request(r: Request, cfg: Config,
         items.append(_err("R-ROUND",
                           f"wrapper round {r.attrs['round']!r} is not a "
                           f"positive integer, so it names no round"))
+    # RVW-T11. OPTIONAL — absence is the default and every envelope emitted
+    # before the attribute existed is silent — but a value outside the closed
+    # vocabulary is refused rather than defaulted. It decides which carrier
+    # both relays print, and an unrecognised one would fall through to `path`:
+    # the reviewer would be handed a kept path on the author's machine, which
+    # is the exact failure the declaration exists to prevent. Target-
+    # independent, so `take` judges it before any git call, and refusing here
+    # is why nothing downstream has to repair it.
+    declared = r.attrs.get("transport")
+    if declared is not None and declared not in vocab.TRANSPORTS:
+        items.append(_err("R-TRANSPORT",
+                          f"wrapper transport {declared!r} is not one of "
+                          f"{list(vocab.TRANSPORTS)}: the carrier both legs "
+                          f"print is chosen from that vocabulary, and a value "
+                          f"outside it names no topology either side can act "
+                          f"on"))
 
     author = r.attrs.get("author", "").lower()
     reviewer = r.attrs.get("reviewer", "").lower()
@@ -741,8 +757,8 @@ def validate_request(r: Request, cfg: Config,
                           f"round {round_no} exceeds the round cap {cap}: the "
                           f"budget breaker escalates to the user instead of "
                           f"emitting. Authorize this lineage explicitly with "
-                          f"`{TOOL_NAME} ledger authorize-cap --to {round_no} "
-                          f"--reason \"...\"` if the loop should continue"))
+                          f"`{paths.command(*paths.lits(TOOL_NAME, 'ledger', 'authorize-cap', '--to'), round_no, paths.Lit('--reason'), paths.qph('...'))}` "
+                          f"if the loop should continue"))
 
     # Sweep F5: the closed section grammar first — duplicates and order are
     # judged from the raw headings, before any content is read through the

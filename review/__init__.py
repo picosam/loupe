@@ -22,7 +22,13 @@ record is exactly what this protects).
 """
 
 TOOL_NAME = "loupe"
-TOOL_VERSION = "0.3.0"
+# Version policy (decided 2026-08-22): a lineage whose clean close will be
+# published bumps this INSIDE the reviewed round, so the version is part of
+# the reviewed diff and `--version` discriminates publishes. Two publications
+# shipped as 0.3.0 (`13d27b9`, `0a6281d`) because bumping after the clean
+# verdict would have been an unreviewed edit — that ambiguity is what this
+# policy removes. A same-version pair of publishes is now a defect, not a gap.
+TOOL_VERSION = "0.5.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never

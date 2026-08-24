@@ -1423,11 +1423,19 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
         import inspect
         from review import cli, emit
         params = inspect.signature(cli._emit).parameters
-        captured = list(params.values())[-1]
-        self.assertIs(captured.default, inspect.Parameter.empty,
-                      f"{captured.name} is optional again: an omitted "
-                      f"capture is a capture nobody made")
-        self.assertEqual(len(params), 4, f"unexpected _emit signature "
+        # All three authored inputs — the captured claim, the resolved roles
+        # (§4) and the resolved transport (RVW-T11) — are required
+        # parameters: an omitted capture is a capture nobody made, and an
+        # omitted resolution would reopen a derive-it-yourself channel here
+        # exactly as `claim=None` once did for the claim. The transport joins
+        # them for the same reason and one more: it is part of the handoff
+        # cache's key, so a value re-derived here could differ from the one
+        # the cache was consulted with.
+        for boundary in list(params.values())[-3:]:
+            self.assertIs(boundary.default, inspect.Parameter.empty,
+                          f"{boundary.name} is optional again: an omitted "
+                          f"capture is a capture nobody made")
+        self.assertEqual(len(params), 6, f"unexpected _emit signature "
                                          f"{list(params)}")
         # And no admitted claim captures as a non-mapping, so nothing
         # downstream can test the value for None and reopen the file.

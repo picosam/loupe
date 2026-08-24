@@ -17,12 +17,14 @@ from __future__ import annotations
 import re
 import textwrap
 
-from . import TOOL_NAME
+from . import TOOL_NAME, paths, vocab
 from .validate import parse_attestations
-# ONE authority for the reference-line grammar. Round 1 F10 came from reading
-# those lines loosely here while transport parsed them strictly, so the précis
-# described a state the envelope did not record.
-from .transport import _REF_LINE_RE
+# ONE authority for the reference-line grammar, and for reading the declared
+# transport off an envelope. Round 1 F10 came from reading those lines loosely
+# here while transport parsed them strictly, so the précis described a state
+# the envelope did not record; a second reading of the transport attribute
+# would be the same defect with a different field.
+from .transport import _REF_LINE_RE, declared_transport
 
 _HEADER = {
     "target": re.compile(r"^Target:\s+(\S+)", re.M),
@@ -70,8 +72,17 @@ def _wrap(text: str, indent: str = "") -> str:
     return " ".join(text.split())
 
 
+# A placeholder a person fills in — and, to a shell, a redirection.
+_PLACEHOLDER = re.compile(r"<[^<>]*>")
+
+
 def _fence(*commands: str, lang: str = "bash") -> list[str]:
     """A command block that survives being relayed into a chat.
+
+    Round 5 F1: with `lang="bash"` every line here is a command an agent
+    runs verbatim, so every line must be a rendered `paths.Command` — a
+    string built any other way is refused rather than trusted. The one
+    non-command use is the envelope paste (`lang=""`), which is bytes.
 
     Indentation does not: markdown strips it, and five rounds of this
     account reached the human with its commands run together as prose. A
@@ -89,6 +100,26 @@ def _fence(*commands: str, lang: str = "bash") -> list[str]:
     content (§9bis.4: paste is the cross-machine transport, and it carries
     bytes or it carries nothing).
     """
+    if lang == "bash":
+        checked = []
+        for line in commands:
+            paths.executable(line, "a fenced relay line")
+            # Workshop (c): the promise is that every live line runs as
+            # PRINTED, so a line carrying a placeholder nobody has filled in
+            # is not a live line. `<...>` is a redirection to a shell, so
+            # `--as <your id>` and `--from-json <dispositions.json>` are not
+            # merely incomplete — they are syntax errors that stop the whole
+            # pasted block, which is how a fence came to promise something
+            # its own bytes broke.
+            #
+            # The rule lives HERE rather than at each call site for the same
+            # reason the executable check does: a promise every caller has to
+            # remember is one the next caller breaks. Commented, the reader
+            # still gets the exact command, and the block still parses.
+            if not str(line).startswith("#") and _PLACEHOLDER.search(line):
+                line = paths.comment(line)
+            checked.append(line)
+        commands = tuple(checked)
     longest = 0
     for line in commands:
         for run in re.findall(r"`+", line):
@@ -177,7 +208,7 @@ def request_precis(parsed, ledger=None) -> str:
             for k, rx in _HEADER.items()}
     claim = sections.get("claim", "")
 
-    out = ["## WHAT THIS ASKS", ""]
+    out = ["## What this asks", ""]
     rnd = head["round"] or attrs.get("round", "?")
     lineage = m.group(1) if (m := _LINEAGE.search(body)) else "?"
     out.append(f"- **Round** — {rnd}, lineage {lineage}")
@@ -270,9 +301,18 @@ def verdict_precis(parsed, source: str | None = None,
     continues. They cannot intervene on a tally. Every finding is now named,
     with what the reviewer requires, blocking ones first.
     """
-    out = ["## WHAT THIS RULES", ""]
-    ruling = parsed.verdict or "no verdict line found"
-    out.append(f"- **Verdict** — {ruling}")
+    ruling = parsed.verdict or ""
+    # The heading IS the verdict (user-directed 2026-08-22): the first
+    # thing the carrier reads is the ruling itself, not a label for it.
+    # First letter capitalized like every heading (round-1 F4); the
+    # machine vocabulary is untouched — validators consume the wire's
+    # VERDICT line, never this rendering. No verdict line → the generic
+    # heading and the absence stated, never a heading inventing a ruling.
+    if ruling:
+        out = [f"## {ruling[0].upper()}{ruling[1:]}", ""]
+    else:
+        out = ["## What this rules", "",
+               "- **Verdict** — no verdict line found"]
     if parsed.sha:
         out.append(f"- **On commit** — {parsed.sha[:12]}")
 
@@ -324,89 +364,209 @@ def verdict_precis(parsed, source: str | None = None,
                    f"reference(s) the reviewer could not retrieve; the "
                    f"verdict says so rather than ruling around them")
 
+    # Workshop (c): the audience line and the carrier choice used to be two
+    # bullets HERE, describing a fence printed somewhere below them. Round 1
+    # had put them inside the relay as prose and a relaying agent mangled
+    # them; the brief was the reply to that. But a person handed the fence
+    # alone — which is the whole point of a block you paste as-is — then held
+    # commands naming the REVIEWER's own file with nothing saying so.
+    #
+    # Both now travel inside the fence as comments, where they cannot be
+    # separated from the commands they qualify and cannot be reworded in
+    # transit. What stays here is what the brief is for: an account of what
+    # was ruled, for a person deciding whether to intervene.
     return "\n".join(out)
 
 
-def verdict_relay(parsed, source: str | None = None) -> str:
-    """The commands that follow a verdict, as their own artifact.
+def verdict_relay(parsed, source: str | None = None,
+                  transport: str = vocab.TRANSPORT_DEFAULT,
+                  envelope: str | None = None) -> str:
+    """The commands that follow a verdict, as one block safe to run as-is.
 
-    These lines used to sit inside `verdict_precis`, under a `Next` heading,
-    and that merge is a real defect rather than a formatting preference. The
-    request side has carried two separate fields since it was written — a
-    `brief` a human reads and a `relay` a human copies — and the verdict side
-    carried one blob containing both kinds of text. An agent handing that to
-    a person has no structural signal about which half is which, so it
-    improvises a split, differently each round: fencing the prose, or burying
-    the command inside the summary. Three sessions of the same complaint were
-    the symptom; one field doing two jobs was the cause.
+    On a declared paste round, `envelope` (the verdict's own bytes) travels
+    UNDER the command that consumes them, inside a fence the bytes cannot
+    close — exactly as the request leg has always carried its envelope.
+    Round 3, live: the verdict crossed a chat surface as loose prose, the
+    renderer stripped its markdown headings, and the author's `close`
+    refused a mangled document the reviewer had validated byte-for-byte. A
+    fence is the one region a chat surface preserves verbatim; bytes
+    outside one are bytes the transit may rewrite.
 
-    So the account and the instructions are separated at the source, and the
-    adapters can state one rule for both directions: give the human the
-    brief, then give them the relay.
+    The lineage of this shape, each turn answering a real failure: the
+    commands began inside `verdict_precis` (one blob; every relayer
+    improvised its own split); round 3 separated brief from relay; round 5
+    fenced the commands; lineage-5 round 1 named the audience in prose
+    beside them, and a relaying agent wrapped the whole section in a fence
+    of its own; 2026-08-22 the user cut the prose entirely, leaving a bare
+    fence whose first line named a path on the REVIEWER's machine.
 
-    Round 5: the commands are FENCED. A four-space indent is how a terminal
-    sets a command apart and how markdown builds a code block — but only if
-    nothing upstream has already stripped the indent, which is exactly what
-    happens when an agent relays this into a chat. A fence survives the trip,
-    and it is the one place a fence belongs: this half IS the copy-this half.
+    Workshop (c) is the turn that stops the oscillation, because prose
+    beside a fence and prose in the brief were the only two options being
+    traded. A comment is inside the block and inert, so the block keeps one
+    promise — every line runs exactly as printed — while carrying the two
+    facts a person needed: who runs it, and that the path is the reviewer's.
+
+    `respond` is a comment for the same reason, and it is the sharper case:
+    it carries `<dispositions.json>` and `<disposition.md>`, files the
+    author has to write first. Printed live beside `close`, it made the one
+    block a person is told to paste as-is contain a line that could not be
+    — so a paste-and-run either failed on a file named `<dispositions.json>`
+    or taught the reader not to trust the fence. Commented, the author reads
+    the exact command and runs it when it is true.
+
+    Round-2 F4: a real `source` path renders shell-safe — these lines are
+    run verbatim, and a path with a space split into the wrong argv. The
+    placeholder forms stay literal: a placeholder is filled in by a
+    person, never executed, and quoting it would suggest otherwise.
     """
-    where = source or "<verdict.md>"
+    # The name states the property the inventory scan enforces: anything
+    # interpolated after a command token is either paths.shell_path(...)
+    # at the site or a local whose name declares it pre-quoted — and this
+    # one's single assignment is the proof.
+    verdict_word = (paths.Lit("-") if transport == vocab.TRANSPORT_PASTE
+                    else (source if source else paths.Ph("<verdict.md>")))
     ruling = parsed.verdict or ""
-    out = ["## WHAT TO RUN NEXT", ""]
-    if ruling.startswith("clean to advance"):
-        out.append("Nothing is blocking. Recording it closes the lineage "
-                   "at this commit:")
-        out.append("")
-        out.extend(_fence(f"{TOOL_NAME} close --verdict {where}"))
+    # `respond` used to ride here as a comment. It is gone, and the reason
+    # is not brevity: `close` DERIVES the next command when it records the
+    # round — `changes requested` returns `respond --verdict <the recorded
+    # verdict> …`, `clean to advance` returns nothing — so printing a second
+    # copy here made two sources for one fact, and this was the copy that
+    # could be wrong. It named the REVIEWER's path, while the one `close`
+    # emits names the path the tool actually kept. A relay that guesses the
+    # next step ahead of the verb that computes it is a guess the reader
+    # cannot distinguish from an answer.
+    #
+    # What stays is what nothing else carries. The audience: the verdict
+    # brief no longer states it, and a person reading `loupe close` in their
+    # own terminal reasonably ran it — that is a real 2026-08-20 report, not
+    # a hypothetical. The carrier: round 4 F2, ruled a High design gap,
+    # because this line names a file on the REVIEWER's machine and an author
+    # anywhere else has no way to see that from the line itself.
+    # RVW-T11. Until the topology was declared, this line had to hedge: it
+    # named the reviewer's own path and then explained, on every round, what
+    # to do if the author was somewhere else — a caveat that was noise in the
+    # only configuration the loop had ever run, and the sole protection in
+    # the one it had never run. Now the round says which it is, so the line
+    # states one fact instead of two possibilities.
+    #
+    # What does NOT depend on the topology is the audience. That line answers
+    # a real 2026-08-20 report — a person read `loupe close` in their own
+    # terminal and ran it — and being on one machine is exactly the case
+    # where running the author's command as the reviewer is easy. It stays in
+    # both shapes.
+    if transport == vocab.TRANSPORT_PASTE:
+        note = ("the author's to run — this round declares no shared "
+                "filesystem, so paste the verdict into it")
     else:
-        out.append("Recording it concedes nothing — it files the ruling "
-                   "and leaves the lineage open:")
+        note = "the author's to run"
+    close_cmd = paths.command(paths.Lit(TOOL_NAME), paths.Lit("close"),
+                              paths.Lit("--verdict"), verdict_word)
+    # F1 (lineage 6 round 1): a placeholder-bearing line is a Template, and
+    # a Template may not be a live fence line — the fence promises every
+    # line runs exactly as printed. With no real source path the command is
+    # a person's to finish, so it travels as a comment.
+    if isinstance(close_cmd, paths.Template):
+        close_cmd = paths.comment(close_cmd)
+    lines = [paths.comment(note), close_cmd]
+    out = ["## What to run next", "", *_fence(*lines)]
+    if transport == vocab.TRANSPORT_PASTE and envelope is not None:
         out.append("")
-        out.extend(_fence(f"{TOOL_NAME} close --verdict {where}"))
+        out.append("The verdict, to paste:")
         out.append("")
-        out.append("Then each finding is answered, which is where "
-                   "accept / refute / defer is decided:")
-        out.append("")
-        out.extend(_fence(f"{TOOL_NAME} respond --verdict {where} "
-                          f"--from-json <dispositions.json> "
-                          f"--out <disposition.md>"))
+        # Not a command: no language tag, and a fence the verdict's own
+        # backtick runs cannot close (the request leg's exact shape).
+        out.extend(_fence(envelope.rstrip("\n"), lang=""))
     return "\n".join(out)
 
 
 # ------------------------------------------------------------------- relay
 
 def relay(kept: str | None, parsed, envelope: str,
-          paste: bool = False) -> str:
-    """The exact thing the human carries — a command, or the bytes.
+          paste: bool = False, transport: str | None = None) -> str:
+    """The exact thing the human carries — one block, same shape as the
+    verdict side.
 
-    Both are printed unconditionally rather than the tool guessing which the
-    situation needs: a path is useless to an agent on another machine, and
-    pasted bytes are needless friction on this one. The human can see which
-    applies from the reachability line in the précis above.
+    Workshop (c): this leg used to print two fences with prose between them
+    and a third line of prose after, and the person had to read all of it to
+    decide which fence applied. The verdict leg, meanwhile, printed one bare
+    fence and kept its prose in the brief. One job, two conventions, and the
+    only thing a relaying agent could do reliably with either was move the
+    whole section and hope.
+
+    Now both legs are: a heading, one fence, and every fact that qualifies a
+    command inside it as a comment.
+
+    RVW-T11 finished the sentence Workshop (c) left open. The shape was
+    right and the CONTENT was still hedging: one live line for the carrier
+    the tool could see working, plus a commented alternative for the case it
+    could not see — printed every round, in a loop where that case had never
+    once occurred. The tool could not see it because nobody had told it, and
+    nothing in the envelope said which topology the round ran over.
+
+    Now the round declares it. `path` — the two ends read the same disk —
+    renders exactly one line and nothing else: the carrier that applies, no
+    alternative, no caveat, nothing for a relaying agent to reword. `paste`
+    renders the other carrier live and the bytes beneath it, because a
+    reviewer who cannot open this filesystem needs the envelope itself and
+    not a pointer into it. Neither shape asks the reader to choose; the
+    round already chose, and the fence says what it chose.
     """
+    transport = (transport if transport is not None
+                 else declared_transport(parsed))
     # `--as` is part of the command, not an option to discover: round 1 F4
     # made the identity declaration mandatory, and a relay that prints a line
     # the tool will refuse is worse than printing none — the human hands over
     # something that fails and has to debug a tool they are only carrying for.
     reviewer = (getattr(parsed, "attrs", {}) or {}).get("reviewer", "")
-    as_flag = f" --as {reviewer}" if reviewer else " --as <your id>"
-    out = ["## HOW TO CARRY IT", ""]
-    if kept and not kept.startswith("not kept"):
-        out.append("Same machine — give the reviewer this line verbatim:")
-        out.append("")
-        out.extend(_fence(f"{TOOL_NAME} take {kept}{as_flag}"))
-        out.append("")
+    # Round 4 F1: the identity is a dynamic shell WORD, not a path and not
+    # therefore safe — a permitted id carrying `;` altered the command an
+    # agent is instructed to run verbatim. The placeholder stays literal;
+    # round 5 F1 made both of them words of a rendered command rather than
+    # a fragment spliced into one.
+    as_words = (paths.Lit("--as"),
+                reviewer if reviewer else paths.Ph("<your id>"))
+    pasted = paths.command(paths.Lit(TOOL_NAME), paths.Lit("take"),
+                           paths.Lit("-"), *as_words)
+    # F1 (lineage 6 round 1): with no reviewer stamped, the take line
+    # carries a placeholder — a Template, which may not be a live fence
+    # line. It travels as a comment a person finishes.
+    if isinstance(pasted, paths.Template):
+        pasted = paths.comment(pasted)
+    # No audience line on this leg: `request_precis` already opens with
+    # `- **Direction** — <author> wrote it, <reviewer> rules on it`, and a
+    # relay that restates the brief beside it is paying twice for one fact.
+    # The verdict leg keeps its audience line precisely because its brief
+    # does NOT carry the equivalent.
+    have_kept = bool(kept) and not kept.startswith("not kept")
+    lines = []
+    if have_kept and transport != vocab.TRANSPORT_PASTE:
+        # One line, and it is the whole block. Quoted exactly when the shell
+        # needs it (F3): this line is copied into a shell, and a state path
+        # with a space would otherwise split into the wrong argv. An ordinary
+        # path renders unchanged.
+        take_line = paths.command(paths.Lit(TOOL_NAME), paths.Lit("take"),
+                                  kept, *as_words)
+        if isinstance(take_line, paths.Template):
+            take_line = paths.comment(take_line)
+        lines.append(take_line)
+    elif have_kept:
+        lines.append(paths.comment(
+            "the reviewer's to run — this round declares no shared "
+            "filesystem, so paste the envelope below into it"))
+        lines.append(pasted)
     else:
-        out.append("Same machine — the bytes were not kept, so the paste "
-                   "below is the only transport.")
-        out.append("")
-    out.append(f"Another machine or a cloud session — have the reviewer run "
-               f"`{TOOL_NAME} take -{as_flag}` and paste the envelope into it.")
-    if not paste:
-        out.append("")
-        out.append(f"Re-run with `--paste` to print the {len(envelope)} bytes "
-                   f"to paste.")
-    else:
+        # Neither declaration's doing: the bytes were never kept, so there is
+        # no path to offer under either topology.
+        lines.append(paths.comment(
+            "the bytes were not kept, so paste is the only carrier:"))
+        lines.append(pasted)
+    # A declared paste round needs the bytes, not a flag that would print
+    # them: the human carrying this has no second command to run, and asking
+    # them to re-invoke the tool to obtain the thing they were just told to
+    # carry is the extra step the declaration exists to remove.
+    paste = paste or (transport == vocab.TRANSPORT_PASTE and have_kept)
+    out = ["## How to carry it", "", *_fence(*lines)]
+    if paste:
         out.append("")
         out.append("The envelope, to paste:")
         out.append("")
