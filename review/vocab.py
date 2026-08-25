@@ -163,6 +163,80 @@ CLAIM_NONEMPTY = ("objective",)
 TRANSPORT_PATH = "path"
 TRANSPORT_PASTE = "paste"
 TRANSPORTS = (TRANSPORT_PATH, TRANSPORT_PASTE)
+
+# --------------------------------------------------------- stamped envelopes
+# Which envelope kinds carry a tool-identity stamp, and every production seam
+# that READS one — the finite authority round-2 F2 required, because fixing
+# one silent reader would only have left the next unpartitioned door.
+#
+# `cross` means the envelope can have been written by another installation, so
+# the seam must compare before it renders or records. `same_process` means the
+# verb wrote the envelope itself in the same run: a comparison there could
+# only ever say `match`, and a check that cannot fail is worse than a stated
+# absence. The verdict is in neither list — it has NO emitter, being
+# hand-authored by the reviewer agent from a shape block, so there is nothing
+# to compare and stamping it would be a model transcribing a digest.
+STAMPED_KINDS = ("request", "disposition")
+
+STAMPED_READERS = {
+    ("take", "request"): "cross",
+    ("brief", "request"): "cross",
+    ("validate", "request"): "cross",
+    ("validate", "disposition"): "cross",
+    ("ledger add", "request"): "cross",
+    ("ledger add", "disposition"): "cross",
+    # Round-3 F1. Re-running `handoff` on an unchanged tip returns the
+    # RETAINED request from a previous run and renders its relay — across
+    # processes, and therefore across installations. It was absent from
+    # this table, and the matrix that was supposed to catch that compared
+    # one hand-written list against another and so could not.
+    ("handoff cache", "request"): "cross",
+    # The fresh emission renders what it has just built in this process.
+    ("handoff", "request"): "same_process",
+    ("respond", "disposition"): "same_process",
+    # Archival: envelopes that predate the stamp, so there is nothing to
+    # compare — distinct from `same_process`, where a comparison would be
+    # possible but could only ever say `match`. Used by workbench-only
+    # import paths; no seam declared here carries it.
+}
+
+SEAM_CLASSES = ("cross", "same_process", "archival")
+
+# Where the production code actually PARSES a stamped envelope, attributed
+# to the seams those parses serve. Round-3 F1: an authority listing readers
+# is only as complete as whoever remembered to add one, so the test that
+# guards it walks the source for every `parse_request` / `parse_disposition`
+# / `_detect_and_parse` call and fails on any site this map does not name.
+# A new read path is then unclassified until someone classifies it.
+#
+# An empty tuple means the site is not a seam of its own: `_detect_and_parse`
+# parses only to decide which kind it has, and its callers are the seams.
+# Several helpers serve two seams — `_brief_into` and `record_handoff` are
+# reached from both the fresh and the cached handoff branch — so the
+# comparison belongs to the branch, not to the helper.
+STAMPED_PARSE_SITES = {
+    ("cli", "_detect_and_parse"): (),
+    ("cli", "cmd_validate"): (("validate", "request"),
+                              ("validate", "disposition")),
+    ("cli", "cmd_respond"): (("respond", "disposition"),),
+    ("cli", "cmd_ledger_add"): (("ledger add", "request"),
+                                ("ledger add", "disposition")),
+    ("cli", "cmd_handoff"): (("handoff cache", "request"),),
+    ("cli", "_emit"): (("handoff", "request"),),
+    ("cli", "_brief_into"): (("handoff", "request"),
+                             ("handoff cache", "request")),
+    ("cli", "cmd_take"): (("take", "request"),),
+    ("cli", "cmd_brief"): (("brief", "request"),),
+    ("transport", "record_response"): (("respond", "disposition"),),
+    ("transport", "cached_handoff"): (("handoff cache", "request"),),
+    ("transport", "record_handoff"): (("handoff", "request"),
+                                      ("handoff cache", "request")),
+    ("transport", "take"): (("take", "request"),),
+}
+
+#: The parse calls that reach a stamped envelope, for the source walk.
+STAMPED_PARSE_CALLS = ("parse_request", "parse_disposition",
+                       "_detect_and_parse")
 # What an UNSTAMPED envelope or a legacy ledger record READS as: every
 # envelope and record written before the attribute existed came from a
 # same-filesystem loop, and reading that silence as anything else would

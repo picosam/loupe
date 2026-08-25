@@ -753,12 +753,22 @@ def validate_request(r: Request, cfg: Config,
     cap = cfg.round_cap if round_cap is None else round_cap
     round_no = r.attrs.get("round", "")
     if not structural_only and round_no.isdigit() and int(round_no) > cap:
-        items.append(_err("R-BUDGET",
-                          f"round {round_no} exceeds the round cap {cap}: the "
-                          f"budget breaker escalates to the user instead of "
-                          f"emitting. Authorize this lineage explicitly with "
-                          f"`{paths.command(*paths.lits(TOOL_NAME, 'ledger', 'authorize-cap', '--to'), round_no, paths.Lit('--reason'), paths.qph('...'))}` "
-                          f"if the loop should continue"))
+        # ADVISORY, not an error (user decision 2026-08-25). A round count
+        # is a threshold, not an observed anomaly: it says how long the loop
+        # has run, never that anything is wrong with it. Refusing on it
+        # stopped legitimate work — a lineage whose findings are real and
+        # whose fixes land still needs however many rounds it needs — and
+        # the refusal taught nothing about WHETHER the loop was converging,
+        # which is the question the count is a poor proxy for. The tool now
+        # emits and says so, and `ledger convergence` answers the real
+        # question from the record rather than from a number.
+        items.append(_notice("R-BUDGET",
+                             f"round {round_no} is past the round cap {cap} — "
+                             f"advisory, not a refusal. The count is a "
+                             f"threshold, not evidence; "
+                             f"`{paths.command(*paths.lits(TOOL_NAME, 'ledger', 'convergence'))}` "
+                             f"reports whether this lineage is closing its "
+                             f"findings or hunting the same domains"))
 
     # Sweep F5: the closed section grammar first — duplicates and order are
     # judged from the raw headings, before any content is read through the

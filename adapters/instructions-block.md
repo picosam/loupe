@@ -1,7 +1,7 @@
 <!-- BEGIN GENERATED: loupe adapter — do not edit; `loupe render-adapters` regenerates, `--check` guards -->
 # loupe — review procedure (instruction block, GENERATED)
 
-For a project instruction file (AGENTS.md / CLAUDE.md region) on a surface that reads no skill directory. Tool version 0.5.0.
+For a project instruction file (AGENTS.md / CLAUDE.md region) on a surface that reads no skill directory. Tool version 0.6.0.
 
 ## What this is
 

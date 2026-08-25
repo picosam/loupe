@@ -12,7 +12,7 @@ from pathlib import Path
 from . import (FORMER_NAMES, TOOL_NAME, TOOL_VERSION, adapters, brief, config,
                emit, paths, transport, vocab, wire)
 from .digest import sha256_file, sha256_text
-from .ledger import Ledger, render_report_md
+from .ledger import Ledger, render_convergence_md, render_report_md
 from .validate import (errors_in, validate_disposition, validate_request,
                        validate_verdict)
 
@@ -54,7 +54,8 @@ RUNNABLE_KEYS = ("next", "reviewer_next", "diff")
 # every payload passes through it at runtime. The scan survives in
 # `test_command_boundary` as advisory drift evidence only.
 PROSE_KEYS = (
-    "absent", "anchor_path", "at_round", "attrs", "author", "author_next",
+    "absent", "agreement", "anchor_path", "at_round", "attrs", "author",
+    "author_next",
     "authorized_by", "base",
     # Round 2 F1: the emission stamp binding a disposition row to its
     # companion events; an identity the agent reads, never a command.
@@ -62,26 +63,38 @@ PROSE_KEYS = (
     "blocking", "breaker", "brief", "bytes",
     "bytes_freed", "cached", "checked", "cites", "claim_digest",
     "classification", "classification_notes", "classifications", "closures",
-    "config", "covers", "data", "declared_transport", "default_cap", "digest",
+    "config", "convergence", "covers", "data", "declared_transport",
+    "default_cap", "digest",
     "disposition", "dispositions", "dry_run",
     "entry", "envelope", "error", "event", "events_added", "events_total",
     "exit", "falsification", "fetch", "files", "finding_id", "finding_ids",
-    "findings", "fp", "from", "gate_output", "head", "id",
+    "findings", "findings_per_round", "fp", "from", "gate_output", "head",
+    "hunted_anchors", "id",
     "ignored_control_fields", "install", "installed", "items", "kept",
     "kept_unrecognised", "kind", "ledger", "ledgers", "limits", "lineage",
     "lineage_closed_at_round", "moved", "mutation", "next_kind",
-    "next_lineage", "note", "of", "ok", "open_request", "out", "outcome",
+    "new_per_round", "next_lineage", "note", "of", "ok", "open_request",
+    "out", "outcome",
     "path", "payload", "permitted_authors", "permitted_reviewers",
     "preventable_by", "pruned", "reason", "recorded", "referenced_shas",
-    "references", "rejected_reviewers", "relay", "remedy", "repeated",
+    "reader", "reading", "references", "rejected_reviewers", "relay",
+    "remedy", "repeated",
     "reviewer", "roles", "round", "round_cap", "severities", "severity",
-    "sha", "source", "source_digest", "status", "subtype", "superseded",
-    "tag", "target", "taxonomy", "test_digest", "then", "title", "to",
+    "rounds", "sha", "source", "source_digest", "stalled_threads", "state",
+    "status", "subtype", "superseded",
+    "tag", "target", "taxonomy", "test_digest", "then", "threads", "title",
+    "to",
     "token_budget", "tokens",
+    # Lineage 7 round 1: which INSTALLATION wrote the envelope and which is
+    # reading it, with the verdict on whether they agree. Read, never run —
+    # and deliberately not a command, because the tool takes no position on
+    # which of two differing installations should win.
+    "tool", "tool_agreement", "tool_writer",
     # RVW-T11: an enum the agent READS. It decides which command the tool
     # renders, and is never itself a command — the relay it selects goes
     # through the same runnable door as every other executable field.
-    "transport", "unanswered", "verdict", "verdict_sha", "wrapper", "written",
+    "transport", "unanswered", "verdict", "verdict_sha", "withdrawn_any",
+    "wrapper", "writer", "written",
 )
 
 _CLASSIFIED_KEYS = frozenset(RUNNABLE_KEYS) | frozenset(PROSE_KEYS)
@@ -109,7 +122,8 @@ def _out(payload: dict, tty_text: str | None = None):
 
 
 def _finish(items, next_cmd: str, brief_text: str | None = None,
-            remedy: str = "", relay_text: str | None = None) -> int:
+            remedy: str = "", relay_text: str | None = None,
+            agreement: dict | None = None) -> int:
     """The items-list exit, typed like every other one.
 
     Round 2 F8 typed this branch `command` "by construction, not by
@@ -127,6 +141,13 @@ def _finish(items, next_cmd: str, brief_text: str | None = None,
     payload = {"items": [i.as_dict() for i in items],
                "ok": not errors_in(items)}
     lines = [f"{i.level}: [{i.code}] {i.message}" for i in items]
+    # Round-2 F2: a verb that reads a STAMPED envelope reports whose
+    # installation wrote it, in both output modes and whether or not the
+    # envelope validates — a defective envelope from another installation
+    # is exactly when knowing that matters.
+    if agreement is not None:
+        payload["tool"] = agreement
+        lines.append(render_tool_agreement(agreement).rstrip("\n"))
     if brief_text:
         payload["brief"] = brief_text
     # The account and the commands stay separate fields all the way out, so
@@ -249,6 +270,11 @@ def cmd_validate(args, cfg) -> int:
                    f"{{request|verdict|disposition}}> tag; envelopes come "
                    f"from `handoff`, `respond` and the reviewer, never from "
                    f"a command that rewrites this file")
+    # Round-2 F2: `validate` accepts every envelope kind from anywhere —
+    # it is the verb a refusal names as its next command — so it is a
+    # cross-installation reader of both stamped kinds and says so.
+    agreement = (transport.tool_agreement(parsed)
+                 if kind in vocab.STAMPED_KINDS else None)
     if kind == "request":
         items = validate_request(
             parsed, cfg,
@@ -304,6 +330,7 @@ def cmd_validate(args, cfg) -> int:
             envelope=text)
         if is_verdict and not errors_in(items) else None)
     return _finish(items, "", brief_text=precis, relay_text=verdict_next,
+                   agreement=agreement,
                    remedy=f"whoever authored {args.envelope} must correct the "
                           f"items above and re-run "
                           f"`{paths.command(*paths.lits(TOOL_NAME, 'validate'), args.envelope)}`; envelopes "
@@ -512,6 +539,7 @@ def cmd_ledger_add(args, cfg) -> int:
     digest = sha256_file(Path(args.envelope))
     size = Path(args.envelope).stat().st_size
     added = 0
+    agreement = None
     if kind == "verdict":
         items = validate_verdict(
             parsed, cfg, answering=_dispositions_answered(ledger, parsed))
@@ -560,6 +588,7 @@ def cmd_ledger_add(args, cfg) -> int:
         # lifecycle decision reads. The same request validation `take` and
         # `handoff` apply runs here, against the cap in force for this
         # lineage, before anything is appended; a refusal appends nothing.
+        agreement = transport.tool_agreement(parsed)
         items = validate_request(
             parsed, cfg,
             round_cap=ledger.effective_round_cap(cfg.round_cap))
@@ -580,6 +609,12 @@ def cmd_ledger_add(args, cfg) -> int:
         # two doors record, through the one function they use.
         added += ledger.add_all(transport.request_events(
             parsed, round_no, digest, size, args.tokens))
+        ledger.add({"event": "ingest", "kind": "request",
+                    "round": round_no, "digest": digest,
+                    "tool": agreement["reader"],
+                    "tool_agreement": agreement["agreement"],
+                    **({"tool_writer": agreement["writer"]}
+                       if agreement["writer"] else {})})
     elif kind == "disposition":
         # Round 2 F2: this path recorded whatever identity it was handed.
         # A disposition binds by fingerprint, so it cannot be recorded
@@ -608,13 +643,30 @@ def cmd_ledger_add(args, cfg) -> int:
                                          args.envelope))
         added += ledger.add_all(
             transport.disposition_events(parsed, against, cfg))
+        # Round-1 F3. This is the ONE door a disposition can arrive at from
+        # another installation — `respond --out` writes and records in one
+        # process, so its stamp is this end's by construction and comparing
+        # there could only ever say `match`. Here it cannot, so here is
+        # where the comparison means something.
+        agreement = transport.tool_agreement(parsed)
+        ledger.add({"event": "ingest", "kind": "disposition",
+                    "round": int(parsed.data.get("round", 0)),
+                    "digest": digest, "tool": agreement["reader"],
+                    "tool_agreement": agreement["agreement"],
+                    **({"tool_writer": agreement["writer"]}
+                       if agreement["writer"] else {})})
     else:
         return _blocked(
             paths.command(*paths.lits(TOOL_NAME, "validate"), args.envelope),
             f"{args.envelope} is not a recognizable request, verdict or "
             f"disposition envelope")
-    _out({"ok": True, "events_added": added, "ledger": str(ledger.path)},
-         f"added {added} events to {ledger.path}")
+    payload = {"ok": True, "events_added": added, "ledger": str(ledger.path)}
+    report = ""
+    if agreement is not None:
+        payload["tool"] = agreement
+        report = render_tool_agreement(agreement)
+    _out(payload, f"added {added} events to {ledger.path}\n{report}".rstrip()
+                  + "\n")
     return EXIT_OK
 
 
@@ -666,6 +718,21 @@ def cmd_ledger_report(args, cfg) -> int:
         print(render_report_md(report))
     else:
         print(json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True))
+    return EXIT_OK
+
+
+def cmd_ledger_convergence(args, cfg) -> int:
+    """Is this lineage closing its findings, or hunting the same domains?
+
+    The verb the advisory round cap points at. A count of rounds says how
+    long the loop has run; this says which direction it is going, from the
+    closures and anchors already in the record.
+    """
+    ledger = _ledger(cfg, args)
+    result = ledger.convergence()
+    result["ok"] = True
+    result["ledger"] = str(ledger.path)
+    _out(result, render_convergence_md(result))
     return EXIT_OK
 
 
@@ -940,22 +1007,45 @@ def cmd_handoff(args, cfg) -> int:
                                "dispositions, or the recorded decision — "
                                "then re-runs this command")
     round_no = emit.next_round(ledger)
+    # User decision 2026-08-25: past the cap the tool emits and INVESTIGATES
+    # rather than refusing. The count alone taught nothing — it fires on a
+    # lineage doing exactly what it should — so the answer travels with the
+    # warning: which findings the loop is failing to close, and which
+    # domains keep producing new ones however many are fixed.
+    past_cap = round_no > ledger.effective_round_cap(cfg.round_cap)
     cached = transport.cached_handoff(cfg, ledger, round_no,
                                       claim_digest=claim_digest,
                                       roles=roles,
                                       transport=selected_transport)
     if cached is not None:
+        # Round-3 F1: this branch reads a request RETAINED by an earlier
+        # run — across processes, so possibly across installations — and
+        # then re-records it and renders its relay. It is a
+        # cross-installation reader like any other, and it compares BEFORE
+        # either of those, because both are what a stale installation gets
+        # wrong.
+        agreement = transport.tool_agreement(
+            wire.parse_request(cached["envelope"]))
         rec = transport.record_handoff(cfg, ledger, cached["envelope"],
                                        round_no, claim_digest=claim_digest)
         rec["cached"] = True
         rec["ok"] = True
+        rec["tool"] = agreement
+        ledger.add({"event": "ingest", "kind": "request",
+                    "round": round_no, "digest": rec.get("digest"),
+                    "source": "handoff cache",
+                    "tool": agreement["reader"],
+                    "tool_agreement": agreement["agreement"],
+                    **({"tool_writer": agreement["writer"]}
+                       if agreement["writer"] else {})})
         if args.out:
             Path(args.out).write_text(cached["envelope"], encoding="utf-8")
             rec["out"] = args.out
         _brief_into(rec, cached["envelope"], ledger)
         _out(rec, f"round {round_no} request for {rec['sha']} is already "
                   f"recorded and kept at {paths.display_path(rec['kept'])} — gates not re-run "
-                  f"(§9bis.3 rule 5)\n\n{rec['brief']}\n\n{rec['relay']}\n\n"
+                  f"(§9bis.3 rule 5)\n\n{rec['brief']}\n\n"
+                  f"{render_tool_agreement(agreement)}\n{rec['relay']}\n\n"
                   f"author: {rec['author_next']}")
         return EXIT_OK
     result = _emit(args, cfg, ledger, captured, roles,
@@ -971,10 +1061,14 @@ def cmd_handoff(args, cfg) -> int:
         Path(args.out).write_text(envelope, encoding="utf-8")
         rec["out"] = args.out
     _brief_into(rec, envelope, ledger)
+    if past_cap:
+        rec["convergence"] = ledger.convergence()
     _out(rec, f"round {round_no} request emitted for {rec['sha']}, "
               f"recorded ({rec['bytes']} bytes, sha256 {rec['digest'][:16]}…), "
               f"kept at {paths.display_path(rec['kept'])}\n\n"
-              f"{rec['brief']}\n\n{rec['relay']}\n\n"
+              f"{rec['brief']}\n\n"
+              f"{render_convergence_md(rec['convergence']) if past_cap else ''}"
+              f"{rec['relay']}\n\n"
               f"author: {rec['author_next']}")
     return EXIT_OK
 
@@ -1017,12 +1111,38 @@ def cmd_take(args, cfg) -> int:
     refs = "\n".join(f"  {r['status']:<40} {r['path']}"
                       for r in rec["references"]) or "  (none declared)"
     rec["brief"] = brief.request_precis(wire.parse_request(envelope), ledger)
+    # Round-1 F4: the agreement was returned in JSON and rendered nowhere a
+    # human looks. A report-not-refuse decision rests on the human SEEING
+    # the difference; a field only the non-TTY path carries cannot support
+    # a decision the visible command never names.
     _out(rec, f"{rec['envelope']}\n"
               f"--- taken: round {rec['round']} target {rec['sha']} as "
               f"reviewer {rec['reviewer']}\n\n{rec['brief']}\n\n"
               f"target: {rec['target']}\nreferences:\n{refs}\n"
+              f"{render_tool_agreement(rec['tool'])}"
               f"diff:   {rec['diff']}\nthen:   {rec['then']}")
     return EXIT_OK
+
+
+def render_tool_agreement(agreement: dict) -> str:
+    """The tool-identity report, for the eyes the decision belongs to.
+
+    All three states are printed, `match` included: a line that appears
+    only on disagreement teaches the reader nothing about what its absence
+    means, and this round's own record is that an absence gets read as
+    agreement. One line when the installations agree, and the reason beside
+    it when they do not (round-1 F4).
+    """
+    state = agreement.get("agreement")
+    if state == "match":
+        return f"tool:   match — both ends are {agreement['reader']}\n"
+    if state == "unstamped":
+        return (f"tool:   UNSTAMPED — this end is {agreement['reader']}; the "
+                f"envelope names no installation\n"
+                f"        {agreement['note']}\n")
+    return (f"tool:   DIFFERS — this end is {agreement['reader']}, the "
+            f"envelope was written by {agreement['writer']}\n"
+            f"        {agreement['note']}\n")
 
 
 def cmd_waive(args, cfg) -> int:
@@ -1172,15 +1292,22 @@ def cmd_brief(args, cfg) -> int:
                 remedy="the author re-emits the request: a brief cannot "
                        "summarise, and a relay cannot carry, an envelope "
                        "whose own grammar refuses it")
+        # Round-2 F2: `brief` RENDERS the command a human carries, which is
+        # precisely the output a stale installation gets wrong — it is the
+        # incident this mechanism exists to expose. It compares before it
+        # renders, like every other cross-installation reader.
+        agreement = transport.tool_agreement(as_request)
         rec = {"kind": "request", "source": source, "ok": True,
                "round": as_request.attrs.get("round"),
                "sha": as_request.sha, "superseded": superseded,
+               "tool": agreement,
                "brief": brief.request_precis(as_request, ledger),
                "relay": brief.relay(source, as_request, text,
                                     paste=args.paste)}
         note = (f"\nNOTE: {superseded} earlier emission(s) of this round are "
                 f"superseded; this is the live one.\n" if superseded else "")
-        _out(rec, f"{rec['brief']}\n{note}\n{rec['relay']}")
+        _out(rec, f"{rec['brief']}\n{note}\n"
+                  f"{render_tool_agreement(agreement)}\n{rec['relay']}")
         return EXIT_OK
 
     as_verdict = wire.parse_verdict(text)
@@ -1445,6 +1572,10 @@ def build_parser() -> argparse.ArgumentParser:
     lab.add_argument("--by", required=True,
                      help="who took the decision; not inferred from silence")
     lab.set_defaults(func=cmd_authorize_breaker)
+    lc = lsub.add_parser("convergence",
+                         help="is this lineage closing its findings, or "
+                              "hunting the same domains?")
+    lc.set_defaults(func=cmd_ledger_convergence)
     lr = lsub.add_parser("report", help="breakers + metrics")
     lr.add_argument("--format", choices=("json", "md"))
     lr.set_defaults(func=cmd_ledger_report)

@@ -9,13 +9,14 @@ install tests never touch a real agent directory: every target is a temp
 path passed in explicitly, and the CLI test patches `install_targets`.
 """
 import contextlib
+import json
 import io
 import re
 import tempfile
 import unittest
 from pathlib import Path
 
-from review import TOOL_NAME, TOOL_VERSION, adapters, cli, config
+from review import TOOL_NAME, TOOL_VERSION, adapters, cli, config, vocab
 from review.digest import sha256_text
 from review.tests.util import REPO_ROOT, public_path, spec_path
 
@@ -243,6 +244,469 @@ class TestAdvertisedVersionParity(unittest.TestCase):
             code = cli.main(["--version"])
         self.assertEqual(code, 0)
         self.assertEqual(buf.getvalue().strip(), self._advertised())
+
+
+class TestShippedRestatements(unittest.TestCase):
+    """Round-2 F3: a CLOSED inventory of every fact the shipped documents
+    restate by hand, each bound to the authority that owns it.
+
+    The history is three rounds of the same lesson. Round-5 F1 found the
+    version advertised on one surface and held on another. The repair
+    guarded the version. Round-1 F2 found "Four mechanisms" beside five
+    headings; that repair guarded the count. Round-2 F3 then deleted the
+    `escalated` row from the shipped disposition table and every one of
+    those gates stayed green — because each was a named regex for the
+    newest reproducer, which is the example-by-example loop the
+    boundary-closure rule prohibits.
+
+    So the domain is enumerated instead. `RESTATEMENTS` binds each shipped
+    restatement to its runtime authority and its exact location, every
+    entry is checked in BOTH directions — a missing member and an invented
+    one are equally wrong — and `test_every_closed_vocabulary_is_registered`
+    fails when the code grows a closed vocabulary that no entry covers, so
+    the inventory cannot fall behind the authority it describes.
+    """
+
+    #: name -> (authority members, where they are restated, how to read it)
+    #: `pattern` captures ONE region of the shipped document; `reader` turns
+    #: that region into the member set. A reader per entry rather than one
+    #: rule for all, because the sites genuinely differ — a table states its
+    #: members in the first column, the verdict strings carry a `VERDICT: `
+    #: prefix, a closure member carries its outcomes after a colon — and a
+    #: single blanket rule would have forced those documents to be reworded
+    #: to suit the test rather than the reader.
+    @staticmethod
+    def _ticked(region):
+        return set(re.findall(r"`([^`]+)`", region))
+
+    @classmethod
+    def _table_keys(cls, region):
+        """A markdown table states its members in the first column."""
+        return {row.split("|")[1].strip().strip("`")
+                for row in region.splitlines()
+                if row.startswith("|") and "---" not in row
+                and row.split("|")[1].strip().startswith("`")}
+
+    @classmethod
+    def _before_colon(cls, region):
+        return {t.split(":", 1)[0].strip() for t in cls._ticked(region)}
+
+    @classmethod
+    def _after_verdict(cls, region):
+        return {t.split("VERDICT:", 1)[-1].strip()
+                for t in cls._ticked(region)}
+
+    RESTATEMENTS = {
+        # (authority, document, pattern, reader)
+        # Round-3 F2: the DOCUMENT is part of every entry. Round 2's
+        # inventory read only the specification, so the README's own
+        # breaker list — the very drift this lineage opened with — went
+        # unchecked while the closed-world gate stayed green. An inventory
+        # that cannot name two documents is not an inventory of what ships.
+        "dispositions": (vocab.DISPOSITIONS, "design",
+                         r"closed vocabulary of five.*?\n\n(\|.*?)\n\n",
+                         "_table_keys"),
+        "closures": (vocab.CLOSURES, "design",
+                     r"\*\*Reviewer closure events\*\* —(.*?)— are",
+                     "_before_colon"),
+        "verdicts": (vocab.VERDICTS, "design",
+                     r"\*\*two-string verdict\*\*:(.*?)the first "
+                     r"meaningful line", "_after_verdict"),
+        "transports": (vocab.TRANSPORTS, "design",
+                       r"declared, closed-vocabulary input —(.*?)defaulting",
+                       "_ticked"),
+        "breakers (design)": (vocab.BREAKERS, "design",
+                              r"the breakers\s*\((.*?)\)", "_ticked"),
+        "breakers (readme)": (vocab.BREAKERS, "readme",
+                              r"the breakers\s*\((.*?)\)", "_ticked"),
+        "falsification_statuses": (vocab.FALSIFICATION_STATUSES, "design",
+                                   r"records `status`\s*\((.*?)\) for the",
+                                   "_ticked"),
+        "mutation_outcomes": (vocab.MUTATION_OUTCOMES, "design",
+                              r"and `mutation` \((.*?)\) for the same",
+                              "_ticked"),
+        # Round-3 F3: these four were declared "deliberately undocumented"
+        # on the premise that the specification gives them no member list.
+        # It gives all four one. The exclusion mechanism had certified real
+        # restatements as non-restatements, so the inventory was complete
+        # only relative to a false classification.
+        "finding_fields": (vocab.FINDING_FIELDS, "design",
+                           r"and each carries (.*?)\.\s", "_prose_list"),
+        "accepted_subtypes": (vocab.ACCEPTED_SUBTYPES, "design",
+                              r"one structured subtype, `accepted\((.*?)\)`",
+                              "_bare"),
+        "test_amended_payload": (vocab.TEST_AMENDED_PAYLOAD, "design",
+                                 r"unsatisfiable \(payload: (.*?)\)",
+                                 "_ticked"),
+        "test_amendment_outcomes": (vocab.TEST_AMENDMENT_OUTCOMES, "design",
+                                    r"`test_amendment: (.*?)`", "_alternates"),
+        # Found by the tripwire below on its first run, in a table this
+        # very lineage added: §3.3(e)'s reader table enumerates the stamped
+        # kinds, so `STAMPED_KINDS` was a restatement the moment it was
+        # written, and my own UNDOCUMENTED list was wrong about it exactly
+        # the way round-3 F3 says such lists go wrong.
+        "stamped_kinds": (vocab.STAMPED_KINDS, "design",
+                          r"\| stamped \| written by \|(.*?)\n\n",
+                          "_stamped_rows"),
+        # Two more the cross-product discovery found in the README on its
+        # first run, both of which the round-2 inventory could not have
+        # seen because it had no notion of a second document.
+        "verdicts (readme)": (vocab.VERDICTS, "readme",
+                              r"→ records; (.*?)\n.*?lineage is closed",
+                              "_ticked"),
+        "stamped_kinds (readme)": (vocab.STAMPED_KINDS, "readme",
+                                   r"review tool: (.*?)\nenvelopes",
+                                   "_arrow_chain"),
+    }
+
+    #: Authorities no shipped document enumerates. Kept explicit, and kept
+    #: HONEST by `test_no_excluded_authority_is_quietly_enumerated` below —
+    #: round-3 F3 was this list containing four vocabularies the
+    #: specification spells out in full.
+    UNDOCUMENTED = {
+        "BLOCKING_ILLEGAL", "FALSIFICATION_KINDS", "FALSIFICATION_RECORD",
+        "LINEAGE_KINDS", "LINEAGE_MERGING", "CLAIM_STRING_FIELDS",
+        "CLAIM_LIST_FIELDS", "CLAIM_REQUIRED", "CLAIM_NONEMPTY",
+        "CLAIM_REFERENCE_REQUIRED", "SEAM_CLASSES", "STAMPED_PARSE_CALLS",
+    }
+
+    @classmethod
+    def _registered(cls):
+        """Which authorities RESTATEMENTS actually binds — read from the
+        inventory itself, never restated beside it.
+
+        Round-4 F5: this was a second hand list, so it could certify an
+        authority as registered when no entry existed. That is the same
+        false-classification path as round-3 F3, one level up: a list
+        asserting a fact about another list, with nothing comparing them.
+        """
+        by_value = {id(getattr(vocab, name)): name
+                    for name in cls._closed_vocabularies()}
+        return {by_value[id(entry[0])] for entry in cls.RESTATEMENTS.values()
+                if id(entry[0]) in by_value}
+
+    @staticmethod
+    def _arrow_chain(region):
+        """`request → verdict → disposition`: the loop's three envelopes,
+        of which two are stamped. `verdict` is named there for the same
+        reason it has a row in the specification's table — it is the third
+        envelope and the unstamped one — so the reader drops it rather than
+        the sentence being reworded to suit a test."""
+        return {part.strip() for part in region.split("→")
+                if part.strip() and part.strip() != "verdict"}
+
+    @classmethod
+    def _stamped_rows(cls, region):
+        """The reader table lists the stamped kinds AND one row for the
+        deliberately unstamped verdict, whose `compared by` cell is a bare
+        em dash. The unstamped row is the point of that line, so the reader
+        recognises it rather than the document being reworded to suit."""
+        return {row.split("|")[1].strip()
+                for row in region.splitlines()
+                if row.startswith("|") and "---" not in row
+                and row.split("|")[3].strip() != "—"}
+
+    @staticmethod
+    def _bare(region):
+        return {region.strip()}
+
+    @staticmethod
+    def _alternates(region):
+        return {part.strip() for part in region.split("|")}
+
+    @staticmethod
+    def _prose_list(region):
+        """A sentence listing members in prose: `a, b, c and d`."""
+        return {part.strip().strip("`")
+                for chunk in region.replace(" and ", ", ").split(",")
+                for part in [chunk] if part.strip()}
+
+    def _members(self, text, pattern, reader):
+        found = re.search(pattern, text, re.S)
+        self.assertIsNotNone(
+            found, f"the shipped document no longer carries this "
+                   f"restatement where the inventory says it is; a "
+                   f"restatement nothing can locate is one nothing checks")
+        return getattr(self, reader)(found.group(1))
+
+    def _document(self, name):
+        """A shipped document by short name.
+
+        The set searched here is `design` and `readme`. That it is the
+        WHOLE set of shipped documents restating a runtime vocabulary is
+        proved in `test_identity_boundary.py`, against the extraction
+        inventory — which stays in the workbench, where a new travelling
+        document appears and must be decided (round-4 F4). This half may
+        not read that inventory: a travelling file that references a
+        workbench-only path is a coupling the extraction audit refuses, and
+        it refused this when the derivation lived here.
+        """
+        path = spec_path() if name == "design" else public_path("README.md")
+        if path is None:
+            self.skipTest(f"no {name} shipped in this tree")
+        return path.read_text(encoding="utf-8")
+
+    def _members(self, text, pattern, reader):
+        found = re.search(pattern, text, re.S)
+        self.assertIsNotNone(
+            found, f"the shipped document no longer carries this "
+                   f"restatement where the inventory says it is; a "
+                   f"restatement nothing can locate is one nothing checks")
+        return getattr(self, reader)(found.group(1))
+
+    def _document(self, name):
+        """A shipped document by short name.
+
+        The set searched here is `design` and `readme`. That it is the
+        WHOLE set of shipped documents restating a runtime vocabulary is
+        proved in `test_identity_boundary.py`, against the extraction
+        inventory — which stays in the workbench, where a new travelling
+        document appears and must be decided (round-4 F4). This half may
+        not read that inventory: a travelling file that references a
+        workbench-only path is a coupling the extraction audit refuses, and
+        it refused this when the derivation lived here.
+        """
+        path = spec_path() if name == "design" else public_path("README.md")
+        if path is None:
+            self.skipTest(f"no {name} shipped in this tree")
+        return path.read_text(encoding="utf-8")
+
+    def _members(self, text, pattern, reader):
+        found = re.search(pattern, text, re.S)
+        self.assertIsNotNone(
+            found, f"the shipped document no longer carries this "
+                   f"restatement where the inventory says it is; a "
+                   f"restatement nothing can locate is one nothing checks")
+        return getattr(self, reader)(found.group(1))
+
+    def _document(self, name):
+        """A shipped document by short name.
+
+        The set searched here is `design` and `readme`. That it is the
+        WHOLE set of shipped documents restating a runtime vocabulary is
+        proved in `test_identity_boundary.py`, against the extraction
+        inventory — which stays in the workbench, where a new travelling
+        document appears and must be decided (round-4 F4). This half may
+        not read that inventory: a travelling file that references a
+        workbench-only path is a coupling the extraction audit refuses, and
+        it refused this when the derivation lived here.
+        """
+        path = spec_path() if name == "design" else public_path("README.md")
+        if path is None:
+            self.skipTest(f"no {name} shipped in this tree")
+        return path.read_text(encoding="utf-8")
+
+    def _members(self, text, pattern, reader):
+        found = re.search(pattern, text, re.S)
+        self.assertIsNotNone(
+            found, f"the shipped document no longer carries this "
+                   f"restatement where the inventory says it is; a "
+                   f"restatement nothing can locate is one nothing checks")
+        return getattr(self, reader)(found.group(1))
+
+    def _document(self, name):
+        """A shipped document by short name.
+
+        The set searched here is `design` and `readme`. That it is the
+        WHOLE set of shipped documents restating a runtime vocabulary is
+        proved in `test_identity_boundary.py`, against the extraction
+        inventory — which stays in the workbench, where a new travelling
+        document appears and must be decided (round-4 F4). This half may
+        not read that inventory: a travelling file that references a
+        workbench-only path is a coupling the extraction audit refuses, and
+        it refused this when the derivation lived here.
+        """
+        path = spec_path() if name == "design" else public_path("README.md")
+        if path is None:
+            self.skipTest(f"no {name} shipped in this tree")
+        return path.read_text(encoding="utf-8")
+
+    def test_every_registered_restatement_matches_its_authority(self):
+        """FALSIFICATION for round-2 F3, the reviewer's own probe: delete
+        the `escalated` row from the shipped disposition table. Before this
+        round all six parity tests stayed green; now this names it.
+        Mutation, the other direction: add a member to any authority
+        without documenting it, and the same entry fails."""
+        for name, entry in self.RESTATEMENTS.items():
+            authority, document, pattern, reader = entry
+            with self.subTest(restatement=name):
+                documented = self._members(self._document(document),
+                                           pattern, reader)
+                expected = set(authority)
+                self.assertEqual(
+                    expected - documented, set(),
+                    f"the shipped document omits {name} member(s) the code "
+                    f"declares")
+                self.assertEqual(
+                    documented - expected, set(),
+                    f"the shipped document states {name} member(s) the code "
+                    f"does not declare")
+
+    @staticmethod
+    def _closed_vocabularies():
+        return {name for name in dir(vocab)
+                if name.isupper()
+                and isinstance(getattr(vocab, name), tuple)
+                and getattr(vocab, name)
+                and all(isinstance(x, str) for x in getattr(vocab, name))}
+
+    def test_every_closed_vocabulary_is_registered_or_declared_absent(self):
+        """The inventory cannot fall behind its subject: every closed
+        vocabulary the code exports is either registered above or listed as
+        deliberately undocumented. A new one fails here until someone
+        decides which."""
+        closed = self._closed_vocabularies()
+        self.assertEqual(
+            sorted(closed - self._registered() - self.UNDOCUMENTED), [],
+            "a closed vocabulary is neither registered as a shipped "
+            "restatement nor declared deliberately undocumented")
+        self.assertEqual(
+            sorted(self._registered() - closed), [],
+            "the inventory registers something that is no longer a closed "
+            "vocabulary")
+        self.assertEqual(
+            sorted(self.UNDOCUMENTED & self._registered()), [],
+            "a vocabulary is both registered and declared undocumented")
+
+    #: How close together every member of a vocabulary must appear before
+    #: the text counts as ENUMERATING it rather than mentioning its members
+    #: in passing. A member list is tight; incidental co-occurrence across a
+    #: long table is not.
+    ENUMERATION_SPAN = 400
+
+    def _enumerates(self, text, members):
+        """Whether `text` appears to spell out every member in one place."""
+        if len(members) < 2:
+            # A one-member vocabulary has no member LIST to find: the member
+            # appearing in prose is a mention, not an enumeration, and
+            # treating it as one would make every such vocabulary
+            # permanently unregisterable.
+            return False
+        starts = []
+        for member in members:
+            found = [m.start() for m in re.finditer(re.escape(member), text)]
+            if not found:
+                return False
+            starts.append(min(found))
+        return max(starts) - min(starts) <= self.ENUMERATION_SPAN
+
+    def test_every_document_that_enumerates_a_vocabulary_has_an_entry(self):
+        """FALSIFICATION for round-3 F2 and F3 together, and the reason the
+        first two attempts at this inventory were incomplete.
+
+        Round 2's inventory was a list of entries, so it was exactly as
+        complete as whoever wrote it: it omitted the README (F2) and it
+        declared four vocabularies undocumented that the specification
+        spells out in full (F3). Both failures share a shape — a hand list
+        cannot discover what it left out.
+
+        So the cross product is searched instead: every shipped document
+        against every closed vocabulary. Wherever a document enumerates
+        one, `RESTATEMENTS` must carry an entry for that exact pair. This
+        is a TRIPWIRE, not a proof, and worth being exact about which: it
+        recognises a member list by every member appearing within
+        `ENUMERATION_SPAN` characters, and it can miss a list written in
+        some shape it does not recognise. What it cannot do is let the
+        README's breaker list, or the specification's finding fields, go
+        unregistered again.
+
+        Mutations, each a live state of this code: delete the
+        `breakers (readme)` entry, or move any registered vocabulary into
+        UNDOCUMENTED, and this fails naming the pair.
+        """
+        registered = {(entry[0], entry[1])
+                      for entry in self.RESTATEMENTS.values()}
+        documents = {name: self._document(name)
+                     for name in ("design", "readme")}
+        # The derived set and the searched set are the same set — asserted
+        # by `test_every_shipped_document_is_searched_or_excluded_by_rule`,
+        # so this walk cannot silently cover less than what ships.
+        missing = []
+        for name in sorted(self._closed_vocabularies()):
+            members = getattr(vocab, name)
+            for doc_name, text in documents.items():
+                if not self._enumerates(text, members):
+                    continue
+                if (members, doc_name) not in registered:
+                    missing.append(f"{name} in {doc_name}")
+        self.assertEqual(
+            missing, [],
+            "shipped document(s) enumerate a closed vocabulary that the "
+            "restatement inventory does not bind to that document: an "
+            "inventory that cannot discover what it omits is complete only "
+            "against its own omissions")
+
+    def test_every_registered_document_is_retrievable(self):
+        """Each entry names a document and a location, and both must
+        resolve — a locator that matches nothing is a restatement nobody
+        checks, which is indistinguishable from having no entry at all."""
+        for name, entry in self.RESTATEMENTS.items():
+            _authority, document, pattern, _reader = entry
+            with self.subTest(restatement=name):
+                text = self._document(document)
+                self.assertIsNotNone(
+                    re.search(pattern, text, re.S),
+                    f"{name}: the locator matches nothing in {document}")
+
+    def test_the_stated_count_matches_the_mechanisms_it_counts(self):
+        """§3.3's count, derived from the headings it counts. Kept from
+        round 1: a count is a restatement whose authority is the document's
+        own structure rather than a vocabulary."""
+        section = self._section()
+        stated = re.search(r"^(\w+) mechanisms, all deterministic", section,
+                           re.M)
+        self.assertIsNotNone(stated, "§3.3 no longer opens with a count")
+        words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                 "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+        word = stated.group(1).lower()
+        self.assertIn(word, words, f"unrecognised count word {word!r}")
+        headings = re.findall(r"^\*\*\(([a-z])\) ", section, re.M)
+        self.assertEqual(words[word], len(headings),
+                         f"§3.3 says {word} and enumerates {len(headings)}")
+
+    def test_the_mechanism_letters_are_gapless(self):
+        headings = re.findall(r"^\*\*\(([a-z])\) ", self._section(), re.M)
+        self.assertTrue(headings)
+        self.assertEqual(headings,
+                         [chr(ord("a") + i) for i in range(len(headings))])
+
+    def _section(self):
+        text = self._document("design")
+        start = text.index("### 3.3 ")
+        return text[start:text.index("### 3.4 ", start)]
+
+    #: The wrapper attributes are a restatement too, but their authority is
+    #: the emitters rather than a vocabulary tuple — read from the emitters,
+    #: never from a fixture, because a fixture is one more hand-kept copy.
+    OPEN_TAG = re.compile(r"-review-(?:request|disposition)(.*?)>['\"]", re.S)
+
+    def _emitted_attributes(self):
+        found = set()
+        for module in (REPO_ROOT / "review" / "emit.py",
+                       REPO_ROOT / "review" / "wire.py"):
+            source = module.read_text(encoding="utf-8")
+            for tag in self.OPEN_TAG.findall(source):
+                found |= set(re.findall(r'(\w+)="\{', tag))
+        self.assertTrue(found, "no wrapper open tag found in the emitters")
+        from review import wire
+        live = wire.parse_disposition(wire.emit_disposition(
+            tag=TOOL_NAME, verdict_sha="a" * 40, head="b" * 40,
+            author="claude", round_no=1, dispositions=[])).attrs
+        self.assertTrue(set(live) <= found,
+                        f"a live emission carries {sorted(set(live) - found)}, "
+                        f"which the source scan missed")
+        return found
+
+    def test_the_specification_enumerates_every_emitted_attribute(self):
+        text = self._document("design")
+        found = re.search(r"The wrapper's own attribute text is closed the "
+                          r"same way[^\n]*\n(.*?)occurring once each",
+                          text, re.S)
+        self.assertIsNotNone(found, "§3.1 no longer enumerates the wrapper "
+                                    "attributes in the shape this checks")
+        listed = set(re.findall(r"`([a-z_]+)`", found.group(1)))
+        self.assertEqual(self._emitted_attributes() - listed, set())
+        self.assertEqual(listed - self._emitted_attributes(), set())
 
 
 class TestInstall(unittest.TestCase):

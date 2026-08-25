@@ -37,7 +37,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from . import TOOL_NAME, paths, refs, validate, vocab, wire
+from . import (TOOL_NAME, paths, refs, tool_identity, validate,
+               vocab, wire)
 from .config import Config
 from .digest import sha256_file, sha256_text
 from .fingerprint import alias_event
@@ -790,6 +791,11 @@ def disposition_events(parsed: wire.Disposition,
     new yields a different one and the documented exemption applies.
     """
     round_no = int(parsed.data.get("round", 0))
+    # Round-1 F3: which installation WROTE this answer, from the envelope's
+    # own stamp — not from `tool_identity()`, which would record whoever
+    # happened to ingest it. Absent for an envelope written before the
+    # stamp existed, and absent is left absent rather than defaulted.
+    wrote = (parsed.attrs or {}).get("tool")
     derived = _derived_identities(parsed, against)
     # Round 2 F1: one recorded answer is up to THREE events, and the answer
     # supersedes as a unit — so every event of one emission carries the same
@@ -810,7 +816,8 @@ def disposition_events(parsed: wire.Disposition,
         "payload": rec.get("payload", {}),
         "verdict_sha": parsed.attrs.get("verdict_sha"),
         "head": parsed.attrs.get("head"),
-        "batch": batch}
+        "batch": batch,
+        **({"tool": wrote} if wrote else {})}
         for rec in parsed.data.get("dispositions", [])]
     for rec in parsed.data.get("dispositions", []):
         text = str(rec.get("payload", {}).get("evidence", "")).strip()
@@ -932,6 +939,49 @@ def authorize_breaker(cfg: Config, ledger: Ledger, breaker: str,
             "authorized_by": authorized_by.strip()}
 
 
+def tool_agreement(parsed) -> dict:
+    """Whether the envelope in hand was written by THIS installation.
+
+    Three states, and the middle one is why this exists:
+
+      `match`      the writer stamped an identity equal to mine.
+      `differs`    it stamped a different one. The envelope is still sound —
+                   the 2026-08-23 incident proved a stale reader validates a
+                   good envelope perfectly well — but every line this end
+                   RENDERS from it comes from different code, and that is
+                   what reached the human wrong, twice.
+      `unstamped`  no identity at all: an envelope from an installation
+                   older than this mechanism. Reported as its own state
+                   rather than folded into `match`, because historical
+                   silence is not agreement (§5.2's rule for reading an
+                   undeclared field).
+
+    It reports; it does not refuse. A digest carries no ordering, so
+    `differs` cannot distinguish a reader that is behind from one that is
+    ahead — and refusing a sound envelope because the reviewer's tool is
+    NEWER would block the better of the two. The tool refuses where it can
+    be certain something is broken and reports where it can only be certain
+    something is different; which of those a skew is, is the human's call,
+    and this is what puts it in front of them.
+    """
+    mine = tool_identity()
+    theirs = (parsed.attrs or {}).get("tool")
+    if not theirs:
+        return {"agreement": "unstamped", "reader": mine, "writer": None,
+                "note": "the envelope was written by an installation that "
+                        "predates tool identity; nothing can be compared, "
+                        "which is not the same as agreement"}
+    if theirs == mine:
+        return {"agreement": "match", "reader": mine, "writer": theirs}
+    return {"agreement": "differs", "reader": mine, "writer": theirs,
+            "note": "the envelope was written by a DIFFERENT installation "
+                    "of this tool. What it says is sound; what this end "
+                    "renders from it — the relay, the commands you are "
+                    "about to hand back — comes from different code. "
+                    "Reconcile the two installations, or proceed knowing "
+                    "which one produced what"}
+
+
 def unauthorized_breakers(cfg: Config, ledger: Ledger) -> list[dict]:
     """The fired breakers no recorded decision covers (§5.3d, sweep F8):
     a firing is covered only when an override lists its identity."""
@@ -1020,7 +1070,27 @@ def handoff_preflight(cfg: Config, ledger: Ledger) -> None:
             f"round-{owed['round']} verdict with `{answer_cmd}`, then hand "
             f"off",
             "")
-    fired = unauthorized_breakers(cfg, ledger)
+    # The ROUND COUNT is a threshold, not an observed anomaly (user decision
+    # 2026-08-25). Round-4 F2: the first cut of this exempted every `budget`
+    # firing without looking at `limit`, which silently removed the
+    # TOKEN-budget stop as well — a stop nobody asked to remove. The two are
+    # different kinds of fact. A round count is a proxy: it says how long the
+    # loop ran and nothing about whether it closed anything. A token breach
+    # is MEASURED, against a ceiling the repository declared, and a lower
+    # bound over that ceiling is a true positive. So only `limit == "rounds"`
+    # advises; a token breach still refuses and still needs a recorded
+    # decision. Every other breaker names something the record shows went
+    # wrong — a finding that returned after a refutation, a run that cannot
+    # execute, a companion that answers no emission — and stopping on those
+    # is the point. `budget` names only how much the loop has spent, which
+    # is a proxy: it fires on lineages doing exactly what they should and
+    # says nothing about whether they are converging. It is still evaluated,
+    # still reported, and still needs no authorization to be seen; it just
+    # no longer refuses. `ledger convergence` answers the question the
+    # threshold was standing in for.
+    fired = [f for f in unauthorized_breakers(cfg, ledger)
+             if not (f.get("breaker") == "budget"
+                     and f.get("limit") == "rounds")]
     if fired:
         named = "; ".join(
             f"{f['breaker']} (round {f.get('round', '?')}"
@@ -1570,10 +1640,18 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
     # end will render its verdict leg for.
     declared = declared_transport(parsed)
     effective = transport if transport is not None else declared
+    # Which installation ruled, in the record. The 2026-08-23 skew was
+    # reconstructed afterwards by noticing that the take event lacked a
+    # field the request had — inference from an absence. It is stated now.
+    agreement = tool_agreement(parsed)
     take_event = {"event": "take", "round": round_no, "sha": sha,
                   "reviewer": me, "source_digest": digest,
                   "transport": effective,
+                  "tool": agreement["reader"],
+                  "tool_agreement": agreement["agreement"],
                   "fetch": target.get("fetch"), "references": ref_summary}
+    if agreement["writer"]:
+        take_event["tool_writer"] = agreement["writer"]
     if effective != declared:
         take_event["declared_transport"] = declared
     ledger.add(take_event)
@@ -1584,7 +1662,7 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
     return _runnable({"round": round_no, "sha": sha, "reviewer": me,
             "target": target, "references": refs, "kept": kept,
             "digest": digest, "diff": diff_cmd, "envelope": envelope,
-            "transport": effective,
+            "transport": effective, "tool": agreement,
             "then": f"write the verdict as <{parsed.tag}-review-verdict "
                     f'sha="{sha}"> and run '
                     f"`{paths.command(*paths.lits(TOOL_NAME, 'validate'), paths.Ph('<verdict.md>'))}`; "

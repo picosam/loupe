@@ -15,7 +15,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from . import paths, vocab
+from . import paths, tool_identity, vocab
 from .fingerprint import compute as fp_compute
 from .fingerprint import legacy_v1 as fp_legacy_v1
 
@@ -680,7 +680,7 @@ def emit_disposition(tag: str, verdict_sha: str, head: str, author: str,
     body = json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True)
     open_tag = (
         f'<{tag}-review-disposition verdict_sha="{verdict_sha}" head="{head}" '
-        f'author="{author}" round="{round_no}">'
+        f'author="{author}" round="{round_no}" tool="{tool_identity()}">'
     )
     return f"{open_tag}\n{body}\n</{tag}-review-disposition>\n"
 

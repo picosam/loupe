@@ -153,20 +153,37 @@ class TestRequestValidation(unittest.TestCase):
         items = validate.validate_request(wire.parse_request(text), CFG)
         self.assertIn("R-REVIEWER-REJECTED", errs(items))
 
-    def test_round_past_cap_rejected(self):
-        # Cap-relative, so raising the cap (a real decision, taken twice now)
-        # does not silently disarm the test that guards it. The shadow ledger
-        # holds one verdict, so the emitted request is round 2.
+    def test_round_past_cap_is_advisory_and_still_emits(self):
+        """User decision 2026-08-25: the cap warns, it does not refuse.
+
+        A round count is a threshold, not an observed anomaly — it says how
+        long the loop has run and nothing about whether it is closing
+        anything, so it fired on lineages doing exactly what they should.
+        The notice still names the round and the cap, and points at the
+        verb that answers the question the count was standing in for.
+
+        Mutation: make R-BUDGET an error again and the first assertion
+        fails; drop it entirely and the second does.
+        """
         text = synth.emitted_request()
         self.assertIn('round="2"', text)
         over = text.replace('round="2"', f'round="{CFG.round_cap + 1}"')
-        self.assertIn("R-BUDGET",
-                      errs(validate.validate_request(wire.parse_request(over),
-                                                     CFG)))
+        items = validate.validate_request(wire.parse_request(over), CFG)
+        self.assertNotIn("R-BUDGET", errs(items),
+                         "the cap refuses again: it is advisory")
+        past = [i for i in items if i.code == "R-BUDGET"]
+        self.assertEqual(len(past), 1, "no notice at all is not advisory "
+                                       "either — silence past the cap says "
+                                       "nothing to the human")
+        self.assertNotEqual(past[0].level, "error")
+        self.assertIn("convergence", past[0].message,
+                      "the notice does not name what answers the question "
+                      "the count only proxies for")
         at_cap = text.replace('round="2"', f'round="{CFG.round_cap}"')
-        self.assertNotIn("R-BUDGET",
-                         errs(validate.validate_request(
-                             wire.parse_request(at_cap), CFG)))
+        self.assertEqual(
+            [i for i in validate.validate_request(
+                wire.parse_request(at_cap), CFG) if i.code == "R-BUDGET"],
+            [], "a round AT the cap is not past it")
 
     def test_unrecognized_required_reference_cannot_validate_or_disappear_at_take(
             self):

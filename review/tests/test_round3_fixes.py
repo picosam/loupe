@@ -226,17 +226,27 @@ class TestRoundCapOverride(unittest.TestCase):
             len([e for e in led.events() if e["event"] == "cap_override"]), 2,
             "every authorization stays on the record")
 
-    def test_request_over_the_effective_cap_is_rejected(self):
+    def test_the_effective_cap_is_what_the_advisory_reads(self):
+        """The override still decides WHICH number the notice is measured
+        against — that half is unchanged. What changed (2026-08-25) is that
+        being past it advises rather than refuses."""
         from review.tests import synth
         text = synth.emitted_request()  # round 2 over a one-round ledger
         over = text.replace('round="2"', 'round="6"')
-        codes = {i.code for i in validate.validate_request(
-            wire.parse_request(over), CFG, round_cap=5) if i.level == "error"}
-        self.assertIn("R-BUDGET", codes)
+        items = validate.validate_request(wire.parse_request(over), CFG,
+                                          round_cap=5)
+        self.assertNotIn("R-BUDGET", {i.code for i in items
+                                      if i.level == "error"})
+        notice = [i for i in items if i.code == "R-BUDGET"]
+        self.assertEqual(len(notice), 1)
+        self.assertIn("5", notice[0].message, "the notice names the "
+                                              "EFFECTIVE cap, not the repo "
+                                              "default")
         at_cap = text.replace('round="2"', 'round="5"')
-        codes = {i.code for i in validate.validate_request(
-            wire.parse_request(at_cap), CFG, round_cap=5) if i.level == "error"}
-        self.assertNotIn("R-BUDGET", codes)
+        self.assertEqual(
+            [i for i in validate.validate_request(
+                wire.parse_request(at_cap), CFG, round_cap=5)
+             if i.code == "R-BUDGET"], [])
 
 
 class TestF16EnvelopeIdentity(unittest.TestCase):

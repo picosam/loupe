@@ -618,6 +618,156 @@ class Ledger:
             fire["firing"] = firing_id(fire)
         return fired
 
+    # ----------------------------------------------------------- convergence
+
+    #: A fingerprint the reviewer has refused to withdraw this many times is
+    #: a thread the loop is not closing.
+    SUSTAINED_THREAD = 2
+    #: An anchor that produces NEW fingerprints in this many rounds is a
+    #: domain being hunted rather than a defect being fixed.
+    HUNTED_ANCHOR = 2
+
+    def convergence(self) -> dict:
+        """Is this lineage closing its findings, or hunting the same
+        domains? A REPORT, not a verdict — read what it counts, not the
+        word it ends with.
+
+        Added 2026-08-25, when the round cap stopped refusing. A count of
+        rounds is a threshold: it fires on a lineage doing exactly what it
+        should and stays silent on one that is genuinely stuck, because it
+        measures duration and the question is direction. This measures
+        direction, from what the record already holds.
+
+        Two signals, and the second is the one a round count cannot see.
+
+        `threads` — per finding identity, the reviewer's closure each round.
+        A fingerprint SUSTAINED repeatedly is a claim the author keeps
+        answering and the reviewer keeps rejecting; that is the loop failing
+        to close one thing.
+
+        `hunted` — an anchor whose findings are NEW fingerprints round after
+        round. Every one of them may be real and every fix may land, and the
+        domain still never closes, because what is being asked for is
+        completeness over a set nobody can enumerate from inside. That is
+        not a stuck author or a stubborn reviewer; it is a boundary demand
+        with no stopping condition, and it looks like healthy progress from
+        inside any single round — every finding true, every fix accepted,
+        the same anchor back next time.
+
+        Neither signal proves anything. A sustained thread can be a
+        reviewer who is simply right, and a hunted anchor can be a genuinely
+        rich domain being worked through in order. What the report gives a
+        human is the shape of the loop over its whole length, which no
+        single round shows.
+        """
+        rounds = sorted(self.rounds())
+        findings = [e for e in self.current() if e.get("event") == "finding"]
+        closures = [e for e in self.current() if e.get("event") == "closure"]
+
+        first_seen, per_round, anchors = {}, {}, {}
+        for f in findings:
+            ident = self.resolve(f.get("fp", ""))
+            r = f.get("round", 0)
+            first_seen.setdefault(ident, r)
+            per_round.setdefault(r, []).append(ident)
+            if f.get("anchor_path"):
+                anchors.setdefault(f["anchor_path"], {}).setdefault(r, set()
+                                                                    ).add(ident)
+
+        threads = {}
+        for ident, opened in sorted(first_seen.items()):
+            outcomes = [(c.get("round", 0), c.get("closure"))
+                        for c in closures
+                        if self.resolve(c.get("fp", "")) == ident]
+            outcomes.sort()
+            threads[ident] = {
+                "opened_round": opened,
+                "closures": [o for _, o in outcomes],
+                "sustained": sum(1 for _, o in outcomes if o == "sustained"),
+                "withdrawn": any(o == "withdrawn" for _, o in outcomes),
+                "anchor": next((f.get("anchor_path") for f in findings
+                                if self.resolve(f.get("fp", "")) == ident), None),
+            }
+
+        stuck = sorted(i for i, t in threads.items()
+                       if t["sustained"] >= self.SUSTAINED_THREAD
+                       and not t["withdrawn"])
+        # Round-4 F6: FRESH means first seen in that round. The first cut
+        # rendered every identity present in a round, so a finding returning
+        # under the same fingerprint was displayed as new — the report
+        # overstating exactly the evidence it exists to weigh.
+        hunted = {}
+        for anchor, by_round in anchors.items():
+            fresh = {r: sorted(i for i in ids if first_seen[i] == r)
+                     for r, ids in sorted(by_round.items())}
+            fresh = {r: ids for r, ids in fresh.items() if ids}
+            distinct = set().union(*fresh.values()) if fresh else set()
+            if len(fresh) >= self.HUNTED_ANCHOR and len(distinct) > 1:
+                hunted[anchor] = fresh
+
+        # Named states, so the report says which shape it is in rather than
+        # leaving a reader to derive it — and never more than the counts
+        # support.
+        # Round-4 F3: `closing` used to mean only "not rising", so a loop
+        # taking one fresh finding every round for ever reported as closing
+        # — a reassuring word for the shape this report exists to expose,
+        # handed to a human as the answer to whether the loop converges.
+        # Closing now requires what the word claims: inflow actually falling
+        # AND the reviewer actually withdrawing things. A flat loop is
+        # `steady`, which is neither an alarm nor a reassurance.
+        counts = [len(per_round.get(r, [])) for r in rounds]
+        withdrew = any(t["withdrawn"] for t in threads.values())
+        falling = len(counts) > 1 and counts[-1] < counts[0] and all(
+            b <= a for a, b in zip(counts, counts[1:]))
+        if len(rounds) < 2:
+            state = "open"
+        elif stuck:
+            state = "stalled"
+        elif hunted:
+            state = "hunting"
+        elif falling and withdrew:
+            state = "closing"
+        else:
+            state = "steady"
+
+        return {
+            "state": state,
+            "rounds": rounds,
+            "findings_per_round": {r: len(per_round.get(r, []))
+                                   for r in rounds},
+            "new_per_round": {r: sum(1 for i in per_round.get(r, [])
+                                     if first_seen[i] == r) for r in rounds},
+            "threads": threads,
+            "stalled_threads": stuck,
+            "hunted_anchors": hunted,
+            "withdrawn_any": withdrew,
+            "reading": self._convergence_reading(state, stuck, hunted),
+        }
+
+    @staticmethod
+    def _convergence_reading(state, stuck, hunted) -> str:
+        if state == "stalled":
+            return (f"{len(stuck)} finding(s) the reviewer has refused to "
+                    f"withdraw twice or more: the loop is not closing them, "
+                    f"and another round of the same answer will not either")
+        if state == "hunting":
+            return (f"{len(hunted)} anchor(s) produced NEW findings in "
+                    f"several rounds. Every one may be real and every fix "
+                    f"may have landed — that is what makes this shape hard "
+                    f"to see from inside a round. Ask whether the domain "
+                    f"can be closed at all from inside the artifact, or "
+                    f"whether the claim should be narrowed to what a stated "
+                    f"authority covers")
+        if state == "closing":
+            return ("findings per round are falling and the reviewer is "
+                    "withdrawing them: the loop is closing what it opens")
+        if state == "steady":
+            return ("findings keep arriving and inflow is not falling. That "
+                    "is not an alarm and not a reassurance — it says the "
+                    "loop is neither stuck on one claim nor hunting one "
+                    "domain, and is still opening as much as it closes")
+        return "too little recorded to say anything about direction"
+
     # ---------------------------------------------------------------- tokens
 
     def token_state(self, token_budget: int | None) -> dict:
@@ -913,6 +1063,10 @@ class Ledger:
             "round_cap": round_cap,
             "gate_manifest": list(gate_manifest) if gate_manifest else [],
             "tokens": self.token_state(token_budget),
+            # The direction of the loop, beside its spend. A budget says how
+            # much has been used; this says whether it is being used to
+            # close anything (2026-08-25).
+            "convergence": self.convergence(),
             "metrics": self.metrics(gate_manifest),
             # The skipped half of the record. Reported even when empty, and
             # as a list rather than a count, because "which commits and why"
@@ -930,6 +1084,34 @@ class Ledger:
         }
 
 
+def render_convergence_md(c: dict) -> str:
+    """Markdown rendering of convergence(); every number comes from the
+    dict, and the reading beneath them says only what they support."""
+    lines = [f"## Convergence — **{c['state']}**", "", c["reading"], ""]
+    lines.append("| round | findings | new identities |")
+    lines.append("|---|---|---|")
+    for r in c["rounds"]:
+        lines.append(f"| {r} | {c['findings_per_round'].get(r, 0)} | "
+                     f"{c['new_per_round'].get(r, 0)} |")
+    lines.append("")
+    if c["stalled_threads"]:
+        lines.append("**Threads the reviewer will not withdraw**")
+        for ident in c["stalled_threads"]:
+            t = c["threads"][ident]
+            lines.append(f"- `{ident}` opened round {t['opened_round']}, "
+                         f"sustained {t['sustained']}× "
+                         f"({t['anchor'] or 'no anchor'})")
+        lines.append("")
+    if c["hunted_anchors"]:
+        lines.append("**Anchors producing NEW findings round after round**")
+        for anchor_path, by_round in c["hunted_anchors"].items():
+            rounds = ", ".join(f"round {r}: {len(ids)}"
+                               for r, ids in by_round.items())
+            lines.append(f"- `{anchor_path}` — {rounds}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def render_report_md(report: dict) -> str:
     """Markdown rendering of report(); every number comes from the dict."""
     lines = ["## Ledger report — breakers and metrics (§5.3–5.4)", ""]
@@ -944,6 +1126,8 @@ def render_report_md(report: dict) -> str:
                      f"[`{b.get('firing') or firing_id(b)}`]: "
                      f"{b['rule']} → {b['decision_required']}")
     lines.append("")
+    if report.get("convergence"):
+        lines.append(render_convergence_md(report["convergence"]))
     waived = report.get("waived") or {"count": 0, "commits": []}
     lines.append(f"Waived (deliberately unreviewed): **{waived['count']}**")
     for w in waived["commits"]:

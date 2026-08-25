@@ -1857,21 +1857,33 @@ class TestLedgerAddRequest(unittest.TestCase):
             len(good.encode("utf-8")))
         self.assertEqual(payload["events_added"], len(expected))
         kinds = [e["event"] for e in ledger.events()]
-        self.assertEqual(kinds, [e["event"] for e in expected])
+        # Lineage-7 round 2 F2: this door is a cross-installation READER of a
+        # stamped envelope, so it also records WHO read it and whether the
+        # two installations agree. That row belongs to the read, not to the
+        # envelope, which is why it is not in `request_events`.
+        self.assertEqual(kinds, [e["event"] for e in expected] + ["ingest"])
+        ingest = ledger.events()[-1]
+        self.assertEqual(ingest["kind"], "request")
+        self.assertIn(ingest["tool_agreement"], ("match", "differs",
+                                                 "unstamped"))
         # And parity is idempotence: filing the same envelope through the
         # normal path afterwards is a no-op, never a duplicate.
         self.assertEqual(ledger.add_all(expected), 0)
 
-    def test_the_cap_in_force_is_the_one_checked(self):
-        # A round past this lineage's effective cap is invalid at this door
-        # too, exactly as `handoff` and `validate` refuse it.
+    def test_the_cap_in_force_is_advisory_at_this_door_too(self):
+        """The cap reads the same at every door — and since 2026-08-25 it
+        advises at every one of them rather than refusing. This door still
+        RECORDS the request, because a round past the cap is a round that
+        happened; what it no longer does is pretend the count is a defect."""
         import re
         text = re.sub(r'round="\d+"', 'round="9"',
                       self.synth.emitted_request(), count=1)
         code, payload = self._add(text)
-        self.assertNotEqual(code, 0)
-        self.assertIn("R-BUDGET", {i["code"] for i in payload["items"]})
-        self.assertEqual(Ledger(self.tmp).events(), [])
+        self.assertEqual(code, 0, payload)
+        recorded = [e["event"] for e in Ledger(self.tmp).events()]
+        self.assertIn("request", recorded,
+                      "the round past the cap was not recorded: the cap is "
+                      "advisory, so the record must still hold what happened")
 
 
 class TestResponseLifecycle(unittest.TestCase):

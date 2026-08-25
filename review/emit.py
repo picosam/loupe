@@ -23,7 +23,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
-from . import TOOL_NAME, TOOL_VERSION, env_var, paths, refs, vocab, wire
+from . import (TOOL_NAME, TOOL_VERSION, env_var, paths, refs,
+               tool_identity, vocab, wire)
 from .config import Config
 from .digest import sha256_text
 from .ledger import Ledger, render_report_md
@@ -1064,9 +1065,13 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
     contract = "\n".join(claim.get("contract", []))
 
     parts = [
+        # `tool` is what the emitting installation IS, not what it calls
+        # itself: the reader compares it with its own and says so, because
+        # two installations that disagree produce two different relays from
+        # one sound envelope (lineage 7 round 1).
         f'<{cfg.wrapper_tag}-review-request sha="{head}" branch="{branch}" '
         f'author="{author}" reviewer="{reviewer}" round="{round_no}" '
-        f'transport="{transport}">',
+        f'transport="{transport}" tool="{tool_identity()}">',
         f"Roles: author={author} · reviewer={reviewer} · relay={relay} · "
         f"transport={transport}. "
         f"Per-invocation stamp, overriding the default direction for this "

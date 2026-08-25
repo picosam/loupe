@@ -81,13 +81,19 @@ declared under the earlier one would vanish between the raw envelope and
 both the validator and the reviewer's probe. A heading that merely starts
 like a section name (`## References`) is not that section and fails as
 absent.
-The wrapper's own attribute text is closed the same way: every attribute
-(`sha`, `branch`, `author`, `reviewer`, `round`, and the disposition's
-`verdict_sha`/`head`) occurs once — the first declaration is the value, a
-repeat is a validation error, and text between the tag name and `>` that is
-not a `key="value"` pair is refused — so a defective wrapper cannot choose
-the SHA that validation, the fetch and the ledger bind. All of this is
-judged before any git call.
+The wrapper's own attribute text is closed the same way — the attributes
+(`sha`, `branch`, `author`, `reviewer`, `round`, `transport`, `tool`, and
+the disposition's `verdict_sha`/`head`) — occurring once each: the first
+declaration is the value, a repeat is a validation error, and text between
+the tag name and `>` that is not a `key="value"` pair is refused — so a
+defective wrapper cannot choose the SHA that validation, the fetch and the
+ledger bind. All of this is judged before any git call. "Closed" here means
+each attribute occurs once and nothing but attributes appear; it does not
+mean an unlisted NAME is refused, and that is deliberate — an older
+installation must be able to read an envelope carrying an attribute it has
+never heard of, or every addition would be a flag day.
+
+`tool` is the emitting installation's content identity (§3.3e).
 The two JSON bodies — the disposition's, and the machine attestation block
 inside Evidence — are read through one boundary that refuses a repeated
 object member at any depth and names it; `json.loads` alone keeps the last
@@ -215,8 +221,8 @@ finding**, from a closed vocabulary of five, each with a mandatory payload.
 | `escalated` | genuine disagreement the evidence does not settle | the question, both positions, and either the evidence that would settle it or a named decision authority plus criterion | yes — ends the round |
 
 `accepted` carries one structured subtype, `accepted(test_amended)`, for a
-falsification test that is itself unsatisfiable (payload: original test,
-amended test, why). The reviewer's next closure ratifies or contests it;
+falsification test that is itself unsatisfiable (payload: `original_test`,
+`amended_test`, `why_unsatisfiable`). The reviewer's next closure ratifies or contests it;
 silence is neither.
 
 **The symmetry rule.** A finding dies in exactly two ways: the author accepts
@@ -243,7 +249,7 @@ author closes findings unilaterally after N rounds (expiry is not resolution).
 
 ### 3.3 How the loop detects that it is running in circles
 
-Four mechanisms, all deterministic, all computed by the tool.
+Five mechanisms, all deterministic, all computed by the tool.
 
 **(a) Mandatory falsification for blocking findings.** A blocking finding
 that names no falsification is **downgraded to advisory by the validator**,
@@ -308,13 +314,51 @@ is refused before anything is appended: a required flag proves a token was
 supplied, not that a decision was taken. A breaker that only appears inside
 an exit-0 request does not break the circuit; this one does.
 
+**The round count advises; everything else refuses, token budgets
+included.** `budget` covers two limits and they are not the same kind of
+fact, so they do not get the same treatment.
+
+`limit = rounds` is a PROXY. It says only how long the loop has run: it
+fires on lineages doing exactly what they should, and stays silent on ones
+that are genuinely stuck, because it measures duration and the question is
+direction. It is still evaluated and still reported, and it no longer
+refuses; `ledger convergence` answers the question it was standing in for,
+and a handoff past the cap carries that answer with it rather than a
+number.
+
+`limit = tokens` is MEASURED, against a ceiling the repository declared,
+and a partial count over that ceiling is a lower bound whose breach is
+real. It refuses exactly as it always did, and continuing past it still
+needs a reason-bearing recorded authorization. Every other breaker points
+at something the record shows went wrong — a finding that returned after a
+refutation, a run that cannot execute, a companion that answers no
+emission — and stopping the loop on those is the point.
+
+**Convergence (§3.3f).** Two signals, read from the ledger. `stalled` — a
+finding identity the reviewer has refused to withdraw across rounds: the
+loop failing to close one claim. `hunting` — an anchor whose findings are
+NEW identities round after round; every one may be real and every fix may
+have landed, and the domain still never closes, because what is being
+asked for is completeness over a set nobody can enumerate from inside.
+That second shape is invisible from inside any single round — each finding
+true, each fix accepted, the same anchor back next time — and invisible to
+a finding count, which can fall while it happens. Neither signal is a
+proof: a sustained thread can be a reviewer who is simply right, and a
+hunted anchor can be a rich domain worked through in order. What the
+report gives a human is the shape of the loop over its whole length.
+`closing` means what the word says — inflow falling AND findings
+being withdrawn; a loop opening one finding every round and closing
+none is `steady`, which is neither an alarm nor a reassurance.
+Calling that `closing` was the first version's error, and it
+mattered because this report replaces a hard stop.
+
 | Breaker | Fires when |
 |---|---|
 | **repetition** | a fingerprint returns after `refuted` and the round cites no new *content-addressed* evidence (a new pointer to the same bytes is not novelty) |
 | **stale** | a fingerprint returns after `accepted` and a passing falsification test |
 | **no-progress** | a completed round adds zero new fingerprints, zero disposition changes, zero new material evidence and no changed falsification outcome |
 | **unverifiable** | a blocking finding's falsification test cannot be executed — *blocking* judged per finding (the run event carries its finding's effective blocking state), so a Medium finding's unexecutable test is reported in the record but fires nothing |
-| **budget** | round count > cap (default 3), or cumulative counted tokens > declared budget — a partial count is a lower bound; a breach by the bound is real, silence means nothing |
+| **budget** | `rounds`: round count > cap (default 3) — **advisory**, reported and does not refuse. `tokens`: cumulative counted tokens > declared budget — a partial count is a lower bound; a breach by the bound is real, silence means nothing, and it **refuses** pending a recorded authorization |
 | **orphan** | a disposition companion event (a falsification run, refutation evidence) binds no recorded emission — its batch stamp matches no row, or no row exists for its key. An orphan is kept on the audit surface, is never a standing answer, feeds no other breaker and certifies no acceptance; it fires until a human decides what it is |
 
 Progress breakers read *completed* rounds only: a round with a request and
@@ -322,6 +366,82 @@ no verdict yet is in flight, not spinning. Rejected: "do not repeat
 yourself" as an instruction (unenforceable); embedding similarity
 (non-deterministic, needs a model to judge a model); author-side veto after
 N repeats; escalating severity on repetition (rewards persistence).
+
+**(e) Tool identity.** The two sides of a round run two *installations* of
+this tool, and they can differ while agreeing on `TOOL_VERSION`. Every
+envelope the tool emits carries `tool`, a 16-hex digest over the travelling
+artefacts that determine its behaviour, by **logical path** and content: the
+package modules, and the launcher of every advertised install path —
+`bin/loupe` for the two copy-based paths, and `pyproject.toml`, whose
+`[project.scripts]` entry is what the `uvx` path builds its console script
+from. An identity over modules alone would call two installations equal
+while one of them refused to start; an identity covering one launcher and
+not the other would do the same for one install shape out of three.
+
+*Logical* path because extraction maps `public/X` to `X`: one artefact is
+`public/pyproject.toml` in the workbench and `pyproject.toml` in the tree
+extracted from it, and the identity must call those the same file or the
+two would never agree. What the digest does **not** cover is a built
+wheel's generated console script — it is not readable from inside the
+installed package — so what is covered is the input that produces it. That
+is the limit, stated rather than claimed away.
+
+The set is enumerated per artefact, never by prefix: every travelling file
+is carried or excluded with a reason, and a gate asserts that enumeration
+equals what actually travels in both directions. A prefix rule would let
+the next behavioural file inherit an exclusion nobody decided, which is
+how the `uvx` launcher went uncovered for a round.
+
+Each stamp has a named reader, and a stamp without one is decoration. The
+readers are a closed set (`vocab.STAMPED_READERS`), each classed by whether
+the envelope can have crossed an installation boundary before reaching it.
+That set is not trusted on its own: `vocab.STAMPED_PARSE_SITES` attributes
+every place the production code parses a stamped envelope to the seams it
+serves, and a gate walks the source for those parses and fails on any it
+does not name. A reader authority checked only against another hand-written
+list cannot discover the reader nobody wrote down, which is how the warm
+cache stayed silent for a round.
+
+| stamped | written by | compared by, and why |
+|---|---|---|
+| request | `handoff` | `take`, `brief`, `validate`, `ledger add`, and the warm `handoff` cache — every verb that reads one. `brief` matters most: it renders the command a human carries, which is exactly what a stale installation gets wrong. The cache matters for the same reason and is easier to miss: re-running `handoff` on an unchanged tip returns a request RETAINED by an earlier run, so the reader and the writer are different processes and may be different installations |
+| disposition | `respond --out` | `validate` and `ledger add`. Not `respond --out` itself: it writes and records in one process, so a comparison there could only ever say `match`, and a check that cannot fail is worse than a stated absence |
+| verdict | *nobody* | — |
+
+The verdict is **not** stamped. It has no emitter: the reviewer agent
+hand-authors it from a shape block, so a stamp there would be a model
+transcribing a digest, which proves nothing about the code that ran. An
+unverifiable field is worse than an absent one.
+
+A reader reports one of three states: `match`, `differs`, or `unstamped` (an
+envelope written before this existed — historical silence, which is not
+agreement). Both readers render all three where a human can see them and
+record them in the ledger, so the record says which installation ruled
+instead of leaving it to be inferred from an absence.
+
+It reports; it does not refuse. The envelope is sound either way — a stale
+installation validates a good envelope perfectly well, which is exactly
+what made the drift invisible. What differs is everything the reading end
+*renders*: the relay, the commands handed back to the human. And a digest
+carries no ordering, so `differs` cannot tell a reader that is behind from
+one that is ahead; refusing would block the case where the reviewer's tool
+is the better of the two. The rule is: refuse where the tool can be certain
+something is broken, report where it can only be certain something is
+different.
+
+Why a digest and not the version: on 2026-08-23 a reviewer ruled a round
+with an installation grafted from three fixes earlier and relayed a command
+carrying a shell syntax error that the round under review existed to fix.
+Both installations honestly reported `0.4.0`. Bumping the version inside the
+reviewed round (§9) makes publications distinguishable; it structurally
+cannot make two builds of one version distinguishable, and that is the case
+that fired. The same argument the gate attestations have always made about
+the executables they run — a version string is what a tool says about
+itself, the digest is what it is — now applies to this tool.
+
+One stated limit: the wrapper grammar has no attribute allow-list, so an
+installation predating `tool` reads a stamped envelope without complaint and
+without comparing. Detection is one-directional until both ends carry it.
 
 ### 3.4 Cost as a design constraint
 
@@ -799,7 +919,8 @@ loop over a bare path remote): the three envelopes and their validators; the
 gate manifest with field-by-field attestation validation; roles and stamps,
 including per-invocation selection within the permitted lists (§4);
 fingerprints v2 with declared anchors and citations, alias lineage and
-fail-closed resolution; the ledger with lineage scoping; the five breakers;
+fail-closed resolution; the ledger with lineage scoping; the breakers
+(`repetition`, `stale`, `no-progress`, `unverifiable`, `budget`, `orphan`);
 the metrics with honest token states; reachability (push, observe, stamp,
 verify); `handoff` / `take` / `respond` / `close`; state retention with
 `prune` (§5.3); the former-name dialect acceptance and state migration;
