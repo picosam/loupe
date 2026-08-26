@@ -940,7 +940,13 @@ def authorize_breaker(cfg: Config, ledger: Ledger, breaker: str,
 
 
 def tool_agreement(parsed) -> dict:
-    """Whether the envelope in hand was written by THIS installation.
+    """Whether the envelope in hand was written under the same declared
+    behavioural set this end carries.
+
+    The comparison is between two identities of the DECLARED travelling
+    set (`tool_identity`), never between "the installations" — a claim the
+    digest cannot warrant, since anything outside the declared authority is
+    outside what it measures (lineage 8).
 
     Three states, and the middle one is why this exists:
 
@@ -974,12 +980,12 @@ def tool_agreement(parsed) -> dict:
     if theirs == mine:
         return {"agreement": "match", "reader": mine, "writer": theirs}
     return {"agreement": "differs", "reader": mine, "writer": theirs,
-            "note": "the envelope was written by a DIFFERENT installation "
-                    "of this tool. What it says is sound; what this end "
-                    "renders from it — the relay, the commands you are "
-                    "about to hand back — comes from different code. "
-                    "Reconcile the two installations, or proceed knowing "
-                    "which one produced what"}
+            "note": "the envelope was written under a DIFFERENT declared "
+                    "behavioural set of this tool. What it says is sound; "
+                    "what this end renders from it — the relay, the "
+                    "commands you are about to hand back — comes from "
+                    "different code. Reconcile the two installations, or "
+                    "proceed knowing which one produced what"}
 
 
 def unauthorized_breakers(cfg: Config, ledger: Ledger) -> list[dict]:

@@ -146,6 +146,25 @@ is one point of a domain, and the next unpartitioned point is the next
 round. The rule is carried in the generated adapters, so both sides read it
 from the same source.
 
+The rule has one terminator. Some domains terminate by exhaustion, because
+their completeness can be established from inside the artifact — a parser's
+admitted input kinds, a closed grammar's members. Others cannot: "every
+travelling artefact whose bytes affect behaviour" is a set that can be
+declared but never proven complete from within, so on such a domain the
+rule alone can always demand one more point, and a competent reviewer will
+always find one. Such a domain may be declared closed relative to a stated
+authority: a machine-generated, separately gated artifact that derives the
+set — never a hand-maintained list, because every hand list in the record
+reproduced the defect one level down. The author declares the authority in
+the claim, per anchor, and the reviewer rules on it in the same envelope:
+the authority's derivation and coverage are attackable, and an instance
+finding against a declared-closed domain must name the authority it
+escapes — that citation is what makes it a completeness finding rather
+than the next round of an unbounded hunt. Rejecting the authority is an
+ordinary finding, anchored on the authority itself. The declaration is not
+an exemption: it moves the attackable surface from an unbounded hunt onto
+a finite artifact, and a narrow authority is itself the defect.
+
 **Claim** — objective / decision boundary, what changed and why, what was
 *deliberately not* done, stop conditions, hand-back questions, self-assessed
 risk with a reason. Cheap, high-signal, and explicitly not evidence: the
@@ -370,7 +389,12 @@ N repeats; escalating severity on repetition (rewards persistence).
 **(e) Tool identity.** The two sides of a round run two *installations* of
 this tool, and they can differ while agreeing on `TOOL_VERSION`. Every
 envelope the tool emits carries `tool`, a 16-hex digest over the travelling
-artefacts that determine its behaviour, by **logical path** and content: the
+artefacts that determine its behaviour, by **logical path** and content —
+an identity of the *declared travelling behavioural set, per that declared
+authority*, never of "what the installation is": the guarantee is relative
+to the enumeration, and the enumeration, not the claim, is what a reviewer
+attacks (the boundary-closure terminator above, applied to the tool's own
+identity). The set: the
 package modules, and the launcher of every advertised install path —
 `bin/loupe` for the two copy-based paths, and `pyproject.toml`, whose
 `[project.scripts]` entry is what the `uvx` path builds its console script
@@ -851,7 +875,7 @@ timeout, so an unreachable remote fails rather than hangs.
 
 ## 6. Packaging
 
-**A CLI core**, Python 3.11+, standard library only, no network in its own
+**A CLI core**, Python 3.14.x, standard library only, no network in its own
 code, no model in any code path — the only shape every agent can shell out
 to, CI can run, and a human with no agent can use. Three install paths:
 `uvx --from git+<repo> loupe`, a vendored directory committed into a

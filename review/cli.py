@@ -1135,13 +1135,14 @@ def render_tool_agreement(agreement: dict) -> str:
     """
     state = agreement.get("agreement")
     if state == "match":
-        return f"tool:   match — both ends are {agreement['reader']}\n"
+        return (f"tool:   match — both ends carry the declared behavioural "
+                f"set {agreement['reader']}\n")
     if state == "unstamped":
-        return (f"tool:   UNSTAMPED — this end is {agreement['reader']}; the "
-                f"envelope names no installation\n"
+        return (f"tool:   UNSTAMPED — this end carries "
+                f"{agreement['reader']}; the envelope declares no set\n"
                 f"        {agreement['note']}\n")
-    return (f"tool:   DIFFERS — this end is {agreement['reader']}, the "
-            f"envelope was written by {agreement['writer']}\n"
+    return (f"tool:   DIFFERS — this end carries {agreement['reader']}, the "
+            f"envelope was written under {agreement['writer']}\n"
             f"        {agreement['note']}\n")
 
 

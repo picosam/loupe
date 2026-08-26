@@ -6,7 +6,7 @@ fingerprinted findings, an append-only ledger with circuit breakers. No model
 runs inside it; it decides everything derivable so the agents on either side
 run one command each and stop.
 
-Python 3.11+, standard library only, no network in the tool's own code (git
+Python 3.14.x, standard library only, no network in the tool's own code (git
 performs the one publish step). Design: [docs/design.md](docs/design.md).
 
 ## What it does, in one loop
@@ -104,7 +104,7 @@ working with nothing installed.
 
 ## Status
 
-Version 0.6.0 — the version is bumped inside the reviewed round of any
+Version 0.7.0 — the version is bumped inside the reviewed round of any
 change that will be published, so `--version` discriminates publishes.
 Implemented and tested: the envelopes and validators, the
 gate manifest and attestation checks, roles and stamps (including
@@ -117,8 +117,29 @@ adapters. Designed but not implemented: risk tiering, path-scoped contract
 invariants, auto-execution of falsification tests, a git-notes carrier, an
 MCP facade. See design §9.
 
-Changed in 0.6.0, if you are upgrading. Every envelope the tool emits now
-carries a `tool` attribute — the content identity of the installation that
+Changed in 0.7.0, if you are upgrading. The review contract both agents
+read gained a terminator for the boundary-closure rule: a domain whose
+completeness cannot be established from inside the artifact may be
+declared closed relative to a stated authority — a machine-generated,
+separately gated artifact that derives the set, declared by the author in
+the claim, per anchor. The reviewer then attacks the authority's
+derivation and coverage, and an instance finding against a declared-closed
+domain must name the authority it escapes; rejecting the authority is an
+ordinary finding anchored on it. The tool identity's claim narrows to
+match: `tool` identifies the declared travelling behavioural set per its
+authority, never "what the installation is", and the readers report in
+those terms. The three items 0.6.0 named as known and unfixed are closed
+under exactly that contract: the workbench half of the reader scan derives
+its module universe from the generated extraction inventory through an
+explicit module predicate; the AST scanner is one factored function that
+owns its call domain, probed by synthetic modules; and the generated
+`adapters/` documents render every vocabulary enumeration from
+`review/vocab.py` itself, which is what makes their exclusion from the
+shipped-restatement search true rather than asserted.
+
+Changed in 0.6.0. Every envelope the tool emits
+carries a `tool` attribute — the content identity of the declared
+behavioural set of the installation that
 wrote it — and `take`, `brief`, `validate` and `ledger add` report whether
 the reading installation matches, differs, or read an envelope written
 before the stamp existed. They report; they do not refuse. **The round cap
@@ -126,17 +147,6 @@ no longer refuses either**: it is advisory, and `loupe ledger convergence`
 reports whether a lineage is closing its findings or returning to the same
 domains. A token-budget breach is unchanged and still refuses, because it
 is measured against a declared ceiling rather than standing in for one.
-
-Known and unfixed at 0.6.0, from the review that produced it: the
-workbench-only half of the reader scan derives its module universe from a
-literal list rather than from the generated inventory; the AST scanner's
-import-alias handling is asserted by a parallel implementation in its test
-rather than by the scanner itself; and the generated `adapters/` documents
-are excluded from the shipped-restatement check although they do enumerate
-runtime vocabularies. None affects the envelopes, the ledger or the gates.
-All three are instances of one open design question — how a completeness
-domain is declared closed relative to a stated authority — and are the
-subject of the next review lineage rather than pending patches.
 
 The tool was developed and falsified against a private review corpus that
 stays with its author; the public suite runs on synthetic fixtures produced

@@ -47,7 +47,12 @@ TOOL_NAME = "loupe"
 # was already paid once at 0.3.0. What the exception costs is that this one
 # line is unreviewed; what it buys is that `--version` still tells two
 # publications apart. The user directed the publication knowing what stands.
-TOOL_VERSION = "0.6.0"
+#
+# 0.7.0 returns to the policy: bumped inside lineage 8's reviewed round,
+# which lands the boundary-authority terminator in the shipped contract,
+# narrows the identity claim to the declared behavioural set, and closes
+# the three findings 0.6.0's README named as standing.
+TOOL_VERSION = "0.7.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never
@@ -55,8 +60,13 @@ TOOL_VERSION = "0.6.0"
 # is silent).
 FORMER_NAMES = ("rvw",)
 
-# What this tool IS — every travelling artefact whose bytes can change what
-# it does, by LOGICAL path: the name the artefact has in an installed tree.
+# The declared travelling behavioural set — every travelling artefact whose
+# bytes can change what the tool does, by LOGICAL path: the name the
+# artefact has in an installed tree. This enumeration is the AUTHORITY the
+# tool's identity is computed against, and the identity claims exactly this
+# set — never "what this installation is", which is a claim no enumeration
+# can warrant (lineage 8, the boundary-authority decision: the attackable
+# surface is the finite, gated enumeration, not an unbounded claim).
 #
 # Lineage 7. A version string is what a tool chooses to say about itself; the
 # digest of the files that ran is what it is. `emit.py` has made that argument
@@ -170,36 +180,42 @@ IDENTITY_EXCLUDED = {
 }
 
 
-#: Workbench-only, and so absent from the inventory's travelling set:
-#: `corpus.py` derives this workbench's own review history, no CLI path
-#: imports it, and carrying it would make a workbench and a byte-identical
-#: installed tree compare as different tools forever.
-IDENTITY_NOT_SHIPPED = ("review/corpus.py",)
+def is_package_module(logical: str) -> bool:
+    """The explicit, finite module predicate: a logical path is a package
+    module iff it lies under `review/`, ends `.py`, and is not a test.
+
+    Lineage 8: every module universe is an AUTHORITY filtered through this
+    one predicate — the installed tree's universe filters the travelling
+    enumeration (`IDENTITY_ARTEFACTS`, below), and the workbench's filters
+    the extraction inventory's `stays` entries, in the boundary suite where
+    that inventory lives. The predicate decides what a path IS, never which
+    paths exist: existence always comes from the authority, so a module
+    cannot exist without being scanned, and neither universe rests on a
+    list someone typed.
+    """
+    return (logical.startswith("review/") and logical.endswith(".py")
+            and not logical.startswith("review/tests/"))
 
 
-#: The modules a production read path can live in: everything the identity
-#: carries under the package, plus the workbench-only ones it declares.
+#: The modules a production read path can live in — in an installed tree.
 #: Round-4 F1: the parse-site gate walked a tuple of fourteen names written
 #: in the test, so `review/corpus.py` — which parses a request — was outside
 #: it, and a NEW module could be added and never scanned. The universe is
 #: now derived from the same enumeration the boundary gate already proves
 #: equals what travels, so a module cannot exist without being scanned.
-def production_modules(include_workbench: bool = False) -> tuple:
-    """Every non-test module of this package, by logical path.
+def production_modules() -> tuple:
+    """Every non-test module of the installed tree, by logical path: the
+    travelling authority filtered through `is_package_module`.
 
-    Travelling modules by default — the complete universe in an installed
-    tree, and what the travelling gate can honestly scan. A workbench also
-    holds modules that stay behind (`IDENTITY_NOT_SHIPPED`); those are
-    scanned by the workbench-only boundary suite, where they exist, for the
-    same reason the extraction inventory's completeness is judged there.
+    A workbench also holds modules that stay behind; their authority is the
+    extraction inventory's `stays` entries, which stay in the workbench —
+    so the workbench universe is derived THERE, in the boundary suite,
+    through the same predicate. Until lineage 8 the workbench extra was a
+    literal tuple here (`IDENTITY_NOT_SHIPPED`), which is exactly the hand
+    list the reviewer broke twice, one level down each time.
     """
-    modules = list(IDENTITY_ARTEFACTS)
-    if include_workbench:
-        modules += list(IDENTITY_NOT_SHIPPED)
-    return tuple(sorted(
-        p for p in modules
-        if p.startswith("review/") and p.endswith(".py")
-        and not p.startswith("review/tests/")))
+    return tuple(sorted(p for p in IDENTITY_ARTEFACTS
+                        if is_package_module(p)))
 
 
 def installation_root() -> Path:
@@ -230,8 +246,15 @@ def identity_paths(root: Path | None = None) -> dict:
 
 
 def tool_identity(root: Path | None = None) -> str:
-    """The content identity of THIS installation: 16 hex characters over
-    `IDENTITY_ARTEFACTS`, logical path and bytes.
+    """The content identity of the declared travelling behavioural set —
+    `IDENTITY_ARTEFACTS`, which is the authority — as this installation
+    carries it: 16 hex characters over logical path and bytes.
+
+    The claim is bounded by the authority, deliberately: this identifies
+    the declared set, not "what this installation is". Whether the set is
+    complete is the authority's own property, held by its gate — the
+    attackable surface is the finite enumeration, never the unbounded
+    claim (lineage 8).
 
     Equal across a workbench and an installed tree carrying the same code,
     because the set is exactly what travels and decides and the extraction

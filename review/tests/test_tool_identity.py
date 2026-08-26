@@ -1,5 +1,9 @@
-"""Lineage 7 round 1: an installation says what it IS, and the installation
-reading its envelope says whether the two agree.
+"""Lineage 7 round 1: an installation states the identity of the declared
+travelling behavioural set it carries, and the installation reading its
+envelope says whether the two agree. (Lineage 8 narrowed the claim: the
+identity covers the declared set per its authority — `IDENTITY_ARTEFACTS`
+— never "what the installation is"; the enumeration is the attackable
+surface, and it is what the boundary gate proves complete.)
 
 The defect this closes fired twice. On 2026-08-23 a reviewer ruled a round
 with an installation grafted from three fixes earlier and relayed a command
@@ -18,7 +22,9 @@ the manifest's completeness against the package and against the CLI's own
 import closure, the three agreement states at the read seam, and what the
 ledger records about which installation ruled.
 """
+import ast
 import json
+import operator
 import re
 import shutil
 import subprocess
@@ -28,13 +34,16 @@ import unittest
 from pathlib import Path
 
 from review import (IDENTITY_ARTEFACTS, IDENTITY_EXCLUDED,
-                    IDENTITY_NOT_SHIPPED, TOOL_VERSION,
+                    TOOL_VERSION,
                     identity_paths, installation_root,
                     production_modules, tool_identity, vocab)
 from review.digest import sha256_file_set
 from review.ledger import Ledger
 from review import cli, transport, wire
-from review.tests.util import REPO_ROOT, spec_path
+from review.tests.util import (REPO_ROOT, SCOPE_RULES, TRANSPARENT_NODES,
+                               ast_grammar_nodes, grammar_fields,
+                               grammar_problems, public_path, spec_path,
+                               stamped_parse_sites)
 
 PACKAGE = Path(transport.__file__).resolve().parent
 
@@ -106,10 +115,10 @@ class TestTheManifestIsComplete(unittest.TestCase):
         self.assertEqual(
             loaded - set(IDENTITY_ARTEFACTS), set(),
             "the CLI loads a module the identity does not cover")
-        for path in IDENTITY_NOT_SHIPPED:
-            self.assertNotIn(
-                path, loaded,
-                f"{path} is declared not-shipped but the CLI loads it")
+        # Loading a stays module (e.g. review/corpus.py) would fail the
+        # assertion above — it is not in the travelling enumeration. The
+        # workbench boundary suite, where the stays authority lives, holds
+        # the other direction: no stays module enters this universe.
 
     def test_the_version_itself_is_covered(self):
         """`__init__.py` holds TOOL_VERSION, so an identity that omitted it
@@ -353,7 +362,7 @@ class TestTheThreeAgreementStates(unittest.TestCase):
         self.assertEqual(result["agreement"], "differs")
         self.assertEqual(result["writer"], "0" * 16)
         self.assertEqual(result["reader"], tool_identity())
-        self.assertIn("DIFFERENT installation", result["note"])
+        self.assertIn("DIFFERENT declared behavioural set", result["note"])
 
     def test_an_unstamped_envelope_is_its_own_state(self):
         """FALSIFICATION. Mutation: return `match` (or nothing) when the
@@ -619,48 +628,15 @@ class TestEveryStampedReaderCompares(unittest.TestCase):
         universe now comes from `review.production_modules()`, derived from
         the same enumeration the boundary gate proves equals what travels.
 
-        The call domain is closed to what a structural walk can see:
-        attribute calls (`wire.parse_request`), bare calls, and calls
-        through an import ALIAS (`from .wire import parse_request as pr`),
-        inside sync and async functions alike. What it cannot see is stated
-        rather than implied: a parse reached by dynamic dispatch —
-        `getattr(wire, name)(...)` — is invisible to any structural walk,
-        and that is the declared bound of this gate.
+        Lineage 8: the walk itself is `util.stamped_parse_sites` — THE
+        scanner, which owns its call domain and is probed by synthetic
+        modules below. This test contributes only the universe.
         """
-        import ast
         found = set()
         for logical in production_modules():
             source = (REPO_ROOT / logical).read_text(encoding="utf-8")
             module = logical.split("/")[-1][:-3]
-            tree = ast.parse(source)
-            # Import aliases first: a renamed import is the same call.
-            aliases = {}
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.Import, ast.ImportFrom)):
-                    for name in node.names:
-                        if name.name in vocab.STAMPED_PARSE_CALLS and name.asname:
-                            aliases[name.asname] = name.name
-            stack = []
-
-            class Walk(ast.NodeVisitor):
-                def _scope(self, node):
-                    stack.append(node.name)
-                    self.generic_visit(node)
-                    stack.pop()
-
-                visit_FunctionDef = _scope
-                visit_AsyncFunctionDef = _scope
-
-                def visit_Call(self, node):
-                    func = node.func
-                    name = (func.attr if isinstance(func, ast.Attribute)
-                            else getattr(func, "id", None))
-                    name = aliases.get(name, name)
-                    if name in vocab.STAMPED_PARSE_CALLS and stack:
-                        found.add((module, stack[-1]))
-                    self.generic_visit(node)
-
-            Walk().visit(tree)
+            found |= stamped_parse_sites(module, source)
         return found
 
     def test_no_production_parse_of_a_stamped_envelope_is_unclassified(self):
@@ -711,21 +687,489 @@ class TestEveryStampedReaderCompares(unittest.TestCase):
         for logical in universe:
             self.assertTrue((REPO_ROOT / logical).is_file(), logical)
 
-    def test_an_aliased_import_is_the_same_parse(self):
-        """The call domain, closed where a structural walk can close it: a
-        renamed import is the same call. Mutation: drop the alias map and
-        this fails."""
-        import ast
-        import tempfile as _tf
-        source = ("from .wire import parse_request as _pr\n"
-                  "def sneaky(text):\n    return _pr(text)\n")
-        tree = ast.parse(source)
-        aliases = {n.asname: n.name for node in ast.walk(tree)
-                   if isinstance(node, (ast.Import, ast.ImportFrom))
-                   for n in node.names
-                   if n.name in vocab.STAMPED_PARSE_CALLS and n.asname}
-        self.assertEqual(aliases, {"_pr": "parse_request"},
-                         "an aliased stamped parse is not recognised as one")
+    #: Every comparison operator PEP 440 defines for a version specifier.
+    #: This is the operator AUTHORITY: the regex below is built from it, so
+    #: the syntax the gate recognises cannot drift from the set it
+    #: classifies, and the mutation set is derived from it rather than from
+    #: the refusal table — an entry deleted from that table then fails the
+    #: completeness assertion instead of silently deleting its own test
+    #: case (found by mutating this fix).
+    RECOGNISED_OPS = ("===", "==", "!=", "~=", ">=", "<=", ">", "<")
+
+    #: Clause operators whose meaning a (major, minor) model reproduces
+    #: EXACTLY, and so the only ones this gate will judge. `>=3.14` admits
+    #: every 3.14 patch and everything above; `<3.15` excludes every 3.15
+    #: patch and everything above. Neither says anything about a patch
+    #: within a minor, which is precisely why a minor-granular model can
+    #: prove them.
+    MINOR_EXACT_OPS = {">=": operator.ge, "<": operator.lt}
+
+    #: Operators this gate RECOGNISES and refuses, with the reason. Under
+    #: PEP 440 each carries patch-level force that a (major, minor) model
+    #: silently erases (round-6 F1: `==3.14` and `>=3.14,<=3.14` passed the
+    #: adjacent-minor assertions while admitting only 3.14.0 and refusing
+    #: the 3.14.7 this suite runs on). The mutation set below is DERIVED
+    #: from this table, so a spelling added here cannot keep the bypass.
+    PATCH_SENSITIVE_OPS = {
+        "==": "admits one release only — `==3.14` is 3.14.0, not 3.14.x",
+        "<=": "`<=3.14` excludes 3.14.1 and later, since they compare "
+              "greater than 3.14",
+        ">": "`>3.14` excludes 3.14.0 while admitting later 3.14 patches",
+        "!=": "excludes a single release from within a minor",
+        "~=": "a compatible-release clause whose bound depends on the "
+              "component count, not on the minor alone",
+        "===": "an arbitrary-equality clause with no ordering semantics",
+    }
+
+    @classmethod
+    def _admitted_minors(cls, spec):
+        """`requires-python` as a predicate over (major, minor).
+
+        FAIL-CLOSED (round-6 F1): only `MINOR_EXACT_OPS` are judged, so the
+        admitted syntax is never wider than the semantics this model can
+        prove. Every other operator — recognised-and-patch-sensitive, or
+        not recognised at all — raises rather than being evaluated at a
+        granularity that erases its meaning. That is the same posture as
+        refusing an undeclared taxonomy: a check that cannot judge a shape
+        says so instead of guessing.
+        """
+        clauses = []
+        for raw in spec.split(","):
+            alternation = "|".join(re.escape(op) for op in sorted(
+                cls.RECOGNISED_OPS, key=len, reverse=True))
+            found = re.fullmatch(rf"\s*({alternation})\s*"
+                                 rf"(\d+)\.(\d+)(\.\S+)?\s*", raw)
+            if found is None:
+                raise ValueError(
+                    f"requires-python clause {raw!r} is not a bare "
+                    f"`<op>X.Y`; this gate judges only the shapes whose "
+                    f"admitted interval it can compute")
+            op, patch = found.group(1), found.group(4)
+            if patch is not None:
+                raise ValueError(
+                    f"requires-python clause {raw!r} names a patch "
+                    f"component; the supported interval is a MINOR, "
+                    f"because a minor is what carries an ast grammar")
+            if op in cls.PATCH_SENSITIVE_OPS:
+                raise ValueError(
+                    f"requires-python clause {raw!r} uses `{op}`, which "
+                    f"this gate refuses: {cls.PATCH_SENSITIVE_OPS[op]}. A "
+                    f"(major, minor) model cannot prove it, and evaluating "
+                    f"it at minor granularity would report full-minor "
+                    f"support for a patch-pinned contract")
+            if op not in cls.MINOR_EXACT_OPS:
+                raise ValueError(
+                    f"requires-python clause {raw!r} uses an operator this "
+                    f"gate does not judge")
+            clauses.append((cls.MINOR_EXACT_OPS[op],
+                            (int(found.group(2)), int(found.group(3)))))
+        if not clauses:
+            raise ValueError("requires-python declares no clause")
+        return lambda version: all(op(version, bound)
+                                   for op, bound in clauses)
+
+    def test_the_supported_interval_equals_the_gated_grammar(self):
+        """The claim is no broader than its authority, at BOTH ends
+        (round-5 F1) and at patch granularity (round-6 F1).
+
+        The scanner's scope domain is closed against the `ast` grammar of
+        the interpreter running this gate, and CI runs that one minor. The
+        packaging contract must admit exactly that minor: the running one
+        admitted, the minor below and above refused — and the whole minor,
+        which is why every patch-sensitive operator is refused rather than
+        evaluated at a granularity that would erase it.
+
+        Mutation: delete the upper bound, widen it, drop the floor, or
+        write any patch-sensitive spelling, and this fails naming what it
+        admits. The bounded declaration is the paired valid control.
+        """
+        import tomllib
+        pyproject = public_path("pyproject.toml")
+        if pyproject is None:
+            self.skipTest("no pyproject shipped in this tree")
+        spec = tomllib.loads(pyproject.read_text(encoding="utf-8"))[
+            "project"]["requires-python"]
+        try:
+            admits = self._admitted_minors(spec)
+        except ValueError as exc:
+            self.fail(str(exc))
+        major, minor = sys.version_info[:2]
+        self.assertTrue(
+            admits((major, minor)),
+            f"requires-python {spec!r} does not admit {major}.{minor}, the "
+            f"interpreter this gate and CI actually run")
+        for unsupported in ((major, minor - 1), (major, minor + 1)):
+            with self.subTest(minor=f"{unsupported[0]}.{unsupported[1]}"):
+                self.assertFalse(
+                    admits(unsupported),
+                    f"requires-python {spec!r} admits "
+                    f"{unsupported[0]}.{unsupported[1]}, which no grammar "
+                    f"authority and no CI job covers: the packaging "
+                    f"contract is wider than what is gated")
+
+    def test_no_patch_sensitive_spelling_passes_the_interval_gate(self):
+        """FALSIFICATION for round-6 F1, with the mutation set DERIVED
+        from the operator table rather than typed here — a spelling added
+        to `PATCH_SENSITIVE_OPS` cannot retain the bypass, and one added
+        to `MINOR_EXACT_OPS` must earn a reason first.
+
+        The defect: `==3.14` and `>=3.14,<=3.14` admit 3.14.0 and refuse
+        the 3.14.7 this suite runs on, yet passed every adjacent-minor
+        assertion, because the model compared `(major, minor)` tuples
+        while the operator's force is at patch level.
+        """
+        major, minor = sys.version_info[:2]
+        refused = [op for op in self.RECOGNISED_OPS
+                   if op not in self.MINOR_EXACT_OPS]
+        specs = [f"{op}{major}.{minor}" for op in refused]
+        specs += [f">={major}.{minor},{op}{major}.{minor}" for op in refused]
+        specs.append(f">={major}.{minor}.0,<{major}.{minor + 1}")
+        specs.append("")
+        for spec in specs:
+            with self.subTest(spec=spec):
+                with self.assertRaises(ValueError):
+                    self._admitted_minors(spec)
+        # The paired valid control, and the two operators it uses.
+        admits = self._admitted_minors(f">={major}.{minor},<{major}.{minor + 1}")
+        self.assertTrue(admits((major, minor)))
+        self.assertEqual(sorted(self.MINOR_EXACT_OPS), ["<", ">="])
+        self.assertEqual(
+            sorted(set(self.MINOR_EXACT_OPS) & set(self.PATCH_SENSITIVE_OPS)),
+            [], "an operator is both minor-exact and patch-sensitive")
+        classified = set(self.MINOR_EXACT_OPS) | set(self.PATCH_SENSITIVE_OPS)
+        self.assertEqual(
+            sorted(set(self.RECOGNISED_OPS) - classified), [],
+            "a recognised operator is neither judged nor refused with a "
+            "reason: it would drop out of the derived mutation set")
+        self.assertEqual(
+            sorted(classified - set(self.RECOGNISED_OPS)), [],
+            "an operator is classified that the parser does not recognise")
+        for op, reason in self.PATCH_SENSITIVE_OPS.items():
+            self.assertTrue(str(reason).strip(),
+                            f"{op} is refused without a reason")
+
+    def test_the_shipped_prose_names_the_pinned_minor(self):
+        """The floor is a promise on every shipped surface, not only in
+        the metadata: a README saying `3.14+` re-advertises the range the
+        interval just closed."""
+        major, minor = sys.version_info[:2]
+        for name in ("README.md", "docs/design.md"):
+            document = public_path(name)
+            if document is None:
+                continue
+            text = document.read_text(encoding="utf-8")
+            with self.subTest(document=name):
+                self.assertNotIn(
+                    f"Python {major}.{minor}+", text,
+                    f"{name} advertises an open-ended range the packaging "
+                    f"contract does not")
+                self.assertIn(f"Python {major}.{minor}.x", text,
+                              f"{name} does not name the pinned minor")
+
+    def test_the_scope_grammar_covers_the_ast_grammar(self):
+        """THE AUTHORITY GATE. The scanner's execution-container domain is
+        declared closed relative to the `ast` grammar — generated by
+        CPython, finite, reviewable — and every node type and every field
+        of every scope-introducing node is classified exactly once, with
+        no prefix rule and no default arm.
+
+        Mutations: delete any node from TRANSPARENT_NODES or SCOPE_RULES,
+        or any field from a rule, and this names it.
+        """
+        self.assertEqual(
+            grammar_problems(ast_grammar_nodes(), grammar_fields), [])
+
+    def test_an_unclassified_node_or_field_is_named(self):
+        """FALSIFICATION for the authority gate, run against a MODIFIED
+        grammar rather than by editing the tables: a node type the grammar
+        grows, and a field a scope-introducing node grows, must each be
+        named. This is the reviewer's own probe shape, kept permanent —
+        the live grammar above is the paired valid control."""
+        grown = ast_grammar_nodes() | {"ZzNewLazyScope"}
+        self.assertIn(
+            "ZzNewLazyScope",
+            " ".join(grammar_problems(grown, grammar_fields)),
+            "a node type nothing classifies went unnamed")
+
+        def with_new_field(name):
+            fields = grammar_fields(name)
+            if name == "FunctionDef" and fields is not None:
+                return fields + ("zz_new_field",)
+            return fields
+
+        self.assertIn(
+            "FunctionDef.zz_new_field",
+            " ".join(grammar_problems(ast_grammar_nodes(), with_new_field)),
+            "an unrouted field of a scope-introducing node went unnamed")
+
+    def test_lazy_type_parameter_scopes(self):
+        """Round-3 F1's grammar, version-gated: every PEP 695 / PEP 696
+        lazy annotation scope reports `<annotation>`, with paired
+        no-parser controls. The future import does NOT stringify these,
+        which is asserted rather than assumed."""
+        cases = {
+            "function type-parameter bound": (
+                "from . import wire\n"
+                "def f[T: wire.parse_request('')]():\n    pass\n",
+                {("m", "<annotation>")}),
+            "async function type-parameter bound": (
+                "from . import wire\n"
+                "async def f[T: wire.parse_request('')]():\n    pass\n",
+                {("m", "<annotation>")}),
+            "class type-parameter bound": (
+                "from . import wire\n"
+                "class C[T: wire.parse_request('')]:\n    pass\n",
+                {("m", "<annotation>")}),
+            "type-parameter constraints tuple": (
+                "from . import wire\n"
+                "def f[T: (int, wire.parse_request(''))]():\n    pass\n",
+                {("m", "<annotation>")}),
+            "type alias value": (
+                "from . import wire\n"
+                "type Alias = wire.parse_request('')\n",
+                {("m", "<annotation>")}),
+            "type alias own type-parameter bound": (
+                "from . import wire\n"
+                "type Alias[T: wire.parse_request('')] = int\n",
+                {("m", "<annotation>")}),
+            "nested function type-parameter bound": (
+                "from . import wire\n"
+                "def outer():\n"
+                "    def inner[T: wire.parse_request('')]():\n"
+                "        pass\n"
+                "    return inner\n",
+                {("m", "<annotation>")}),
+            "future import does not defer PEP 695 scopes": (
+                "from __future__ import annotations\n"
+                "from . import wire\n"
+                "type Alias = wire.parse_request('')\n",
+                {("m", "<annotation>")}),
+            "control: no parser in a type parameter": (
+                "from . import wire\n"
+                "def f[T: wire.render_request('')]():\n    pass\n",
+                set()),
+            "control: legacy annotation still stringifies": (
+                "from __future__ import annotations\n"
+                "from . import wire\n"
+                "def f(t: wire.parse_request('')):\n    return t\n",
+                set()),
+        }
+        for label, (source, expected) in cases.items():
+            with self.subTest(form=label):
+                self.assertEqual(stamped_parse_sites("m", source), expected)
+
+    def test_lazy_type_parameter_defaults(self):
+        for label, source in {
+            "TypeVar default": "def f[T = wire.parse_request('')]():\n"
+                               "    pass\n",
+            "ParamSpec default":
+                "def f[**P = [wire.parse_request('')]]():\n    pass\n",
+            "TypeVarTuple default":
+                "def f[*Ts = *(wire.parse_request(''),)]():\n    pass\n",
+        }.items():
+            with self.subTest(form=label):
+                self.assertEqual(
+                    stamped_parse_sites("m", "from . import wire\n" + source),
+                    {("m", "<annotation>")})
+
+    def test_the_runtime_really_defers_those_scopes(self):
+        """The live control behind the attribution: these expressions do
+        not run at the definition statement, only on attribute access —
+        which is WHY they may not be credited to the defining scope. The
+        scanner is a structural walk; this is the fact it models."""
+        for label, source, touch in (
+            ("function type-parameter bound",
+             "def f[T: probe()](): pass", lambda ns: ns["f"].__type_params__[0].__bound__),
+            ("class type-parameter bound",
+             "class C[T: probe()]: pass", lambda ns: ns["C"].__type_params__[0].__bound__),
+            ("type alias value",
+             "type Alias = probe()", lambda ns: ns["Alias"].__value__),
+        ):
+            with self.subTest(form=label):
+                ran = []
+                ns = {"probe": lambda: ran.append(1) or int}
+                exec(compile(source, "<probe>", "exec"), ns)
+                self.assertEqual(ran, [], f"{label} ran at definition")
+                touch(ns)
+                self.assertEqual(ran, [1], f"{label} never ran on access")
+
+    def test_the_scanner_call_domain_on_synthetic_modules(self):
+        """The scanner's admitted call domain, each form probed through THE
+        scanner itself — `util.stamped_parse_sites`, the same function the
+        production walk and the workbench walk use — never a re-derivation
+        of its logic beside it (lineage 8; the workbench copy had silently
+        lost the alias arm, which is what re-derivation costs).
+
+        One synthetic module per admitted form, with the paired control.
+        Mutations, each verified by hand against the factored scanner:
+        drop the alias map and the alias case fails; drop the async visitor
+        and the async case fails; drop the `<module>` fallback and the
+        import-time case fails.
+        """
+        cases = {
+            "bare call": ("from .wire import parse_request\n"
+                          "def f(t):\n    return parse_request(t)\n",
+                          {("m", "f")}),
+            "attribute call": ("from . import wire\n"
+                               "def g(t):\n    return wire.parse_request(t)\n",
+                               {("m", "g")}),
+            "aliased import": ("from .wire import parse_request as _pr\n"
+                               "def sneaky(t):\n    return _pr(t)\n",
+                               {("m", "sneaky")}),
+            "async body": ("from . import wire\n"
+                           "async def h(t):\n"
+                           "    return wire.parse_request(t)\n",
+                           {("m", "h")}),
+            "innermost function wins": (
+                "from . import wire\n"
+                "def outer(t):\n"
+                "    def inner(u):\n"
+                "        return wire.parse_request(u)\n"
+                "    return inner(t)\n",
+                {("m", "inner")}),
+            "import-time call is <module>": (
+                "from . import wire\nX = wire.parse_request('')\n",
+                {("m", "<module>")}),
+            # Round-1 F2: definition-time expressions run in the ENCLOSING
+            # scope when the def statement executes, never in the body.
+            "top-level decorator is <module>": (
+                "from . import wire\n"
+                "@wire.parse_request('')\n"
+                "def f(t):\n    return t\n",
+                {("m", "<module>")}),
+            "top-level positional default is <module>": (
+                "from . import wire\n"
+                "def f(x=wire.parse_request('')):\n    return x\n",
+                {("m", "<module>")}),
+            "top-level keyword-only default is <module>": (
+                "from . import wire\n"
+                "def f(*, x=wire.parse_request('')):\n    return x\n",
+                {("m", "<module>")}),
+            "async default is <module>": (
+                "from . import wire\n"
+                "async def f(x=wire.parse_request('')):\n    return x\n",
+                {("m", "<module>")}),
+            "nested default is the enclosing function": (
+                "from . import wire\n"
+                "def outer():\n"
+                "    def inner(x=wire.parse_request('')):\n"
+                "        return x\n"
+                "    return inner\n",
+                {("m", "outer")}),
+            "nested decorator is the enclosing function": (
+                "from . import wire\n"
+                "def outer():\n"
+                "    @wire.parse_request('')\n"
+                "    def inner():\n        pass\n"
+                "    return inner\n",
+                {("m", "outer")}),
+            # Round-2 F1: an annotation is its own seam on every module
+            # that does not stringify it — the supported runtimes span
+            # PEP 649: evaluated only when __annotations__ is read, so
+            # the defining scope is not the scope that runs them.
+            "return annotation is its own seam": (
+                "from . import wire\n"
+                "def f(t) -> wire.parse_request(''):\n    return t\n",
+                {("m", "<annotation>")}),
+            "parameter annotation is its own seam": (
+                "from . import wire\n"
+                "def f(t: wire.parse_request('')):\n    return t\n",
+                {("m", "<annotation>")}),
+            "stringified annotations are never evaluated": (
+                "from __future__ import annotations\n"
+                "from . import wire\n"
+                "def f(t: wire.parse_request('')) "
+                "-> wire.parse_request(''):\n    return t\n",
+                set()),
+            # Round-2 F1: a generator's body is deferred until a consumer
+            # iterates; only the outermost iterable runs at creation.
+            "generator element is deferred": (
+                "from . import wire\n"
+                "def f(xs):\n"
+                "    return (wire.parse_request(x) for x in xs)\n",
+                {("m", "<genexpr>")}),
+            "generator filter is deferred": (
+                "from . import wire\n"
+                "def f(xs):\n"
+                "    return (x for x in xs if wire.parse_request(x))\n",
+                {("m", "<genexpr>")}),
+            "generator inner iterable is deferred": (
+                "from . import wire\n"
+                "def f(xs):\n"
+                "    return (x for a in xs "
+                "for x in wire.parse_request(a))\n",
+                {("m", "<genexpr>")}),
+            "generator outermost iterable is eager": (
+                "from . import wire\n"
+                "def f():\n"
+                "    return (x for x in wire.parse_request(''))\n",
+                {("m", "f")}),
+            "module-level generator element is deferred": (
+                "from . import wire\n"
+                "G = (wire.parse_request(x) for x in [])\n",
+                {("m", "<genexpr>")}),
+            "async generator element is deferred": (
+                "from . import wire\n"
+                "async def f(xs):\n"
+                "    return (wire.parse_request(x) async for x in xs)\n",
+                {("m", "<genexpr>")}),
+            # Paired eager controls: comprehensions run when created.
+            "list comprehension is the creating scope": (
+                "from . import wire\n"
+                "def f(xs):\n"
+                "    return [wire.parse_request(x) for x in xs]\n",
+                {("m", "f")}),
+            "set comprehension is the creating scope": (
+                "from . import wire\n"
+                "def f(xs):\n"
+                "    return {wire.parse_request(x) for x in xs}\n",
+                {("m", "f")}),
+            "dict comprehension is the creating scope": (
+                "from . import wire\n"
+                "def f(xs):\n"
+                "    return {x: wire.parse_request(x) for x in xs}\n",
+                {("m", "f")}),
+            "lambda body is its own scope": (
+                "from . import wire\n"
+                "F = lambda t: wire.parse_request(t)\n",
+                {("m", "<lambda>")}),
+            "lambda default is the enclosing scope": (
+                "from . import wire\n"
+                "F = lambda t=wire.parse_request(''): t\n",
+                {("m", "<module>")}),
+            "class body is import-time code": (
+                "from . import wire\n"
+                "class C:\n    X = wire.parse_request('')\n",
+                {("m", "<module>")}),
+            "method default is import-time code": (
+                "from . import wire\n"
+                "class C:\n"
+                "    def m(self, x=wire.parse_request('')):\n"
+                "        return x\n",
+                {("m", "<module>")}),
+            # The stated over-approximation, pinned so a change is noticed:
+            # no supported runtime evaluates a function-local variable
+            # annotation, but it reports under the annotation seam rather
+            # than vanishing.
+            "function-local variable annotation is the annotation seam": (
+                "from . import wire\n"
+                "def f(t):\n"
+                "    x: wire.parse_request('') = t\n"
+                "    return x\n",
+                {("m", "<annotation>")}),
+            "control: not a parse call": (
+                "from . import wire\n"
+                "def f(t):\n    return wire.render_request(t)\n",
+                set()),
+            "control: non-parser decorator and default": (
+                "from . import wire\n"
+                "@wire.render_request('')\n"
+                "def f(x=wire.render_request('')):\n    return x\n",
+                set()),
+        }
+        for label, (source, expected) in cases.items():
+            with self.subTest(form=label):
+                self.assertEqual(stamped_parse_sites("m", source), expected)
 
     def test_every_attributed_seam_is_a_declared_reader(self):
         """The two halves of the authority agree: every seam a parse site

@@ -421,81 +421,11 @@ class TestShippedRestatements(unittest.TestCase):
                 for chunk in region.replace(" and ", ", ").split(",")
                 for part in [chunk] if part.strip()}
 
-    def _members(self, text, pattern, reader):
-        found = re.search(pattern, text, re.S)
-        self.assertIsNotNone(
-            found, f"the shipped document no longer carries this "
-                   f"restatement where the inventory says it is; a "
-                   f"restatement nothing can locate is one nothing checks")
-        return getattr(self, reader)(found.group(1))
-
-    def _document(self, name):
-        """A shipped document by short name.
-
-        The set searched here is `design` and `readme`. That it is the
-        WHOLE set of shipped documents restating a runtime vocabulary is
-        proved in `test_identity_boundary.py`, against the extraction
-        inventory — which stays in the workbench, where a new travelling
-        document appears and must be decided (round-4 F4). This half may
-        not read that inventory: a travelling file that references a
-        workbench-only path is a coupling the extraction audit refuses, and
-        it refused this when the derivation lived here.
-        """
-        path = spec_path() if name == "design" else public_path("README.md")
-        if path is None:
-            self.skipTest(f"no {name} shipped in this tree")
-        return path.read_text(encoding="utf-8")
-
-    def _members(self, text, pattern, reader):
-        found = re.search(pattern, text, re.S)
-        self.assertIsNotNone(
-            found, f"the shipped document no longer carries this "
-                   f"restatement where the inventory says it is; a "
-                   f"restatement nothing can locate is one nothing checks")
-        return getattr(self, reader)(found.group(1))
-
-    def _document(self, name):
-        """A shipped document by short name.
-
-        The set searched here is `design` and `readme`. That it is the
-        WHOLE set of shipped documents restating a runtime vocabulary is
-        proved in `test_identity_boundary.py`, against the extraction
-        inventory — which stays in the workbench, where a new travelling
-        document appears and must be decided (round-4 F4). This half may
-        not read that inventory: a travelling file that references a
-        workbench-only path is a coupling the extraction audit refuses, and
-        it refused this when the derivation lived here.
-        """
-        path = spec_path() if name == "design" else public_path("README.md")
-        if path is None:
-            self.skipTest(f"no {name} shipped in this tree")
-        return path.read_text(encoding="utf-8")
-
-    def _members(self, text, pattern, reader):
-        found = re.search(pattern, text, re.S)
-        self.assertIsNotNone(
-            found, f"the shipped document no longer carries this "
-                   f"restatement where the inventory says it is; a "
-                   f"restatement nothing can locate is one nothing checks")
-        return getattr(self, reader)(found.group(1))
-
-    def _document(self, name):
-        """A shipped document by short name.
-
-        The set searched here is `design` and `readme`. That it is the
-        WHOLE set of shipped documents restating a runtime vocabulary is
-        proved in `test_identity_boundary.py`, against the extraction
-        inventory — which stays in the workbench, where a new travelling
-        document appears and must be decided (round-4 F4). This half may
-        not read that inventory: a travelling file that references a
-        workbench-only path is a coupling the extraction audit refuses, and
-        it refused this when the derivation lived here.
-        """
-        path = spec_path() if name == "design" else public_path("README.md")
-        if path is None:
-            self.skipTest(f"no {name} shipped in this tree")
-        return path.read_text(encoding="utf-8")
-
+    # One copy of each helper. (Lineage 8, author-found while working the
+    # adapters exclusion, declared as unrequested: the pair below had been
+    # accidentally quadruplicated by earlier edits — four byte-identical
+    # definitions, the last silently winning. Dead weight, no behaviour
+    # change.)
     def _members(self, text, pattern, reader):
         found = re.search(pattern, text, re.S)
         self.assertIsNotNone(
@@ -1140,6 +1070,271 @@ class TestInstall(unittest.TestCase):
         code, payload = run(check_install=True)
         self.assertEqual(code, 0, payload)
         self.assertTrue(payload["ok"])
+
+
+class TestAdapterEnumerationsAreDerived(unittest.TestCase):
+    """Lineage 8: the generated adapters ENUMERATE runtime vocabularies —
+    dispositions, verdicts, the claim and reference grammars, the
+    falsification record — which is exactly what the shipped-restatement
+    discipline polices in `docs/design.md` and the README. The adapters'
+    exclusion from that search claimed they restate no vocabulary; that
+    claim was false. It is now true by construction, and this class is
+    what makes the construction a fact rather than an intention: every
+    enumeration is rendered from `review/vocab.py` at render time
+    (`adapters.procedure()` is a function, not an import-time constant),
+    so mutating the authority and re-rendering must move the text.
+
+    The completeness proof is STRUCTURAL (round-1 F3): the inventory below
+    classifies every collection-valued authority `vocab` exports — tuples
+    of strings, mapping keys, composite constants, whatever shape — as
+    DERIVED (probed by authority mutation, sentinels required in EVERY
+    rendered kind), INCIDENTAL (flagged by the advisory proximity scan
+    without an enumeration standing behind it, with the reason), or
+    NOT_ENUMERATED (with the reason the adapters do not state it). A new
+    collection fails by name until someone decides which it is. The
+    lexical proximity scan is ADVISORY — a tripwire that catches what it
+    can see, never the completeness proof; round-1 F3's probe showed a
+    mapping-shaped enumeration walking straight past a tuples-only
+    detector.
+    """
+
+    #: vocabulary -> the vocab attributes its rendering reads. `None`
+    #: means patch by shape (tuple -> same-arity sentinels, dict -> one
+    #: added sentinel key); a string is an explicit sentinel for a named
+    #: constant. Sentinels must appear in every rendered kind.
+    DERIVED = {
+        "DISPOSITIONS": {"DISPOSITIONS": None},
+        "BLOCKING_ILLEGAL": {"BLOCKING_ILLEGAL": None},
+        "FALSIFICATION_STATUSES": {"FALSIFICATION_STATUSES": None},
+        "MUTATION_OUTCOMES": {"MUTATION_OUTCOMES": None},
+        "FALSIFICATION_RECORD": {"FALSIFICATION_RECORD": None},
+        "TRANSPORTS": {"TRANSPORTS": None},
+        "CLAIM_LIST_FIELDS": {"CLAIM_LIST_FIELDS": None},
+        "CLAIM_FIELDS": {"CLAIM_FIELDS": None},
+        "CLAIM_REQUIRED": {"CLAIM_REQUIRED": None},
+        "CLAIM_REFERENCE_FIELDS": {"CLAIM_REFERENCE_FIELDS": None},
+        "CLAIM_REFERENCE_REQUIRED": {"CLAIM_REFERENCE_REQUIRED": None},
+        "VERDICTS": {"VERDICT_CLEAN": "zz-verdict-clean-sentinel",
+                     "VERDICT_CHANGES": "zz-verdict-changes-sentinel"},
+    }
+
+    #: Vocabularies the advisory scan may flag in adapter text without a
+    #: derived enumeration standing behind them, each with the reason the
+    #: flag is incidental.
+    INCIDENTAL = {
+        "DISPOSITION_PAYLOADS": (
+            "its keys are exactly DISPOSITIONS, so the scan flags it "
+            "wherever the derived dispositions enumeration appears; the "
+            "payloads themselves — the values — are the validator's "
+            "contract and are never stated in the procedure"),
+        "STAMPED_KINDS": (
+            "its two members are the first and third names in the "
+            "`request → verdict → disposition` chain describing the loop's "
+            "three envelopes; the stamped SUBSET is never listed as such — "
+            "the chain co-locates the members only where the surrounding "
+            "frontmatter is short enough to bring them inside the span"),
+    }
+
+    #: Collections the adapters deliberately do not enumerate, each with
+    #: the reason — the structural inventory's third arm, so a collection
+    #: can never sit in no category (round-1 F3).
+    NOT_ENUMERATED = {
+        "ACCEPTED_SUBTYPES": "the subtype grammar is the validator's; the "
+                             "procedure never lists subtypes",
+        "BREAKERS": "the procedure names the breaker MECHANISM, never the "
+                    "member list; the shipped documents' breaker "
+                    "enumerations are registered in RESTATEMENTS",
+        "CLAIM_NONEMPTY": "nonemptiness is enforced at the boundary, not "
+                          "stated as a member list",
+        "CLAIM_STRING_FIELDS": "its members appear only inside the full "
+                               "member list derived from CLAIM_FIELDS; the "
+                               "string/list split is described "
+                               "structurally ('the rest are strings'), "
+                               "never as a list",
+        "CLOSURES": "the procedure tells the reviewer WHERE closures are "
+                    "answered, not the closure vocabulary",
+        "FALSIFICATION_KINDS": "not stated anywhere in the procedure",
+        "FINDING_FIELDS": "the procedure says 'every required field', "
+                          "never the field list; the design document's "
+                          "enumeration is registered in RESTATEMENTS",
+        "LINEAGE_KINDS": "fingerprint-lineage grammar; not in the "
+                         "procedure",
+        "LINEAGE_MERGING": "fingerprint-lineage grammar; not in the "
+                           "procedure",
+        "SEAM_CLASSES": "reader-authority internals; the procedure never "
+                        "names seams",
+        "STAMPED_PARSE_CALLS": "reader-authority internals; the procedure "
+                               "never names parser functions",
+        "STAMPED_PARSE_SITES": "reader-authority internals; the procedure "
+                               "never names parse sites",
+        "STAMPED_READERS": "reader-authority internals; the procedure "
+                           "never names readers",
+        "TEST_AMENDED_PAYLOAD": "the subtype grammar is the validator's "
+                                "and the specification's",
+        "TEST_AMENDMENT_OUTCOMES": "the subtype grammar is the "
+                                   "validator's and the specification's",
+        "TRANSPORT_PROVIDER_SIGNALS": "provider-detection detail; the "
+                                      "procedure names the environment "
+                                      "declaration only",
+    }
+
+    #: The advisory scan reuses the restatement suite's criterion, span
+    #: included — one detector, explicitly demoted to tripwire duty here.
+    ENUMERATION_SPAN = TestShippedRestatements.ENUMERATION_SPAN
+
+    @staticmethod
+    def _collections():
+        """Every collection-valued authority vocab exports, by shape —
+        the structural inventory's domain. Not just tuples of strings:
+        round-1 F3's probe walked a dict straight past a tuples-only
+        detector."""
+        out = {}
+        for name in dir(vocab):
+            if not name.isupper():
+                continue
+            value = getattr(vocab, name)
+            if isinstance(value, (tuple, list, dict, set, frozenset)) \
+                    and len(value):
+                out[name] = value
+        return out
+
+    @staticmethod
+    def _members_of(value):
+        """The member names of a collection, whatever its shape: a
+        mapping enumerates by its keys; a tuple of tuples by its rows'
+        first elements; a flat collection by its string members."""
+        if isinstance(value, dict):
+            return [str(k) for k in value]
+        if all(isinstance(x, str) for x in value):
+            return list(value)
+        return [str(x[0]) if isinstance(x, (tuple, list)) and x else str(x)
+                for x in value]
+
+    @classmethod
+    def _sentinels(cls, name, attrs):
+        """The patch set for one vocabulary: same shape, unmistakable.
+        Returns (patches, expected sentinel strings)."""
+        patches, expected = {}, []
+        for attr, fixed in attrs.items():
+            if fixed is not None:
+                patches[attr] = fixed
+                expected.append(fixed)
+                continue
+            value = getattr(vocab, attr)
+            if isinstance(value, dict):
+                key = f"zz-{name.lower()}-key"
+                patches[attr] = {**value, key: "string"}
+                expected.append(key)
+            else:
+                sentinel = tuple(f"zz-{name.lower()}-{i}"
+                                 for i in range(len(value)))
+                patches[attr] = sentinel
+                expected.extend(sentinel)
+        return patches, expected
+
+    @contextlib.contextmanager
+    def _patched(self, patches):
+        saved = {attr: getattr(vocab, attr) for attr in patches}
+        try:
+            for attr, value in patches.items():
+                setattr(vocab, attr, value)
+            yield
+        finally:
+            for attr, value in saved.items():
+                setattr(vocab, attr, value)
+
+    def test_the_structural_inventory_is_complete_and_disjoint(self):
+        """THE COMPLETENESS PROOF (round-1 F3): every collection vocab
+        exports is classified in exactly one of DERIVED, INCIDENTAL,
+        NOT_ENUMERATED — mapping-shaped and composite collections
+        included. A new collection fails here by name until someone
+        decides which it is; a stale entry fails in the other
+        direction."""
+        collections = set(self._collections())
+        classified = (set(self.DERIVED) | set(self.INCIDENTAL)
+                      | set(self.NOT_ENUMERATED))
+        self.assertEqual(
+            sorted(collections - classified), [],
+            "collection-valued vocabulary authorities with no decision: "
+            "derived, incidental, or deliberately not enumerated")
+        self.assertEqual(
+            sorted(classified - collections), [],
+            "the inventory classifies something vocab no longer exports "
+            "as a collection")
+        for a, b in (("DERIVED", "INCIDENTAL"),
+                     ("DERIVED", "NOT_ENUMERATED"),
+                     ("INCIDENTAL", "NOT_ENUMERATED")):
+            self.assertEqual(
+                sorted(set(getattr(self, a)) & set(getattr(self, b))), [],
+                f"a vocabulary is in both {a} and {b}")
+        for name, reason in {**self.INCIDENTAL,
+                             **self.NOT_ENUMERATED}.items():
+            self.assertTrue(str(reason).strip(),
+                            f"{name} is classified without a reason")
+
+    def test_every_derived_enumeration_follows_its_authority(self):
+        """THE PROBE, per rendered kind (round-1 F3: sentinels are
+        required in EVERY rendered kind, not one). Mutation, verified by
+        hand: freeze any derived renderer in `adapters.procedure()` to
+        the literal text it currently renders, and that vocabulary's
+        subtests fail — the sentinel never appears, which is what
+        distinguishes a derivation from a restatement that happens to
+        agree."""
+        for name, attrs in self.DERIVED.items():
+            patches, expected = self._sentinels(name, attrs)
+            with self._patched(patches):
+                for kind in adapters.OUTPUTS:
+                    rendered = adapters.render(kind)
+                    for member in expected:
+                        with self.subTest(vocabulary=name, kind=kind,
+                                          member=member):
+                            self.assertIn(
+                                member, rendered,
+                                f"{name}: the rendered {kind} did not "
+                                f"follow a mutation of its authority — "
+                                f"the enumeration is hand-typed, not "
+                                f"derived")
+
+    def test_unpatched_render_carries_every_derived_member(self):
+        """The paired control: with the real authorities in place, every
+        member of every derived vocabulary appears in every rendered
+        kind."""
+        for kind in adapters.OUTPUTS:
+            rendered = adapters.render(kind)
+            for name, attrs in self.DERIVED.items():
+                for attr, fixed in attrs.items():
+                    value = getattr(vocab, attr)
+                    members = ([value] if isinstance(value, str)
+                               else self._members_of(value))
+                    for member in members:
+                        with self.subTest(kind=kind, vocabulary=name,
+                                          member=member):
+                            self.assertIn(member, rendered)
+
+    def test_the_advisory_scan_flags_nothing_unclassified(self):
+        """THE TRIPWIRE, explicitly advisory (round-1 F3 demoted it): the
+        restatement suite's proximity detector, run over every rendered
+        kind. It catches tuple-shaped member lists it can see and can
+        miss shapes it cannot — completeness is the structural inventory
+        above, not this. A flag outside DERIVED and INCIDENTAL still
+        fails by name, because a visible enumeration with no
+        classification is exactly how the adapters/ exclusion went false
+        the first time."""
+        suite = TestShippedRestatements
+        detector = suite._enumerates
+        for kind in adapters.OUTPUTS:
+            rendered = adapters.render(kind)
+            for name, value in sorted(self._collections().items()):
+                members = self._members_of(value)
+                with self.subTest(kind=kind, vocabulary=name):
+                    if not detector(self, rendered, tuple(members)):
+                        continue
+                    self.assertTrue(
+                        name in self.DERIVED or name in self.INCIDENTAL,
+                        f"the rendered {kind} enumerates {name} and the "
+                        f"enumeration is neither derived from the "
+                        f"authority nor declared incidental with a reason "
+                        f"— the adapters/ exclusion is false again")
 
 
 if __name__ == "__main__":

@@ -55,7 +55,17 @@ def _claim_members() -> str:
 
 # ONE source. Role-agnostic on purpose: an agent learns which side it holds
 # from the envelope's stamp (author=… reviewer=…), never from this text.
-PROCEDURE = {
+#
+# A FUNCTION, not a module-level dict (lineage 8): every vocabulary
+# enumeration below is rendered from `review/vocab.py` at call time, so the
+# derivation is live — patch the authority and re-render, and the text
+# follows. That property is what makes the shipped-restatement exclusion
+# for `adapters/` TRUE rather than asserted: these documents cannot restate
+# a vocabulary, they instantiate it, and
+# `test_adapter_enumerations_are_derived` proves it by mutation.
+def procedure() -> dict:
+    status_key, mutation_key = vocab.FALSIFICATION_RECORD
+    return {
     "both": [
         "Exit codes mean exactly one thing: 0 ok, 1 findings or refusal, "
         "2 usage. Every non-zero exit carries `next_kind`: when it is "
@@ -78,7 +88,21 @@ PROCEDURE = {
         "an answer, it is one point of a domain, and the next unpartitioned "
         "point is the next round. This binds both sides: an acceptance and a "
         "closure are judged by whether the domain is closed, never by whether "
-        "the example passes.",
+        "the example passes. One terminator, and only one: a domain whose "
+        "completeness cannot be established from inside the artifact — a set "
+        "that can be declared but never proven complete from within — may be "
+        "declared CLOSED RELATIVE TO A STATED AUTHORITY. An authority is a "
+        "machine-generated, separately gated artifact that derives the set; "
+        "a hand-maintained list is never one. The author declares it in the "
+        "claim, per anchor. From then on the reviewer attacks the authority "
+        "— its derivation and its coverage — and may still bring an "
+        "instance, but an instance against a declared-closed domain must "
+        "name the authority it escapes; one that names none is not a "
+        "completeness finding. Rejecting the authority is an ordinary "
+        "finding, anchored on the authority itself. The declaration is not "
+        "an exemption: it moves the attackable surface from an unbounded "
+        "hunt onto a finite artifact, and a narrow authority is itself the "
+        "defect.",
         "Every request and every verdict result carries TWO fields, and they "
         "are two different kinds of text. `brief` is the plain-language "
         "account of what is being asked or ruled — give it to the human as "
@@ -99,11 +123,13 @@ PROCEDURE = {
         "that is what decides which carrier the relay prints. You do not "
         "decide it and you do not detect it: the tool resolves it from "
         "declarations, strongest first — an explicit `--transport "
-        "path|paste`, then `[roles] transport` in the repository's config, "
+        f"{'|'.join(vocab.TRANSPORTS)}`, "
+        "then `[roles] transport` in the repository's config, "
         f"then the environment's own declaration (`{vocab.TRANSPORT_ENV}`, "
         "set by a cloud environment's configuration) or a documented cloud "
         "provider signal, and with none of those a new emission carries "
-        "`path`, the workflow's steady case: author and reviewer on the "
+        f"`{vocab.TRANSPORT_EMISSION_DEFAULT}`, "
+        "the workflow's steady case: author and reviewer on the "
         "operator's machine. A cloud-authored round therefore reaches "
         "`paste` through its environment's declaration, never through your "
         "guess (a locally readable request file proves nothing about what "
@@ -128,9 +154,11 @@ PROCEDURE = {
         ("write the claim",
          None,
          f"A JSON claim file, and a closed grammar: its members are "
-         f"{_claim_members()} — `references` is a list of objects carrying a "
-         f"non-empty `path` (the reviewer must read it; the tool digests it) "
-         f"and optionally `required` and `note`; "
+         f"{_claim_members()} — `{vocab.CLAIM_REFERENCES_FIELD}` is a list "
+         f"of objects carrying a non-empty "
+         f"{', '.join(f'`{m}`' for m in vocab.CLAIM_REFERENCE_REQUIRED)} "
+         f"(the reviewer must read it; the tool digests it) and optionally "
+         f"{', '.join(f'`{m}`' for m in sorted(set(vocab.CLAIM_REFERENCE_FIELDS) - set(vocab.CLAIM_REFERENCE_REQUIRED)))}; "
          f"{', '.join(f'`{m}`' for m in vocab.CLAIM_LIST_FIELDS)} are lists "
          f"of strings; the rest are strings; "
          f"{', '.join(f'`{m}`' for m in vocab.CLAIM_REQUIRED)} is required. "
@@ -166,9 +194,10 @@ PROCEDURE = {
         ("close the round",
          paths.command(*paths.lits(TOOL_NAME, "close", "--verdict"),
                        paths.Ph("<verdict.md>")),
-         "Validates and records the verdict. `changes requested` → the "
-         "lineage stays open and the next command is `respond`; `clean to "
-         "advance` → the lineage is closed at the exact reviewed SHA. Merge "
+         f"Validates and records the verdict. `{vocab.VERDICT_CHANGES}` → "
+         f"the lineage stays open and the next command is `respond`; "
+         f"`{vocab.VERDICT_CLEAN}` → the lineage is closed at the exact "
+         f"reviewed SHA. Merge "
          "authority is the account allowlist and the standing rules you "
          "operate under, not this tool."),
         ("respond",
@@ -176,15 +205,18 @@ PROCEDURE = {
                        paths.Ph("<verdict.md>"), paths.Lit("--from-json"),
                        paths.Ph("<d.json>"), paths.Lit("--out"),
                        paths.Ph("<disposition.md>")),
-         "Exactly one disposition per finding — accepted / refuted / "
-         "deferred / preference / escalated — each with its mandatory "
-         "payload; a blocking finding cannot be deferred or preferred. "
+         f"Exactly one disposition per finding — "
+         f"{' / '.join(vocab.DISPOSITIONS)} — each with its mandatory "
+         f"payload; a blocking finding cannot take "
+         f"{' or '.join(f'`{d}`' for d in vocab.BLOCKING_ILLEGAL)}. "
          "An `accepted` disposition for a finding that names a "
          "falsification test also records the run of THAT test, in "
-         "`payload.falsification`: `status` (pass | fail | cannot_execute) "
-         "on the head you hand back, and `mutation` — the same test with "
-         "the defect reintroduced (fails_without_fix | passes_without_fix "
-         "| not_run), which is the proof the test can fail at all. A test "
+         f"`payload.falsification`: `{status_key}` "
+         f"({' | '.join(vocab.FALSIFICATION_STATUSES)}) "
+         f"on the head you hand back, and `{mutation_key}` — the same test "
+         f"with the defect reintroduced "
+         f"({' | '.join(vocab.MUTATION_OUTCOMES)}), "
+         "which is the proof the test can fail at all. A test "
          "that still fails, or one that passes without the fix, is refused "
          "as an acceptance; `cannot_execute` and `not_run` need a `note` "
          "saying why. Do the mutation before you write the record, not "
@@ -234,7 +266,7 @@ PROCEDURE = {
          "round, do not send it back for fix-and-resubmit, and do not "
          "decide whether it enters the record."),
     ],
-}
+    }
 
 
 def verb_table() -> list[tuple[str, str]]:
@@ -270,15 +302,16 @@ def _body() -> list[str]:
              f"envelope's stamp (`author=… reviewer=…`) says which, per "
              f"invocation, and this text does not.")
     L.append("")
+    steps = procedure()
     L.append("## Rules that hold on both sides")
     L.append("")
-    for rule in PROCEDURE["both"]:
+    for rule in steps["both"]:
         L.append(f"- {rule}")
     L.append("")
     for role in ("author", "reviewer"):
         L.append(f"## If you hold the {role} stamp")
         L.append("")
-        for i, (title, cmd, what) in enumerate(PROCEDURE[role], 1):
+        for i, (title, cmd, what) in enumerate(steps[role], 1):
             L.append(f"{i}. **{title}**" + (f" — `{cmd}`" if cmd else ""))
             L.append(f"   {what}")
         L.append("")
