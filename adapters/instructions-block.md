@@ -1,7 +1,7 @@
 <!-- BEGIN GENERATED: loupe adapter — do not edit; `loupe render-adapters` regenerates, `--check` guards -->
 # loupe — review procedure (instruction block, GENERATED)
 
-For a project instruction file (AGENTS.md / CLAUDE.md region) on a surface that reads no skill directory. Tool version 0.7.0.
+For a project instruction file (AGENTS.md / CLAUDE.md region) on a surface that reads no skill directory. Tool version 0.8.0.
 
 ## What this is
 
@@ -38,7 +38,7 @@ For a project instruction file (AGENTS.md / CLAUDE.md region) on a surface that 
 2. **rule**
    Read the diff with the printed command and rule by the declared taxonomy only. Findings ordered by severity, atomic (one claim per ID), each with every required field and a FALSIFICATION. Prior dispositions are answered under `## closures` by fingerprint. Material you could not retrieve goes under `## unavailable references` and forbids a clean verdict.
 3. **validate, then stop** — `loupe validate <verdict.md>`
-   Repeat until it exits 0. Then STOP: hand the human the block under `## What to run next`, whole and unedited — it is the author's to run, and it says so on its own first line. On a paste round that block already carries the verdict bytes in their own fence beneath the command; hand it over as one piece and never restate the bytes as loose prose (a chat surface rewrites unfenced text). On a path round hand the kept file's path with it. Add no prose around it. You do not start the next round, do not send it back for fix-and-resubmit, and do not decide whether it enters the record.
+   Repeat until it exits 0. Then STOP: hand the human the block under `## What to run next`, whole and unedited — it is the author's to run. On a paste round that block already carries the verdict bytes in their own fence beneath the command; hand it over as one piece and never restate the bytes as loose prose (a chat surface rewrites unfenced text). On a path round hand the kept file's path with it. Add no prose around it. You do not start the next round, do not send it back for fix-and-resubmit, and do not decide whether it enters the record.
 
 ## Verbs (from the CLI itself)
 

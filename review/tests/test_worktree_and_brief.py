@@ -302,13 +302,17 @@ class TestPrecisIsDerived(unittest.TestCase):
                 # alternatives beside it are alternatives, not steps.
                 live = [l for l in body if not l.startswith("#")]
                 self.assertEqual(len(live), 1, f"expected one live line: {body}")
-                # And no comment restates what the brief already carries: the
-                # request leg's audience is its precis's Direction line, so
-                # only the verdict leg — whose brief has no equivalent —
-                # names its audience here.
+                # And no comment restates what the block's own heading
+                # already says: a path round's relay carries the command
+                # alone (user, 2026-08-26). Only a paste round keeps a note,
+                # because there the note is an instruction — the verdict
+                # bytes have to reach that command.
                 named = any("author's to run" in l for l in body)
-                self.assertEqual(named, name.startswith("verdict"),
-                                 f"{name}: audience line in the wrong leg")
+                self.assertEqual(named,
+                                 name.startswith("verdict") and "paste" in name,
+                                 f"{name}: only the verdict leg of a PASTE "
+                                 f"round keeps a note, and only because "
+                                 f"there the note is an instruction")
 
     def test_a_relay_block_is_valid_shell_and_runs_only_its_live_lines(self):
         """The promise, checked by a shell rather than asserted.
@@ -992,7 +996,7 @@ class TestVerdictCarrier(unittest.TestCase):
         relay = brief.verdict_relay(parsed, source="/tmp/verdict.md")
         self.assertIn(f"{TOOL_NAME} close --verdict /tmp/verdict.md", relay)
         self.assertNotIn("--verdict -", relay)
-        self.assertIn("the author's to run", relay)
+        self.assertNotIn("the author's to run", relay)
         self.assertNotIn("shared filesystem", relay)
 
     def test_the_relay_does_not_guess_the_step_close_computes(self):

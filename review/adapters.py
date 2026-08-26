@@ -257,7 +257,7 @@ def procedure() -> dict:
                        paths.Ph("<verdict.md>")),
          "Repeat until it exits 0. Then STOP: hand the human the block "
          "under `## What to run next`, whole and unedited — it is the "
-         "author's to run, and it says so on its own first line. On a "
+         "author's to run. On a "
          "paste round that block already carries the verdict bytes in "
          "their own fence beneath the command; hand it over as one piece "
          "and never restate the bytes as loose prose (a chat surface "

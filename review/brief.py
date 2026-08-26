@@ -449,16 +449,17 @@ def verdict_relay(parsed, source: str | None = None,
     # the one it had never run. Now the round says which it is, so the line
     # states one fact instead of two possibilities.
     #
-    # What does NOT depend on the topology is the audience. That line answers
-    # a real 2026-08-20 report — a person read `loupe close` in their own
-    # terminal and ran it — and being on one machine is exactly the case
-    # where running the author's command as the reviewer is easy. It stays in
-    # both shapes.
+    # On a paste round the note carries an INSTRUCTION — the verdict bytes
+    # have to get into that command somehow — so it stays. On a path round
+    # it carried nothing the block did not already say under its own
+    # "## What to run next" heading, and a comment that restates its heading
+    # is noise on every single relay (user, 2026-08-26). Removed rather than
+    # made suppressible: an option would be one more thing to know.
     if transport == vocab.TRANSPORT_PASTE:
         note = ("the author's to run — this round declares no shared "
                 "filesystem, so paste the verdict into it")
     else:
-        note = "the author's to run"
+        note = None
     close_cmd = paths.command(paths.Lit(TOOL_NAME), paths.Lit("close"),
                               paths.Lit("--verdict"), verdict_word)
     # F1 (lineage 6 round 1): a placeholder-bearing line is a Template, and
@@ -467,7 +468,7 @@ def verdict_relay(parsed, source: str | None = None,
     # a person's to finish, so it travels as a comment.
     if isinstance(close_cmd, paths.Template):
         close_cmd = paths.comment(close_cmd)
-    lines = [paths.comment(note), close_cmd]
+    lines = [close_cmd] if note is None else [paths.comment(note), close_cmd]
     out = ["## What to run next", "", *_fence(*lines)]
     if transport == vocab.TRANSPORT_PASTE and envelope is not None:
         out.append("")

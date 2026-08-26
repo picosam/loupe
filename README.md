@@ -104,7 +104,7 @@ working with nothing installed.
 
 ## Status
 
-Version 0.7.0 — the version is bumped inside the reviewed round of any
+Version 0.8.0 — the version is bumped inside the reviewed round of any
 change that will be published, so `--version` discriminates publishes.
 Implemented and tested: the envelopes and validators, the
 gate manifest and attestation checks, roles and stamps (including
@@ -117,7 +117,15 @@ adapters. Designed but not implemented: risk tiering, path-scoped contract
 invariants, auto-execution of falsification tests, a git-notes carrier, an
 MCP facade. See design §9.
 
-Changed in 0.7.0, if you are upgrading. The review contract both agents
+Changed in 0.8.0, if you are upgrading. The verdict relay of a `path`
+round now prints its command alone: the `# the author's to run` comment
+above it restated the block's own `## What to run next` heading and is
+gone. A `paste` round keeps its note, because there it carries an
+instruction — the verdict bytes have to reach the command. Nothing about
+what you run changes; if you match relay bytes exactly, match one line
+fewer.
+
+Changed in 0.7.0. The review contract both agents
 read gained a terminator for the boundary-closure rule: a domain whose
 completeness cannot be established from inside the artifact may be
 declared closed relative to a stated authority — a machine-generated,

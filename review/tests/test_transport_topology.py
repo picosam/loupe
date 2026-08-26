@@ -582,16 +582,18 @@ class TestBothRelaysAgreeWithTheRecord(unittest.TestCase):
         self.assertNotIn("The verdict, to paste:", pathed)
         self.assertNotIn(bytes_, pathed)
 
-    def test_the_audience_line_survives_both_declarations(self):
-        """It answers a 2026-08-20 report of a person running the author's
-        command in the reviewer's terminal, which sharing one machine makes
-        easier, not harder. It is not a carrier caveat and does not go with
-        one."""
+    def test_only_the_paste_round_keeps_a_note(self):
+        """The note survives exactly where it carries an INSTRUCTION: a paste
+        round has to get the verdict bytes into the command. A path round's
+        note restated the block's own heading and is gone (user,
+        2026-08-26)."""
         for declared in vocab.TRANSPORTS:
-            self.assertIn("the author's to run",
-                          brief.verdict_relay(self._verdict(),
-                                              source="/tmp/v.md",
-                                              transport=declared))
+            relay = brief.verdict_relay(self._verdict(), source="/tmp/v.md",
+                                        transport=declared)
+            if declared == vocab.TRANSPORT_PASTE:
+                self.assertIn("paste the verdict into it", relay)
+            else:
+                self.assertNotIn("the author's to run", relay)
 
     def test_the_verdict_leg_defaults_when_nobody_says(self):
         self.assertIn("--verdict /tmp/v.md",

@@ -52,7 +52,14 @@ TOOL_NAME = "loupe"
 # which lands the boundary-authority terminator in the shipped contract,
 # narrows the identity claim to the declared behavioural set, and closes
 # the three findings 0.6.0's README named as standing.
-TOOL_VERSION = "0.7.0"
+#
+# 0.8.0, inside lineage 9's round 4: the verdict relay of a PATH round no
+# longer prints an audience comment above its command. Minor rather than
+# patch because a relay is bytes an agent reproduces verbatim and a human
+# reads, so its shape is interface — and the reviewer adapters, which said
+# the block "says so on its own first line", are regenerated with that
+# clause gone. The lineage's other work is workbench-only.
+TOOL_VERSION = "0.8.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never
