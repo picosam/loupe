@@ -200,6 +200,152 @@ def repo_identity(repo_root: Path) -> str:
     return f"{_identity_name(origin, root)}-{h}"
 
 
+# Round 4 F4. `from_text` caught only TOMLDecodeError, so "TOML the config
+# layer rejects" was not a closed state: `taxonomy = []` crashed inside
+# resolution with a raw TypeError, and `[limits] round_cap = "x"` acquired
+# target authority and raised a raw ValueError later, after the boundary had
+# reported success. Both left the CLI without its typed author remedy.
+#
+# The schema is DERIVED from DEFAULTS, which is already the authority for
+# what a section is and what kind each value has — a hand-kept second list
+# would be one more thing to drift. Only what DEFAULTS deliberately omits is
+# named here, and each omission is documented at its own entry above.
+CONFIG_DECLARED_ELSEWHERE = {
+    ("roles", "relay"): str,            # what carries the envelope
+    ("roles", "transport"): str,        # unstated must stay observable
+    ("limits", "token_budget"): int,    # absent is not zero and not infinity
+}
+_KIND_OF = {str: "a string", int: "a whole number", list: "a list of strings",
+            dict: "a table of string values", bool: "true or false"}
+
+
+def _kind_for(section: str, key: str):
+    """The Python type a declared value must have, from DEFAULTS."""
+    declared = DEFAULTS.get(section, {})
+    if key in declared and declared[key] is not None:
+        return type(declared[key])
+    return CONFIG_DECLARED_ELSEWHERE.get((section, key))
+
+
+def _bad(where: str, saw, want: str) -> str:
+    return (f"{where} must be {want}, not "
+            f"{type(saw).__name__} ({saw!r})")
+
+
+def _check_value(section: str, key: str, value, errors: list) -> None:
+    want = _kind_for(section, key)
+    where = f"[{section}] {key}"
+    if want is bool or isinstance(value, bool) and want is int:
+        # `bool` is an `int` in Python and is never a count here.
+        if want is not bool:
+            errors.append(_bad(where, value, _KIND_OF[want]))
+        return
+    if not isinstance(value, want):
+        errors.append(_bad(where, value, _KIND_OF[want]))
+        return
+    if want is list and not all(isinstance(x, str) for x in value):
+        errors.append(f"{where} must hold strings only")
+    if want is dict and not all(isinstance(k, str) and isinstance(v, str)
+                                for k, v in value.items()):
+        errors.append(f"{where} must map strings to strings")
+    if want is int and value < 0:
+        errors.append(f"{where} must not be negative")
+    if (section, key) == ("limits", "round_cap") and value < 1:
+        errors.append(f"{where} must be at least 1")
+
+
+def _check_gates(rows, errors: list) -> None:
+    if not isinstance(rows, list):
+        errors.append(_bad("gates", rows, "a list of tables"))
+        return
+    for i, row in enumerate(rows):
+        at = f"gates[{i}]"
+        if not isinstance(row, dict):
+            errors.append(_bad(at, row, "a table"))
+            continue
+        unknown = sorted(set(row) - {"id", "command", "blocking"})
+        if unknown:
+            errors.append(f"{at} states unknown key(s) {unknown}")
+        gid = row.get("id")
+        if not isinstance(gid, str) or not gid.strip():
+            errors.append(f"{at} must state a non-empty string `id`")
+        elif not re.fullmatch(vocab.GATE_ID_RE, gid):
+            errors.append(
+                f"{at} id {gid!r} is not one filename component: a gate id "
+                f"names its retained output at "
+                f"<ledger>/gate-output/<sha>/<id>.log, so it must match "
+                f"{vocab.GATE_ID_RE} — an absolute form discards that "
+                f"directory and a separator or dot segment leaves it")
+        elif len(gid) > vocab.GATE_ID_MAX:
+            errors.append(f"{at} id is longer than {vocab.GATE_ID_MAX} "
+                          f"characters")
+        command = row.get("command")
+        if (not isinstance(command, list) or not command
+                or not all(isinstance(w, str) for w in command)):
+            errors.append(f"{at} `command` must be a non-empty list of "
+                          f"strings")
+        if "blocking" in row and not isinstance(row["blocking"], bool):
+            errors.append(_bad(f"{at} `blocking`", row["blocking"],
+                               "true or false"))
+    # Round 5 F2: the rows were judged one at a time, so the SHAPE was closed
+    # and the IDENTITY was not. A gate id is the join key for blocking policy,
+    # missing-gate checks, retained output (`<sha>/<id>.log`) and the
+    # deterministic-preventable metric — so two rows sharing one id are two
+    # gates wearing one identity: both run, the second output overwrites the
+    # first, and the first record's pointer then names bytes that are not its
+    # own. Uniqueness is a property of the manifest, and only the manifest can
+    # be asked about it.
+    seen: dict[str, int] = {}
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        gid = row.get("id")
+        if isinstance(gid, str) and gid.strip():
+            # Round 6 F2: distinct STRINGS are not distinct destinations on a
+            # case-folding filesystem, and the destination is what the
+            # identity has to be unique in.
+            key = gid.casefold()
+            if key in seen:
+                errors.append(
+                    f"gates[{seen[key]}] and gates[{i}] declare ids that name "
+                    f"one retained output ({gid!r}): a gate id names its own "
+                    f"file and joins the attestation, so two rows cannot "
+                    f"share a destination")
+            else:
+                seen[key] = i
+
+
+def check_shape(user: dict, source: str) -> None:
+    """Every declared section, key and value kind, or a ConfigError naming
+    all of them at once — a person repairing a config should see the whole
+    list, not one error per run."""
+    errors: list[str] = []
+    if not isinstance(user, dict):
+        raise ConfigError(f"{source} is not a table")
+    known = set(DEFAULTS) | {"gates"}
+    for name in sorted(set(user) - known):
+        errors.append(f"unknown section [{name}]; the declared sections are "
+                      f"{sorted(known)}")
+    for section in sorted(set(user) & set(DEFAULTS)):
+        body = user[section]
+        if not isinstance(body, dict):
+            errors.append(_bad(f"[{section}]", body, "a table"))
+            continue
+        for key in sorted(body):
+            if _kind_for(section, key) is None:
+                errors.append(f"[{section}] states unknown key {key!r}")
+                continue
+            _check_value(section, key, body[key], errors)
+    if "gates" in user:
+        _check_gates(user["gates"], errors)
+    if errors:
+        raise ConfigError(
+            f"{source} declares {len(errors)} invalid value(s): "
+            + "; ".join(errors),
+            remedy=f"a person repairs {source}; every item above names the "
+                   f"section, the key and the kind it must have")
+
+
 def _merged(user: dict) -> dict:
     merged = {}
     for section, defaults in DEFAULTS.items():
@@ -229,6 +375,7 @@ def from_text(text: str, like: "Config", source: str) -> "Config":
             remedy=f"the author must repair {source} at the target commit; "
                    f"a request whose governing config cannot be read cannot "
                    f"be ruled on") from exc
+    check_shape(user, source)
     sections = _merged(user)
     return Config(repo_root=like.repo_root, repo_id=like.repo_id,
                   source=source, gates=user.get("gates", DEFAULT_GATES),
@@ -321,6 +468,7 @@ def load(repo_root: Path | None = None, ledger_dir: str | None = None,
             source = label
             break
 
+    check_shape(user, source)
     sections = _merged(user)
     cfg = Config(repo_root=repo_root, repo_id=repo_id, source=source,
                  gates=user.get("gates", DEFAULT_GATES), **sections)

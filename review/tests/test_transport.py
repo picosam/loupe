@@ -9,15 +9,21 @@ close → next handoff — because a first real execution is a different
 instrument from unit tests (slice-1 lesson 3); it self-skips, with the reason
 stated, where filesystem writes are denied.
 """
+import contextlib
 import dataclasses
+import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
-from review import cli, config, transport, validate, wire
+from review import (TOOL_NAME, cli, config, tool_identity,
+                    transport,
+                    validate, wire)
 from review import ledger as ledger_mod
 from review.emit import _git
 from review.ledger import Ledger
@@ -44,7 +50,8 @@ def fake_git(mapping):
 
 
 def request_text(sha=SHA_B, base=SHA_A, reviewer="codex", author="claude",
-                 round_no=1, push=True, refs=None, transport_attr=None):
+                 round_no=1, push=True, refs=None, transport_attr=None,
+                 tool_attr=None):
     """A structurally valid request (round-2 F4: `take` judges the
     target-independent grammar before any git call, so a unit fixture must
     pass it — risk stated, NOT captured stated, every §5.1 section present
@@ -62,8 +69,15 @@ def request_text(sha=SHA_B, base=SHA_A, reviewer="codex", author="claude",
     # envelope emitted before the attribute existed does — the topology
     # reader has to read that absence as the default, not as an unknown.
     tr = f' transport="{transport_attr}"' if transport_attr else ""
+    # Round 1 F2 put the identity in the warm-cache key, so a fixture that
+    # has to REACH the checks past it must stamp one. Absent by default,
+    # exactly like the transport attribute above and for the same reason:
+    # what an envelope emitted before the field existed does is a state the
+    # readers have to keep answering for.
+    tl = f' tool="{tool_attr}"' if tool_attr else ""
     return (f'<loupe-review-request sha="{sha}" branch="main" '
-            f'author="{author}" reviewer="{reviewer}" round="{round_no}"{tr}>\n'
+            f'author="{author}" reviewer="{reviewer}" round="{round_no}"'
+            f'{tr}{tl}>\n'
             f"Roles: author={author} · reviewer={reviewer} · relay=user.\n\n"
             f"Target: {sha}\nBase:   {base}   (the SHA ruled on in round 0)\n"
             f"Diff:   git diff {base}...{sha}\nTree:   clean at emission\n"
@@ -639,7 +653,9 @@ class TestTake(unittest.TestCase):
             ("cat-file", "-e", f"{SHA_B}^{{commit}}"): "",
             ("cat-file", "-e", f"{SHA_A}^{{commit}}"): "",
             ("merge-base", "--is-ancestor", SHA_A, SHA_B): "",
-            ("show", f"{SHA_B}:review.toml"): toml,
+            ("ls-tree", "--full-tree", SHA_B, "--", "review.toml"):
+                            "100644 blob 0000000\treview.toml",
+                        ("show", f"{SHA_B}:review.toml"): toml,
             ("cat-file", "-t", f"{SHA_B}:review.toml"): "blob",
             ("cat-file", "-t", f"{SHA_B}:review/wire.py"): "blob",
             ("show", f"{SHA_B}:review/wire.py"): "not the manifest's bytes",
@@ -1020,7 +1036,7 @@ class TestCachedHandoff(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(
             tmp, ignore_errors=True))
         cfg = dataclasses.replace(CFG, ledger_dir=tmp)
-        text = request_text()
+        text = request_text(tool_attr=tool_identity())
         kept = transport.keep_bytes(cfg, 1, "request", text)
         self.assertTrue(Path(kept).is_file())
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
@@ -1059,7 +1075,7 @@ class TestCachedHandoff(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(
             tmp, ignore_errors=True))
         cfg = dataclasses.replace(CFG, ledger_dir=tmp)
-        text = request_text()
+        text = request_text(tool_attr=tool_identity())
         transport.keep_bytes(cfg, 1, "request", text)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
                         ("status", "--porcelain"): ""})
@@ -1099,7 +1115,7 @@ class TestCachedHandoff(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(
             tmp, ignore_errors=True))
         cfg = dataclasses.replace(CFG, ledger_dir=tmp)
-        text = request_text()
+        text = request_text(tool_attr=tool_identity())
         transport.keep_bytes(cfg, 1, "request", text)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
                         ("status", "--porcelain"): ""})
@@ -1151,7 +1167,9 @@ class TestCachedHandoff(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(
             tmp, ignore_errors=True))
         cfg = dataclasses.replace(CFG, ledger_dir=tmp)
-        text = request_text()
+        # Stamped, so every row of the table below tests the CLAIM rule it is
+        # about rather than falling cold on round 1 F2's identity key.
+        text = request_text(tool_attr=tool_identity())
         transport.keep_bytes(cfg, 1, "request", text)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
                         ("status", "--porcelain"): ""})
@@ -1536,11 +1554,15 @@ class TestFullLoopIntegration(unittest.TestCase):
         self.assertTrue(taken2["target"]["config"].startswith(
             "target review.toml at"))
         # A target that carries no review.toml is governed by the checkout,
-        # and the record says so rather than pretending otherwise.
-        rec2 = transport.target_config(
+        # and the record says so rather than pretending otherwise. Round 3
+        # F2: absence is the answer to `ls-tree`, not the answer to a failed
+        # read — a target whose config cannot be READ is a refusal, and the
+        # sibling rows for that live in TestAuthorityOriginIsClassified.
+        rec2, origin = transport.resolve_authority(
             dataclasses.replace(CFG, ledger_dir=None), "0" * 40,
-            git=lambda *a: (_ for _ in ()).throw(RuntimeError("absent")))
-        self.assertIn("the target carries no review.toml", rec2.source)
+            git=lambda *a: "")
+        self.assertEqual(origin, transport.AUTHORITY_EXTERNAL)
+        self.assertIn("carries no review.toml", rec2.source)
         self.assertEqual(rec2.taxonomy, CFG.taxonomy)
 
 
@@ -3387,6 +3409,1154 @@ class _FakeDisposition:
         self.data = data
         self.attrs = {"verdict_sha": data.get("verdict_sha"),
                       "head": data.get("head")}
+
+
+class TestDefectiveEnvelopeIsBlockedNotRedirected(unittest.TestCase):
+    """`take`'s refusal sent the reviewer to a command answering under a
+    DIFFERENT authority, and the reviewer reported the wrong blocker.
+
+    Live 2026-08-27. A Codex reviewer on a detached worktree took a
+    mangled request for a private repository. `take` refused, naming the
+    envelope's real
+    defects, and set `next` to `loupe validate <source>`. The reviewer ran
+    it verbatim — which is exactly what the adapter contract requires of it
+    — and `validate`, which resolves configuration from the CHECKOUT rather
+    than from the target commit, answered `T-UNDECLARED`. That is a defect
+    of the reviewer's tree, not of the request, and it is what reached the
+    human as the blocker while the real cause (mangled bytes) went unnamed.
+
+    Sweep F6 had already shut this door on the inbound side: it moved take's
+    validation onto the target commit's own config precisely because "a
+    valid envelope was refused as T-UNDECLARED ... for a fault in the
+    reviewer's tree". The refusal's `next` reopened it on the way out.
+
+    A defective envelope is the AUTHOR's under either authority, so the
+    reviewer has nothing to run: `_blocked`'s own documented state for "an
+    envelope that must be authored". The remedy names who fixes it and the
+    items travel with the refusal, so the reviewer relays a diagnosis
+    computed once, under the authority that governs it.
+
+    The mutation: restore either `paths.command(... "validate" ...)` and
+    both refusal tests fail on `next_cmd`.
+    """
+
+    def _cfg(self):
+        return dataclasses.replace(CFG, roles=dict(CFG.roles), ledger_dir="")
+
+    def _wrapped_but_defective(self):
+        """Wrapped — so it IS a request — and empty of every §5.1 section,
+        which the target-INDEPENDENT grammar refuses before any git call."""
+        return (f'<loupe-review-request sha="{SHA_B}" branch="main" '
+                f'author="claude" reviewer="codex" round="1">\n'
+                f"Target: {SHA_B}\n</loupe-review-request>\n")
+
+    def test_structural_defect_blocks_and_carries_its_items(self):
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.take(self._cfg(), Ledger.in_memory(),
+                           self._wrapped_but_defective(), "r.md",
+                           reviewer="codex")
+        exc = ctx.exception
+        # Blocked: nothing for the reviewer to run.
+        self.assertEqual(exc.next_cmd, "")
+        self.assertNotIn("validate", exc.next_cmd)
+        # And the two fields a blocked exit exists to carry.
+        self.assertTrue(exc.remedy)
+        self.assertIn("AUTHOR", exc.remedy)
+        self.assertTrue(exc.items)
+        self.assertIn("R-TAXONOMY", [i.code for i in exc.items])
+
+    def test_target_governed_defect_blocks_and_carries_its_items(self):
+        """The post-fetch half: these items are the TARGET commit's config's
+        judgment, which is the authority `validate` would NOT have used."""
+        governed = validate.Item("error", "R-FIXTURE",
+                                 "refused by the target's own config")
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.take(self._cfg(), Ledger.in_memory(), request_text(),
+                           "r.md", reviewer="codex",
+                           git=TestTake._git(TestTake()),
+                           validate_items=lambda parsed, governing: [governed])
+        exc = ctx.exception
+        self.assertEqual(exc.next_cmd, "")
+        self.assertNotIn("validate", exc.next_cmd)
+        self.assertTrue(exc.remedy)
+        self.assertEqual([i.code for i in exc.items], ["R-FIXTURE"])
+
+    def test_a_sound_envelope_still_takes(self):
+        """The VALID control: the refusals above are a judgment about
+        defective envelopes, not a door that now refuses everything."""
+        rec = transport.take(self._cfg(), Ledger.in_memory(), request_text(),
+                             "r.md", reviewer="codex",
+                             git=TestTake._git(TestTake()))
+        self.assertEqual(rec["reviewer"], "codex")
+
+
+
+class TestGoverningAuthorityReachesTheVerdictLeg(unittest.TestCase):
+    """Sweep F6's authority stopped at `take`; the reviewer could not finish
+    the step `take` tells them to run.
+
+    Live 2026-08-27: a take SUCCEEDED — target fetched, references checked,
+    six findings written — and `loupe validate <verdict.md>`, which the
+    procedure requires before a verdict may be handed back, answered
+    T-UNDECLARED, because the reviewer was on a detached worktree carrying
+    no `review.toml`. `--from-target` reaches the authority the target
+    itself declares, deriving the SHA from the envelope's own stamp.
+
+    Round 6 F1 removed the other origin entirely, and with it the record,
+    the digest and the skew they were built to survive: an authority living
+    on one machine cannot be shown to a second, and a review is the act of
+    showing it to a second. What is left is the case that never needed
+    proving.
+    """
+
+    def _cfg(self):
+        return dataclasses.replace(CFG, roles=dict(CFG.roles), ledger_dir="")
+
+    def _target_carrying_config(self):
+        toml = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
+        return fake_git({("cat-file", "-e", f"{SHA_B}^{{commit}}"): "",
+                         ("ls-tree", "--full-tree", SHA_B, "--",
+                          "review.toml"): "100644 blob 0000000\treview.toml",
+                         ("show", f"{SHA_B}:review.toml"): toml})
+
+    def _configless(self):
+        return fake_git({
+            ("cat-file", "-e", f"{SHA_B}^{{commit}}"): "",
+            ("ls-tree", "--full-tree", SHA_B, "--", "review.toml"): ""})
+
+    def test_the_target_supplies_the_authority_it_declares(self):
+        governing = transport.governing_for(
+            self._cfg(), SHA_B, git=self._target_carrying_config())
+        self.assertIn(SHA_B[:12], governing.source)
+        self.assertTrue(governing.taxonomy_declared)
+
+    def test_absent_target_refuses_rather_than_falling_back(self):
+        """The property `target_config` deliberately did NOT have: silence
+        here would hand back this checkout's rules under the target's name."""
+        def git(*args):
+            raise RuntimeError("no such object")
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.governing_for(self._cfg(), SHA_B, git=git)
+        self.assertEqual(ctx.exception.next_cmd, "")
+        self.assertIn("not in this clone", str(ctx.exception))
+
+    def test_a_target_declaring_no_rules_refuses(self):
+        """Round 6 F1: the origin that could not be proved across machines
+        is not narrowed, it is gone — from BOTH ends, which is round 2 F1's
+        rule that the two ends refuse and accept the same states."""
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.governing_for(self._cfg(), SHA_B,
+                                    git=self._configless())
+        self.assertIn("carries no review.toml", str(ctx.exception))
+        # `take` refuses the same state on a real repository, where its probe
+        # is real too: TestTheReviewedCommitCarriesItsOwnRules covers it.
+
+    def test_take_hands_over_the_authority_it_used(self):
+        rec = transport.take(self._cfg(), Ledger.in_memory(), request_text(),
+                             "r.md", reviewer="codex",
+                             git=TestTake._git(TestTake()))
+        self.assertIn("--from-target", rec["then"])
+
+class TestToolIdentityIsInTheWarmKey(unittest.TestCase):
+    """Round 1 F2 (High): a changed behavioural set still hit the cache.
+
+    `cached_handoff`'s own docstring calls a proper-subset cache key the
+    defect class it exists to prevent, and then omitted one input: the tool
+    identity. It is stamped ON the envelope and it covers the code that runs
+    the gates, validates and renders — so serving a copy emitted under a
+    different set lets an upgrade leave the author on the old runner's
+    attestations while `cached: true` says the emission is current.
+    Reporting `differs` afterwards is evidence, not currency.
+
+    Absent is cold too, deliberately: a stamp that cannot be compared cannot
+    be shown to be current, and this tool refuses absent-is-agreement
+    everywhere else.
+
+    The mutation: delete the identity comparison and the differing and
+    unstamped rows both go warm.
+    """
+
+    def setUp(self):
+        try:
+            self.tmp = Path(tempfile.mkdtemp(prefix="identity-key-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self.tmp, ignore_errors=True))
+        self.cfg = dataclasses.replace(CFG, ledger_dir=self.tmp)
+        self.git = fake_git({("rev-parse", "HEAD"): SHA_B,
+                             ("status", "--porcelain"): ""})
+
+    def _warm(self, tool_attr):
+        text = request_text(tool_attr=tool_attr)
+        transport.keep_bytes(self.cfg, 1, "request", text)
+        ledger = Ledger.in_memory()
+        ledger.add({"event": "request", "round": 1, "sha": SHA_B,
+                    "source_digest": transport._digest_text(text),
+                    "bytes": len(text), "claim_digest": transport.NO_CLAIM})
+        return transport.cached_handoff(
+            self.cfg, ledger, 1, git=self.git,
+            claim_digest=transport.NO_CLAIM) is not None
+
+    def test_the_matching_identity_stays_warm(self):
+        """The control: the rule must not simply kill the cache."""
+        self.assertTrue(self._warm(tool_identity()))
+
+    def test_a_differing_identity_is_cold(self):
+        self.assertFalse(self._warm("0" * 16))
+
+    def test_an_unstamped_envelope_is_cold(self):
+        """Absence is not agreement — the rule this tool applies everywhere
+        else, applied inside its own cache."""
+        self.assertFalse(self._warm(None))
+
+    def test_a_freshly_emitted_wrapper_carries_the_current_identity(self):
+        """The other half: the key is only honest if what the emitter
+        stamps is what the reader compares."""
+        self.assertIn(f'tool="{tool_identity()}"',
+                      request_text(tool_attr=tool_identity()))
+
+
+class TestBlockedTakeRendersItsItemsToAHuman(unittest.TestCase):
+    """Round 1 F3 (Medium): the remedy pointed at items a TTY never printed.
+
+    `_out` discards the structured payload on a TTY and prints `tty_text`;
+    `_blocked` rendered auxiliary data only through `detail`, which lands
+    AFTER the recovery line, and `cmd_take` supplied none. So a person at a
+    terminal read "Relay the items above" over nothing — and was pushed back
+    toward the recomputation under the wrong authority that this whole
+    lineage forbids.
+
+    `lead` is the region a recovery line may point at, and it renders before
+    the remedy. The mutation: drop `lead=` from cmd_take's refusal and the
+    TTY rows fail while the JSON rows still pass, which is exactly the gap
+    that shipped.
+    """
+
+    def _take(self, tty):
+        cwd = os.getcwd()
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix="tty-take-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            tmp, ignore_errors=True))
+        env = tmp / "r.md"
+        env.write_text(f'<loupe-review-request sha="{SHA_B}" branch="main" '
+                       f'author="claude" reviewer="codex" round="1">\n'
+                       f"Target: {SHA_B}\n</loupe-review-request>\n",
+                       encoding="utf-8")
+        os.chdir(REPO_ROOT)
+        try:
+            out = io.StringIO()
+            with unittest.mock.patch.object(cli, "_tty", lambda: tty):
+                with contextlib.redirect_stdout(out):
+                    code = cli.main(["--ledger-dir", str(tmp), "take",
+                                     str(env), "--as", "codex"])
+            return code, out.getvalue()
+        finally:
+            os.chdir(cwd)
+
+    def test_the_tty_prints_each_item_code_and_message(self):
+        code, text = self._take(tty=True)
+        self.assertNotEqual(code, 0)
+        self.assertIn("[R-TAXONOMY]", text)
+        self.assertIn("no declared taxonomy section", text)
+        # And the recovery line comes after what it points at.
+        self.assertLess(text.index("[R-TAXONOMY]"), text.index("blocked:"))
+
+    def test_the_structured_form_still_carries_them(self):
+        """The paired control: the JSON channel is unchanged."""
+        code, text = self._take(tty=False)
+        payload = json.loads(text)
+        self.assertNotEqual(code, 0)
+        self.assertIn("R-TAXONOMY", [i["code"] for i in payload["items"]])
+        self.assertEqual(payload["next_kind"], "blocked")
+
+
+
+class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
+    """Round 6 F1, end to end on real repositories.
+
+    Rounds 2 to 5 built a proof that the rules a verdict was judged by were
+    the rules its request was judged by, for the case where those rules live
+    on the reviewer's machine rather than in the commit. Every round the
+    proof held and a new seam appeared one level out — a record the far end
+    could not have, a skew no report-only comparison reaches, a domain
+    statement shipped only to the build that already agrees.
+
+    The seam was never in the proof. An authority on one machine cannot be
+    shown to a second, and a review is the act of showing it to a second. So
+    the origin goes: a handoff refuses where the repository tracks no
+    configuration, and both reviewer verbs refuse a target that declares
+    none. Nothing is left to prove, and the machinery that proved it is
+    deleted rather than narrowed.
+    """
+
+    def setUp(self):
+        try:
+            self.tmp = Path(tempfile.mkdtemp(prefix="own-rules-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self.tmp, ignore_errors=True))
+        self.repo = self.tmp / "repo"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)],
+                       check=True, capture_output=True, timeout=60)
+        self.toml = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
+        (self.repo / "keep.txt").write_text("keep\n", encoding="utf-8")
+        self.base = self._commit("base")
+
+    def _git(self, *args):
+        return subprocess.run(
+            ["git", "-C", str(self.repo), "-c", "user.email=t@example.invalid",
+             "-c", "user.name=t", *args], check=True, capture_output=True,
+            text=True, timeout=60).stdout.strip()
+
+    def _commit(self, subject):
+        self._git("add", "-A")
+        self._git("commit", "--allow-empty", "-qm", subject)
+        return self._git("rev-parse", "HEAD")
+
+    def _cfg(self):
+        return dataclasses.replace(config.load(self.repo),
+                                   ledger_dir=self.tmp / "ledger")
+
+    def _envelope(self, sha):
+        blob = self._git("rev-parse", f"{sha}:keep.txt")
+        digest = __import__("hashlib").sha256(subprocess.run(
+            ["git", "-C", str(self.repo), "cat-file", "blob", blob],
+            check=True, capture_output=True, timeout=60).stdout).hexdigest()
+        return request_text(
+            sha=sha, base=self.base, push=True,
+            refs=f"  keep.txt  sha256:{digest}  [required] a kept file\n")
+
+    def _validate(self, sha, *extra):
+        verdict = self.tmp / "v.md"
+        verdict.write_text(
+            f'<loupe-review-verdict sha="{sha}">\nVERDICT: clean to '
+            f"advance\n\n## findings\n\nNone\n\n## evidence "
+            f"checked\n\n- took it\n</loupe-review-verdict>\n",
+            encoding="utf-8")
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = cli.main(["--ledger-dir", str(self.tmp / "ledger"),
+                                 "validate", str(verdict), *extra])
+            return code, json.loads(out.getvalue())
+        finally:
+            os.chdir(cwd)
+
+    def test_a_handoff_refuses_where_the_rules_do_not_travel(self):
+        """The author's end, before a commit, a push, a gate or an emission."""
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.handoff_preflight(self._cfg(),
+                                        Ledger(self.tmp / "ledger"))
+        exc = ctx.exception
+        self.assertIn("tracks no review.toml", str(exc))
+        self.assertEqual(exc.next_cmd, "")
+        self.assertIn("commits review.toml", exc.remedy)
+
+    def test_a_tracked_config_is_the_paired_control(self):
+        (self.repo / "review.toml").write_text(self.toml, encoding="utf-8")
+        self._commit("rules")
+        transport.handoff_preflight(self._cfg(), Ledger(self.tmp / "ledger"))
+
+    def test_both_reviewer_verbs_refuse_a_target_declaring_no_rules(self):
+        sha = self._commit("no rules")
+        (self.repo / "review.toml").write_text(self.toml, encoding="utf-8")
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.take(self._cfg(), Ledger(self.tmp / "ledger"),
+                           self._envelope(sha), "r.md", reviewer="codex",
+                           fetch=False)
+        self.assertIn("carries no review.toml", str(ctx.exception))
+        code, payload = self._validate(sha, "--from-target")
+        self.assertNotEqual(code, 0, payload)
+        self.assertEqual(payload["next_kind"], "blocked", payload)
+        self.assertNotIn("items", payload, payload)
+
+    def test_the_printed_command_validates_a_commit_carrying_its_rules(self):
+        (self.repo / "review.toml").write_text(self.toml, encoding="utf-8")
+        sha = self._commit("rules")
+        rec = transport.take(self._cfg(), Ledger(self.tmp / "ledger"),
+                             self._envelope(sha), "r.md", reviewer="codex",
+                             fetch=False)
+        self.assertIn("--from-target", rec["then"])
+        code, payload = self._validate(sha, "--from-target")
+        codes = [i["code"] for i in payload.get("items", [])]
+        self.assertIn("T-AUTHORITY", codes, payload)
+        self.assertNotIn("T-UNDECLARED", codes, payload)
+
+    def test_without_the_flag_nothing_about_the_default_changed(self):
+        (self.repo / "review.toml").write_text(self.toml, encoding="utf-8")
+        sha = self._commit("rules")
+        (self.repo / "review.toml").unlink()
+        code, payload = self._validate(sha)
+        self.assertNotIn("T-AUTHORITY",
+                         [i["code"] for i in payload.get("items", [])])
+
+class TestAuthorityOriginIsClassified(unittest.TestCase):
+    """Round 3 F2 and F3: absence and unreadability were one branch.
+
+    `_git` turns every nonzero git exit into `RuntimeError`, and the old
+    resolver caught that whole class as "the target carries no review.toml".
+    So a present entry whose blob object was missing answered with the
+    CHECKOUT's rules — measured: target `round_cap` 3, checkout 9, and the
+    checkout won. Round 3's digest could not see it, because both ends asked
+    the same misclassifying question; a green continuity proof sat on top.
+    Invalid UTF-8 escaped further: the text-mode reader raised
+    `UnicodeDecodeError` past every typed refusal, leaving an agent with no
+    `next_kind` and no `remedy`.
+
+    External fallback is advertised for ONE state, and it is now established
+    by the question that answers it (`ls-tree`: silent and exit 0 for a path
+    a tree lacks) rather than inferred from a failure to read. Every other
+    outcome refuses.
+
+    The mutation: restore `except RuntimeError: fall back` around the read
+    and the corrupt-object and operational rows pass when they must not.
+    """
+
+    VALID = "review.toml"
+
+    def _repo(self, body=None, *, as_bytes=False, as_dir=False,
+              corrupt=False, symlink_to=None, executable=False,
+              gitlink=False):
+        """A target commit carrying `body` as review.toml, plus a DIFFERENT
+        valid config in the checkout — so a silent fallback is visible as
+        the wrong rules rather than as no rules at all."""
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix="origin-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            tmp, ignore_errors=True))
+        repo = tmp / "repo"
+        good = (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)],
+                       check=True, capture_output=True, timeout=60)
+        if symlink_to is not None:
+            # The link TEXT is itself valid TOML, and the file it names holds
+            # different valid TOML: the two ends must not be able to read
+            # different bytes for one SHA (round 4 F1).
+            (repo / symlink_to).write_text(
+                (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
+                .replace("round_cap = 3", "round_cap = 9"), encoding="utf-8")
+            (repo / self.VALID).symlink_to(symlink_to)
+        elif as_dir:
+            (repo / self.VALID).mkdir()
+            (repo / self.VALID / "x").write_text("x", encoding="utf-8")
+        elif body is not None:
+            target = repo / self.VALID
+            if as_bytes:
+                target.write_bytes(body)
+            else:
+                target.write_text(body, encoding="utf-8")
+        (repo / "other.txt").write_text("x", encoding="utf-8")
+        if executable:
+            (repo / self.VALID).chmod(0o755)
+
+        def commit(subject, stage=True):
+            steps = (("add", "-A"),) if stage else ()
+            for args in (*steps,
+                         ("-c", "user.email=t@example.invalid", "-c",
+                          "user.name=t", "commit", "--allow-empty", "-qm",
+                          subject)):
+                subprocess.run(["git", "-C", str(repo), *args], check=True,
+                               capture_output=True, timeout=60)
+            return subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True, timeout=60).stdout.strip()
+
+        # A REAL base: the take row below must refuse for its own reason,
+        # and a fixture base SHA that does not resolve refuses first — which
+        # is how that row passed under the mutation it exists to catch.
+        held = (repo / self.VALID)
+        link = os.readlink(held) if held.is_symlink() else None
+        stashed = (held.read_bytes()
+                   if link is None and held.is_file() else None)
+        if link is not None or stashed is not None:
+            held.unlink()
+        self.base = commit("base")
+        if link is not None:
+            held.symlink_to(link)          # still a symlink at the target
+        elif stashed is not None:
+            held.write_bytes(stashed)
+        sha = commit("target")
+        if gitlink:
+            subprocess.run(
+                ["git", "-C", str(repo), "update-index", "--add",
+                 "--cacheinfo", f"160000,{sha},{self.VALID}"], check=True,
+                capture_output=True, timeout=60)
+            # No `add -A`: it would re-stage the worktree file as a blob and
+            # undo the gitlink this row exists to test.
+            sha = commit("gitlink", stage=False)
+        if corrupt:
+            blob = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", f"{sha}:{self.VALID}"],
+                check=True, capture_output=True, text=True,
+                timeout=60).stdout.strip()
+            (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+        # The checkout's rules differ, so a substitution is legible.
+        if as_dir or (repo / self.VALID).is_symlink():
+            (repo / self.VALID).unlink() if (
+                repo / self.VALID).is_symlink() else None
+        if as_dir:
+            __import__("shutil").rmtree(repo / self.VALID)
+        (repo / self.VALID).write_text(
+            good.replace("round_cap = 3", "round_cap = 9"), encoding="utf-8")
+        cfg = dataclasses.replace(config.load(repo), ledger_dir=tmp / "l")
+        return cfg, sha
+
+    def _resolve(self, **kw):
+        cfg, sha = self._repo(**kw)
+        return transport.resolve_authority(cfg, sha)
+
+    # ------------------------------------------------------ the controls
+
+    def test_a_truly_absent_config_is_the_advertised_fallback(self):
+        governing, origin = self._resolve(body=None)
+        self.assertEqual(origin, transport.AUTHORITY_EXTERNAL)
+        self.assertEqual(governing.round_cap, 9)   # the checkout's, honestly
+
+    def test_a_readable_config_is_the_targets_own(self):
+        good = (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
+        governing, origin = self._resolve(body=good)
+        self.assertEqual(origin, transport.AUTHORITY_TARGET)
+        self.assertEqual(governing.round_cap, 3)   # the TARGET's
+
+    def test_ordinary_non_ascii_utf8_is_read(self):
+        good = (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
+        governing, origin = self._resolve(body="# caf\u00e9 \u2014 \u00e9\n" + good)
+        self.assertEqual(origin, transport.AUTHORITY_TARGET)
+        self.assertEqual(governing.round_cap, 3)
+
+    # ------------------------------------------------------ the refusals
+
+    def _refuses(self, why, **kw):
+        with self.assertRaises(transport.Refusal) as ctx:
+            self._resolve(**kw)
+        exc = ctx.exception
+        self.assertEqual(exc.next_cmd, "", why)
+        self.assertTrue(exc.remedy, why)
+        return exc
+
+    def test_a_present_but_unreadable_blob_refuses(self):
+        """F2's own falsification: entry present, object gone."""
+        good = (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
+        self.assertIn("PRESENT", str(self._refuses("corrupt object",
+                                                   body=good, corrupt=True)))
+
+    def test_an_executable_regular_file_is_still_a_file(self):
+        """The control for the mode check: 100755 carries bytes a checkout
+        reads, so it must be ADMITTED, not swept up with the refusals."""
+        good = (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
+        governing, origin = self._resolve(body=good, executable=True)
+        self.assertEqual(origin, transport.AUTHORITY_TARGET)
+        self.assertEqual(governing.round_cap, 3)
+
+    def test_a_tree_entry_refuses(self):
+        self.assertIn("a directory",
+                      str(self._refuses("tree entry", as_dir=True)))
+
+    def test_a_submodule_entry_refuses(self):
+        good = (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
+        self.assertIn("a submodule",
+                      str(self._refuses("gitlink", body=good, gitlink=True)))
+
+    def test_a_symlink_cannot_split_the_two_ends(self):
+        """Round 4 F1's falsification. A symlink is mode 120000 and object
+        type `blob`, so a type-only check admitted it and `git show` handed
+        back the LINK TEXT — while the author's `config.load` followed the
+        link and read the file. One SHA, two configurations."""
+        cfg, sha = self._repo(symlink_to="linked.toml")
+        # The author's end follows the link: this is the value it would use.
+        self.assertEqual(cfg.round_cap, 9)
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.resolve_authority(cfg, sha)
+        self.assertIn("a symbolic link", str(ctx.exception))
+        self.assertEqual(ctx.exception.next_cmd, "")
+
+    def test_a_dangling_symlink_refuses_for_the_same_reason(self):
+        cfg, sha = self._repo(symlink_to="linked.toml")
+        (cfg.repo_root / "linked.toml").unlink()
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.resolve_authority(cfg, sha)
+        self.assertIn("a symbolic link", str(ctx.exception))
+
+    def test_every_invalid_config_shape_is_a_typed_refusal(self):
+        """Round 4 F4: "TOML the config layer rejects" was not a closed
+        state. `taxonomy = []` crashed inside resolution with a raw
+        TypeError, and a string `round_cap` acquired target authority and
+        raised a raw ValueError later — after this boundary had reported
+        success. The schema is derived from DEFAULTS, so each row below is a
+        kind that authority already declares."""
+        good = (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
+        for label, body in (
+                ("a section that is not a table", "taxonomy = []"),
+                ("a scalar of the wrong type",
+                 "[limits]\nround_cap = \"not-an-int\""),
+                ("a boolean where a count belongs",
+                 "[limits]\nround_cap = true"),
+                ("a list holding non-strings",
+                 "[taxonomy]\nseverities = [1, 2]"),
+                ("a table holding non-strings",
+                 "[taxonomy]\nclassification_notes = {a = 1}"),
+                ("an unknown section", "[nope]\nx = 1"),
+                ("an unknown key", "[limits]\nnope = 1"),
+                ("a gate row that is not a table", "gates = [1]"),
+                ("a gate with no id",
+                 "[[gates]]\nid = \"\"\ncommand = [\"true\"]"),
+                ("a gate with an empty command",
+                 "[[gates]]\nid = \"x\"\ncommand = []"),
+                ("a gate with a non-boolean blocking",
+                 "[[gates]]\nid = \"x\"\ncommand = [\"true\"]\n"
+                 "blocking = \"yes\""),
+                # Round 5 F2: shape was closed, IDENTITY was not. A gate id
+                # names the retained output and joins the attestation, so two
+                # rows sharing one are two gates wearing one identity — both
+                # run, the second output overwrites the first, and the first
+                # record's pointer then names bytes that are not its own.
+                ("two gate rows sharing one id",
+                 "[[gates]]\nid = \"dup\"\ncommand = [\"echo\", \"a\"]\n"
+                 "[[gates]]\nid = \"dup\"\ncommand = [\"echo\", \"b\"]"),
+        ):
+            with self.subTest(shape=label):
+                self.assertIn("AUTHOR", self._refuses(label, body=body).remedy)
+        # The paired canonical control: the repository's own configuration,
+        # which every row above is a mutation of, still resolves.
+        governing, origin = self._resolve(body=good)
+        self.assertEqual(origin, transport.AUTHORITY_TARGET)
+        # And the distinct-id control, so the uniqueness rule is a rule about
+        # collision rather than a rule against declaring two gates.
+        two, _ = self._resolve(
+            body="[[gates]]\nid = \"one\"\ncommand = [\"true\"]\n"
+                 "[[gates]]\nid = \"two\"\ncommand = [\"true\"]\n"
+                 + good)
+        self.assertEqual([g["id"] for g in two.gates][:2], ["one", "two"])
+
+    def _timeout(self, *_a):
+        raise subprocess.TimeoutExpired(cmd="git", timeout=120)
+
+    def test_a_timeout_at_the_presence_probe_is_typed(self):
+        """Round 4 F3: a timeout is an ADMITTED outcome — both readers
+        declare one — and TimeoutExpired is not a RuntimeError, so it tore
+        through every caller's catch and left an agent with no next_kind."""
+        cfg, _ = self._repo(body="round_cap = 3")
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.resolve_authority(cfg, "b" * 40, git=self._timeout)
+        self.assertEqual(ctx.exception.next_cmd, "")
+        self.assertTrue(ctx.exception.remedy)
+
+    def test_a_timeout_at_the_byte_read_is_typed(self):
+        cfg, sha = self._repo(
+            body=(REPO_ROOT / self.VALID).read_text(encoding="utf-8"))
+        entry = f"100644 blob 0000000\t{self.VALID}"
+
+        def git(*args):
+            if args[0] == "ls-tree":
+                return entry
+            raise subprocess.TimeoutExpired(cmd="git", timeout=120)
+
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.resolve_authority(cfg, sha, git=git)
+        self.assertIn("cannot be read", str(ctx.exception))
+        self.assertTrue(ctx.exception.remedy)
+
+    def test_a_missing_executable_is_typed(self):
+        cfg, _ = self._repo(body="round_cap = 3")
+
+        def git(*args):
+            raise FileNotFoundError(2, "no such file", "git")
+
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.resolve_authority(cfg, "b" * 40, git=git)
+        self.assertEqual(ctx.exception.next_cmd, "")
+
+    def test_an_unreadable_tree_listing_refuses(self):
+        cfg, _ = self._repo(body="round_cap = 3")
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.resolve_authority(
+                cfg, "b" * 40, git=lambda *a: "garbage")
+        self.assertIn("cannot be read", str(ctx.exception))
+
+    def test_invalid_leading_bytes_refuse(self):
+        self.assertIn("not valid UTF-8",
+                      str(self._refuses("0xff 0xfe", body=b"\xff\xfe\x00x",
+                                    as_bytes=True)))
+
+    def test_truncated_multibyte_input_refuses(self):
+        self.assertIn("not valid UTF-8",
+                      str(self._refuses("lone continuation byte",
+                                    body=b"round_cap = 3\n\xc3",
+                                    as_bytes=True)))
+
+    def test_a_byte_order_mark_is_refused_rather_than_stripped(self):
+        """BOM policy, stated rather than left to chance: the bytes decode,
+        and the config layer then rejects them. Declared here so the row
+        cannot silently become 'stripped' later."""
+        good = (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
+        self._refuses("utf-8 BOM",
+                      body=b"\xef\xbb\xbf" + good.encode("utf-8"),
+                      as_bytes=True)
+
+    def test_decodable_but_malformed_toml_still_refuses(self):
+        """The paired control for the two byte rows: same typed refusal,
+        different cause."""
+        self._refuses("malformed TOML", body="[[[ not toml")
+
+    # ------------------------------------------------- through the verbs
+
+    def test_take_refuses_a_corrupt_target_config_and_records_nothing(self):
+        good = (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
+        cfg, sha = self._repo(body=good, corrupt=True)
+        ledger = Ledger(cfg.ledger_dir)
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.take(cfg, ledger,
+                           request_text(sha=sha, base=self.base), "r.md",
+                           reviewer="codex", fetch=False)
+        # Bound to its own cause, not to whatever refuses first.
+        self.assertIn("cannot be read", str(ctx.exception))
+        self.assertEqual(ledger.events(), [],
+                         "a refusal before validation appends nothing")
+
+
+
+class TestGateIdIsASafeFilenameComponent(unittest.TestCase):
+    """Round 6 F2: a gate id is a logical identity AND a path component.
+
+    `_retain_output` writes `<ledger>/gate-output/<sha>/<id>.log`, so an
+    ABSOLUTE id discards the directory entirely — measured: a manifest whose
+    id was an absolute path was accepted, ran, and wrote outside the ledger's
+    subtree — while separators and dot segments escape or alias it. Round 5
+    established that two rows cannot share an id STRING; two distinct strings
+    can still name one destination, and on a case-folding filesystem
+    routinely do.
+
+    The grammar is closed rather than the escapes enumerated: containment and
+    one-id-one-file are properties of the alphabet, not of a blacklist.
+
+    Mutations: accept any non-blank id and the escape rows pass; compare ids
+    case-sensitively and the alias row passes.
+    """
+
+    def _cfg(self):
+        return dataclasses.replace(CFG, ledger_dir=None)
+
+    def _rows(self, *ids):
+        return "".join(f'[[gates]]\nid = "{i}"\ncommand = ["true"]\n'
+                       for i in ids)
+
+    def _refused(self, body, door):
+        with self.assertRaises(config.ConfigError) as ctx:
+            if door == "from_text":
+                config.from_text(body, self._cfg(), source="t")
+            else:
+                tmp = Path(tempfile.mkdtemp(prefix="gate-id-"))
+                self.addCleanup(lambda: __import__("shutil").rmtree(
+                    tmp, ignore_errors=True))
+                subprocess.run(["git", "init", "-q", str(tmp)], check=True,
+                               capture_output=True, timeout=60)
+                (tmp / "review.toml").write_text(body, encoding="utf-8")
+                config.load(tmp)
+        return str(ctx.exception)
+
+    ESCAPES = {
+        "absolute": "/tmp/escaped",
+        "parent segment": "../escaped",
+        "separator": "a/b",
+        "leading dot": ".hidden",
+        "dot segment": "..",
+        "backslash": "a\\b",
+        "space": "two words",
+    }
+
+    def test_no_escape_form_survives_either_configuration_door(self):
+        for door in ("from_text", "load"):
+            for label, gid in self.ESCAPES.items():
+                with self.subTest(door=door, form=label):
+                    self.assertIn("filename component",
+                                  self._refused(self._rows(gid), door))
+
+    def test_two_ids_naming_one_destination_refuse(self):
+        """Distinct strings, one file: the alias round 5's string equality
+        could not see."""
+        self.assertIn("one retained output",
+                      self._refused(self._rows("tests", "TESTS"),
+                                    "from_text"))
+
+    def test_distinct_valid_ids_are_the_paired_control(self):
+        cfg = config.from_text(self._rows("tests", "lint-2", "a.b_c"),
+                               self._cfg(), source="t")
+        self.assertEqual([g["id"] for g in cfg.gates],
+                         ["tests", "lint-2", "a.b_c"])
+
+    def test_every_admitted_id_stays_an_immediate_child(self):
+        """The property the grammar exists to give `_retain_output`: for any
+        id the schema admits, the destination is one level under the
+        per-SHA directory and nowhere else."""
+        target = Path("/ledger/gate-output/abcdef")
+        cfg = config.from_text(self._rows(*self.CONTAINMENT), self._cfg(),
+                               source="t")
+        for gate in cfg.gates:
+            with self.subTest(id=gate["id"]):
+                out = (target / f"{gate['id']}.log").resolve()
+                self.assertEqual(out.parent, target.resolve())
+
+    CONTAINMENT = ("tests", "lint-2", "a.b_c", "A", "z9")
+
+
+
+class TestTheProspectiveCommitCarriesItsRules(unittest.TestCase):
+    """Round 7 F1, F2 and F3, at the doors an author actually reaches.
+
+    Round 6 asked `ls-files`, which answers whether the OLD commit tracks the
+    path. Publication then runs `commit -a`, which stages tracked
+    working-tree deletions and type changes — so a tracked `review.toml`
+    deleted in the worktree passed the check, and the commit that check
+    existed to protect carried none. The question is about the tree the
+    commit will have, and for `commit -a` that tree is the WORKTREE.
+
+    It also lived at one door. `emit-request` — the lower half of handoff —
+    committed and emitted the exact state the lifecycle calls unsupported.
+    Two author doors accepting and refusing different states is round 2 F1
+    with the author's own ends as the two ends.
+
+    And its remedy never arrived: `cmd_handoff` replaced every preflight
+    refusal's remedy with one sentence about dispositions, so the repository
+    that needed a migration action was handed advice that cannot repair it.
+    The round-6 test called the preflight directly and verified a remedy
+    production overwrote.
+
+    Mutations: drop the worktree half and the deletion and symlink rows pass;
+    drop either call site and that door emits a configless commit again;
+    restore the fixed remedy and the missing-config remedy row fails.
+    """
+
+    MINIMAL = (
+        '[taxonomy]\nseverities = ["Blocker", "Low"]\n'
+        'blocking = ["Blocker"]\nclassifications = ["design_gap"]\n'
+        '[roles]\nauthor = "claude"\nreviewer = "codex"\n'
+        'permitted_authors = ["claude"]\npermitted_reviewers = ["codex"]\n')
+
+    def setUp(self):
+        try:
+            self.tmp = Path(tempfile.mkdtemp(prefix="prospective-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self.tmp, ignore_errors=True))
+        self.repo = self.tmp / "repo"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)],
+                       check=True, capture_output=True, timeout=60)
+        (self.repo / "review.toml").write_text(self.MINIMAL, encoding="utf-8")
+        (self.repo / "keep.txt").write_text("keep\n", encoding="utf-8")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "rules")
+        self.head = self._git("rev-parse", "HEAD")
+        # The finding's scenario: a user-level copy governs, so roles resolve
+        # and this boundary is the one that answers. Without it a deleted
+        # config falls back to defaults and the roles refusal fires first —
+        # which is how the first cut of this class passed under mutation.
+        self.home = self.tmp / "home"
+        (self.home / ".config" / "loupe").mkdir(parents=True, exist_ok=True)
+        (self.home / ".config" / "loupe"
+         / f"{config.load(self.repo).repo_id}.toml").write_text(
+            self.MINIMAL, encoding="utf-8")
+
+    def _git(self, *args):
+        return subprocess.run(
+            ["git", "-C", str(self.repo), "-c", "user.email=t@example.invalid",
+             "-c", "user.name=t", *args], check=True, capture_output=True,
+            text=True, timeout=60).stdout.strip()
+
+    def _cfg(self):
+        return dataclasses.replace(config.load(self.repo),
+                                   ledger_dir=self.tmp / "ledger")
+
+    def _run(self, *argv):
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            out = io.StringIO()
+            with unittest.mock.patch.dict(os.environ,
+                                          {"HOME": str(self.home)}), \
+                    contextlib.redirect_stdout(out):
+                code = cli.main(["--ledger-dir", str(self.tmp / "ledger"),
+                                 *argv])
+            try:
+                return code, json.loads(out.getvalue())
+            except json.JSONDecodeError:
+                return code, {"raw": out.getvalue()}
+        finally:
+            os.chdir(cwd)
+
+    # ------------------------------------------------- prospective states
+
+    def _make(self, state):
+        cfgfile = self.repo / "review.toml"
+        if state == "unstaged deletion":
+            cfgfile.unlink()
+        elif state == "staged deletion":
+            self._git("rm", "-q", "--cached", "review.toml")
+            cfgfile.unlink()
+        elif state == "type change to a symlink":
+            # Pointed at VALID TOML on purpose: a symlink to something else
+            # refuses at config load, which is a different boundary, and the
+            # row would then pass without reaching this one.
+            (self.repo / "alt.toml").write_text(self.MINIMAL,
+                                                encoding="utf-8")
+            cfgfile.unlink()
+            cfgfile.symlink_to("alt.toml")
+        elif state == "type change to a directory":
+            cfgfile.unlink()
+            cfgfile.mkdir()
+        elif state == "unstaged content change":
+            cfgfile.write_text(self.MINIMAL + "\n# edited\n",
+                               encoding="utf-8")
+        elif state == "staged content change":
+            cfgfile.write_text(self.MINIMAL + "\n# staged\n",
+                               encoding="utf-8")
+            self._git("add", "review.toml")
+        elif state == "executable regular file":
+            cfgfile.chmod(0o755)
+
+    #: States the CLI can reach: a directory or a symlink to non-TOML
+    #: refuses at configuration load, an earlier boundary, so those live in
+    #: the direct rows below where this boundary is the only one running.
+    REFUSED = ("unstaged deletion", "staged deletion",
+               "type change to a symlink")
+    ADMITTED = ("unstaged content change", "staged content change",
+                "executable regular file")
+
+    def test_no_author_door_emits_a_commit_without_its_rules(self):
+        """Both real entrypoints, every prospective state that would produce
+        one — blocked, HEAD unmoved, and no request written."""
+        for door in (("handoff",), ("emit-request", "--local-only")):
+            for state in self.REFUSED:
+                with self.subTest(door=door[0], state=state):
+                    self.setUp()
+                    self._make(state)
+                    code, payload = self._run(*door)
+                    self.assertNotEqual(code, 0, payload)
+                    self.assertEqual(payload.get("next_kind"), "blocked",
+                                     payload)
+                    self.assertTrue(payload.get("remedy"), payload)
+                    # Bound to ITS OWN cause. Without this the rows pass on
+                    # whatever refuses first — a deleted config falls back to
+                    # defaults and the roles refusal blocks too, with HEAD
+                    # unmoved and no request written, so both mutations
+                    # survived the first cut of this class.
+                    error = payload.get("error", "")
+                    self.assertTrue(
+                        "tracks no review.toml" in error
+                        or "is tracked but is" in error,
+                        f"refused for another reason: {error}")
+                    self.assertEqual(self._git("rev-parse", "HEAD"),
+                                     self.head, "HEAD moved")
+                    self.assertFalse(
+                        list((self.tmp / "ledger").glob("**/*request*")),
+                        "a request was written")
+
+    def test_every_non_regular_prospective_shape_refuses_here(self):
+        """The boundary itself, where nothing else can answer first."""
+        for state, says in (("unstaged deletion", "deleted in the working"),
+                            ("type change to a directory", "a directory"),
+                            ("type change to a symlink", "a symbolic link")):
+            with self.subTest(state=state):
+                self.setUp()
+                self._make(state)
+                with self.assertRaises(transport.Refusal) as ctx:
+                    transport.prospective_authority(
+                        dataclasses.replace(CFG, repo_root=self.repo,
+                                            ledger_dir=None))
+                self.assertIn(says, str(ctx.exception))
+
+    def _with_filter(self, driver):
+        self._git("config", "filter.mangle.clean", driver)
+        (self.repo / ".gitattributes").write_text(
+            "review.toml filter=mangle\n", encoding="utf-8")
+        self._git("add", ".gitattributes")
+        self._git("commit", "-qm", "attrs")
+        return self._git("rev-parse", "HEAD")
+
+    #: The complete attribute-result domain. Round 9 asked git's TEXT
+    #: presentation of the declared state, and that presentation is lossy:
+    #: `unspecified` renders both an absent attribute and an active driver
+    #: NAMED `unspecified`, so a filter could occupy the token meaning
+    #: absence. Presence of the attribute NAME has no such collision —
+    #: names come from git's own parse — so that is what is asked, and
+    #: every declared filter refuses whatever its value.
+    ATTRIBUTES = {
+        "an active driver named unspecified": ("filter=unspecified", False),
+        "an active driver named unset": ("filter=unset", False),
+        "a value whose last colon part is a sentinel":
+            ("filter=a:unspecified", False),
+        "an explicit unset": ("-filter", False),
+        "a boolean set": ("filter", False),
+        "an ordinary string driver": ("filter=mangle", False),
+        "an unrelated attribute": ("text", True),
+        "no attributes at all": (None, True),
+    }
+
+    def test_the_whole_attribute_domain_partitions(self):
+        for label, (attr, admitted) in self.ATTRIBUTES.items():
+            with self.subTest(attribute=label):
+                self.setUp()
+                if attr is not None:
+                    (self.repo / ".gitattributes").write_text(
+                        f"review.toml {attr}\n", encoding="utf-8")
+                    self._git("add", ".gitattributes")
+                    self._git("commit", "-qm", "attrs")
+                if admitted:
+                    transport.prospective_authority(self._cfg())
+                else:
+                    with self.assertRaises(transport.Refusal) as ctx:
+                        transport.prospective_authority(self._cfg())
+                    self.assertIn("filter attribute is declared",
+                                  str(ctx.exception))
+
+    def test_the_reserved_name_driver_refuses_at_both_doors(self):
+        """Round 10 F1's own falsification: an identity-first driver NAMED
+        `unspecified`, which round 9 read as absence and then invoked."""
+        stateful = str(self.tmp / "stateful.sh")
+        Path(stateful).write_text(
+            "#!/bin/sh\nf=%s\nif [ -e \"$f\" ]; then sed 's/claude/gemini/'; "
+            "else touch \"$f\"; cat; fi\n" % (self.tmp / "seen"),
+            encoding="utf-8")
+        Path(stateful).chmod(0o755)
+        self._git("config", "filter.unspecified.clean", stateful)
+        (self.repo / ".gitattributes").write_text(
+            "review.toml filter=unspecified\n", encoding="utf-8")
+        self._git("add", ".gitattributes")
+        self._git("commit", "-qm", "attrs")
+        head = self._git("rev-parse", "HEAD")
+        for door in (("handoff",), ("emit-request", "--local-only")):
+            with self.subTest(door=door[0]):
+                code, payload = self._run(*door)
+                self.assertNotEqual(code, 0, payload)
+                self.assertEqual(payload.get("next_kind"), "blocked", payload)
+                self.assertIn("filter attribute is declared",
+                              payload.get("error", ""))
+                self.assertEqual(self._git("rev-parse", "HEAD"), head,
+                                 "HEAD moved")
+                self.assertFalse(
+                    list((self.tmp / "ledger").glob("**/*request*")))
+
+    def test_an_unreadable_attribute_listing_refuses(self):
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.prospective_authority(
+                self._cfg(), git=lambda *a: ("" if a[0] == "ls-files"
+                                             else "one\0two"))
+        self.assertIn("cannot be read", str(ctx.exception))
+
+    def test_every_declared_filter_refuses_before_a_driver_runs(self):
+        """Round 9 F1. Round 8 compared one filtered object id against one
+        plain one — an equality observed over a SINGLE execution of an
+        external program. A driver that echoes its input the first time and
+        rewrites it afterwards passed that check and then rewrote the
+        commit; the emitted request was bound to a target whose rules
+        forbade its own author. The declared state is asked instead, so the
+        no-op and identity-first drivers refuse for the same reason as the
+        rewriting one: a filter is DECLARED."""
+        stateful = str(self.tmp / "stateful.sh")
+        Path(stateful).write_text(
+            "#!/bin/sh\nf=%s\nif [ -e \"$f\" ]; then sed 's/claude/gemini/'; "
+            "else touch \"$f\"; cat; fi\n" % (self.tmp / "seen"),
+            encoding="utf-8")
+        Path(stateful).chmod(0o755)
+        for label, driver in (("a rewriting filter", "tr a A"),
+                              ("a no-op filter", "cat"),
+                              ("an identity-first filter", stateful)):
+            with self.subTest(filter=label):
+                self.setUp()
+                head = self._with_filter(driver)
+                with self.assertRaises(transport.Refusal) as ctx:
+                    transport.prospective_authority(self._cfg())
+                self.assertIn("filter attribute is declared", str(ctx.exception))
+                for door in (("handoff",), ("emit-request", "--local-only")):
+                    code, payload = self._run(*door)
+                    self.assertNotEqual(code, 0, payload)
+                    self.assertEqual(payload.get("next_kind"), "blocked",
+                                     payload)
+                    self.assertIn("filter attribute is declared",
+                                  payload.get("error", ""))
+                    self.assertEqual(self._git("rev-parse", "HEAD"), head,
+                                     "HEAD moved")
+
+    def test_a_content_filter_cannot_change_what_the_commit_declares(self):
+        """Round 8 F1: the shape was asked of the pathname and the BYTES were
+        inferred from it. A clean filter transforms what a commit records, so
+        the author is governed by the worktree file while the commit carries
+        something else — the same two-ends-read-different-bytes split as the
+        symlink, arriving through an attribute."""
+        head = self._with_filter("tr a A")
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.prospective_authority(self._cfg())
+        self.assertIn("filter attribute is declared", str(ctx.exception))
+        for door in (("handoff",), ("emit-request", "--local-only")):
+            with self.subTest(door=door[0]):
+                code, payload = self._run(*door)
+                self.assertNotEqual(code, 0, payload)
+                self.assertEqual(payload.get("next_kind"), "blocked", payload)
+                self.assertIn("filter attribute is declared",
+                                payload.get("error", ""))
+                self.assertEqual(self._git("rev-parse", "HEAD"), head,
+                                 "HEAD moved")
+
+    def test_a_built_in_conversion_is_still_caught_by_derivation(self):
+        """`check-attr filter` does not report eol/text/encoding, and those
+        change committed bytes too — deterministically, so the object-id
+        derivation still settles them."""
+        (self.repo / "review.toml").write_text(
+            self.MINIMAL.replace("\n", "\r\n"), encoding="utf-8",
+            newline="")
+        (self.repo / ".gitattributes").write_text(
+            "review.toml text eol=lf\n", encoding="utf-8")
+        self._git("add", ".gitattributes")
+        self._git("commit", "-qm", "attrs")
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.prospective_authority(self._cfg())
+        self.assertIn("built-in conversion", str(ctx.exception))
+
+    def test_an_unfiltered_tracked_config_is_the_paired_control(self):
+        """The control that keeps the rule about filters rather than about
+        attributes: a .gitattributes with no filter for this path passes."""
+        (self.repo / ".gitattributes").write_text(
+            "*.txt text\n", encoding="utf-8")
+        self._git("add", ".gitattributes")
+        self._git("commit", "-qm", "attrs")
+        transport.prospective_authority(self._cfg())
+
+    def test_the_admitted_states_are_the_paired_controls(self):
+        """Content changes and an executable regular file all produce a
+        commit that carries readable rules, so none of them refuses."""
+        for state in self.ADMITTED:
+            with self.subTest(state=state):
+                self.setUp()
+                self._make(state)
+                transport.prospective_authority(self._cfg())
+
+    def test_the_clean_case_passes_both_doors(self):
+        transport.prospective_authority(self._cfg())
+
+    # ------------------------------------------------------- the remedy
+
+    def test_the_refusal_keeps_its_own_remedy_through_the_cli(self):
+        """Round 7 F3: the remedy is the only recovery field a blocked exit
+        has, and it belongs to the refusal that raised."""
+        # The finding's own scenario: governed by a USER-level config, and
+        # tracking none. Without the user copy the roles refusal fires first
+        # and the row would pass for another refusal's reason.
+        self._git("rm", "-q", "review.toml")
+        self._git("commit", "-qm", "no rules")
+        code, payload = self._run("handoff")
+        self.assertEqual(payload.get("next_kind"), "blocked", payload)
+        self.assertIn("commits review.toml", payload.get("remedy", ""))
+        self.assertNotIn("dispositions", payload.get("remedy", ""))
+
 
 
 if __name__ == "__main__":

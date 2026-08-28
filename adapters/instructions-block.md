@@ -1,7 +1,7 @@
 <!-- BEGIN GENERATED: loupe adapter — do not edit; `loupe render-adapters` regenerates, `--check` guards -->
 # loupe — review procedure (instruction block, GENERATED)
 
-For a project instruction file (AGENTS.md / CLAUDE.md region) on a surface that reads no skill directory. Tool version 0.8.0.
+For a project instruction file (AGENTS.md / CLAUDE.md region) on a surface that reads no skill directory. Tool version 0.9.0.
 
 ## What this is
 
@@ -37,8 +37,8 @@ For a project instruction file (AGENTS.md / CLAUDE.md region) on a surface that 
    `--as` is MANDATORY and names you: the tool cannot observe who is running it, so it records the identity you declare and refuses rather than assume one. Declaring an identity that is not yours puts a false actor in an append-only record. Validates the request, checks that you are the stamped reviewer, fetches the target and resolves base and head in this clone, labels every reference checked / mismatch / unavailable, records the take, and prints the envelope with the exact diff command. If it refuses, return its output to the human — never review a defective or unreachable envelope.
 2. **rule**
    Read the diff with the printed command and rule by the declared taxonomy only. Findings ordered by severity, atomic (one claim per ID), each with every required field and a FALSIFICATION. Prior dispositions are answered under `## closures` by fingerprint. Material you could not retrieve goes under `## unavailable references` and forbids a clean verdict.
-3. **validate, then stop** — `loupe validate <verdict.md>`
-   Repeat until it exits 0. Then STOP: hand the human the block under `## What to run next`, whole and unedited — it is the author's to run. On a paste round that block already carries the verdict bytes in their own fence beneath the command; hand it over as one piece and never restate the bytes as loose prose (a chat surface rewrites unfenced text). On a path round hand the kept file's path with it. Add no prose around it. You do not start the next round, do not send it back for fix-and-resubmit, and do not decide whether it enters the record.
+3. **validate, then stop** — `loupe validate <verdict.md> --from-target`
+   `--from-target` judges your verdict against the authority your `take` RECORDED — the target commit's own review.toml where it carries one, and otherwise whatever configuration governed the take, proved by identity rather than resolved again. Its domain is exactly that: a judgment whose take THIS ledger recorded. A target carrying no configuration, taken on another machine or by a build that recorded no authority, is outside it and refuses — and cannot be brought inside, because no later take evidences the rules an earlier review used. Without it the envelope is judged against whatever YOUR checkout holds, which on a detached worktree or a second machine is routinely no config at all, and the step the procedure requires of you cannot complete. Repeat until it exits 0. Then STOP: hand the human the block under `## What to run next`, whole and unedited — it is the author's to run. On a paste round that block already carries the verdict bytes in their own fence beneath the command; hand it over as one piece and never restate the bytes as loose prose (a chat surface rewrites unfenced text). On a path round hand the kept file's path with it. Add no prose around it. You do not start the next round, do not send it back for fix-and-resubmit, and do not decide whether it enters the record.
 
 ## Verbs (from the CLI itself)
 

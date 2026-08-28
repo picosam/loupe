@@ -254,7 +254,20 @@ def procedure() -> dict:
          "references` and forbids a clean verdict."),
         ("validate, then stop",
          paths.command(*paths.lits(TOOL_NAME, "validate"),
-                       paths.Ph("<verdict.md>")),
+                       paths.Ph("<verdict.md>"),
+                       paths.Lit("--from-target")),
+         "`--from-target` judges your verdict against the authority your "
+         "`take` RECORDED — the target commit's own review.toml where it "
+         "carries one, and otherwise whatever configuration governed the "
+         "take, proved by identity rather than resolved again. Its domain "
+         "is exactly that: a judgment whose take THIS ledger recorded. A "
+         "target carrying no configuration, taken on another machine or by "
+         "a build that recorded no authority, is outside it and refuses — "
+         "and cannot be brought inside, because no later take evidences the "
+         "rules an earlier review used. Without it the "
+         "envelope is judged against whatever YOUR checkout holds, which on "
+         "a detached worktree or a second machine is routinely no config at "
+         "all, and the step the procedure requires of you cannot complete. "
          "Repeat until it exits 0. Then STOP: hand the human the block "
          "under `## What to run next`, whole and unedited — it is the "
          "author's to run. On a "

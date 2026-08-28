@@ -50,6 +50,28 @@ from .ledger import Ledger, firing_id
 
 EXCHANGE_DIR = "exchange"
 
+# Sweep F6 moved `take`'s validation onto the TARGET commit's configuration,
+# because "a valid envelope was refused as T-UNDECLARED ... for a fault in
+# the reviewer's tree". The refusal's own `next` then reopened the door it
+# closed: it sent the reviewer to `validate`, which resolves configuration
+# from THIS checkout, so the reviewer re-derived the diagnosis under the
+# wrong authority and reported a defect belonging to their own tree. Live
+# 2026-08-27, a reviewer on a detached worktree did exactly that and named
+# T-UNDECLARED as the blocker of an envelope whose real defect was its
+# bytes.
+#
+# A defective envelope is the AUTHOR's to fix in every case, so the reviewer
+# has no command to run and the exit is `blocked` — the state `_blocked`
+# already documents for "an envelope that must be authored". The items
+# travel with it, computed once, under the authority that governs them.
+_AUTHORS_TO_FIX = (
+    "the AUTHOR corrects the envelope and re-emits it; a reviewer does not "
+    "edit an envelope and has nothing to run here. Relay the items above. "
+    "Do NOT re-derive them with `validate`: these were judged against "
+    "{authority}, and `validate` judges against whatever configuration this "
+    "checkout holds — a different authority, which can report defects that "
+    "belong to your tree rather than to the request")
+
 _BASE_LINE_RE = re.compile(r"^Base:\s+([0-9a-f]{40})\b", re.MULTILINE)
 # The closed reference grammar. Four forms, and `asserted` is one of them:
 # a line naming a path and its requirement marker but carrying no digest, so
@@ -87,11 +109,24 @@ class Refusal(RuntimeError):
     rendered `paths.Command` or the empty string ("no command applies")
     and refuses anything else. A command built by string construction
     cannot reach an agent through this door by being unanalysable.
+
+    `remedy` and `items` are what the empty `next_cmd` needs to be honest.
+    A refusal with no command is `blocked`, and `_blocked`'s contract is
+    that a blocked exit names what a PERSON must do — so a raise site that
+    selects the blocked state has to supply the sentence, or it has typed
+    the state and withheld the only field it carries. `items` travels for
+    the same reason in the one case where the refusing verb has already
+    computed the diagnosis: a reviewer told to relay a defect needs the
+    defect, and re-deriving it with a second command is exactly what the
+    misdirection below made unsafe.
     """
 
-    def __init__(self, why: str, next_cmd: str):
+    def __init__(self, why: str, next_cmd: str, remedy: str = "",
+                 items=None):
         super().__init__(why)
         self.next_cmd = paths.executable(next_cmd, "Refusal.next_cmd")
+        self.remedy = remedy
+        self.items = list(items or [])
 
 
 def _git(repo_root: Path, *args: str, timeout: int = 120) -> str:
@@ -1043,6 +1078,129 @@ def missing_dispositions(ledger: Ledger) -> dict | None:
                            for f in unanswered]}
 
 
+def prospective_authority(cfg: Config, git=None) -> None:
+    """Refuse unless the commit this emission would CREATE carries its rules.
+
+    Round 6 F1 removed the origin whose authority lives on one machine: a
+    reviewed commit carries the rules it is judged by, because an authority
+    on one machine cannot be shown to a second and a review is the act of
+    showing it to a second.
+
+    Round 7 F1: the first cut asked `ls-files`, which answers whether the
+    OLD commit tracks the path. Publication then runs `commit -a`, which
+    stages tracked working-tree deletions and type changes — so a tracked
+    `review.toml` deleted in the worktree passed, and the commit that check
+    was protecting carried none. The question is about the tree the commit
+    will have, and for `commit -a` that tree is the WORKTREE for every
+    tracked path. So the worktree is what gets asked, and both halves are
+    asked: tracked, and present as a regular file.
+
+    Round 7 F2: it is asked by every author door, not by `handoff` alone.
+    A door that emits what no supported reviewer can take is the same defect
+    round 2 F1 named — two ends accepting and refusing different states —
+    with the author's two doors as the two ends.
+    """
+    basename = _config_basename()
+    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    commit_it = (f"a person commits {basename} to this repository — the same "
+                 f"values, in the artifact under review; a user-level copy "
+                 f"still governs every local verb, and only an emission needs "
+                 f"the rules to travel")
+    try:
+        run("ls-files", "--error-unmatch", basename)
+    except RuntimeError:
+        raise Refusal(
+            f"this repository tracks no {basename}, so the commit this would "
+            f"create carries no rules and a reviewer would be asked to rule "
+            f"under whatever their own machine resolves. The authority a "
+            f"verdict is judged by travels in the reviewed commit or it "
+            f"cannot be shown to the far end at all (configuration in force "
+            f"here: {cfg.source})",
+            "", remedy=commit_it)
+    path = Path(cfg.repo_root) / basename
+    if path.is_symlink() or path.is_dir() or not path.is_file():
+        state = ("a symbolic link" if path.is_symlink() else
+                 "a directory" if path.is_dir() else
+                 "deleted in the working tree" if not path.exists() else
+                 "not a regular file")
+        raise Refusal(
+            f"{basename} is tracked but is {state}, and the commit this "
+            f"would create carries the working tree — so the reviewed commit "
+            f"would declare no readable rules",
+            "", remedy=f"a person restores {basename} as a regular file "
+                       f"before emitting; {commit_it}")
+    # Round 10 F1. Round 9 asked the declared state and then read git's
+    # TEXT presentation of it: `check-attr filter` renders the sentinel
+    # `unspecified` for an absent attribute AND for an active driver named
+    # `unspecified`, so a filter could occupy the token that meant absence.
+    # A value's presentation is not the value. `--all -z` answers a
+    # different question that has no such collision: which attribute NAMES
+    # are declared for this path at all. Names come from git's own parse of
+    # the attribute file, so no driver name can occupy one, and an
+    # unspecified attribute is simply absent from the listing.
+    #
+    # Every declared `filter` refuses, whatever its value — including an
+    # explicit unset, whose presentation `unset` an active driver can also
+    # occupy. Failing closed on the whole ambiguous presentation costs a
+    # repository one attribute it did not need; reading it costs the
+    # property that both ends read the same bytes.
+    try:
+        listing = run("check-attr", "--all", "-z", "--", basename)
+    except _UNUSABLE as exc:
+        raise Refusal(
+            f"this clone cannot say which attributes are declared for "
+            f"{basename} ({exc}), so what a commit would record is not "
+            f"established",
+            "", remedy="a person repairs this clone; an object store that "
+                       "cannot be asked is not evidence that the rules "
+                       "would travel")
+    fields = [f for f in listing.split("\0") if f]
+    if len(fields) % 3:
+        raise Refusal(
+            f"the attribute listing for {basename} cannot be read "
+            f"({listing!r}), so what a commit would record is not "
+            f"established",
+            "", remedy="a person repairs this clone; an unreadable listing "
+                       "is not evidence that no filter is declared")
+    if "filter" in {fields[k + 1] for k in range(0, len(fields), 3)}:
+        raise Refusal(
+            f"a content filter attribute is declared for {basename}, so what "
+            f"a commit records for it is whatever an external program "
+            f"returns when the commit runs — which is not what this author "
+            f"read, and need not be what any earlier invocation returned",
+            "", remedy=f"a person removes the filter attribute for "
+                       f"{basename}: the rules a verdict is judged by are "
+                       f"read by both ends, so they may not be produced by "
+                       f"a program that runs between them")
+    # Built-in conversions — eol, text, working-tree-encoding — change
+    # committed bytes too, and are declared through attributes `check-attr
+    # filter` does not report. They are deterministic, so an object-id
+    # derivation settles them: one id with the path's attributes applied,
+    # one without, and they have to agree.
+    try:
+        filtered = run("hash-object", "--path", basename, "--", str(path))
+        plain = run("hash-object", "--no-filters", "--", str(path))
+    except _UNUSABLE as exc:
+        raise Refusal(
+            f"this clone cannot say what a commit would record for "
+            f"{basename} ({exc}), so what the reviewed commit would declare "
+            f"is not established",
+            "", remedy=f"a person repairs this clone; an object store that "
+                       f"cannot be asked is not evidence that the rules "
+                       f"would travel")
+    if filtered != plain:
+        raise Refusal(
+            f"a built-in conversion rewrites {basename} on the way into a "
+            f"commit, "
+            f"so the reviewed commit would carry bytes this author never "
+            f"read ({plain[:12]} here, {filtered[:12]} committed) and the "
+            f"two ends would be governed by different rules",
+            "", remedy=f"a person removes the conversion attributes for "
+                       f"{basename} — eol, text or working-tree-encoding: "
+                       f"the rules a verdict is judged by are read by both "
+                       f"ends, so they may not be transformed between them")
+
+
 def handoff_preflight(cfg: Config, ledger: Ledger) -> None:
     """Refuse a handoff the lifecycle does not permit — BEFORE the cache is
     consulted, a commit made, a push attempted, a gate run or a request
@@ -1055,6 +1213,21 @@ def handoff_preflight(cfg: Config, ledger: Ledger) -> None:
     has not been accepted must not cause the ledger to be read at all. The
     ordering is one chain — claim grammar, then lifecycle, then cache, push,
     gates, emission, ledger mutation."""
+    # Round 6 F1. Six rounds went into proving which rules governed a review
+    # when the target carried none of its own, and each proof was sound and
+    # each left a seam: a record the far end could not have, a skew no
+    # declaration reaches, a domain statement shipped only to the build that
+    # already agrees. The seam is not in any of the proofs. It is that an
+    # authority living on ONE MACHINE can never be shown to a second, and a
+    # review is the act of showing it to a second.
+    #
+    # So the origin goes, rather than the machinery around it. A commit put
+    # up for review must carry the rules it is to be judged by, and then
+    # there is nothing to prove: both ends read the same bytes out of the
+    # same object. User-level configuration keeps governing local operation
+    # — `brief`, `validate`, `ledger` — and stops governing what a reviewer
+    # on another machine is asked to rule on.
+    prospective_authority(cfg)
     owed = missing_dispositions(ledger)
     if owed is not None:
         ids = ", ".join(f"{u['id']} ({u['fp']})" for u in owed["unanswered"])
@@ -1236,6 +1409,18 @@ def cached_handoff(cfg: Config, ledger: Ledger, round_no: int,
         "the transport this invocation resolved" if transport is not None
         else "[roles] transport in the governing config")
     if declared_transport(kept_request) != want_transport:
+        return None
+    # Round 1 F2 (High). The docstring above calls a proper-subset cache key
+    # the defect class it exists to prevent, and then left one input out of
+    # the key: the tool identity. It is stamped ON the envelope and it covers
+    # the code that runs the gates, validates and renders — so a copy emitted
+    # under a different behavioural set is not a current result, and serving
+    # it lets an upgrade leave the author on the old runner's attestations
+    # while `cached: true` says the opposite. Reporting `differs` afterwards
+    # is evidence, not currency. Only an exact match is warm: an absent or
+    # unequal stamp cannot be SHOWN to be current, and the cheap answer to
+    # "cannot be shown" is one re-emission.
+    if attrs.get("tool", "") != tool_identity():
         return None
     return {"envelope": text, "sha": head, "round": round_no,
             "kept": str(path), "digest": request["source_digest"]}
@@ -1494,8 +1679,19 @@ def run_bytes(cfg: Config, git, *args: str) -> bytes:
     `show` returns the file's text and this encodes it back."""
     if git is not None:
         return git(*args).encode("utf-8")
-    out = subprocess.run(["git", "-C", str(cfg.repo_root), *args],
-                         capture_output=True, timeout=120)
+    # Round 4 F3, the byte reader's half of the same normalisation.
+    try:
+        out = subprocess.run(["git", "-C", str(cfg.repo_root), *args],
+                             capture_output=True, timeout=120)
+    except subprocess.SubprocessError as exc:
+        raise RuntimeError(
+            f"a `git` subprocess did not complete: "
+            f"`{paths.command(paths.Lit('git'), *args)}` — "
+            f"{type(exc).__name__}: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"a `git` subprocess could not be started: "
+            f"`{paths.command(paths.Lit('git'), *args)}` — {exc}") from exc
     if out.returncode != 0:
         raise RuntimeError(
             f"a `git` subprocess failed: "
@@ -1509,21 +1705,153 @@ def _digest_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def target_config(cfg: Config, sha: str, git=None) -> Config:
-    """The configuration that governs a request: the target commit's own
-    review.toml, built through config.from_text; or, when the target
-    carries none, this checkout's — stated as such in `source` (sweep F6).
+# Round 4 F3: what "the object store could not answer" is, as a closed set.
+# `_git` and `run_bytes` normalise their own failures, but this boundary
+# promises a typed refusal and so establishes it here rather than resting on
+# a collaborator a caller may replace.
+_UNUSABLE = (RuntimeError, subprocess.SubprocessError, OSError)
+
+def _config_basename() -> str:
+    from . import config as _config
+    return _config.CONFIG_BASENAME
+
+
+AUTHORITY_TARGET = "target"
+AUTHORITY_EXTERNAL = "external"
+
+
+def resolve_authority(cfg: Config, sha: str,
+                      git=None) -> tuple[Config, str]:
+    """The configuration governing `sha`, and WHERE it came from.
+
+    Round 3 F2 and F3. This was `target_config`, which caught every
+    `RuntimeError` from `git show <sha>:review.toml` and answered "the
+    target carries none" — and `_git` turns every nonzero git exit into
+    that one class. So a present entry whose blob object is missing, whose
+    mode is not a blob, or whose read failed for any operational reason was
+    answered with the CHECKOUT's rules, and round 3's digest could not see
+    it because both ends asked the same misclassifying question. Invalid
+    UTF-8 escaped further still: the text-mode reader raised
+    `UnicodeDecodeError` past every typed refusal.
+
+    External fallback is advertised for exactly ONE state — the file is not
+    there — so that state is established by asking the question that
+    answers it (`ls-tree`, which prints nothing and exits 0 for a path a
+    tree lacks) rather than inferred from a failure to read. Every other
+    outcome is a refusal: git unusable, a non-blob entry, an unreadable
+    blob, bytes that are not UTF-8, TOML the config layer rejects.
     """
     from . import config as _config
+    basename = _config.CONFIG_BASENAME
     run = git or (lambda *a: _git(cfg.repo_root, *a))
+    fix = (f"the AUTHOR repairs the configuration in the target commit and "
+           f"re-emits; a reviewer does not edit the rules it is judged by")
     try:
-        text = run("show", f"{sha}:{_config.CONFIG_BASENAME}")
-    except RuntimeError:
+        entry = run("ls-tree", "--full-tree", sha, "--", basename).strip()
+    except _UNUSABLE as exc:
+        raise Refusal(
+            f"this clone cannot say whether {sha[:12]} carries {basename}, "
+            f"so "
+            f"neither its rules nor their absence is established: {exc}",
+            "", remedy="a person repairs this clone; an unusable object "
+                       "store is not evidence that a target carries no "
+                       "configuration")
+    if not entry:
         return dataclasses.replace(
-            cfg, source=f"{cfg.source} (this checkout; the target carries "
-                        f"no {_config.CONFIG_BASENAME})")
-    return _config.from_text(
-        text, cfg, source=f"target {_config.CONFIG_BASENAME} at {sha[:12]}")
+            cfg, source=f"{cfg.source} (external; {sha[:12]} carries no "
+                        f"{basename})"), AUTHORITY_EXTERNAL
+    # Round 4 F1: the OBJECT TYPE was the whole check, and a symlink is
+    # mode 120000 with type `blob`. So a committed symlink entered the
+    # target branch and its LINK TEXT was parsed as TOML, while the author's
+    # `config.load` — which uses Path.is_file() and read_text() — followed
+    # the link and read the file it points at. Two ends, one SHA, different
+    # bytes: the cross-end authority split this lineage exists to remove,
+    # arriving through the one git mode whose type says `blob` and whose
+    # content is a path. The mode is what says whether an entry is a file.
+    fields = entry.split(maxsplit=3)
+    if len(fields) < 3:
+        raise Refusal(
+            f"the tree listing for {basename} in {sha[:12]} cannot be read "
+            f"({entry!r}), so what the entry IS is not established",
+            "", remedy=fix)
+    mode, kind = fields[0], fields[1]
+    if mode not in vocab.GIT_FILE_MODES:
+        raise Refusal(
+            f"{basename} in {sha[:12]} is {vocab.git_mode_name(mode)} "
+            f"(mode {mode}, type {kind}), not a regular file, so the bytes "
+            f"it declares are not the bytes a checkout would read — and its "
+            f"presence is not absence",
+            "", remedy=fix)
+    try:
+        raw = run_bytes(cfg, git, "show", f"{sha}:{basename}")
+    except _UNUSABLE as exc:
+        raise Refusal(
+            f"{basename} is PRESENT in {sha[:12]} and cannot be read "
+            f"({exc}); a file that exists and cannot be read is not a file "
+            f"that is absent, and this checkout's rules are not a "
+            f"substitute for it",
+            "", remedy=fix)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise Refusal(
+            f"{basename} in {sha[:12]} is not valid UTF-8 ({exc}), so the "
+            f"rules it declares cannot be read",
+            "", remedy=fix)
+    try:
+        return _config.from_text(
+            text, cfg,
+            source=f"target {basename} at {sha[:12]}"), AUTHORITY_TARGET
+    except _config.ConfigError as exc:
+        raise Refusal(
+            f"{basename} in {sha[:12]} cannot be read: {exc}", "",
+            remedy=fix)
+
+
+def governing_for(cfg: Config, sha: str, git=None) -> Config:
+    """The authority that governs an envelope about `sha`, for the verbs
+    that are not `take` — PROVED against what `take` recorded, never
+    re-derived on its own.
+
+    Round 1 F1 made this refuse where `target_config` falls back. Round 2
+    F1 showed that made it stricter than `take`, which is its own defect:
+    a repository under review by user-level config alone — a state the
+    adapters advertise — takes fine, because `take` accepts the fallback
+    authority, and then the command `take` PRINTS refused the identical
+    state. One end accepting what the other rejects is not a safety
+    property; it is a dead end in an advertised lifecycle.
+
+    So the rule is neither "target only" nor "whatever is lying around":
+    the authority is resolved exactly as `take` resolved it, and then
+    matched against the identity `take` recorded. Same authority, proved.
+    An absent record, a take that predates the recording, or an authority
+    whose content has moved since — changed, removed, replaced — all
+    block, because none of them can show that this verdict is being judged
+    by the rules its request was.
+    """
+    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    drop = ("a person validates without the declaration, accepting that "
+            "whatever configuration this checkout resolves NOW is a "
+            "different authority from the one the request was judged under")
+    try:
+        run("cat-file", "-e", f"{sha}^{{commit}}")
+    except RuntimeError:
+        raise Refusal(
+            f"target {sha[:12]} is not in this clone, so the authority it "
+            f"was judged under cannot be resolved here",
+            "", remedy=f"a person fetches the target into this clone — "
+                       f"`{paths.command(paths.Lit('git'), paths.Lit('fetch'), paths.Ph('<remote>'), paths.Ph('<ref>'))}` "
+                       f"— or {drop}")
+    governing, origin = resolve_authority(cfg, sha, git=git)
+    if origin != AUTHORITY_TARGET:
+        raise Refusal(
+            f"{sha[:12]} carries no {_config_basename()} of its own, so the "
+            f"rules it would be judged by live on one machine and cannot be "
+            f"shown to another. A reviewed commit carries its own authority",
+            "", remedy=f"the AUTHOR commits {_config_basename()} and "
+                       f"re-emits; a review whose rules are not in the "
+                       f"artifact is a review two ends cannot agree on")
+    return governing
 
 
 def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
@@ -1596,8 +1924,11 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
                       + ", ".join(i.code for i in errors) + "): a reviewer "
                       "does not rule on a defective envelope, and this "
                       "clone fetches nothing on its account",
-                      paths.command(*paths.lits(TOOL_NAME, "validate"),
-                                    source))
+                      "", remedy=_AUTHORS_TO_FIX.format(
+                          authority="the envelope's own target-independent "
+                                    "grammar, which no configuration "
+                                    "governs"),
+                      items=errors)
 
     round_no = int(parsed.attrs.get("round", "0") or 0)
     sha = parsed.sha or ""
@@ -1615,7 +1946,15 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
     # unrelated working-tree bytes.
     target = probe_target(cfg, push, sha, base, fetch=fetch, git=git,
                           retake=(source, me))
-    governing = target_config(cfg, sha, git=git)
+    governing, origin = resolve_authority(cfg, sha, git=git)
+    if origin != AUTHORITY_TARGET:
+        raise Refusal(
+            f"{sha[:12]} carries no {_config_basename()} of its own, so "
+            f"there is no authority in the artifact to rule under — and "
+            f"this checkout's is a different one (round 2 F1: the two ends "
+            f"refuse and accept the same states)",
+            "", remedy=f"the AUTHOR commits {_config_basename()} and "
+                       f"re-emits")
     target["config"] = governing.source
     items = (validate_items(parsed, governing) if validate_items else [])
     errors = [i for i in items if i.level == "error"]
@@ -1623,8 +1962,10 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
         raise Refusal("the request fails validation ("
                       + ", ".join(i.code for i in errors) + "): a reviewer "
                       "does not rule on a defective envelope",
-                      paths.command(*paths.lits(TOOL_NAME, "validate"),
-                                    source))
+                      "", remedy=_AUTHORS_TO_FIX.format(
+                          authority=f"the TARGET commit's own configuration "
+                                    f"({governing.source})"),
+                      items=errors)
     reference = wire.section(parsed.sections, "reference")
     # References are read from the target tree as well: the manifest's
     # digests describe bytes at that commit, and this checkout — at another
@@ -1669,9 +2010,15 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
             "target": target, "references": refs, "kept": kept,
             "digest": digest, "diff": diff_cmd, "envelope": envelope,
             "transport": effective, "tool": agreement,
+            # The flag is not decoration: this `take` resolved the
+            # governing configuration from the target commit, and the
+            # command it hands over must resolve the SAME authority or the
+            # reviewer validates their verdict against whatever their own
+            # checkout happens to hold — which, on the cross-machine round
+            # this tool exists for, is routinely nothing at all.
             "then": f"write the verdict as <{parsed.tag}-review-verdict "
                     f'sha="{sha}"> and run '
-                    f"`{paths.command(*paths.lits(TOOL_NAME, 'validate'), paths.Ph('<verdict.md>'))}`; "
+                    f"`{paths.command(*paths.lits(TOOL_NAME, 'validate'), paths.Ph('<verdict.md>'), paths.Lit('--from-target'))}`; "
                     f"then stop — do not start the next round (standing "
                     f"instructions)"},
                      "diff")

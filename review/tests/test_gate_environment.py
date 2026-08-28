@@ -252,8 +252,12 @@ class TestShimProtocol(_GateHarness):
         self.head = subprocess.run(
             ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
             capture_output=True, text=True, check=True).stdout.strip()
+        # Round 7 F1/F2: a reviewed commit carries the rules it is judged by,
+        # so this fixture's configuration lives IN the repository and is
+        # committed. The env var still points at it — same bytes, and the
+        # shim protocol is what this class is about.
         root = self.repo.parent
-        self.config = root / "config.toml"
+        self.config = self.repo / "review.toml"
         self.config.write_text(
             '[taxonomy]\n'
             'severities = ["High", "Low"]\n'
@@ -270,6 +274,13 @@ class TestShimProtocol(_GateHarness):
             'permitted_authors = ["claude"]\n'
             'permitted_reviewers = ["codex"]\n',
             encoding="utf-8")
+        for args in (("add", "review.toml"),
+                     ("commit", "-q", "-m", "rules")):
+            subprocess.run(["git", "-C", str(self.repo), *args], check=True,
+                           capture_output=True)
+        self.head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip()
         claim = root / "claim.json"
         claim.write_text(json.dumps(
             {"objective": "probe the gate environment through the shim",

@@ -50,6 +50,39 @@ DISPOSITION_PAYLOADS = {
 TEST_AMENDED_PAYLOAD = ("original_test", "amended_test", "why_unsatisfiable")
 
 # Falsification kinds (§5.3a).
+# Round 6 F2. A gate id is not only a logical identity: `_retain_output`
+# interpolates it into `<ledger>/gate-output/<sha>/<id>.log`, so an absolute
+# form discards the directory entirely and a separator or dot segment escapes
+# or aliases it. Raw-string uniqueness cannot establish unique DESTINATIONS.
+# The grammar is closed instead of the escapes being enumerated: an id is one
+# filename component built from a set that contains no separator, no leading
+# dot, and nothing a filesystem folds — so containment and one-id-one-file
+# are properties of the alphabet rather than of a blacklist someone maintains.
+GATE_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+GATE_ID_MAX = 64
+
+
+# Git tree-entry modes (round 4 F1). The set is git's, not this tool's, and
+# it is closed: git writes exactly these. Only the two REGULAR-FILE modes
+# carry bytes a checkout would read — a symlink's blob holds a path, a tree
+# holds entries, a gitlink holds another repository's commit — so only they
+# may supply a configuration.
+GIT_FILE_MODES = ("100644", "100755")
+GIT_MODE_NAMES = {
+    "100644": "a regular file",
+    "100755": "an executable file",
+    "120000": "a symbolic link",
+    "040000": "a directory",
+    "40000": "a directory",
+    "160000": "a submodule",
+}
+
+
+def git_mode_name(mode: str) -> str:
+    """What a tree entry IS, named rather than left as a number."""
+    return GIT_MODE_NAMES.get(mode, f"an unrecognised entry (mode {mode})")
+
+
 FALSIFICATION_KINDS = ("command", "observation")
 
 # What an `accepted` disposition records about the finding's falsification

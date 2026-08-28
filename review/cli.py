@@ -13,8 +13,8 @@ from . import (FORMER_NAMES, TOOL_NAME, TOOL_VERSION, adapters, brief, config,
                emit, paths, transport, vocab, wire)
 from .digest import sha256_file, sha256_text
 from .ledger import Ledger, render_convergence_md, render_report_md
-from .validate import (errors_in, validate_disposition, validate_request,
-                       validate_verdict)
+from .validate import (Item, errors_in, validate_disposition,
+                       validate_request, validate_verdict)
 
 EXIT_OK, EXIT_FINDINGS, EXIT_USAGE = 0, 1, 2
 
@@ -183,7 +183,7 @@ CONTROL_FIELDS = ("ok", "exit", "error", "next", "next_kind", "remedy")
 
 def _blocked(next_cmd: str, why: str, code: int = EXIT_FINDINGS,
              remedy: str = "", extra: dict | None = None,
-             detail: str = "") -> int:
+             detail: str = "", lead: str = "") -> int:
     """Every non-zero exit that is not an items list, in one place.
 
     Round-3 F17 required the next command on every non-zero exit; round-4 F9
@@ -236,11 +236,17 @@ def _blocked(next_cmd: str, why: str, code: int = EXIT_FINDINGS,
     payload.update({"ok": False, "exit": code, "error": why,
                     "next": next_cmd or None, "next_kind": kind})
     tail = f"\n{detail}" if detail else ""
+    # Round 1 F3: `detail` renders AFTER the recovery line, which is right
+    # for "what the run did before it stopped" and wrong for anything the
+    # recovery line refers to. A remedy reading "relay the items above" over
+    # a TTY that printed no items sends the reader back to the recomputation
+    # this lineage forbids. `lead` is the region the recovery may point at.
+    head = f"\n{lead}" if lead else ""
     if kind == "blocked":
         payload["remedy"] = remedy or why
-        _out(payload, f"{why}\nblocked: {payload['remedy']}{tail}")
+        _out(payload, f"{why}{head}\nblocked: {payload['remedy']}{tail}")
     else:
-        _out(payload, f"{why}\nnext: {next_cmd}{tail}")
+        _out(payload, f"{why}{head}\nnext: {next_cmd}{tail}")
     return code
 
 
@@ -275,25 +281,46 @@ def cmd_validate(args, cfg) -> int:
     # cross-installation reader of both stamped kinds and says so.
     agreement = (transport.tool_agreement(parsed)
                  if kind in vocab.STAMPED_KINDS else None)
+    # Sweep F6's authority, made reachable from the verb `take` names. The
+    # declaration is the flag; the SHA is DERIVED from the envelope's own
+    # stamp, so there is no second value to get wrong and no way to judge an
+    # envelope about one commit under another commit's rules.
+    governing, authority = cfg, []
+    if args.from_target:
+        sha = getattr(parsed, "sha", "") or ""
+        if not sha:
+            return _blocked(
+                "", f"--from-target needs the envelope to stamp the commit "
+                    f"it is about, and this {kind} stamps none",
+                remedy="a person drops the declaration, or supplies an "
+                       "envelope that names its target; the tool will not "
+                       "guess which commit's rules apply")
+        try:
+            governing = transport.governing_for(cfg, sha)
+        except transport.Refusal as exc:
+            return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
+        authority = [Item("notice", "T-AUTHORITY",
+                          f"judged against {governing.source}")]
     if kind == "request":
         items = validate_request(
-            parsed, cfg,
-            round_cap=_ledger(cfg, args).effective_round_cap(cfg.round_cap))
+            parsed, governing,
+            round_cap=_ledger(cfg, args).effective_round_cap(
+                governing.round_cap))
     elif kind == "verdict":
         items = validate_verdict(
-            parsed, cfg,
+            parsed, governing,
             answering=_dispositions_answered(_ledger(cfg, args), parsed))
     else:
         against = None
         if args.against:
             against = wire.parse_verdict(
                 Path(args.against).read_text(encoding="utf-8"))
-        items = validate_disposition(parsed, cfg, against)
+        items = validate_disposition(parsed, governing, against)
         if against is None:
-            from .validate import Item
             items.append(Item("notice", "D-STANDALONE",
                               "completeness not checked: pass --against "
                               "<verdict> to enforce it"))
+    items = authority + items
     # A validated verdict is the moment the reviewer hands it back, so it is
     # where the human first meets the ruling. Emitting the précis here means
     # they get the account without anyone remembering to ask for it — and the
@@ -898,6 +925,17 @@ def cmd_emit_request(args, cfg) -> int:
     except (emit.RoleSelectionError, emit.TransportSelectionError,
             emit.ReferenceUnbound) as exc:
         return _blocked("", str(exc), remedy=exc.remedy)
+    # Round 7 F2: the same authority boundary as `handoff`, at the same point
+    # in the same chain — after the authored input's grammar is accepted
+    # (§4; a claim or a reference nobody can read is judged before anything
+    # is looked up), and before the ledger, Git, gates, emission or any
+    # output write. This verb emitted the exact state the lifecycle calls
+    # unsupported; two author doors accepting different states is round 2
+    # F1 with the author's own ends as the two ends.
+    try:
+        transport.prospective_authority(cfg)
+    except transport.Refusal as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
     ledger = _ledger(cfg, args)
     result = _emit(args, cfg, ledger, captured, roles,
                    selected_transport)
@@ -1002,10 +1040,16 @@ def cmd_handoff(args, cfg) -> int:
     try:
         transport.handoff_preflight(cfg, ledger)
     except transport.Refusal as exc:
+        # Round 7 F3: this replaced every preflight refusal's remedy with one
+        # sentence about dispositions and decisions, so the configuration
+        # refusal reached agents with a recovery that could not repair it.
+        # A blocked exit has no runnable `next`; its remedy is the only
+        # recovery field there is, and it belongs to the refusal that raised.
         return _blocked("", str(exc),
-                        remedy="a person supplies what is missing — the "
-                               "dispositions, or the recorded decision — "
-                               "then re-runs this command")
+                        remedy=exc.remedy or
+                        "a person supplies what is missing — the "
+                        "dispositions, or the recorded decision — then "
+                        "re-runs this command")
     round_no = emit.next_round(ledger)
     # User decision 2026-08-25: past the cap the tool emits and INVESTIGATES
     # rather than refusing. The count alone taught nothing — it fires on a
@@ -1106,7 +1150,16 @@ def cmd_take(args, cfg) -> int:
                 parsed, governing,
                 round_cap=ledger.effective_round_cap(governing.round_cap)))
     except transport.Refusal as exc:
-        return _blocked(exc.next_cmd, str(exc))
+        # The items come from the refusal because `take` already computed
+        # them under the authority that governs them — the envelope's own
+        # grammar before the fetch, the TARGET commit's config after it.
+        # Handing back a command that recomputes them under this checkout's
+        # config is the defect this carries the diagnosis to avoid.
+        return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy,
+                        extra=({"items": [i.as_dict() for i in exc.items]}
+                               if exc.items else None),
+                        lead="\n".join(f"{i.level}: [{i.code}] {i.message}"
+                                        for i in exc.items))
     rec["ok"] = True
     refs = "\n".join(f"  {r['status']:<40} {r['path']}"
                       for r in rec["references"]) or "  (none declared)"
@@ -1158,7 +1211,7 @@ def cmd_waive(args, cfg) -> int:
         rec = transport.waive(cfg, ledger, args.sha, args.reason or "",
                               args.by)
     except transport.Refusal as exc:
-        return _blocked(exc.next_cmd, str(exc))
+        return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
     rec["ok"] = True
     _out(rec, f"waived {rec['sha'][:12]}: {rec['reason']}\n"
               f"authorized by {rec['authorized_by']}; recorded in the ledger "
@@ -1205,7 +1258,7 @@ def cmd_close(args, cfg) -> int:
                 parsed, cfg,
                 answering=_dispositions_answered(ledger, parsed)))
     except transport.Refusal as exc:
-        return _blocked(exc.next_cmd, str(exc))
+        return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
     rec["ok"] = True
     rec["brief"] = brief.verdict_precis(parsed_verdict, source=args.verdict)
     rec["relay"] = brief.verdict_relay(
@@ -1528,6 +1581,15 @@ def build_parser() -> argparse.ArgumentParser:
                            parser_class=_Parser)
 
     v = sub.add_parser("validate", help="validate an envelope")
+    v.add_argument("--from-target", action="store_true",
+                   help="judge the envelope against the TARGET commit's own "
+                        "review.toml, read from this clone's object store at "
+                        "the SHA the envelope stamps — the same authority "
+                        "`take` uses, and the one a reviewer needs when "
+                        "their own checkout carries no config. Refuses when "
+                        "the target is not present here; without it the "
+                        "envelope is judged against this checkout, which is "
+                        "a different authority")
     v.add_argument("envelope", help="envelope file, or - for stdin — the "
                                     "same forms `take` and `close` read, so "
                                     "the `next` a refused stdin close names "

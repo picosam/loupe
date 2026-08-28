@@ -22,6 +22,7 @@ import unittest
 from review import brief, config, emit, transport, vocab, wire
 from review.validate import validate_request
 from review.ledger import Ledger
+from review import tool_identity
 from review.tests.test_transport import (SHA_A, SHA_B, fake_git, request_text,
                                          TestTake)
 from review.tests.util import REPO_ROOT
@@ -451,7 +452,11 @@ class TestTheCacheKeyIncludesIt(unittest.TestCase):
 
     def _ledger_and_cfg(self, tmp, declared):
         cfg = dataclasses.replace(CFG, ledger_dir=tmp)
-        envelope = request_text(transport_attr=declared)
+        # Round 1 F2 put the tool identity in the warm key, so a fixture
+        # that must REACH the check it is about stamps the current one;
+        # the identity's own cold cases live in test_transport.
+        envelope = request_text(transport_attr=declared,
+                                tool_attr=tool_identity())
         (tmp / "exchange").mkdir(parents=True, exist_ok=True)
         path = transport.exchange_path(cfg, 1, "request")
         path.write_text(envelope, encoding="utf-8")

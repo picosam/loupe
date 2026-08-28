@@ -368,6 +368,11 @@ class TestShippedRestatements(unittest.TestCase):
         "LINEAGE_KINDS", "LINEAGE_MERGING", "CLAIM_STRING_FIELDS",
         "CLAIM_LIST_FIELDS", "CLAIM_REQUIRED", "CLAIM_NONEMPTY",
         "CLAIM_REFERENCE_REQUIRED", "SEAM_CLASSES", "STAMPED_PARSE_CALLS",
+        # Round 4 F1: git's tree-entry modes, not this tool's vocabulary.
+        # The shipped design documents what the tool decides, and which
+        # modes carry file bytes is git's rule — restating it here would
+        # publish a second copy of someone else's specification.
+        "GIT_FILE_MODES",
     }
 
     @classmethod
@@ -1154,6 +1159,12 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
         "CLOSURES": "the procedure tells the reviewer WHERE closures are "
                     "answered, not the closure vocabulary",
         "FALSIFICATION_KINDS": "not stated anywhere in the procedure",
+        "GIT_FILE_MODES": "git's tree-entry modes, not this tool's "
+                          "vocabulary: the procedure tells an agent what a "
+                          "refusal means, never which modes git writes",
+        "GIT_MODE_NAMES": "the plain-language name each git mode is "
+                          "reported by; it exists so a refusal reads as "
+                          "prose, and the procedure never lists modes",
         "FINDING_FIELDS": "the procedure says 'every required field', "
                           "never the field list; the design document's "
                           "enumeration is registered in RESTATEMENTS",

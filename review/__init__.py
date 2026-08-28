@@ -59,7 +59,34 @@ TOOL_NAME = "loupe"
 # reads, so its shape is interface — and the reviewer adapters, which said
 # the block "says so on its own first line", are regenerated with that
 # clause gone. The lineage's other work is workbench-only.
-TOOL_VERSION = "0.8.0"
+#
+# 0.9.0 is the SECOND documented exception, the same shape as 0.6.0's and
+# recorded for the same reason. Lineage 11 closed by recorded decision on
+# 2026-08-28 at round 11, not clean: round 11's finding was parked whole as
+# RVW-T17 — the author's authority check PREDICTS the commit it would create
+# instead of VERIFYING the one it made — because the answer is a redesign
+# and not a patch. So no reviewed round remained to carry this bump, and the
+# choice was again between publishing under a version that no longer
+# discriminates and bumping outside a round. Six of the eighteen declared
+# behavioural artefacts differ from what 0.8.0 published; two publications
+# reporting the same string is the exact ambiguity this policy exists to
+# remove, and it was already paid for once at 0.3.0.
+#
+# Minor rather than patch, on behaviour that changed at the doors:
+# the external-configuration ORIGIN no longer governs a REVIEWED commit —
+# `handoff`, `take` and `validate --from-target` all refuse a target that
+# carries no configuration of its own, because an authority living on one
+# machine cannot be shown to a second and a review is the act of showing it
+# (round 6 F1). A repository governed only by `~/.config/loupe/<id>.toml`
+# could hand off under 0.8.0 and cannot under 0.9.0; its local verbs are
+# untouched. Alongside it: a gate id is one filename component, closing a
+# write outside the ledger directory (round 6 F2); the config schema is
+# derived from `DEFAULTS` rather than restated (round 4 F4); a non-regular
+# `review.toml` entry is refused by mode rather than admitted by object type,
+# which is where a committed symlink split the two ends (round 4 F1); and
+# every subprocess failure is typed, so an unusable object store is no longer
+# read as evidence that a target carries no configuration (round 3 F2, F3).
+TOOL_VERSION = "0.9.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never

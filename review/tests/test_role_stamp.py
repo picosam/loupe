@@ -329,7 +329,11 @@ class TestCacheRolesKey(unittest.TestCase):
             tmp, ignore_errors=True))
         from review.tests.test_transport import fake_git, request_text, SHA_B
         cfg = dataclasses.replace(CFG, ledger_dir=tmp)
-        text = request_text()          # stamped author=claude reviewer=codex
+        from review import tool_identity
+        # Round 1 F2 put the tool identity in the warm key, so a fixture
+        # that must REACH the check it is about stamps the current one;
+        # the identity's own cold cases live in test_transport.
+        text = request_text(tool_attr=tool_identity())
         transport.keep_bytes(cfg, 1, "request", text)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
                         ("status", "--porcelain"): ""})

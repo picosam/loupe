@@ -104,8 +104,11 @@ working with nothing installed.
 
 ## Status
 
-Version 0.8.0 — the version is bumped inside the reviewed round of any
+Version 0.9.0 — the version is bumped inside the reviewed round of any
 change that will be published, so `--version` discriminates publishes.
+0.9.0 is an exception and says so: the lineage behind it closed by recorded
+decision rather than clean, so no reviewed round remained to carry the bump.
+What stands open from that close is named below.
 Implemented and tested: the envelopes and validators, the
 gate manifest and attestation checks, roles and stamps (including
 per-invocation selection within the permitted lists), fingerprints with
@@ -116,6 +119,34 @@ migration, generated
 adapters. Designed but not implemented: risk tiering, path-scoped contract
 invariants, auto-execution of falsification tests, a git-notes carrier, an
 MCP facade. See design §9.
+
+Changed in 0.9.0, and this one can refuse work that used to run.
+A reviewed commit now carries the rules it is judged by. `handoff`, `take`
+and `validate --from-target` all refuse a target that tracks no `review.toml`
+of its own — an authority living on one machine cannot be shown to a second,
+and a review is the act of showing it. If your repository is governed only by
+a user-level `~/.config/loupe/<repo-id>.toml`, copy it to `review.toml` at the
+repo root and commit it; every local verb is unaffected either way.
+
+Also changed: a gate id is one filename component, so gate output can no
+longer be written outside the state directory; a `review.toml` entry is
+judged by its git MODE rather than its object type, which is how a committed
+symlink could make the two ends read different bytes for one SHA; the config
+schema is derived from the defaults rather than restated beside them; and
+every subprocess failure is typed, so a clone that cannot read its own
+objects is no longer taken as evidence that a target carries no
+configuration.
+
+Known and unfixed in 0.9.0. The author's authority check runs BEFORE the
+commit it describes, so it predicts what `commit -a` will record instead of
+reading what it did. Five rounds found five ways a prediction can be wrong —
+the index against the worktree, a pathname's shape against its bytes, a
+filter's declaration against its behaviour, git's rendered attribute value
+against the attribute name, and a commit hook restaging after the check —
+and the list has no principled end. The fix is placement, not a patch: ask
+the artifact after the commit, which is the question `take` already asks.
+Until then the author-side check is best-effort and the reviewer-side ones,
+which read the commit, are not.
 
 Changed in 0.8.0, if you are upgrading. The verdict relay of a `path`
 round now prints its command alone: the `# the author's to run` comment

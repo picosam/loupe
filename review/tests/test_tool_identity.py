@@ -588,7 +588,7 @@ class TestEveryStampedReaderCompares(unittest.TestCase):
             with self.subTest(stamp=stamp):
                 code, payload, text = self._run(
                     cli.cmd_validate, envelope=str(self._request(stamp)),
-                    against=None)
+                    against=None, from_target=False)
                 self.assertEqual(payload["tool"]["agreement"], expected,
                                  payload or text)
 

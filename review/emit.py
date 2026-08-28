@@ -34,8 +34,26 @@ from .ledger import Ledger, render_report_md
 def _git(repo_root: Path, *args: str) -> str:
     # The timeout is §9bis.4's fail-don't-hang rule as much as hygiene: push
     # and ls-remote reach the network, and an unreachable remote must refuse.
-    out = subprocess.run(["git", "-C", str(repo_root), *args],
-                         capture_output=True, text=True, timeout=120)
+    #
+    # Round 4 F3: a timeout is an ADMITTED outcome — this call declares one —
+    # and `TimeoutExpired` is not a `RuntimeError`, so it escaped every
+    # caller that catches the failure of a git call and left an agent with
+    # no `next_kind` and no remedy. So did a missing executable. Both are
+    # normalised HERE, at the one place that runs git, rather than at each
+    # caller: a reader that can fail in a way its callers cannot name is the
+    # defect, not the individual catch that missed it.
+    try:
+        out = subprocess.run(["git", "-C", str(repo_root), *args],
+                             capture_output=True, text=True, timeout=120)
+    except subprocess.SubprocessError as exc:
+        raise RuntimeError(
+            f"a `git` subprocess did not complete: "
+            f"`{paths.command(paths.Lit('git'), *args)}` — "
+            f"{type(exc).__name__}: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"a `git` subprocess could not be started: "
+            f"`{paths.command(paths.Lit('git'), *args)}` — {exc}") from exc
     if out.returncode != 0:
         raise RuntimeError(
             f"a `git` subprocess failed: "

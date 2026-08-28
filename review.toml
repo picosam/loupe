@@ -74,10 +74,10 @@ permitted_reviewers = ["claude", "codex"]
 rejected_reviewers = ["gemini", "antigravity"]
 
 [limits]
-# Round cap: the budget breaker fires when a lineage exceeds it. Raise ONE
-# lineage past it with `loupe ledger authorize-cap --to N --reason "..."` —
-# recorded, auditable, scoped to that review — never by editing this number
-# because a breaker keeps tripping.
+# ADVISORY. Past this the breaker fires and the tool emits anyway: nothing is
+# gated, and no authorization is needed to continue. `loupe ledger
+# authorize-cap --to N --reason "..."` silences it for one lineage, on the
+# record; editing this number moves every future review's floor instead.
 round_cap = 3
 # Cumulative token budget per lineage. The tool has no model in any code path
 # and cannot count tokens; counts enter via `loupe ledger add --tokens N` /
