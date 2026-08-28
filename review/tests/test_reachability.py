@@ -46,11 +46,35 @@ def fake_git(mapping):
     return run
 
 
+#: RVW-T17. The authority is now read FROM THE COMMIT, inside
+#: `ensure_pushed` and before the push, so every scripted runner has to be
+#: able to answer it. These two calls are exactly what `take` and
+#: `validate --from-target` make — same verb, same arguments — which is the
+#: property the redesign exists to create: one question, one input, three
+#: call sites. The bytes are the repository's own config, so `governing`
+#: resolves to the same values `cfg` carries and these fixtures keep
+#: testing reachability rather than a config mismatch.
+AUTHORITY_BYTES = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
+
+
+def authority_map(sha=None, entry=None, blob=None):
+    """The two git calls `resolve_authority` makes about `sha`."""
+    sha = sha or SHA
+    listing = ("100644 blob 0123456789abcdef0123456789abcdef01234567\t"
+               "review.toml" if entry is None else entry)
+    return {
+        ("ls-tree", "--full-tree", sha, "--", "review.toml"): listing,
+        ("show", f"{sha}:review.toml"):
+            AUTHORITY_BYTES if blob is None else blob,
+    }
+
+
 def clean_repo_map(overrides=None):
     m = {
         ("rev-parse", "--abbrev-ref", "HEAD"): "main",
         ("status", "--porcelain"): "",
         ("rev-parse", "HEAD"): SHA,
+        **authority_map(),
         ("remote",): "origin",
         ("for-each-ref", UPSTREAM_FMT, "refs/heads/main"):
             "origin\trefs/heads/main",
@@ -90,10 +114,22 @@ class TestEnsurePushedDecisions(unittest.TestCase):
     def test_clean_tree_with_upstream_pushes_and_observes(self):
         git = fake_git(clean_repo_map())
         record = ensure_pushed(CFG, git=git)
+        # RVW-T17/U-1: the record also carries the authority RESOLVED FROM
+        # THE COMMIT, because the emitter renders the envelope from it
+        # rather than from this checkout's config. Compared field by field
+        # so the reachability assertion stays about reachability.
+        governing = record.pop("governing")
+        self.assertEqual(record.pop("roles"), ("claude", "codex"),
+                         "the stamps are the roles resolved against the "
+                         "COMMITTED authority (round 1 F2)")
         self.assertEqual(record, {
             "state": "pushed", "branch": "main", "ref": "refs/heads/main",
             "remote": "origin", "url": "ssh://example.invalid/x.git",
             "sha": SHA, "committed": False})
+        self.assertTrue(governing.taxonomy_declared)
+        self.assertIn(("ls-tree", "--full-tree", SHA, "--", "review.toml"),
+                      git.calls)
+        self.assertIn(("show", f"{SHA}:review.toml"), git.calls)
         self.assertIn(("push", "origin", "refs/heads/main:refs/heads/main"),
                       git.calls)
         self.assertIn(("ls-remote", "origin", "refs/heads/main"), git.calls)
@@ -339,7 +375,14 @@ class TestRealPushIntegration(unittest.TestCase):
         self._sh("git", "-C", str(self.repo), "config", "commit.gpgsign",
                  "false")
         (self.repo / "f.txt").write_text("one\n", encoding="utf-8")
-        self._sh("git", "-C", str(self.repo), "add", "f.txt")
+        # RVW-T17: a reviewed commit carries the rules it is judged by, so
+        # the integration repo commits one. This is the real-git leg of the
+        # same property the scripted runners assert, and it is why the leg
+        # is worth having: the boundary now reads a git object, and a fixture
+        # that only ever mocked the read could not show that it works.
+        (self.repo / "review.toml").write_text(AUTHORITY_BYTES,
+                                               encoding="utf-8")
+        self._sh("git", "-C", str(self.repo), "add", "f.txt", "review.toml")
         self._sh("git", "-C", str(self.repo), "commit", "-q", "-m", "init")
         self._sh("git", "init", "-q", "--bare", str(self.remote))
         self._sh("git", "-C", str(self.repo), "remote", "add", "origin",

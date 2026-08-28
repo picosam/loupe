@@ -1440,20 +1440,31 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
         import inspect
         from review import cli, emit
         params = inspect.signature(cli._emit).parameters
-        # All three authored inputs — the captured claim, the resolved roles
-        # (§4) and the resolved transport (RVW-T11) — are required
-        # parameters: an omitted capture is a capture nobody made, and an
-        # omitted resolution would reopen a derive-it-yourself channel here
-        # exactly as `claim=None` once did for the claim. The transport joins
-        # them for the same reason and one more: it is part of the handoff
-        # cache's key, so a value re-derived here could differ from the one
-        # the cache was consulted with.
-        for boundary in list(params.values())[-3:]:
+        # The authored inputs that survive as parameters — the captured
+        # claim and the resolved transport (RVW-T11) — are required: an
+        # omitted capture is a capture nobody made, and an omitted
+        # resolution would reopen a derive-it-yourself channel here exactly
+        # as `claim=None` once did for the claim. The transport is also
+        # part of the handoff cache's key, so a value re-derived here could
+        # differ from the one the cache was consulted with.
+        #
+        # `roles` was the third and is deliberately GONE (lineage 12 round 2
+        # F1). It was a resolution made against the checkout before the
+        # reviewed commit existed, and passing it here is what let a stale
+        # checkout veto an identity the target permits. The roles are now
+        # resolved inside `ensure_pushed`, from the flags, against the
+        # committed authority — so the right shape of this guard is that
+        # there is no roles parameter to omit, not that it is required.
+        for boundary in list(params.values())[-2:]:
             self.assertIs(boundary.default, inspect.Parameter.empty,
                           f"{boundary.name} is optional again: an omitted "
                           f"capture is a capture nobody made")
-        self.assertEqual(len(params), 6, f"unexpected _emit signature "
+        self.assertEqual(len(params), 5, f"unexpected _emit signature "
                                          f"{list(params)}")
+        self.assertNotIn("roles", params,
+                         "a pre-commit role resolution is back in `_emit`: "
+                         "the checkout is not an authority over roles "
+                         "(round 2 F1)")
         # And no admitted claim captures as a non-mapping, so nothing
         # downstream can test the value for None and reopen the file.
         path = self.tmp / "shape.json"

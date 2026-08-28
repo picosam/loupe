@@ -22,6 +22,7 @@ from pathlib import Path
 
 from review import emit, transport, wire
 from review.ledger import Ledger
+from review.tests.util import REPO_ROOT
 from review.tests.synth import (CFG, NO_GATES, emitted_request, head_sha,
                                 reachability, shadow_ledger)
 
@@ -213,83 +214,153 @@ class TestResolveRolesDefaultedSources(unittest.TestCase):
         self.assertEqual(emit.resolve_roles(cfg), ("claude", "codex"))
 
 
-class TestSelectionPrecedesEverySideEffect(unittest.TestCase):
-    """Round-1 F1, the lifecycle half: a refused selection reaches no
-    ledger, no Git, no gate run, no cache and no record. Every downstream
-    side effect is a tripwire; the refusal must arrive first."""
+class TestTheTargetAuthorisesRolesNotTheCheckout(unittest.TestCase):
+    """Round-1 F1's lifecycle property, as amended by lineage 12.
 
-    def _tripped(self, *a, **k):
-        raise AssertionError("a side effect was reached past a refused "
-                             "role selection")
+    Round 1 F1 established that a refused role selection reaches no ledger,
+    no Git, no gate, no cache and no record — with the CHECKOUT deciding.
+    Lineage 12 round 1 F2 then moved authorization to the committed
+    authority, and round 2 F1 found the half that was left behind: the
+    checkout's own permitted and rejected lists could still VETO an
+    identity the target permits. That is the inverse defect in the same
+    place, and it is worse than the original, because it refuses work that
+    is valid.
 
-    def _blocked_payload(self, verb, args, cfg, patches):
+    So the property inverts. A checkout that would refuse must NOT refuse:
+    the decision belongs to the authority the reviewer will judge by, and
+    before the commit exists there is no such authority to ask. What
+    survives unchanged is the OTHER half — a target-rejected role still
+    stops before the push and before any gate — and that is asserted
+    end-to-end, against real repositories and both author doors, in
+    `test_transport.TestTheAuthorDoorStampsTheCommittedRoles`.
+    """
+
+    def _reached(self, *a, **k):
+        raise _ReachedEnsurePushed()
+
+    def _run(self, verb, args, cfg):
         import contextlib
         import io
         import json
         import unittest.mock as mock
         from review import cli
+        from review.ledger import Ledger
         buf = io.StringIO()
+        reached = False
         with contextlib.ExitStack() as stack:
-            for target, name in patches:
-                stack.enter_context(
-                    mock.patch.object(target, name, self._tripped))
+            # An in-memory ledger, so the LIFECYCLE preflight (undisposed
+            # findings, fired breakers) cannot refuse first and mask the
+            # property under test. This class is about role authority, not
+            # about the lifecycle, which has its own tests.
+            stack.enter_context(
+                mock.patch.object(cli, "_ledger",
+                                  lambda *a, **k: Ledger.in_memory()))
+            stack.enter_context(
+                mock.patch.object(cli.emit, "ensure_pushed", self._reached))
             stack.enter_context(contextlib.redirect_stdout(buf))
-            code = verb(args, cfg)
-        self.assertNotEqual(code, 0)
-        return json.loads(buf.getvalue())
+            try:
+                code = verb(args, cfg)
+            except _ReachedEnsurePushed:
+                reached, code = True, None
+        raw = buf.getvalue()
+        return reached, code, (json.loads(raw) if raw.strip() else None)
 
-    def test_handoff_refuses_before_any_side_effect(self):
+    def _args(self, command, **over):
         import argparse
-        from review import cli
-        args = argparse.Namespace(claim_file=None, base=None, head=None,
-                                  local_only=False, out=None,
-                                  ledger_dir=None, command="handoff",
-                                  author="gpt", reviewer=None)
-        payload = self._blocked_payload(
-            cli.cmd_handoff, args, cfg_with_roles(),
-            [(cli, "_ledger"), (cli.emit, "ensure_pushed"),
-             (cli.emit, "run_gates"), (cli.transport, "cached_handoff"),
-             (cli.transport, "record_handoff"),
-             (cli.transport, "handoff_preflight")])
-        self.assertEqual(payload["next_kind"], "blocked")
-        self.assertIn("permitted_authors", payload["error"])
+        base = dict(claim_file=None, base=None, head=None, local_only=False,
+                    out=None, ledger_dir=None, command=command,
+                    author=None, reviewer=None)
+        base.update(over)
+        return argparse.Namespace(**base)
 
-    def test_emit_request_refuses_before_any_side_effect(self):
-        import argparse
-        from review import cli
-        args = argparse.Namespace(claim_file=None, base=None, head=None,
-                                  local_only=False, out=None,
-                                  ledger_dir=None, command="emit-request",
-                                  author=None, reviewer="gemini")
-        payload = self._blocked_payload(
-            cli.cmd_emit_request, args,
-            cfg_with_roles(permitted_reviewers=["codex", "gemini"]),
-            [(cli, "_ledger"), (cli, "_emit"),
-             (cli.emit, "ensure_pushed"), (cli.emit, "run_gates")])
-        self.assertEqual(payload["next_kind"], "blocked")
-        self.assertIn("rejected", payload["error"])
-
-    def test_unassigned_defaults_refuse_before_any_side_effect(self):
-        # Round-2 F2's tripwire, both verbs: no-default config, no flags —
-        # the refusal must arrive before the ledger is even constructed.
-        import argparse
+    def test_a_checkout_that_forbids_the_flag_no_longer_vetoes(self):
+        """FALSIFICATION for round 2 F1. The checkout declares
+        `permitted_authors` without `gpt`; under the pre-fix code this
+        refused at the CLI boundary with a `permitted_authors` message,
+        before the target was ever consulted. It must now reach the
+        committed-authority boundary, where the target rules."""
         from review import cli
         for verb, command in ((cli.cmd_handoff, "handoff"),
                               (cli.cmd_emit_request, "emit-request")):
             with self.subTest(verb=command):
-                args = argparse.Namespace(
-                    claim_file=None, base=None, head=None, local_only=False,
-                    out=None, ledger_dir=None, command=command,
-                    author=None, reviewer=None)
-                payload = self._blocked_payload(
-                    verb, args, cfg_with_roles(author="", reviewer=""),
-                    [(cli, "_ledger"), (cli, "_emit"),
-                     (cli.emit, "ensure_pushed"), (cli.emit, "run_gates"),
-                     (cli.transport, "cached_handoff"),
-                     (cli.transport, "record_handoff"),
-                     (cli.transport, "handoff_preflight")])
+                reached, code, payload = self._run(
+                    verb, self._args(command, author="gpt"),
+                    cfg_with_roles())
+                self.assertTrue(
+                    reached,
+                    f"{command} refused on the CHECKOUT's permitted list; "
+                    f"the target is the only authority entitled to rule "
+                    f"(round 2 F1). payload={payload}")
+
+    def test_a_checkout_that_rejects_the_reviewer_no_longer_vetoes(self):
+        """The same inversion on `rejected_reviewers`."""
+        from review import cli
+        for verb, command in ((cli.cmd_handoff, "handoff"),
+                              (cli.cmd_emit_request, "emit-request")):
+            with self.subTest(verb=command):
+                reached, code, payload = self._run(
+                    verb, self._args(command, reviewer="gemini"),
+                    cfg_with_roles(permitted_reviewers=["codex", "gemini"]),
+                )
+                self.assertTrue(
+                    reached,
+                    f"{command} refused on the CHECKOUT's rejected list; "
+                    f"payload={payload}")
+
+    def test_unassigned_checkout_defaults_no_longer_veto(self):
+        """A checkout assigning no roles at all was round-2 F2's refusal.
+        It is now the target's question too: a checkout is not evidence
+        about what the reviewed commit declares, and a repository governed
+        only by a user-level config legitimately assigns nothing here."""
+        from review import cli
+        for verb, command in ((cli.cmd_handoff, "handoff"),
+                              (cli.cmd_emit_request, "emit-request")):
+            with self.subTest(verb=command):
+                reached, code, payload = self._run(
+                    verb, self._args(command),
+                    cfg_with_roles(author="", reviewer=""))
+                self.assertTrue(
+                    reached,
+                    f"{command} refused on the CHECKOUT's empty defaults; "
+                    f"payload={payload}")
+
+    def test_the_target_refusal_still_reaches_the_human_as_blocked(self):
+        """The refusal moved; its SHAPE did not. `RoleSelectionError` from
+        the committed-authority boundary must still exit blocked, with the
+        refusal's own remedy — round 7 F3's rule, at the new site."""
+        import unittest.mock as mock
+        from review import cli, emit
+
+        def refuse(*a, **k):
+            raise emit.RoleSelectionError(
+                "the target does not permit 'gpt'",
+                remedy="a person selects a permitted identity")
+
+        for verb, command in ((cli.cmd_handoff, "handoff"),
+                              (cli.cmd_emit_request, "emit-request")):
+            with self.subTest(verb=command):
+                import contextlib
+                import io
+                import json
+                from review.ledger import Ledger
+                buf = io.StringIO()
+                with mock.patch.object(
+                        cli, "_ledger",
+                        lambda *a, **k: Ledger.in_memory()), \
+                        mock.patch.object(cli.emit, "ensure_pushed", refuse):
+                    with contextlib.redirect_stdout(buf):
+                        code = verb(self._args(command, author="gpt"),
+                                    cfg_with_roles())
+                payload = json.loads(buf.getvalue())
+                self.assertNotEqual(code, 0)
                 self.assertEqual(payload["next_kind"], "blocked")
-                self.assertIn("at all", payload["error"])
+                self.assertIn("does not permit", payload["error"])
+                self.assertIn("permitted identity", payload["remedy"])
+
+
+class _ReachedEnsurePushed(Exception):
+    """Raised by the tripwire: the invocation got as far as the
+    committed-authority boundary, which is the property under test."""
 
 
 class TestEmittedStamp(unittest.TestCase):
@@ -335,8 +406,17 @@ class TestCacheRolesKey(unittest.TestCase):
         # the identity's own cold cases live in test_transport.
         text = request_text(tool_attr=tool_identity())
         transport.keep_bytes(cfg, 1, "request", text)
+        # Round 2 F1: the warm path resolves the TARGET's authority to
+        # decide the role key, so a scripted runner must answer it.
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
-                        ("status", "--porcelain"): ""})
+                        ("status", "--porcelain"): "",
+                        ("ls-tree", "--full-tree", SHA_B, "--",
+                         "review.toml"):
+                            "100644 blob " + "0" * 40 + "\treview.toml",
+                        ("show", f"{SHA_B}:review.toml"):
+                            (REPO_ROOT / "review.toml").read_text(
+                                encoding="utf-8"),
+                        })
         ledger = Ledger.in_memory()
         ledger.add({"event": "request", "round": 1, "sha": SHA_B,
                     "source_digest": transport._digest_text(text),

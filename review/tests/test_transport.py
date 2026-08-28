@@ -14,6 +14,7 @@ import dataclasses
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,24 @@ def fake_git(mapping):
 
     run.calls = calls
     return run
+
+
+
+def authority_calls(sha=None):
+    """The two reads `resolve_authority` makes about `sha` (lineage 12).
+
+    The warm-cache path resolves the TARGET's authority to decide the role
+    key (round 2 F1), so a scripted runner reaching that path has to answer
+    them. Kept here rather than repeated at each fixture: a mapping that
+    drifts from what the resolver asks is a fixture that tests nothing.
+    """
+    sha = sha or SHA_B
+    return {
+        ("ls-tree", "--full-tree", sha, "--", "review.toml"):
+            "100644 blob " + "0" * 40 + "\treview.toml",
+        ("show", f"{sha}:review.toml"):
+            (REPO_ROOT / "review.toml").read_text(encoding="utf-8"),
+    }
 
 
 def request_text(sha=SHA_B, base=SHA_A, reviewer="codex", author="claude",
@@ -895,6 +914,88 @@ class TestTake(unittest.TestCase):
         self.assertIn("E-ATTR-DUPLICATE",
                       {i.code for i in validate.validate_verdict(v, CFG)})
 
+    def test_the_shape_attribute_has_a_complete_value_grammar(self):
+        """Round 1 F3 (lineage 12), derived from the grammar rather than
+        from examples.
+
+        `shape` was added as a stamped attribute with no value grammar, so
+        an empty, truncated or non-hex value travelled and was rendered to
+        a human as a digest. The rows below ARE the grammar: absence and a
+        canonical 16-hex value are the paired controls; present-empty,
+        length 15, length 17, non-hex and a padded value are the mutations.
+        Every malformed row must produce the named structural error before
+        any git call — asserted, not assumed, by checking the runner.
+
+        The padded row is the reason the pattern is anchored at both ends:
+        a substring match would admit a valid digest with anything around
+        it, which is precisely the value a careless emitter produces.
+
+        MUTATION: delete the `_SHAPE_RE` check in `wire.parse_attrs` and
+        every malformed row is admitted again while the controls still
+        pass.
+        """
+        text = request_text()
+        head = f'<loupe-review-request sha="{SHA_B}"'
+        self.assertIn(head, text)
+
+        def with_shape(value):
+            return text.replace(head, f'{head} shape="{value}"', 1)
+
+        # Controls: absence (a legacy envelope) and the canonical value.
+        self.assertNotIn("shape=", text)
+        for control in (text, with_shape("0123456789abcdef")):
+            parsed = wire.parse_request(control)
+            codes = {i.code for i in validate.validate_request(
+                parsed, self._cfg(), structural_only=True)}
+            self.assertNotIn("E-SHAPE-GRAMMAR", codes)
+        git = self._git()
+        transport.take(self._cfg(), Ledger.in_memory(),
+                       with_shape("0123456789abcdef"), "r.md", git=git,
+                       reviewer="codex")
+        self.assertEqual(git.calls[0][0], "fetch",
+                         "the canonical control must still be taken")
+
+        for value, why in (("", "present-empty"),
+                           ("0123456789abcde", "length 15"),
+                           ("0123456789abcdef0", "length 17"),
+                           ("0123456789abcdeg", "non-hex"),
+                           ("0123456789ABCDEF", "uppercase"),
+                           (" 0123456789abcdef", "padded")):
+            with self.subTest(shape=why):
+                mutated = with_shape(value)
+                parsed = wire.parse_request(mutated)
+                codes = {i.code for i in validate.validate_request(
+                    parsed, self._cfg(), structural_only=True)}
+                self.assertIn("E-SHAPE-GRAMMAR", codes, why)
+                git = self._git()
+                with self.assertRaises(transport.Refusal) as ctx:
+                    transport.take(self._cfg(), Ledger.in_memory(), mutated,
+                                   "r.md", git=git, reviewer="codex")
+                self.assertIn("E-SHAPE-GRAMMAR", str(ctx.exception), why)
+                self.assertEqual(git.calls, [],
+                                 f"{why}: a git call was made on a "
+                                 f"structurally defective wrapper")
+
+    def test_the_shape_grammar_binds_dispositions_too(self):
+        """One shared boundary, per round 1 F3: the disposition wrapper
+        goes through the same attribute parser, so it inherits the grammar
+        rather than restating it. A grammar enforced at two call sites is a
+        grammar with two chances to drift."""
+        good, bad = "0123456789abcdef", "nope"
+        for value, expected in ((good, False), (bad, True)):
+            with self.subTest(shape=value):
+                attrs, defects = wire.parse_attrs(
+                    f'verdict_sha="{SHA_B}" shape="{value}"')
+                self.assertEqual(attrs["shape"], value)
+                self.assertEqual(
+                    any(c == "E-SHAPE-GRAMMAR" for c, _ in defects),
+                    expected)
+        attrs, defects = wire.parse_attrs(f'verdict_sha="{SHA_B}"')
+        self.assertNotIn("shape", attrs)
+        self.assertEqual([c for c, _ in defects], [],
+                         "absence is accepted: an envelope emitted before "
+                         "the attribute existed carries none")
+
     def test_help_does_not_advertise_default_reviewer(self):
         """Round 2 F9 (Low), falsification.
 
@@ -1012,7 +1113,8 @@ class TestCachedHandoff(unittest.TestCase):
     def test_cold_when_no_request_for_this_tip(self):
         cfg = dataclasses.replace(CFG, ledger_dir=None)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
-                        ("status", "--porcelain"): ""})
+                        ("status", "--porcelain"): "",
+                        **authority_calls()})
         ledger = Ledger.in_memory()
         ledger.add({"event": "request", "round": 1, "sha": SHA_A,
                     "source_digest": "x", "bytes": 1})
@@ -1021,7 +1123,8 @@ class TestCachedHandoff(unittest.TestCase):
     def test_cold_when_no_kept_copy(self):
         cfg = dataclasses.replace(CFG, ledger_dir=None)  # no exchange dir
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
-                        ("status", "--porcelain"): ""})
+                        ("status", "--porcelain"): "",
+                        **authority_calls()})
         ledger = Ledger.in_memory()
         ledger.add({"event": "request", "round": 1, "sha": SHA_B,
                     "source_digest": "x", "bytes": 1})
@@ -1040,7 +1143,8 @@ class TestCachedHandoff(unittest.TestCase):
         kept = transport.keep_bytes(cfg, 1, "request", text)
         self.assertTrue(Path(kept).is_file())
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
-                        ("status", "--porcelain"): ""})
+                        ("status", "--porcelain"): "",
+                        **authority_calls()})
         ledger = Ledger.in_memory()
         # A recorded claim state, because round 5 F1 made "neither side says
         # anything" cold: this test is about the KEPT COPY, so it has to get
@@ -1078,7 +1182,8 @@ class TestCachedHandoff(unittest.TestCase):
         text = request_text(tool_attr=tool_identity())
         transport.keep_bytes(cfg, 1, "request", text)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
-                        ("status", "--porcelain"): ""})
+                        ("status", "--porcelain"): "",
+                        **authority_calls()})
         ledger = Ledger.in_memory()
         ledger.add({"event": "request", "round": 1, "sha": SHA_B,
                     "source_digest": transport._digest_text(text),
@@ -1118,7 +1223,8 @@ class TestCachedHandoff(unittest.TestCase):
         text = request_text(tool_attr=tool_identity())
         transport.keep_bytes(cfg, 1, "request", text)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
-                        ("status", "--porcelain"): ""})
+                        ("status", "--porcelain"): "",
+                        **authority_calls()})
         ledger = Ledger.in_memory()
         ledger.add({"event": "request", "round": 1, "sha": SHA_B,
                     "source_digest": transport._digest_text(text),
@@ -1172,7 +1278,8 @@ class TestCachedHandoff(unittest.TestCase):
         text = request_text(tool_attr=tool_identity())
         transport.keep_bytes(cfg, 1, "request", text)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
-                        ("status", "--porcelain"): ""})
+                        ("status", "--porcelain"): "",
+                        **authority_calls()})
         none = transport.NO_CLAIM
 
         OMITTED = object()      # the caller names no state at all
@@ -3585,7 +3692,8 @@ class TestToolIdentityIsInTheWarmKey(unittest.TestCase):
             self.tmp, ignore_errors=True))
         self.cfg = dataclasses.replace(CFG, ledger_dir=self.tmp)
         self.git = fake_git({("rev-parse", "HEAD"): SHA_B,
-                             ("status", "--porcelain"): ""})
+                             ("status", "--porcelain"): "",
+                             **authority_calls()})
 
     def _warm(self, tool_attr):
         text = request_text(tool_attr=tool_attr)
@@ -3707,11 +3815,11 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         (self.repo / "keep.txt").write_text("keep\n", encoding="utf-8")
         self.base = self._commit("base")
 
-    def _git(self, *args):
+    def _git(self, *args, input_text=None):
         return subprocess.run(
             ["git", "-C", str(self.repo), "-c", "user.email=t@example.invalid",
              "-c", "user.name=t", *args], check=True, capture_output=True,
-            text=True, timeout=60).stdout.strip()
+            text=True, timeout=60, input=input_text).stdout.strip()
 
     def _commit(self, subject):
         self._git("add", "-A")
@@ -3749,20 +3857,400 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         finally:
             os.chdir(cwd)
 
-    def test_a_handoff_refuses_where_the_rules_do_not_travel(self):
-        """The author's end, before a commit, a push, a gate or an emission."""
-        with self.assertRaises(transport.Refusal) as ctx:
-            transport.handoff_preflight(self._cfg(),
-                                        Ledger(self.tmp / "ledger"))
-        exc = ctx.exception
-        self.assertIn("tracks no review.toml", str(exc))
-        self.assertEqual(exc.next_cmd, "")
-        self.assertIn("commits review.toml", exc.remedy)
+    def test_the_author_refuses_where_the_rules_do_not_travel(self):
+        """The author's end — RVW-T17: after the commit, before the push.
 
-    def test_a_tracked_config_is_the_paired_control(self):
+        Round 6 asserted this against `handoff_preflight`, which asked
+        before the commit existed and therefore PREDICTED it. The rule is
+        unchanged and its site is not: `ensure_pushed` reads the commit it
+        just made, with the same call `take` makes.
+        """
+        from review import emit as _emit
+        with self.assertRaises(_emit.AuthorityAbsent) as ctx:
+            _emit.ensure_pushed(self._cfg(), local_only=True)
+        exc = ctx.exception
+        self.assertIn("carries no review.toml", str(exc))
+        self.assertIn("commits review.toml", exc.remedy)
+        self.assertIn("Nothing has been pushed or emitted", exc.remedy)
+
+    def _plant_blob_replacement(self):
+        """Commit rules saying `gemini`, then install a replacement BLOB
+        saying `claude`. Returns (sha, original_bytes)."""
+        committed = self.toml.replace(
+            'permitted_authors = ["claude", "codex"]',
+            'permitted_authors = ["gemini"]')
+        self.assertNotEqual(committed, self.toml)
+        (self.repo / "review.toml").write_text(committed, encoding="utf-8")
+        sha = self._commit("rules saying gemini")
+        original = self._git("rev-parse", f"{sha}:review.toml")
+        replacement = self._git("hash-object", "-w", "--stdin",
+                                input_text=self.toml)
+        self._git("replace", original, replacement)
+        return sha, committed
+
+    def test_a_replacement_blob_cannot_change_the_committed_authority(self):
+        """Round 1 F1 (lineage 12), the Blocker.
+
+        `git replace` installs a ref that makes every ordinary object lookup
+        return a REPLACEMENT. It is local, uncommitted, per-machine state —
+        the same class of input as a filter driver — and it reaches
+        `ls-tree` and `cat-file` exactly as it reaches `show`, so the
+        `cat-file` switch this round's own risk paragraph proposed would not
+        have helped. The resolver must read the original.
+
+        MUTATION, asserted below rather than described: the identical read
+        WITHOUT `--no-replace-objects` returns the replacement. That proves
+        the planted replacement is live and that the flag is what stops it,
+        so this test can fail.
+        """
+        sha, committed = self._plant_blob_replacement()
+        governing, origin = transport.resolve_authority(self._cfg(), sha)
+        self.assertEqual(origin, transport.AUTHORITY_TARGET)
+        self.assertEqual(governing.roles["permitted_authors"], ["gemini"],
+                         "the resolver returned the REPLACEMENT's rules")
+        # The mutation: replacement processing on.
+        leaked = transport._git(self.repo, "show", f"{sha}:review.toml")
+        self.assertIn("claude", leaked,
+                      "the planted replacement is not live, so the control "
+                      "above proves nothing")
+        self.assertNotIn("gemini", leaked.split("permitted_authors")[1][:40])
+
+    def test_a_replacement_commit_cannot_change_the_committed_authority(self):
+        """The same attack one object up: replace the COMMIT, so the tree
+        and therefore the config blob are reached through the replacement.
+        Named separately because a guard placed on the blob read alone
+        would pass the test above and fail this one.
+        """
+        (self.repo / "review.toml").write_text(
+            self.toml.replace('permitted_authors = ["claude", "codex"]',
+                              'permitted_authors = ["gemini"]'),
+            encoding="utf-8")
+        sha = self._commit("rules saying gemini")
+        (self.repo / "review.toml").write_text(self.toml, encoding="utf-8")
+        other = self._commit("rules saying claude")
+        self._git("replace", sha, other)
+        governing, origin = transport.resolve_authority(self._cfg(), sha)
+        self.assertEqual(origin, transport.AUTHORITY_TARGET)
+        self.assertEqual(governing.roles["permitted_authors"], ["gemini"])
+        leaked = transport._git(self.repo, "show", f"{sha}:review.toml")
+        self.assertIn("claude", leaked, "the commit replacement is not live")
+
+    def test_an_alternate_replacement_ref_base_is_also_ignored(self):
+        """`GIT_REPLACE_REF_BASE` moves the namespace `refs/replace/` lives
+        in. A guard that unset or ignored only the default namespace would
+        be bypassed by one environment variable; `--no-replace-objects` is
+        evaluated before any base is consulted, so it is not.
+        """
+        import os
+        from unittest import mock
+        base = "refs/myreplace/"
+        with mock.patch.dict(os.environ, {"GIT_REPLACE_REF_BASE": base}):
+            sha, _ = self._plant_blob_replacement()
+            self.assertTrue(
+                self._git("for-each-ref", "--format=%(refname)",
+                          base).strip(),
+                "the replacement was not written to the alternate base, so "
+                "this test is not exercising what it claims")
+            governing, origin = transport.resolve_authority(self._cfg(), sha)
+            self.assertEqual(origin, transport.AUTHORITY_TARGET)
+            self.assertEqual(governing.roles["permitted_authors"], ["gemini"])
+            leaked = transport._git(self.repo, "show", f"{sha}:review.toml")
+            self.assertIn("claude", leaked,
+                          "the alternate-base replacement is not live")
+
+    # ---------------------------------------------------------------
+    # Round 3 F2 (lineage 12). The first cut of this asserted a whole
+    # class at once and exercised only part of it: the eol row could not
+    # have failed (the committed bytes were already LF and the assertion
+    # was that the READ had no CRLF), `working-tree-encoding` was named in
+    # the reference but never configured in a test, and the `log -p` claim
+    # was never exercised at all. A test that states more than it measures
+    # is the same defect as a claim that does — one row per mechanism now,
+    # each proving its own transformation LIVE at the surface where git is
+    # supposed to apply it, then proving the blob form returns the object's
+    # own bytes.
+    #
+    # The sentinel is deliberate: a first cut used `gemini`, which already
+    # appears in this repository's `rejected_reviewers`, so both the
+    # control and the assertion passed for reasons unrelated to any driver.
+    MARK = "ZZCONVERTEDZZ"
+
+    def _conversion_repo(self, attributes: str, **git_config):
+        """A commit whose `review.toml` blob is LF-encoded UTF-8, with the
+        attributes and config declared AFTERWARDS. Returns the sha.
+
+        The ordering is not incidental. A conversion attribute applies in
+        both directions, and declaring `working-tree-encoding=UTF-16LE`
+        before the file is staged makes git read this UTF-8 file AS
+        UTF-16LE on the way in and refuse. Committing the blob first
+        isolates the direction these rows are about — what a CHECKOUT
+        does — and leaves the object holding known bytes."""
+        (self.repo / "review.toml").write_text(
+            self.toml.replace('permitted_authors = ["claude", "codex"]',
+                              'permitted_authors = ["claude"]'),
+            encoding="utf-8", newline="\n")
+        self._commit("rules, before any conversion is declared")
+        (self.repo / ".gitattributes").write_text(attributes,
+                                                  encoding="utf-8")
+        for k, v in git_config.items():
+            self._git("config", k.replace("__", "."), v)
+        # ONLY the attributes file is staged. `add -A` would restage
+        # `review.toml` THROUGH the conversion just declared — git would
+        # read these UTF-8 bytes as UTF-16LE and either refuse or write a
+        # mangled blob — and then the object under test would no longer be
+        # the object these rows are about.
+        self._git("add", ".gitattributes")
+        self._git("commit", "-qm", "declare the conversion")
+        return self._git("rev-parse", "HEAD")
+
+    def _blob(self, sha):
+        """The object's own bytes.
+
+        Deliberately does NOT go through `self._cfg()`: after a
+        `working-tree-encoding` checkout the worktree copy is UTF-16LE and
+        `config.load` cannot decode it — which is itself the point of that
+        row, and would otherwise make the test fail for the reason it is
+        trying to measure. Only `repo_root` is used here."""
+        cfg = dataclasses.replace(CFG, repo_root=self.repo)
+        return transport.run_bytes(cfg, None, "show",
+                                   f"{sha}:review.toml", no_replace=True)
+
+    def test_textconv_is_live_and_does_not_reach_the_read(self):
+        """MUTATION: remove `diff.x.textconv` and the liveness assertion
+        fails; add `--textconv` to the read and the negative fails."""
+        sha = self._conversion_repo(
+            "review.toml diff=x\n",
+            diff__x__textconv=f"sed s/claude/{self.MARK}/")
+        self.assertIn(
+            self.MARK, self._git("show", "--textconv", f"{sha}:review.toml"),
+            "textconv is not live at the surface that opts into it")
+        self.assertNotIn(self.MARK.encode(), self._blob(sha))
+
+    def test_log_p_converts_and_the_read_does_not(self):
+        """The `log -p` claim, EXERCISED rather than asserted in prose:
+        textconv is on by default in the log/diff family, which is what
+        makes the blob form's silence a fact about the blob form rather
+        than about the driver."""
+        sha = self._conversion_repo(
+            "review.toml diff=x\n",
+            diff__x__textconv=f"sed s/claude/{self.MARK}/")
+        patch = self._git("log", "-p", "-1", "--format=", "--",
+                          "review.toml")
+        self.assertIn(self.MARK, patch,
+                      "textconv is not applied where it IS the default, so "
+                      "this row proves nothing about the blob form")
+        self.assertNotIn(self.MARK.encode(), self._blob(sha))
+
+    def test_smudge_is_live_and_does_not_reach_the_read(self):
+        """MUTATION: remove `filter.sm.smudge` and the checkout control
+        fails."""
+        sha = self._conversion_repo(
+            "review.toml filter=sm\n",
+            filter__sm__smudge=f"sed s/claude/{self.MARK}/",
+            filter__sm__clean="cat")
+        (self.repo / "review.toml").unlink()
+        self._git("checkout", "--", "review.toml")
+        self.assertIn(
+            self.MARK,
+            (self.repo / "review.toml").read_text(encoding="utf-8"),
+            "the smudge filter is not live on checkout")
+        self.assertNotIn(self.MARK.encode(), self._blob(sha))
+
+    def test_eol_conversion_is_live_and_does_not_reach_the_read(self):
+        """Proved from the WORKTREE bytes, which is what the first cut
+        missed: the committed bytes are LF, so asserting the read has no
+        CRLF could not fail. The row now asserts the checkout DOES produce
+        CRLF and the read does not."""
+        sha = self._conversion_repo("review.toml text eol=crlf\n")
+        (self.repo / "review.toml").unlink()
+        self._git("checkout", "--", "review.toml")
+        worktree = (self.repo / "review.toml").read_bytes()
+        self.assertIn(b"\r\n", worktree,
+                      "eol conversion is not live on checkout, so the "
+                      "negative below proves nothing")
+        blob = self._blob(sha)
+        self.assertNotIn(b"\r\n", blob)
+        self.assertIn(b"\n", blob)
+
+    def test_working_tree_encoding_is_live_and_does_not_reach_the_read(self):
+        """`working-tree-encoding` re-encodes on checkout. UTF-16LE is used
+        rather than UTF-16 because git requires a BOM for the latter and
+        refuses outright — a refusal is not the transformation this row is
+        about."""
+        sha = self._conversion_repo(
+            "review.toml working-tree-encoding=UTF-16LE\n")
+        (self.repo / "review.toml").unlink()
+        self._git("checkout", "--", "review.toml")
+        worktree = (self.repo / "review.toml").read_bytes()
+        self.assertIn(b"[\x00r\x00o\x00l\x00e\x00s\x00", worktree,
+                      "working-tree-encoding is not live on checkout")
+        blob = self._blob(sha)
+        self.assertIn(b"[roles]", blob,
+                      "the read was re-encoded")
+        self.assertNotIn(b"[\x00r\x00", blob)
+
+    def test_no_conversion_is_the_paired_control(self):
+        """The control every row above needs: with no attributes and no
+        drivers, the read returns the same bytes and the authority
+        resolves normally, so none of the negatives is passing because the
+        read is broken."""
+        sha = self._conversion_repo("")
+        blob = self._blob(sha)
+        self.assertIn(b'permitted_authors = ["claude"]', blob)
+        governing, origin = transport.resolve_authority(self._cfg(), sha)
+        self.assertEqual(origin, transport.AUTHORITY_TARGET)
+        self.assertEqual(governing.roles["permitted_authors"], ["claude"])
+
+    def test_no_replacement_is_the_paired_control(self):
+        """The control the falsification requires: the same repository with
+        NO replacement refs resolves the valid target exactly as before, so
+        the hardening refuses nothing it should admit."""
+        (self.repo / "review.toml").write_text(self.toml, encoding="utf-8")
+        sha = self._commit("rules")
+        self.assertEqual(
+            self._git("for-each-ref", "--format=%(refname)",
+                      "refs/replace/").strip(), "")
+        governing, origin = transport.resolve_authority(self._cfg(), sha)
+        self.assertEqual(origin, transport.AUTHORITY_TARGET)
+        self.assertTrue(governing.taxonomy_declared)
+
+    def test_a_duplicated_tree_entry_is_refused_not_guessed(self):
+        """A tree carrying `review.toml` TWICE.
+
+        `git mktree` accepts duplicate entries and `ls-tree` prints two
+        lines for them. The listing parser could not tell that from one
+        line — `split(maxsplit=3)` yields four fields either way — so only
+        the first entry's mode was ever checked and the second rode along
+        unread. Reproduced with `mktree` below.
+
+        Honest bound, and it is why the refusal says "not established"
+        rather than naming an exploit: `git show` also resolves the first
+        entry, so no divergence between the two ends is demonstrated. What
+        is wrong is that the agreement rests on an undocumented tie-break
+        nothing asked about.
+        """
+        from review import emit as _emit
+        one = self._git("hash-object", "-w", "--stdin", input_text=self.toml)
+        two = self._git("hash-object", "-w", "--stdin",
+                        input_text=self.toml + "\n# second\n")
+        listing = (f"100644 blob {one}\treview.toml\n"
+                   f"100644 blob {two}\treview.toml\n")
+        tree = self._git("mktree", "--missing", input_text=listing)
+        sha = self._git("commit-tree", tree, "-m", "duplicated")
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.resolve_authority(self._cfg(), sha)
+        self.assertIn("more than one entry", str(ctx.exception))
+
+    def test_a_committed_config_is_the_paired_control(self):
+        from review import emit as _emit
         (self.repo / "review.toml").write_text(self.toml, encoding="utf-8")
         self._commit("rules")
-        transport.handoff_preflight(self._cfg(), Ledger(self.tmp / "ledger"))
+        record = _emit.ensure_pushed(self._cfg(), local_only=True)
+        self.assertTrue(record["governing"].taxonomy_declared)
+
+    def test_the_assume_unchanged_divergence_is_caught(self):
+        """RVW-T17's SIXTH face, and the one that needs no hook, no filter
+        and no attribute — only a stock git index bit.
+
+        `git update-index --assume-unchanged review.toml` makes git presume
+        the file has not changed. `status --porcelain` then reports a CLEAN
+        tree, every prospective check passes (the path is tracked, is a
+        regular file, carries no filter attribute, and hashes identically
+        to itself), and `git commit -a` records the INDEX version while
+        `config.load` read the WORKTREE version. Author and reviewer are
+        then governed by different bytes at one SHA — round 2 F1's
+        asymmetry, reached without any of the five mechanisms rounds 7 to
+        11 closed.
+
+        FALSIFICATION: resolve the authority from `cfg` instead of from the
+        commit and this fails, because `cfg` is the worktree's.
+        """
+        from review import emit as _emit
+        committed = self.toml.replace(
+            'permitted_authors = ["claude", "codex"]',
+            'permitted_authors = ["gemini"]')
+        self.assertNotEqual(committed, self.toml, "fixture no longer edits "
+                                                  "the value it means to")
+        (self.repo / "review.toml").write_text(committed, encoding="utf-8")
+        self._commit("rules the reviewer will read")
+        self._git("update-index", "--assume-unchanged", "review.toml")
+        (self.repo / "review.toml").write_text(self.toml, encoding="utf-8")
+        self.assertEqual(self._git("status", "--porcelain"), "",
+                         "the divergence is invisible to status, which is "
+                         "why nothing before the commit could see it")
+        # What the author's own checkout resolves — the worktree bytes.
+        self.assertIn("claude", self._cfg().roles["permitted_authors"])
+        # Round 1 F2: the committed authority excludes the checkout's
+        # default author, so the emission stops HERE — after the commit,
+        # before the push and before any gate. Under the pre-F2 code this
+        # emitted cleanly, stamped `claude`, and the refusal arrived at the
+        # reviewer's `take` as R-AUTHOR-UNPERMITTED after a human had
+        # already carried the envelope.
+        with self.assertRaises(_emit.RoleSelectionError) as ctx:
+            _emit.ensure_pushed(self._cfg(), local_only=True)
+        self.assertIn("gemini", str(ctx.exception))
+
+    def test_the_assume_unchanged_bytes_govern_when_roles_still_permit(self):
+        """The same divergence with the roles left alone, so the assertion
+        is about WHICH BYTES govern rather than about the refusal.
+
+        FALSIFICATION: resolve the authority from `cfg` instead of from the
+        commit and this fails, because `cfg` is the worktree's.
+        """
+        from review import emit as _emit
+        committed = self.toml.replace("round_cap = 3", "round_cap = 7")
+        self.assertNotEqual(committed, self.toml,
+                            "fixture no longer edits the value it means to")
+        (self.repo / "review.toml").write_text(committed, encoding="utf-8")
+        self._commit("rules with a different cap")
+        self._git("update-index", "--assume-unchanged", "review.toml")
+        (self.repo / "review.toml").write_text(self.toml, encoding="utf-8")
+        self.assertEqual(self._git("status", "--porcelain"), "")
+        self.assertEqual(self._cfg().round_cap, 3)
+        record = _emit.ensure_pushed(self._cfg(), local_only=True)
+        self.assertEqual(
+            record["governing"].round_cap, 7,
+            "the emission must be governed by what the COMMIT records, "
+            "not by what this worktree happens to hold")
+
+    def test_a_filter_attribute_needs_no_refusal_of_its_own(self):
+        """The transformation axis collapses (RVW-T17).
+
+        Rounds 8, 9 and 10 each added machinery to establish what a filter
+        WOULD do to the bytes on their way into a commit. Reading the
+        commit makes the question moot: whatever the filter did, the commit
+        records something, and that something is what both ends read. This
+        asserts the collapse directly — a declared filter driver is present
+        and the boundary neither refuses nor cares.
+        """
+        from review import emit as _emit
+        (self.repo / ".gitattributes").write_text(
+            "review.toml filter=mangle\n", encoding="utf-8")
+        self._git("config", "filter.mangle.clean", "cat")
+        (self.repo / "review.toml").write_text(self.toml, encoding="utf-8")
+        self._commit("rules under a filter")
+        record = _emit.ensure_pushed(self._cfg(), local_only=True)
+        self.assertTrue(record["governing"].taxonomy_declared)
+
+    def test_the_skip_worktree_false_refusal_is_gone(self):
+        """A live FALSE refusal the prediction produced.
+
+        With `skip-worktree` set and the worktree copy removed,
+        `prospective_authority` refused "deleted in the working tree" — but
+        `git commit -a` provably does not delete such an entry, so a
+        perfectly valid handoff was blocked. Reading the commit gets it
+        right for the same reason it gets everything else right: it looks.
+        """
+        from review import emit as _emit
+        (self.repo / "review.toml").write_text(self.toml, encoding="utf-8")
+        self._commit("rules")
+        self._git("update-index", "--skip-worktree", "review.toml")
+        (self.repo / "review.toml").unlink()
+        record = _emit.ensure_pushed(self._cfg(), local_only=True)
+        self.assertTrue(
+            record["governing"].taxonomy_declared,
+            "the commit carries the rules; refusing here refuses a valid "
+            "handoff on the strength of a guess about the worktree")
 
     def test_both_reviewer_verbs_refuse_a_target_declaring_no_rules(self):
         sha = self._commit("no rules")
@@ -4208,356 +4696,280 @@ class TestGateIdIsASafeFilenameComponent(unittest.TestCase):
     CONTAINMENT = ("tests", "lint-2", "a.b_c", "A", "z9")
 
 
+class TestTheAuthorDoorStampsTheCommittedRoles(unittest.TestCase):
+    """Round 1 F2 (lineage 12): the author-door role matrix.
 
-class TestTheProspectiveCommitCarriesItsRules(unittest.TestCase):
-    """Round 7 F1, F2 and F3, at the doors an author actually reaches.
+    U-1 routed what the envelope RENDERS through the committed authority
+    and left the role STAMPS resolved from the checkout, before the commit
+    existed. So a repository whose committed `review.toml` declared
+    different role defaults emitted under the CHECKOUT's answer, and any
+    disagreement surfaced at the reviewer's `take` as
+    `R-AUTHOR-UNPERMITTED` — after a human had already carried it.
 
-    Round 6 asked `ls-files`, which answers whether the OLD commit tracks the
-    path. Publication then runs `commit -a`, which stages tracked
-    working-tree deletions and type changes — so a tracked `review.toml`
-    deleted in the worktree passed the check, and the commit that check
-    existed to protect carried none. The question is about the tree the
-    commit will have, and for `commit -a` that tree is the WORKTREE.
+    The divergence is produced with `assume-unchanged`: the worktree holds
+    one configuration, the commit records another, and `status --porcelain`
+    reports a clean tree throughout. That is the same stock git mechanism
+    that produced RVW-T17's sixth face, used here as an instrument.
 
-    It also lived at one door. `emit-request` — the lower half of handoff —
-    committed and emitted the exact state the lifecycle calls unsupported.
-    Two author doors accepting and refusing different states is round 2 F1
-    with the author's own ends as the two ends.
-
-    And its remedy never arrived: `cmd_handoff` replaced every preflight
-    refusal's remedy with one sentence about dispositions, so the repository
-    that needed a migration action was handed advice that cannot repair it.
-    The round-6 test called the preflight directly and verified a remedy
-    production overwrote.
-
-    Mutations: drop the worktree half and the deletion and symlink rows pass;
-    drop either call site and that door emits a configless commit again;
-    restore the fixed remedy and the missing-config remedy row fails.
+    MUTATION: in `_emit`, stamp the pre-resolved tuple again instead of
+    `record["roles"]`. The two divergence rows and both pre-side-effect
+    rows fail; the matching-defaults control still passes, which is what
+    makes it a control.
     """
 
-    MINIMAL = (
-        '[taxonomy]\nseverities = ["Blocker", "Low"]\n'
-        'blocking = ["Blocker"]\nclassifications = ["design_gap"]\n'
-        '[roles]\nauthor = "claude"\nreviewer = "codex"\n'
-        'permitted_authors = ["claude"]\npermitted_reviewers = ["codex"]\n')
+    DOORS = ("handoff", "emit-request")
 
     def setUp(self):
+        self._build()
+
+    def _build(self):
+        import os
+        import shutil
         try:
-            self.tmp = Path(tempfile.mkdtemp(prefix="prospective-"))
+            self.tmp = Path(tempfile.mkdtemp(prefix="author-roles-"))
         except OSError as exc:
             self.skipTest(f"filesystem writes denied ({exc})")
-        self.addCleanup(lambda: __import__("shutil").rmtree(
-            self.tmp, ignore_errors=True))
+        self.addCleanup(lambda d=self.tmp: shutil.rmtree(d,
+                                                         ignore_errors=True))
         self.repo = self.tmp / "repo"
-        subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)],
-                       check=True, capture_output=True, timeout=60)
-        (self.repo / "review.toml").write_text(self.MINIMAL, encoding="utf-8")
-        (self.repo / "keep.txt").write_text("keep\n", encoding="utf-8")
-        self._git("add", "-A")
-        self._git("commit", "-qm", "rules")
-        self.head = self._git("rev-parse", "HEAD")
-        # The finding's scenario: a user-level copy governs, so roles resolve
-        # and this boundary is the one that answers. Without it a deleted
-        # config falls back to defaults and the roles refusal fires first —
-        # which is how the first cut of this class passed under mutation.
-        self.home = self.tmp / "home"
-        (self.home / ".config" / "loupe").mkdir(parents=True, exist_ok=True)
-        (self.home / ".config" / "loupe"
-         / f"{config.load(self.repo).repo_id}.toml").write_text(
-            self.MINIMAL, encoding="utf-8")
+        self.remote = self.tmp / "remote.git"
+        self._sh("git", "init", "-q", "-b", "main", str(self.repo))
+        for k, v in (("user.name", "a"), ("user.email", "a@example.invalid"),
+                     ("commit.gpgsign", "false")):
+            self._sh("git", "-C", str(self.repo), "config", k, v)
+        self._sh("git", "init", "-q", "--bare", str(self.remote))
+        # The gate manifest is stripped: this class is about role
+        # resolution, and the refusal rows assert that NO gate ran, which
+        # a real manifest would make slow without making it truer.
+        full = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
+        self.head_toml = full[:full.index("[[gates]]")]
+        self.roles_toml = full[full.index("[roles]"):]
+        self._write_config()
+        (self.repo / "f.txt").write_text("one\n", encoding="utf-8")
+        self._sh("git", "-C", str(self.repo), "add", ".")
+        self._sh("git", "-C", str(self.repo), "commit", "-q", "-m", "init")
+        self.base = self._git("rev-parse", "HEAD")
+        self._sh("git", "-C", str(self.repo), "remote", "add", "origin",
+                 str(self.remote))
+        self._sh("git", "-C", str(self.repo), "push", "-q", "-u", "origin",
+                 "main")
+        self.claim = self.tmp / "claim.json"
+        self.claim.write_text(json.dumps({
+            "objective": "author role matrix",
+            "references": [{"path": "review.toml", "required": True}]}),
+            encoding="utf-8")
+        self.cwd = os.getcwd()
+        self.addCleanup(os.chdir, self.cwd)
+
+    def _sh(self, *argv):
+        subprocess.run(list(argv), check=True, capture_output=True,
+                       timeout=60)
 
     def _git(self, *args):
         return subprocess.run(
-            ["git", "-C", str(self.repo), "-c", "user.email=t@example.invalid",
-             "-c", "user.name=t", *args], check=True, capture_output=True,
-            text=True, timeout=60).stdout.strip()
+            ["git", "-C", str(self.repo), *args], check=True,
+            capture_output=True, text=True, timeout=60).stdout.strip()
 
-    def _cfg(self):
-        return dataclasses.replace(config.load(self.repo),
-                                   ledger_dir=self.tmp / "ledger")
+    def _write_config(self, author="claude", reviewer="codex",
+                      permitted_authors=("claude", "codex"),
+                      permitted_reviewers=("claude", "codex"),
+                      rejected=("gemini", "antigravity")):
+        body = self.roles_toml
+        subs = {"author": f'"{author}"', "reviewer": f'"{reviewer}"',
+                "permitted_authors":
+                    "[" + ", ".join(f'"{x}"' for x in permitted_authors) + "]",
+                "permitted_reviewers":
+                    "[" + ", ".join(f'"{x}"' for x in permitted_reviewers)
+                    + "]",
+                "rejected_reviewers":
+                    "[" + ", ".join(f'"{x}"' for x in rejected) + "]"}
+        for key, value in subs.items():
+            body = re.sub(rf'^{key} = .*$', f"{key} = {value}", body,
+                          count=1, flags=re.M)
+        (self.repo / "review.toml").write_text(self.head_toml + body,
+                                               encoding="utf-8")
 
-    def _run(self, *argv):
-        cwd = os.getcwd()
+    def _diverge(self, checkout=None, **committed):
+        """Commit one configuration and leave another in the worktree with
+        `assume-unchanged` set, so the tree reads clean and the commit and
+        the checkout disagree.
+
+        `checkout` names the worktree's own configuration where the row
+        needs it to be RESTRICTIVE — round 2 F1's inverse rows, where the
+        checkout would refuse what the target permits."""
+        self._write_config(**committed)
+        self._sh("git", "-C", str(self.repo), "commit", "-qam", "committed")
+        self._git("update-index", "--assume-unchanged", "review.toml")
+        self._write_config(**(checkout or {}))
+        self.assertEqual(self._git("status", "--porcelain"), "",
+                         "the divergence must be invisible to status")
+
+    def _remote_tip(self):
+        out = self._git("ls-remote", str(self.remote), "refs/heads/main")
+        return out.split("\t")[0] if out else ""
+
+    def _run(self, door, *extra):
+        """One author door, end to end, with a gate spy.
+        Returns (code, payload, gate_runs, stamped_roles_or_None)."""
+        import contextlib
+        import io
+        import os
+        from unittest import mock
+        from review import cli, emit as _emit
+        ran = []
+
+        def spy(cfg, target_sha):
+            ran.append(target_sha)
+            return []
+
+        out = self.tmp / "request.md"
         os.chdir(self.repo)
+        buf = io.StringIO()
         try:
-            out = io.StringIO()
-            with unittest.mock.patch.dict(os.environ,
-                                          {"HOME": str(self.home)}), \
-                    contextlib.redirect_stdout(out):
-                code = cli.main(["--ledger-dir", str(self.tmp / "ledger"),
-                                 *argv])
-            try:
-                return code, json.loads(out.getvalue())
-            except json.JSONDecodeError:
-                return code, {"raw": out.getvalue()}
+            with mock.patch.object(_emit, "run_gates", spy):
+                with contextlib.redirect_stdout(buf):
+                    code = cli.main(["--ledger-dir", str(self.tmp / "state"),
+                                     door, "--claim-file", str(self.claim),
+                                     "--base", self.base,
+                                     "--out", str(out), *extra])
         finally:
-            os.chdir(cwd)
+            os.chdir(self.cwd)
+        payload = json.loads(buf.getvalue())
+        stamped = None
+        if out.exists():
+            attrs = wire.parse_request(
+                out.read_text(encoding="utf-8")).attrs
+            stamped = (attrs["author"], attrs["reviewer"])
+        return code, payload, ran, stamped
 
-    # ------------------------------------------------- prospective states
+    # ------------------------------------------------------------- rows
 
-    def _make(self, state):
-        cfgfile = self.repo / "review.toml"
-        if state == "unstaged deletion":
-            cfgfile.unlink()
-        elif state == "staged deletion":
-            self._git("rm", "-q", "--cached", "review.toml")
-            cfgfile.unlink()
-        elif state == "type change to a symlink":
-            # Pointed at VALID TOML on purpose: a symlink to something else
-            # refuses at config load, which is a different boundary, and the
-            # row would then pass without reaching this one.
-            (self.repo / "alt.toml").write_text(self.MINIMAL,
-                                                encoding="utf-8")
-            cfgfile.unlink()
-            cfgfile.symlink_to("alt.toml")
-        elif state == "type change to a directory":
-            cfgfile.unlink()
-            cfgfile.mkdir()
-        elif state == "unstaged content change":
-            cfgfile.write_text(self.MINIMAL + "\n# edited\n",
-                               encoding="utf-8")
-        elif state == "staged content change":
-            cfgfile.write_text(self.MINIMAL + "\n# staged\n",
-                               encoding="utf-8")
-            self._git("add", "review.toml")
-        elif state == "executable regular file":
-            cfgfile.chmod(0o755)
+    def test_matching_defaults_are_the_paired_control(self):
+        """The control: checkout and commit agree, so nothing about this
+        change may alter the outcome."""
+        for door in self.DOORS:
+            with self.subTest(door=door):
+                self._build()
+                code, payload, ran, stamped = self._run(door)
+                self.assertEqual(code, 0, payload)
+                self.assertEqual(stamped, ("claude", "codex"))
+                self.assertEqual(len(ran), 1, "gates must run on a pass")
 
-    #: States the CLI can reach: a directory or a symlink to non-TOML
-    #: refuses at configuration load, an earlier boundary, so those live in
-    #: the direct rows below where this boundary is the only one running.
-    REFUSED = ("unstaged deletion", "staged deletion",
-               "type change to a symlink")
-    ADMITTED = ("unstaged content change", "staged content change",
-                "executable regular file")
+    def test_different_committed_defaults_are_what_gets_stamped(self):
+        """The no-flag divergence row. FAILS under the mutation."""
+        for door in self.DOORS:
+            with self.subTest(door=door):
+                self._build()
+                self._diverge(author="codex", reviewer="claude")
+                code, payload, _, stamped = self._run(door)
+                self.assertEqual(code, 0, payload)
+                self.assertEqual(
+                    stamped, ("codex", "claude"),
+                    "a no-flag emission must stamp the TARGET's defaults, "
+                    "not the checkout's")
 
-    def test_no_author_door_emits_a_commit_without_its_rules(self):
-        """Both real entrypoints, every prospective state that would produce
-        one — blocked, HEAD unmoved, and no request written."""
-        for door in (("handoff",), ("emit-request", "--local-only")):
-            for state in self.REFUSED:
-                with self.subTest(door=door[0], state=state):
-                    self.setUp()
-                    self._make(state)
-                    code, payload = self._run(*door)
-                    self.assertNotEqual(code, 0, payload)
-                    self.assertEqual(payload.get("next_kind"), "blocked",
-                                     payload)
-                    self.assertTrue(payload.get("remedy"), payload)
-                    # Bound to ITS OWN cause. Without this the rows pass on
-                    # whatever refuses first — a deleted config falls back to
-                    # defaults and the roles refusal blocks too, with HEAD
-                    # unmoved and no request written, so both mutations
-                    # survived the first cut of this class.
-                    error = payload.get("error", "")
-                    self.assertTrue(
-                        "tracks no review.toml" in error
-                        or "is tracked but is" in error,
-                        f"refused for another reason: {error}")
-                    self.assertEqual(self._git("rev-parse", "HEAD"),
-                                     self.head, "HEAD moved")
-                    self.assertFalse(
-                        list((self.tmp / "ledger").glob("**/*request*")),
-                        "a request was written")
+    def test_a_checkout_invalid_target_valid_default_passes(self):
+        """Round 2 F1's first inverse row. The CHECKOUT's permitted list
+        excludes the identity the TARGET defaults to and permits. Under the
+        preliminary `resolve_roles(cfg, ...)` this refused before the
+        target was consulted — a false refusal of valid work, which is the
+        inverse of the defect round 1 F2 closed and worse, because it
+        blocks rather than mislabels."""
+        for door in self.DOORS:
+            with self.subTest(door=door):
+                self._build()
+                # The checkout must be invalid for its OWN DEFAULTS, or
+                # the mutation cannot fail this row: with no flags,
+                # `resolve_roles` never consults the permitted lists, so a
+                # merely narrower permitted list is not a checkout refusal.
+                # What DOES bind a default is assignment itself — a
+                # checkout that assigns nothing. That is also the realistic
+                # case: a repository governed only by a user-level config
+                # legitimately assigns no roles in its worktree.
+                self._diverge(
+                    author="codex", reviewer="claude",
+                    permitted_authors=("codex", "claude"),
+                    permitted_reviewers=("codex", "claude"),
+                    checkout=dict(author="", reviewer="",
+                                  permitted_authors=("codex", "claude"),
+                                  permitted_reviewers=("codex", "claude")))
+                code, payload, _, stamped = self._run(door)
+                self.assertEqual(code, 0, payload)
+                self.assertEqual(
+                    stamped, ("codex", "claude"),
+                    "the target permits this pair and it is the only "
+                    "authority entitled to say so")
 
-    def test_every_non_regular_prospective_shape_refuses_here(self):
-        """The boundary itself, where nothing else can answer first."""
-        for state, says in (("unstaged deletion", "deleted in the working"),
-                            ("type change to a directory", "a directory"),
-                            ("type change to a symlink", "a symbolic link")):
-            with self.subTest(state=state):
-                self.setUp()
-                self._make(state)
-                with self.assertRaises(transport.Refusal) as ctx:
-                    transport.prospective_authority(
-                        dataclasses.replace(CFG, repo_root=self.repo,
-                                            ledger_dir=None))
-                self.assertIn(says, str(ctx.exception))
+    def test_a_checkout_excluding_target_permitting_flag_passes(self):
+        """Round 2 F1's second inverse row, on an EXPLICIT selection."""
+        for door in self.DOORS:
+            with self.subTest(door=door):
+                self._build()
+                # Target: defaults claude/claude-reviewer is invalid, so
+                # default author claude with reviewer claude would
+                # self-review; use claude author / claude? No — the target
+                # defaults author=claude reviewer=claude is invalid. Keep
+                # the target's reviewer distinct and permit `codex` as an
+                # author the CHECKOUT does not.
+                self._diverge(
+                    author="claude", reviewer="claude",
+                    permitted_authors=("codex", "claude"),
+                    permitted_reviewers=("claude", "codex"),
+                    checkout=dict(author="claude", reviewer="codex",
+                                  permitted_authors=("claude",)))
+                code, payload, _, stamped = self._run(
+                    door, "--author", "codex", "--reviewer", "claude")
+                self.assertEqual(code, 0, payload)
+                self.assertEqual(
+                    stamped, ("codex", "claude"),
+                    "the checkout does not permit `codex` as an author and "
+                    "is not entitled to refuse it")
 
-    def _with_filter(self, driver):
-        self._git("config", "filter.mangle.clean", driver)
-        (self.repo / ".gitattributes").write_text(
-            "review.toml filter=mangle\n", encoding="utf-8")
-        self._git("add", ".gitattributes")
-        self._git("commit", "-qm", "attrs")
-        return self._git("rev-parse", "HEAD")
+    def test_a_defaulted_identity_the_target_rejects_stops_first(self):
+        """A DEFAULTED identity the committed authority rejects. The
+        checkout would resolve it cleanly; the target would not. Nothing
+        may be pushed and no gate may run. FAILS under the mutation."""
+        for door in self.DOORS:
+            with self.subTest(door=door):
+                self._build()
+                before = self._remote_tip()
+                self._diverge(author="claude", reviewer="codex",
+                              rejected=("codex",))
+                code, payload, ran, _ = self._run(door)
+                self.assertEqual(code, 1, payload)
+                self.assertEqual(payload.get("next_kind"), "blocked")
+                self.assertIn("codex", payload.get("error", ""))
+                self.assertEqual(ran, [], "a gate ran on a refused row")
+                self.assertEqual(self._remote_tip(), before,
+                                 "the branch was pushed on a refused row")
 
-    #: The complete attribute-result domain. Round 9 asked git's TEXT
-    #: presentation of the declared state, and that presentation is lossy:
-    #: `unspecified` renders both an absent attribute and an active driver
-    #: NAMED `unspecified`, so a filter could occupy the token meaning
-    #: absence. Presence of the attribute NAME has no such collision —
-    #: names come from git's own parse — so that is what is asked, and
-    #: every declared filter refuses whatever its value.
-    ATTRIBUTES = {
-        "an active driver named unspecified": ("filter=unspecified", False),
-        "an active driver named unset": ("filter=unset", False),
-        "a value whose last colon part is a sentinel":
-            ("filter=a:unspecified", False),
-        "an explicit unset": ("-filter", False),
-        "a boolean set": ("filter", False),
-        "an ordinary string driver": ("filter=mangle", False),
-        "an unrelated attribute": ("text", True),
-        "no attributes at all": (None, True),
-    }
+    def test_an_explicit_target_permitted_flag_is_selected(self):
+        for door in self.DOORS:
+            with self.subTest(door=door):
+                self._build()
+                # The target defaults BOTH sides to codex, so the stamped
+                # author can only be `claude` if the explicit flag was
+                # honoured against the target's permitted list.
+                self._diverge(author="codex", reviewer="codex")
+                code, payload, _, stamped = self._run(door, "--author",
+                                                      "claude")
+                self.assertEqual(code, 0, payload)
+                self.assertEqual(
+                    stamped[0], "claude",
+                    "an explicit selection the TARGET permits must stand")
 
-    def test_the_whole_attribute_domain_partitions(self):
-        for label, (attr, admitted) in self.ATTRIBUTES.items():
-            with self.subTest(attribute=label):
-                self.setUp()
-                if attr is not None:
-                    (self.repo / ".gitattributes").write_text(
-                        f"review.toml {attr}\n", encoding="utf-8")
-                    self._git("add", ".gitattributes")
-                    self._git("commit", "-qm", "attrs")
-                if admitted:
-                    transport.prospective_authority(self._cfg())
-                else:
-                    with self.assertRaises(transport.Refusal) as ctx:
-                        transport.prospective_authority(self._cfg())
-                    self.assertIn("filter attribute is declared",
-                                  str(ctx.exception))
-
-    def test_the_reserved_name_driver_refuses_at_both_doors(self):
-        """Round 10 F1's own falsification: an identity-first driver NAMED
-        `unspecified`, which round 9 read as absence and then invoked."""
-        stateful = str(self.tmp / "stateful.sh")
-        Path(stateful).write_text(
-            "#!/bin/sh\nf=%s\nif [ -e \"$f\" ]; then sed 's/claude/gemini/'; "
-            "else touch \"$f\"; cat; fi\n" % (self.tmp / "seen"),
-            encoding="utf-8")
-        Path(stateful).chmod(0o755)
-        self._git("config", "filter.unspecified.clean", stateful)
-        (self.repo / ".gitattributes").write_text(
-            "review.toml filter=unspecified\n", encoding="utf-8")
-        self._git("add", ".gitattributes")
-        self._git("commit", "-qm", "attrs")
-        head = self._git("rev-parse", "HEAD")
-        for door in (("handoff",), ("emit-request", "--local-only")):
-            with self.subTest(door=door[0]):
-                code, payload = self._run(*door)
-                self.assertNotEqual(code, 0, payload)
-                self.assertEqual(payload.get("next_kind"), "blocked", payload)
-                self.assertIn("filter attribute is declared",
-                              payload.get("error", ""))
-                self.assertEqual(self._git("rev-parse", "HEAD"), head,
-                                 "HEAD moved")
-                self.assertFalse(
-                    list((self.tmp / "ledger").glob("**/*request*")))
-
-    def test_an_unreadable_attribute_listing_refuses(self):
-        with self.assertRaises(transport.Refusal) as ctx:
-            transport.prospective_authority(
-                self._cfg(), git=lambda *a: ("" if a[0] == "ls-files"
-                                             else "one\0two"))
-        self.assertIn("cannot be read", str(ctx.exception))
-
-    def test_every_declared_filter_refuses_before_a_driver_runs(self):
-        """Round 9 F1. Round 8 compared one filtered object id against one
-        plain one — an equality observed over a SINGLE execution of an
-        external program. A driver that echoes its input the first time and
-        rewrites it afterwards passed that check and then rewrote the
-        commit; the emitted request was bound to a target whose rules
-        forbade its own author. The declared state is asked instead, so the
-        no-op and identity-first drivers refuse for the same reason as the
-        rewriting one: a filter is DECLARED."""
-        stateful = str(self.tmp / "stateful.sh")
-        Path(stateful).write_text(
-            "#!/bin/sh\nf=%s\nif [ -e \"$f\" ]; then sed 's/claude/gemini/'; "
-            "else touch \"$f\"; cat; fi\n" % (self.tmp / "seen"),
-            encoding="utf-8")
-        Path(stateful).chmod(0o755)
-        for label, driver in (("a rewriting filter", "tr a A"),
-                              ("a no-op filter", "cat"),
-                              ("an identity-first filter", stateful)):
-            with self.subTest(filter=label):
-                self.setUp()
-                head = self._with_filter(driver)
-                with self.assertRaises(transport.Refusal) as ctx:
-                    transport.prospective_authority(self._cfg())
-                self.assertIn("filter attribute is declared", str(ctx.exception))
-                for door in (("handoff",), ("emit-request", "--local-only")):
-                    code, payload = self._run(*door)
-                    self.assertNotEqual(code, 0, payload)
-                    self.assertEqual(payload.get("next_kind"), "blocked",
-                                     payload)
-                    self.assertIn("filter attribute is declared",
-                                  payload.get("error", ""))
-                    self.assertEqual(self._git("rev-parse", "HEAD"), head,
-                                     "HEAD moved")
-
-    def test_a_content_filter_cannot_change_what_the_commit_declares(self):
-        """Round 8 F1: the shape was asked of the pathname and the BYTES were
-        inferred from it. A clean filter transforms what a commit records, so
-        the author is governed by the worktree file while the commit carries
-        something else — the same two-ends-read-different-bytes split as the
-        symlink, arriving through an attribute."""
-        head = self._with_filter("tr a A")
-        with self.assertRaises(transport.Refusal) as ctx:
-            transport.prospective_authority(self._cfg())
-        self.assertIn("filter attribute is declared", str(ctx.exception))
-        for door in (("handoff",), ("emit-request", "--local-only")):
-            with self.subTest(door=door[0]):
-                code, payload = self._run(*door)
-                self.assertNotEqual(code, 0, payload)
-                self.assertEqual(payload.get("next_kind"), "blocked", payload)
-                self.assertIn("filter attribute is declared",
-                                payload.get("error", ""))
-                self.assertEqual(self._git("rev-parse", "HEAD"), head,
-                                 "HEAD moved")
-
-    def test_a_built_in_conversion_is_still_caught_by_derivation(self):
-        """`check-attr filter` does not report eol/text/encoding, and those
-        change committed bytes too — deterministically, so the object-id
-        derivation still settles them."""
-        (self.repo / "review.toml").write_text(
-            self.MINIMAL.replace("\n", "\r\n"), encoding="utf-8",
-            newline="")
-        (self.repo / ".gitattributes").write_text(
-            "review.toml text eol=lf\n", encoding="utf-8")
-        self._git("add", ".gitattributes")
-        self._git("commit", "-qm", "attrs")
-        with self.assertRaises(transport.Refusal) as ctx:
-            transport.prospective_authority(self._cfg())
-        self.assertIn("built-in conversion", str(ctx.exception))
-
-    def test_an_unfiltered_tracked_config_is_the_paired_control(self):
-        """The control that keeps the rule about filters rather than about
-        attributes: a .gitattributes with no filter for this path passes."""
-        (self.repo / ".gitattributes").write_text(
-            "*.txt text\n", encoding="utf-8")
-        self._git("add", ".gitattributes")
-        self._git("commit", "-qm", "attrs")
-        transport.prospective_authority(self._cfg())
-
-    def test_the_admitted_states_are_the_paired_controls(self):
-        """Content changes and an executable regular file all produce a
-        commit that carries readable rules, so none of them refuses."""
-        for state in self.ADMITTED:
-            with self.subTest(state=state):
-                self.setUp()
-                self._make(state)
-                transport.prospective_authority(self._cfg())
-
-    def test_the_clean_case_passes_both_doors(self):
-        transport.prospective_authority(self._cfg())
-
-    # ------------------------------------------------------- the remedy
-
-    def test_the_refusal_keeps_its_own_remedy_through_the_cli(self):
-        """Round 7 F3: the remedy is the only recovery field a blocked exit
-        has, and it belongs to the refusal that raised."""
-        # The finding's own scenario: governed by a USER-level config, and
-        # tracking none. Without the user copy the roles refusal fires first
-        # and the row would pass for another refusal's reason.
-        self._git("rm", "-q", "review.toml")
-        self._git("commit", "-qm", "no rules")
-        code, payload = self._run("handoff")
-        self.assertEqual(payload.get("next_kind"), "blocked", payload)
-        self.assertIn("commits review.toml", payload.get("remedy", ""))
-        self.assertNotIn("dispositions", payload.get("remedy", ""))
-
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_an_explicit_target_unpermitted_flag_stops_first(self):
+        """An EXPLICIT identity the committed authority does not permit,
+        selected against a checkout that does. FAILS under the mutation."""
+        for door in self.DOORS:
+            with self.subTest(door=door):
+                self._build()
+                before = self._remote_tip()
+                self._diverge(author="codex", reviewer="claude",
+                              permitted_authors=("codex",))
+                code, payload, ran, _ = self._run(door, "--author", "claude")
+                self.assertEqual(code, 1, payload)
+                self.assertEqual(payload.get("next_kind"), "blocked")
+                self.assertEqual(ran, [], "a gate ran on a refused row")
+                self.assertEqual(self._remote_tip(), before,
+                                 "the branch was pushed on a refused row")

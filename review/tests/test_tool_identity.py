@@ -34,6 +34,7 @@ import unittest
 from pathlib import Path
 
 from review import (IDENTITY_ARTEFACTS, IDENTITY_EXCLUDED,
+                    SHAPE_ARTEFACTS, shape_identity,
                     TOOL_VERSION,
                     identity_paths, installation_root,
                     production_modules, tool_identity, vocab)
@@ -81,15 +82,18 @@ class TestTheManifestIsComplete(unittest.TestCase):
                 self.assertTrue(Path(source).is_file(),
                                 f"{logical} is carried but not present")
 
-    def test_every_advertised_launcher_is_carried(self):
-        """Round-1 F1 and round-2 F1 as one named regression. `bin/loupe`
+    def test_every_advertised_launcher_is_declared_as_shape(self):
+        """Round-1 F1 and round-2 F1 as amended by RVW-T18. `bin/loupe`
         decides which installation runs and what environment its gates see;
         `pyproject.toml` declares the console entrypoint the `uvx` install
-        path builds. Neither is packaging trivia — each is how the tool
-        starts, and an identity blind to either reports two installation
-        shapes equal while one of them starts differently."""
+        path builds. Neither is packaging trivia and neither is dropped —
+        but neither is COMPARABLE either, because a wheel install carries
+        no resolvable copy of either one, so requiring them in the compared
+        set gave three advertised install paths three identities for one
+        codebase. They are stamped and reported instead."""
         for launcher in ("bin/loupe", "pyproject.toml"):
-            self.assertIn(launcher, IDENTITY_ARTEFACTS)
+            self.assertIn(launcher, SHAPE_ARTEFACTS)
+            self.assertNotIn(launcher, IDENTITY_ARTEFACTS)
 
     def test_nothing_the_cli_loads_is_missing_from_the_identity(self):
         """The exclusion may only cover code no CLI path reaches. A module
@@ -140,10 +144,17 @@ class TestTheIdentityIsContent(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
 
     def _copy(self, name):
-        """A minimal installation: every carried artefact at its own path
-        below a fresh root, which is what an extracted candidate is."""
+        """A minimal installation: every DECLARED artefact at its own path
+        below a fresh root, which is what an extracted candidate is.
+
+        Both declared sets are copied — the compared one and the shape one.
+        A fixture that carried only the compared set could not express the
+        probe RVW-T18 kept from round 1, because there would be no shim to
+        break."""
         dest = self.tmp / name
-        for logical, source in identity_paths().items():
+        resolved = dict(identity_paths())
+        resolved.update(identity_paths(artefacts=SHAPE_ARTEFACTS))
+        for logical, source in resolved.items():
             target = dest / logical
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
@@ -151,6 +162,9 @@ class TestTheIdentityIsContent(unittest.TestCase):
 
     def _id(self, root):
         return tool_identity(root)
+
+    def _shape(self, root):
+        return shape_identity(root)
 
     def test_same_code_in_two_places_is_one_identity(self):
         """The control. An installation's location, mtimes and the presence
@@ -191,17 +205,24 @@ class TestTheIdentityIsContent(unittest.TestCase):
         (swapped / "review/paths.py").write_text(one, encoding="utf-8")
         self.assertNotEqual(self._id(swapped), tool_identity())
 
-    def test_the_entrypoint_changes_the_identity_and_the_behaviour(self):
-        """FALSIFICATION for round-1 F1, the reviewer's own probe: insert
-        `exit 73` after the shim's shebang. The tool stops working
-        completely. Before this round the identity did not move, because it
-        covered package modules alone — this asserts both halves at once, so
-        a repair that changed only the list could not pass while the shim
-        was still inert.
+    def test_the_entrypoint_changes_the_shape_and_the_behaviour(self):
+        """FALSIFICATION for round-1 F1, the reviewer's own probe, as
+        amended by RVW-T18: insert `exit 73` after the shim's shebang. The
+        tool stops working completely.
 
-        Mutation: drop `bin/loupe` from IDENTITY_ARTEFACTS and this fails on
-        the identity while the behaviour assertion still passes, which is
-        exactly the gap that was found."""
+        Round 1 asserted this against the BEHAVIOURAL identity, because the
+        shim was in that set. RVW-T18 moved it, for a reason round 1 could
+        not have seen: the same assertion is unsatisfiable in a wheel
+        install, where no `bin/loupe` is resolvable at all. So the probe now
+        asserts against `shape_identity`, which is exactly where the shim's
+        bytes went — the round-1 finding is answered, not dropped, and the
+        thing round 1 actually cared about (a shim that decides what runs
+        must not be invisible) still holds.
+
+        Mutation: drop `bin/loupe` from SHAPE_ARTEFACTS and this fails on
+        the shape while the behaviour assertion still passes, which is the
+        original gap in its new home. Second mutation: put it back into
+        `IDENTITY_ARTEFACTS` and the boundary suite fails instead."""
         working, broken = self._copy("shim-ok"), self._copy("shim-73")
         shim = broken / "bin/loupe"
         head, _, rest = shim.read_text(encoding="utf-8").partition("\n")
@@ -216,10 +237,75 @@ class TestTheIdentityIsContent(unittest.TestCase):
         self.assertEqual(ok.stdout.strip(), TOOL_VERSION)
         self.assertEqual(bad.returncode, 73,
                          "the probe did not actually break the entrypoint")
-        self.assertNotEqual(
+        self.assertEqual(
             self._id(working), self._id(broken),
-            "the entrypoint decides what runs and the identity cannot see "
+            "the shim is not behaviour of the PACKAGE: two trees whose "
+            "modules are byte-identical must agree on the behavioural "
+            "identity however their launchers differ, or RVW-T18's split "
+            "bought nothing")
+        self.assertNotEqual(
+            self._shape(working), self._shape(broken),
+            "the entrypoint decides what runs and no declared set can see "
             "it: round-1 F1 is back")
+
+    def test_an_install_carrying_no_launcher_agrees_on_the_behaviour(self):
+        """RVW-T18's whole point, as a falsification.
+
+        A wheel install resolves NEITHER shape artefact — measured: 16 of
+        the 18 formerly-declared artefacts present, `pyproject.toml` absent
+        from the wheel RECORD and `bin/loupe` present only as a generated
+        console script the package cannot resolve. This reproduces that
+        shape by deleting both from a copy, and asserts the property the
+        split exists to create: the behavioural identity is EQUAL to a full
+        tree's, while the shape is not.
+
+        Mutation: put either launcher back into `IDENTITY_ARTEFACTS` and
+        the first assertion fails — which is precisely the state in which
+        three advertised install paths computed three identities for one
+        codebase."""
+        full, wheelish = self._copy("full"), self._copy("wheelish")
+        for logical in SHAPE_ARTEFACTS:
+            target = wheelish / logical
+            if target.exists():
+                target.unlink()
+        self.assertEqual(
+            self._id(full), self._id(wheelish),
+            "an install shape that carries no launcher must still agree "
+            "on what the tool DOES; this is the DIFFERS that fired on "
+            "every cross-machine round for no behavioural reason")
+        self.assertNotEqual(
+            self._shape(full), self._shape(wheelish),
+            "absence must be visible SOMEWHERE, or the split discarded "
+            "the launchers rather than relocating them")
+
+    def test_a_differing_shape_is_never_a_differing_verdict(self):
+        """`shape` is reported, never compared (RVW-T18).
+
+        The failure mode being guarded is a later reader quietly folding
+        the shape into the agreement, which would restore exactly the
+        false DIFFERS the split removed. Two envelopes identical but for
+        their `shape` attribute must yield the same `agreement`.
+        """
+        from review import transport
+
+        class _Parsed:
+            def __init__(self, attrs):
+                self.attrs = attrs
+
+        mine = tool_identity()
+        same = transport.tool_agreement(
+            _Parsed({"tool": mine, "shape": "0000000000000000"}))
+        other = transport.tool_agreement(
+            _Parsed({"tool": mine, "shape": "ffffffffffffffff"}))
+        self.assertEqual(same["agreement"], "match")
+        self.assertEqual(other["agreement"], "match")
+        self.assertEqual(same["writer_shape"], "0000000000000000")
+        self.assertEqual(other["writer_shape"], "ffffffffffffffff")
+        absent = transport.tool_agreement(_Parsed({"tool": mine}))
+        self.assertEqual(absent["agreement"], "match",
+                         "an envelope predating the split declares no "
+                         "shape; historical silence is not disagreement")
+        self.assertIsNone(absent["writer_shape"])
 
     def test_two_extracted_installations_of_one_tree_match(self):
         """The control F1 required beside the mutation: byte-identical

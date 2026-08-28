@@ -82,8 +82,8 @@ both the validator and the reviewer's probe. A heading that merely starts
 like a section name (`## References`) is not that section and fails as
 absent.
 The wrapper's own attribute text is closed the same way — the attributes
-(`sha`, `branch`, `author`, `reviewer`, `round`, `transport`, `tool`, and
-the disposition's `verdict_sha`/`head`) — occurring once each: the first
+(`sha`, `branch`, `author`, `reviewer`, `round`, `transport`, `tool`,
+`shape`, and the disposition's `verdict_sha`/`head`) — occurring once each: the first
 declaration is the value, a repeat is a validation error, and text between
 the tag name and `>` that is not a `key="value"` pair is refused — so a
 defective wrapper cannot choose the SHA that validation, the fetch and the
@@ -93,7 +93,7 @@ mean an unlisted NAME is refused, and that is deliberate — an older
 installation must be able to read an envelope carrying an attribute it has
 never heard of, or every addition would be a flag day.
 
-`tool` is the emitting installation's content identity (§3.3e).
+`tool` is the emitting installation's content identity, and `shape` its install shape (§3.3e).
 The two JSON bodies — the disposition's, and the machine attestation block
 inside Evidence — are read through one boundary that refuses a repeated
 object member at any depth and names it; `json.loads` alone keeps the last
@@ -163,7 +163,84 @@ escapes — that citation is what makes it a completeness finding rather
 than the next round of an unbounded hunt. Rejecting the authority is an
 ordinary finding, anchored on the authority itself. The declaration is not
 an exemption: it moves the attackable surface from an unbounded hunt onto
-a finite artifact, and a narrow authority is itself the defect.
+a finite artifact.
+
+That last sentence, left unbounded, is what two lineages then closed on,
+and the shape was identical: "your authority rests on a set one level
+down" is always available and always true, so each round derived one more
+authority and the next round found the next universe beneath it — every
+one of those rounds a legitimate application of the clause as written.
+Rejection is therefore bounded, by one thing and not two.
+
+The declaration carries a domain. The author states, beside the authority,
+what it is claimed to cover, in the terms the authority enforces. The
+order in which that is ruled on is the whole of it, and it is two
+judgments, not one.
+
+First the domain itself: does it match the anchor's declared purpose and
+every surface still relied on downstream? This is the reviewer's to rule
+before anything is bounded by it, and a concrete escape outside the
+declaration is admissible evidence that the domain is too narrow — the
+evidence for that judgment, never something the declaration excludes from
+being heard. A domain narrower than its anchor's purpose is a finding
+about the claim.
+
+Only once a stated domain is accepted is coverage ruled against it, never
+against a wider one the reviewer has in mind, and only then is a
+completeness demand outside it scope rather than a finding — however well
+it reproduces. Narrowing is a complete answer only when the anchor's
+purpose and every consumer claim narrow with it, leaving no wider reliance
+implicit; a narrowing that leaves a wider promise standing is not an
+answer but the defect itself. Where it is complete it is preferred to
+widening the mechanism — in the record, widening manufactured the next
+round's subject three times running. An authority narrower than its own
+stated domain is still the defect; an authority narrower than some
+unstated ideal, with nothing downstream relying on the difference, is
+scope.
+
+That the bound is about the CLAIM rather than about the reproducer is a
+correction the loop paid for twice. A second bound was drafted beside this
+one and removed before it shipped: past the first derivation, a
+completeness finding would have had to carry a live instance. It could not
+be stated single-valued. "An instance that exists in the tree" classified
+two structurally identical probes differently, because most lifecycle
+inputs — Git configuration, hooks, attributes, replacement refs, the
+environment, constructed parser bytes — live outside the reviewed tree by
+nature. Repaired to turn on whether the production path exists, it split
+again on boundaries whose admitted input is itself code: a static
+analyser, a template engine, a plugin loader, generated code, data-driven
+dispatch. And when every finding in the record was finally classified
+under it, it excluded none of them — the reviewers had reproduced every
+time. A bound that cannot be stated once and excludes nothing is not a
+bound, and the class it was meant to catch is already covered above: a
+demand that reproduces something the stated domain never claimed is not a
+coverage finding, and needs no second rule to say so.
+
+The price is stated rather than hidden, and so is the reach. Every finding
+the unbounded demand produced still reproduces and still stands; what
+changes is what they are ruled against. In the record, each of the three
+that closed a lineage was anchored on a coverage claim wider than what the
+authority enforced — one said the scan "finds every git invocation", one
+said every invocation in a production module was classified, one said the
+gate proved the workbench modules too — and each of those reviewers named
+the same repair the author did not take: make the coverage claim match the
+enforced domain. Under this bound, narrowing answers them completely, and
+nothing has to be built.
+
+The cost is that an author may declare a domain narrow enough to be
+trivially covered, leaving a real defect outside it unraised. That is
+close to the falsifier this clause was given when it was written: a domain
+closing fast under an authority that excludes a real defect. What holds it
+is the adequacy judgment above, and it holds only because that judgment
+comes FIRST and lives in the operative contract rather than here. Stated
+in the wrong order — coverage bounded before the domain is accepted — the
+same words suppress the escape that proves the declaration too narrow,
+which is how this clause first shipped and what a review round caught.
+A third lineage that also closed by decision is *not*
+addressed by any of this: its findings installed ordinary Git state
+against production paths already present, its pathology was a check that
+predicted an artifact instead of reading it, and it was answered by a
+redesign rather than by a rule.
 
 **Claim** — objective / decision boundary, what changed and why, what was
 *deliberately not* done, stop conditions, hand-back questions, self-assessed
@@ -394,21 +471,51 @@ an identity of the *declared travelling behavioural set, per that declared
 authority*, never of "what the installation is": the guarantee is relative
 to the enumeration, and the enumeration, not the claim, is what a reviewer
 attacks (the boundary-closure terminator above, applied to the tool's own
-identity). The set: the
-package modules, and the launcher of every advertised install path —
-`bin/loupe` for the two copy-based paths, and `pyproject.toml`, whose
-`[project.scripts]` entry is what the `uvx` path builds its console script
-from. An identity over modules alone would call two installations equal
-while one of them refused to start; an identity covering one launcher and
-not the other would do the same for one install shape out of three.
+identity). The set is the package modules, and **only** the package
+modules.
+
+There are **two** declared sets and two stamped values, and the split is
+the correction of a real defect (RVW-T18). Until 0.9.0 the compared set
+also held the launcher of every advertised install path — `bin/loupe` for
+the two copy-based paths, and `pyproject.toml`, whose `[project.scripts]`
+entry is what the `uvx` path builds its console script from. The argument
+was that an identity over modules alone would call two installations equal
+while one of them refused to start. The argument was sound; the set was
+not. This enumeration is read by code *inside* the package, and a wheel
+install carries only the package. Measured across four shapes of
+byte-identical code: workbench and full clone 18/18 artefacts; a vendored
+`review/` + `bin/loupe` 17/18; a `uvx` wheel install 16/18, with
+`pyproject.toml` absent from the wheel `RECORD` entirely and `bin/loupe`
+present only as the generated console script, which the package's own
+`installation_root()` does not resolve. Three identities — and of the three
+**advertised** install paths, no two could ever agree. Covering both
+launchers did not fix the problem it was reasoned to fix; it produced a
+worse version of it, and every cross-machine round reported a disagreement
+that said nothing about what either end would do.
+
+So `tool` covers what can be equal across every install shape, and `shape`
+— a second 16-hex digest over `bin/loupe` and `pyproject.toml` — carries
+what cannot. `shape` is **reported and never compared**. That is not a
+weaker guarantee standing in for a stronger one: equality is not a property
+this value has, because a wheel install and a clone of identical code
+differ here by construction, and a reader that demanded agreement would
+rebuild the defect. What it buys is that nothing was discarded to get
+shape-invariance — in particular `bin/loupe`, which decides what runs and
+exports the environment stash every gate subprocess inherits, still travels
+in the envelope where a human can see it moved.
 
 *Logical* path because extraction maps `public/X` to `X`: one artefact is
 `public/pyproject.toml` in the workbench and `pyproject.toml` in the tree
-extracted from it, and the identity must call those the same file or the
-two would never agree. What the digest does **not** cover is a built
-wheel's generated console script — it is not readable from inside the
-installed package — so what is covered is the input that produces it. That
-is the limit, stated rather than claimed away.
+extracted from it, and a digest must call those the same file or two trees
+would never agree. **The limit, stated rather than claimed away:** in a
+wheel install neither shape artefact is resolvable at all — not the
+generated console script, which is not readable from inside the installed
+package, and not `pyproject.toml`, which the wheel does not carry. Both
+digest as *absent*, so `shape` is stable and meaningful **within** one
+install shape and says nothing across two. The earlier statement of this
+limit — that what is covered is "the input that produces" the console
+script — was false for the `uvx` path it was written about, since that
+input is exactly what a wheel omits.
 
 The set is enumerated per artefact, never by prefix: every travelling file
 is carried or excluded with a reason, and a gate asserts that enumeration

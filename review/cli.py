@@ -90,6 +90,12 @@ PROSE_KEYS = (
     # and deliberately not a command, because the tool takes no position on
     # which of two differing installations should win.
     "tool", "tool_agreement", "tool_writer",
+    # RVW-T18: the install SHAPE either end carries — the launchers, which
+    # a wheel install does not resolve at all. Read, never run, and never
+    # compared: two installs of identical code differ here by construction,
+    # so these are reported beside the behavioural verdict rather than
+    # folded into it.
+    "reader_shape", "writer_shape",
     # RVW-T11: an enum the agent READS. It decides which command the tool
     # renders, and is never itself a command — the relay it selects goes
     # through the same runnable door as every other executable field.
@@ -841,14 +847,15 @@ def _claim_defect_exit(exc: "emit.ClaimDefective") -> int:
 
 
 def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
-          roles: tuple[str, str], selected_transport: str):
+          selected_transport: str):
     """emit-request's body, shared with handoff: push, emit, validate.
     Returns (envelope, parsed) or an int exit code.
 
-    `roles` is the effective (author, reviewer) the verb already resolved at
-    its boundary (`emit.resolve_roles`), passed explicitly like the captured
-    claim: both are authored inputs judged before anything is committed,
-    pushed, run or recorded, and neither is re-derived here.
+    Round 2 F1 (lineage 12): the effective roles are NOT passed in. They are
+    resolved inside `ensure_pushed`, against the committed authority, from
+    the flags — because the only authority entitled to authorise a role is
+    the one the reviewer will judge it by, and before the commit exists
+    there is no such authority to ask.
 
     `captured` is the claim the verb already read and closed at the capture
     boundary, passed explicitly (lineage-3 round 7 F1). There is no fallback
@@ -863,12 +870,42 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
     # §9bis.4: commit outstanding work, push the reviewed branch, observe the
     # remote ref — BEFORE emission, refusing every state that cannot yield a
     # fetchable target. The record is what the envelope stamps.
-    record = emit.ensure_pushed(cfg, head=args.head,
-                                local_only=args.local_only,
-                                commit_subject=claim.get("commit_subject"),
-                                round_no=emit.next_round(ledger),
-                                transport=selected_transport)
-    envelope = emit.emit_request(cfg, ledger, claim, base=args.base,
+    try:
+        record = emit.ensure_pushed(cfg, head=args.head,
+                                    local_only=args.local_only,
+                                    commit_subject=claim.get("commit_subject"),
+                                    round_no=emit.next_round(ledger),
+                                    transport=selected_transport,
+                                    author_flag=getattr(args, "author", None),
+                                    reviewer_flag=getattr(args, "reviewer",
+                                                          None))
+    except (emit.AuthorityAbsent, emit.RoleSelectionError) as exc:
+        # RVW-T17: ONE catch, reached by both author doors, because both
+        # reach `ensure_pushed` through this function. Round 7 F2's defect —
+        # two author doors accepting different states — has no second place
+        # to live any more.
+        return _blocked("", str(exc), remedy=exc.remedy)
+    # U-1. What governs the emission is the authority resolved FROM THE
+    # TARGET, not this checkout's config. The two are routinely different
+    # and nothing compared them: `LOUPE_CONFIG` names an out-of-tree file
+    # the reviewer never reads; an `assume-unchanged` index entry makes the
+    # worktree bytes and the committed bytes disagree; and the wrapper tag
+    # decides the envelope's own element name, so a checkout saying `x`
+    # emitted `<x-review-request>` while `take` refused E-TAG under the
+    # target's `loupe`. Moving the ORIGIN question to the artifact without
+    # moving the VALUES would have left round 2 F1 alive one level out —
+    # the author's taxonomy, gate ids, budget, blocking severities, round
+    # cap, roles and tag all reaching the envelope from a source the
+    # reviewer does not read. `take` judges every one of them against the
+    # target's config, so that is what renders them.
+    governing = record["governing"]
+    # Round 1 F2: the stamps are the roles re-resolved against the COMMITTED
+    # authority, not the tuple resolved from this checkout before the commit
+    # existed. The early tuple is still computed and still refuses — it is
+    # the cache key and it catches an unassigned or rejected identity before
+    # any git call — but it is not what reaches the envelope.
+    roles = record["roles"]
+    envelope = emit.emit_request(governing, ledger, claim, base=args.base,
                                  head=record["sha"], reachability=record,
                                  author=roles[0], reviewer=roles[1],
                                  transport=selected_transport)
@@ -877,12 +914,12 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
                              if e.get("event") == "verdict"),
                             key=lambda e: e["round"])["sha"]
     shape = emit.diff_shape(cfg.repo_root, base, parsed.sha)
-    items = validate_request(parsed, cfg,
+    items = validate_request(parsed, governing,
                              recomputed_shape=(shape["files"],
                                                shape["insertions"],
                                                shape["deletions"]),
                              round_cap=ledger.effective_round_cap(
-                                 cfg.round_cap))
+                                 governing.round_cap))
     if errors_in(items):
         return _finish(items, "",
                        remedy=f"a person must correct review.toml or "
@@ -907,10 +944,16 @@ def cmd_emit_request(args, cfg) -> int:
     # The other authored inputs, judged at the same boundary: before the
     # ledger is consulted, before the push, gates or emission (§4;
     # round-2 F3 for the references).
+    # Round 2 F1 (lineage 12): NO config-dependent role check runs here.
+    # Round 1 F2 moved authorization to the committed authority and left
+    # this call in place as a cache key and an early refusal — but every
+    # check it makes reads the CHECKOUT's permitted and rejected lists, so
+    # a stale checkout could veto an identity the target permits. That is
+    # the inverse of the defect F2 closed, in the same place. The flags
+    # travel instead, provenance intact, and the target authorises: at
+    # `ensure_pushed` on the cold path, inside `cached_handoff` on the warm
+    # one, where HEAD is provably the target.
     try:
-        roles = emit.resolve_roles(cfg,
-                                   author=getattr(args, "author", None),
-                                   reviewer=getattr(args, "reviewer", None))
         # RVW-T11: the declared topology is an authored input like the role
         # stamp, and it is resolved at the same boundary for the same two
         # reasons — an unrecognised value is refused before anything is
@@ -926,19 +969,16 @@ def cmd_emit_request(args, cfg) -> int:
             emit.ReferenceUnbound) as exc:
         return _blocked("", str(exc), remedy=exc.remedy)
     # Round 7 F2: the same authority boundary as `handoff`, at the same point
-    # in the same chain — after the authored input's grammar is accepted
-    # (§4; a claim or a reference nobody can read is judged before anything
-    # is looked up), and before the ledger, Git, gates, emission or any
-    # output write. This verb emitted the exact state the lifecycle calls
-    # unsupported; two author doors accepting different states is round 2
-    # F1 with the author's own ends as the two ends.
-    try:
-        transport.prospective_authority(cfg)
-    except transport.Refusal as exc:
-        return _blocked("", str(exc), remedy=exc.remedy)
+    # RVW-T17. This door used to carry its own copy of the authority check,
+    # because round 7 F2 found `emit-request` emitting the exact state
+    # `handoff` refused — two author doors accepting different states, which
+    # is round 2 F1 with the author's own ends as the two ends. That fix
+    # made them call one function; this one makes them share one CALL SITE.
+    # Both doors reach `emit.ensure_pushed` through `_emit`, and the check
+    # lives there, so the defect class is now unrepresentable rather than
+    # tested: there is no second place to put a different question.
     ledger = _ledger(cfg, args)
-    result = _emit(args, cfg, ledger, captured, roles,
-                   selected_transport)
+    result = _emit(args, cfg, ledger, captured, selected_transport)
     if isinstance(result, int):
         return result
     envelope, parsed = result
@@ -1017,9 +1057,6 @@ def cmd_handoff(args, cfg) -> int:
     # warm; references bind before it so a warm re-serve cannot re-record a
     # request whose required evidence no commit carries.
     try:
-        roles = emit.resolve_roles(cfg,
-                                   author=getattr(args, "author", None),
-                                   reviewer=getattr(args, "reviewer", None))
         # RVW-T11: same boundary, same reason as the role stamp — the
         # effective value is part of what makes a kept envelope warm, so it
         # is resolved before the cache is consulted, not at the emitter the
@@ -1057,11 +1094,25 @@ def cmd_handoff(args, cfg) -> int:
     # warning: which findings the loop is failing to close, and which
     # domains keep producing new ones however many are fixed.
     past_cap = round_no > ledger.effective_round_cap(cfg.round_cap)
-    cached = transport.cached_handoff(cfg, ledger, round_no,
-                                      claim_digest=claim_digest,
-                                      roles=roles,
-                                      transport=selected_transport)
+    cached = transport.cached_handoff(
+        cfg, ledger, round_no, claim_digest=claim_digest,
+        transport=selected_transport,
+        author_flag=getattr(args, "author", None),
+        reviewer_flag=getattr(args, "reviewer", None))
     if cached is not None:
+        # RVW-T17, the call site the redesign had to rule on rather than
+        # inherit: this branch returns BEFORE `_emit`, so it never reaches
+        # `ensure_pushed` and never re-reads the committed authority. That
+        # is correct, and it is worth saying why rather than leaving it to
+        # look like an oversight. `cached_handoff` serves only when the
+        # tree is clean AND HEAD equals the SHA of the request it kept. A
+        # SHA names a tree; the same SHA is the same `review.toml` bytes,
+        # necessarily. The authority was verified against that SHA when the
+        # kept request was first emitted, so re-reading it here could not
+        # return a different answer — and an amend, which is the one way
+        # the content under a served request could move, changes HEAD and
+        # busts the cache before this branch is reached.
+        #
         # Round-3 F1: this branch reads a request RETAINED by an earlier
         # run — across processes, so possibly across installations — and
         # then re-records it and renders its relay. It is a
@@ -1092,8 +1143,7 @@ def cmd_handoff(args, cfg) -> int:
                   f"{render_tool_agreement(agreement)}\n{rec['relay']}\n\n"
                   f"author: {rec['author_next']}")
         return EXIT_OK
-    result = _emit(args, cfg, ledger, captured, roles,
-                   selected_transport)
+    result = _emit(args, cfg, ledger, captured, selected_transport)
     if isinstance(result, int):
         return result
     envelope, parsed = result
@@ -1188,15 +1238,45 @@ def render_tool_agreement(agreement: dict) -> str:
     """
     state = agreement.get("agreement")
     if state == "match":
-        return (f"tool:   match — both ends carry the declared behavioural "
+        head = (f"tool:   match — both ends carry the declared behavioural "
                 f"set {agreement['reader']}\n")
-    if state == "unstamped":
-        return (f"tool:   UNSTAMPED — this end carries "
+    elif state == "unstamped":
+        head = (f"tool:   UNSTAMPED — this end carries "
                 f"{agreement['reader']}; the envelope declares no set\n"
                 f"        {agreement['note']}\n")
-    return (f"tool:   DIFFERS — this end carries {agreement['reader']}, the "
-            f"envelope was written under {agreement['writer']}\n"
-            f"        {agreement['note']}\n")
+    else:
+        head = (f"tool:   DIFFERS — this end carries {agreement['reader']}, "
+                f"the envelope was written under {agreement['writer']}\n"
+                f"        {agreement['note']}\n")
+    return head + _render_shape(agreement)
+
+
+def _render_shape(agreement: dict) -> str:
+    """The install-shape line: REPORTED, never a verdict (RVW-T18).
+
+    It renders on its own line, below the behavioural one, and it never
+    says `match`, `differs` or anything else that reads as a judgement —
+    because it is not one. A wheel install and a clone of the same code
+    carry different shapes by construction, so equality here is not a
+    property worth asserting and inequality is not a fault. What the line
+    is for is the one thing the behavioural identity genuinely cannot see:
+    `bin/loupe` decides what runs and exports the environment stash every
+    gate subprocess inherits, so a shim that moved is a fact a human may
+    want, even though no reader should refuse on it.
+
+    Omitted entirely when this end has no shape to report AND the envelope
+    declared none — an envelope predating the split says nothing here, and
+    a line saying nothing is worse than no line.
+    """
+    mine = agreement.get("reader_shape")
+    theirs = agreement.get("writer_shape")
+    if not mine and not theirs:
+        return ""
+    if not theirs:
+        return (f"shape:  this end {mine}; the envelope declares none "
+                f"(reported, never compared)\n")
+    return (f"shape:  this end {mine}, the envelope {theirs} "
+            f"(reported, never compared)\n")
 
 
 def cmd_waive(args, cfg) -> int:

@@ -417,7 +417,13 @@ def diff_command(repo_root, base: str, head: str) -> str:
     """THE diff command both sides print — the emitter into the envelope,
     `take` into the reviewer's result. One renderer, so the two surfaces
     cannot disagree on quoting."""
-    return command(Lit("git"), Lit("-C"), repo_root, Lit("diff"),
+    # Round 3 F1 (lineage 12). The command a human RUNS must resolve the
+    # same object graph the tool read. Without this, a replacement ref on
+    # the reviewer's machine shows them a diff that is not the diff the
+    # emitter measured, the gates attested, or the verdict will bind — and
+    # nothing in the round would say so.
+    return command(Lit("git"), Lit("-C"), repo_root,
+                   Lit("--no-replace-objects"), Lit("diff"),
                    f"{base}...{head}")
 
 

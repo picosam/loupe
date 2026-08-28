@@ -376,8 +376,12 @@ class TestSurfacesSplitToOneArgument(unittest.TestCase):
     def test_the_diff_command_carries_one_word_per_revision(self):
         cmd = paths.diff_command("/tmp/repo with space", "a" * 40,
                                  "topic;printf")
+        # Round 3 F1 (lineage 12): the printed command carries
+        # `--no-replace-objects`, so the diff a human runs is the diff the
+        # tool measured. It is git-wide and therefore precedes `diff`.
         self.assertEqual(shlex.split(cmd),
-                         ["git", "-C", "/tmp/repo with space", "diff",
+                         ["git", "-C", "/tmp/repo with space",
+                          "--no-replace-objects", "diff",
                           f"{'a' * 40}...topic;printf"])
 
     def _verdict_text(self, sha="a" * 40):

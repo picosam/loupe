@@ -24,14 +24,24 @@ from types import MappingProxyType
 from typing import Mapping
 
 from . import (TOOL_NAME, TOOL_VERSION, env_var, paths, refs,
-               tool_identity, vocab, wire)
+               shape_identity, tool_identity, vocab, wire)
 from .config import Config
 from .digest import sha256_text
 from .ledger import Ledger, render_report_md
 
 
 
-def _git(repo_root: Path, *args: str) -> str:
+#: Round 2 F1 of lineage 12 hardened the AUTHORITY read against `git
+#: replace`; round 2 F2 found the reference reads were the other half. A
+#: manifest digest is evidence about the target's bytes exactly as the
+#: config is, and a replacement ref rewrites both — so every read that
+#: derives a file reference from the target object graph disables
+#: replacement too. Shared spelling with `transport.NO_REPLACE`, and the
+#: same reasoning: a git-wide option, evaluated before any ref base.
+NO_REPLACE = "--no-replace-objects"
+
+
+def _git(repo_root: Path, *args: str, no_replace: bool = False) -> str:
     # The timeout is §9bis.4's fail-don't-hang rule as much as hygiene: push
     # and ls-remote reach the network, and an unreachable remote must refuse.
     #
@@ -43,7 +53,8 @@ def _git(repo_root: Path, *args: str) -> str:
     # caller: a reader that can fail in a way its callers cannot name is the
     # defect, not the individual catch that missed it.
     try:
-        out = subprocess.run(["git", "-C", str(repo_root), *args],
+        out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
+                              "-C", str(repo_root), *args],
                              capture_output=True, text=True, timeout=120)
     except subprocess.SubprocessError as exc:
         raise RuntimeError(
@@ -62,11 +73,16 @@ def _git(repo_root: Path, *args: str) -> str:
     return out.stdout.strip()
 
 
-def _git_bytes(repo_root: Path, *args: str) -> bytes:
+def _git_bytes(repo_root: Path, *args: str,
+               no_replace: bool = False) -> bytes:
     """Raw stdout, for content that must be digested as BYTES rather than
     decoded first — `git show <sha>:<path>` over a file this process has no
-    business assuming is UTF-8 (round 3 F1)."""
-    out = subprocess.run(["git", "-C", str(repo_root), *args],
+    business assuming is UTF-8 (round 3 F1).
+
+    `no_replace` carries round 2 F2's guarantee: a digest that describes
+    the target's bytes must be taken from the ORIGINAL object graph."""
+    out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
+                          "-C", str(repo_root), *args],
                          capture_output=True, timeout=120)
     if out.returncode != 0:
         raise RuntimeError(
@@ -77,8 +93,10 @@ def _git_bytes(repo_root: Path, *args: str) -> bytes:
 
 
 def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
-    out = subprocess.run(["git", "-C", str(repo_root), "merge-base",
-                          "--is-ancestor", ancestor, descendant],
+    # Round 3 F1: ancestry is a statement about the object graph.
+    out = subprocess.run(["git", NO_REPLACE, "-C", str(repo_root),
+                          "merge-base", "--is-ancestor", ancestor,
+                          descendant],
                          capture_output=True, text=True, timeout=60)
     return out.returncode == 0
 
@@ -105,7 +123,9 @@ def ensure_pushed(cfg: Config, head: str | None = None,
                   local_only: bool = False,
                   commit_subject: str | None = None,
                   round_no: int | None = None, git=None,
-                  transport: str | None = None) -> dict:
+                  transport: str | None = None,
+                  author_flag: str | None = None,
+                  reviewer_flag: str | None = None) -> dict:
     """Make the review target fetchable BEFORE emission (§9bis.4, RVW-T7).
 
     Commits outstanding tracked work, pushes the reviewed branch, and returns
@@ -181,6 +201,70 @@ def ensure_pushed(cfg: Config, head: str | None = None,
 
     target = run("rev-parse", "HEAD")
 
+    # RVW-T17: THE authority boundary, and the only one on the author's
+    # side. It is here — after the commit above, before the local-only
+    # return and before the push — because everywhere earlier is a
+    # PREDICTION. Rounds 7 to 11 of lineage 11 each found a different way
+    # to make a prediction wrong (the index against the worktree, a
+    # pathname's shape against its bytes, a filter's declaration against
+    # its behaviour, git's rendered attribute against the attribute name,
+    # a commit hook restaging after the check), and that list has no
+    # principled end: git offers arbitrarily many ways to change what a
+    # commit records between a check and the commit. A sixth was found
+    # while building the domain partition and needs no hook, filter or
+    # attribute at all — `git update-index --assume-unchanged review.toml`
+    # leaves `status --porcelain` clean, lets every prospective check pass,
+    # and then `commit -a` records the INDEX while the author's config was
+    # loaded from the WORKTREE.
+    #
+    # So nothing is predicted. `resolve_authority` reads the artifact —
+    # `git show <sha>:review.toml` — which is the identical call `take` and
+    # `validate --from-target` make, against the identical input. Whatever
+    # a filter, a hook, an attribute or the index did, the commit records
+    # something and that something is what is read.
+    #
+    # The cost is that a local commit may exist before a refusal. That is
+    # not a new class: this function already commits AND pushes before the
+    # taxonomy refusal below and before the post-emission validation
+    # refusal in the CLI, so the boundary here is strictly LESS
+    # side-effecting than two refusals the tool already ships. Nothing is
+    # pushed and nothing is emitted, and the commit is the author's own to
+    # amend.
+    #
+    # Function-local import: `transport` imports this module's siblings but
+    # not this module, and `transport` already reaches for `config` this way
+    # twice for the same reason.
+    from .transport import AUTHORITY_TARGET, resolve_authority
+    governing, origin = resolve_authority(cfg, target, git=git)
+    if origin != AUTHORITY_TARGET:
+        raise AuthorityAbsent(
+            f"the commit under review, {target[:12]}, carries no "
+            f"{_config_basename(cfg)} of its own, so the rules a reviewer "
+            f"would judge it by live on this machine and cannot be shown to "
+            f"another. A reviewed commit carries its own authority "
+            f"(configuration in force here: {cfg.source})",
+            remedy=f"the author commits {_config_basename(cfg)} to this "
+                   f"repository — the same values, in the artifact under "
+                   f"review — and re-runs. A user-level copy still governs "
+                   f"every local verb; only an emission needs the rules to "
+                   f"travel. Nothing has been pushed or emitted")
+
+    # Round 1 F2 (lineage 12). U-1 routed what the envelope RENDERS through
+    # the committed authority and left the role STAMPS behind: `resolve_roles`
+    # runs before this function, against the checkout, so a no-flag emission
+    # stamped the checkout's default author and reviewer while `take` judged
+    # them against the target's `permitted_authors`/`permitted_reviewers`.
+    # The provenance is what makes the fix expressible — a DEFAULTED role is
+    # re-resolved from the authority, an EXPLICIT one is re-validated against
+    # it — so the flags are passed in rather than the already-resolved tuple,
+    # which cannot say which of the two a value was.
+    #
+    # Placement is the same argument as the authority read above: after the
+    # commit, before the push and before any gate runs, so an identity the
+    # target rejects stops with no external side effect.
+    effective_roles = resolve_roles(governing, author=author_flag,
+                                    reviewer=reviewer_flag)
+
     remotes = [r for r in run("remote").splitlines() if r.strip()]
     if local_only:
         if remotes:
@@ -189,7 +273,8 @@ def ensure_pushed(cfg: Config, head: str | None = None,
                 f"the flag exists for repos with no fetchable surface at "
                 f"all, never as a bypass of the push rule (§9bis.4)")
         return {"state": "local-only", "branch": branch, "sha": target,
-                "committed": committed}
+                "committed": committed, "governing": governing,
+                "roles": effective_roles}
     if not remotes:
         raise RuntimeError(
             "no remote configured: a SHA the reviewer cannot fetch is not a "
@@ -236,12 +321,15 @@ def ensure_pushed(cfg: Config, head: str | None = None,
 
     return {"state": "pushed", "branch": branch, "ref": merge_ref,
             "remote": remote, "url": url, "sha": target,
-            "committed": committed}
+            "committed": committed, "governing": governing,
+            "roles": effective_roles}
 
 
 def diff_shape(repo_root: Path, base: str, head: str) -> dict:
     """Machine-computed diff shape — never hand-counted (round-1 trap #3)."""
-    numstat = _git(repo_root, "diff", "--numstat", f"{base}...{head}")
+    # Round 3 F1: the shape is a measurement of the target's own history.
+    numstat = _git(repo_root, "diff", "--numstat", f"{base}...{head}",
+                   no_replace=True)
     files, ins, dels, areas = [], 0, 0, set()
     for line in numstat.splitlines():
         a, d, path = line.split("\t", 2)
@@ -590,8 +678,15 @@ def _reference_block(repo_root: Path, references: list[dict],
     travel keeps its declared-unavailable state; it is now declared at
     emission rather than discovered by the reviewer.
     """
-    run = git or (lambda *a: _git(repo_root, *a))
-    run_bytes = git_bytes or (lambda *a: _git_bytes(repo_root, *a))
+    # Round 2 F2: both target reads, replacement-disabled. The manifest
+    # this renders is a promise about bytes the reviewer will fetch, so it
+    # must describe the ORIGINAL objects — and the reviewer's own
+    # verification (`probe_references`) is hardened the same way, or the two
+    # ends would derive a reference from two different object graphs for
+    # one SHA.
+    run = git or (lambda *a: _git(repo_root, *a, no_replace=True))
+    run_bytes = git_bytes or (lambda *a: _git_bytes(repo_root, *a,
+                                                    no_replace=True))
     lines = []
     for ref in references:
         path = str(ref["path"])
@@ -710,6 +805,31 @@ def resolve_transport(cfg: Config, transport: str | None = None,
             return entailed
     return (vocab.TRANSPORT_PATH if local_only
             else vocab.TRANSPORT_EMISSION_DEFAULT)
+
+
+class AuthorityAbsent(RuntimeError):
+    """The reviewed commit carries no configuration of its own (RVW-T17,
+    round 6 F1's rule at its verified site).
+
+    Raised from `ensure_pushed` AFTER the commit and BEFORE the push, so
+    it names an artifact that exists rather than one that was predicted.
+    Its remedy is the author's — the only party who can commit the rules —
+    which is why it carries one at all: round 7 F3 found a preflight
+    refusal reaching agents under a neighbour's recovery sentence, and a
+    blocked exit has no runnable `next` to fall back on. The CLI maps this
+    to `blocked`."""
+
+    def __init__(self, message: str, remedy: str):
+        super().__init__(message)
+        self.remedy = remedy
+
+
+def _config_basename(cfg) -> str:
+    """The configuration filename, from the config layer rather than typed
+    here — the same source `transport`'s refusals name it from, so the two
+    ends cannot drift on what a reviewed commit is being asked to carry."""
+    from . import config as _config
+    return _config.CONFIG_BASENAME
 
 
 class ReferenceUnbound(RuntimeError):
@@ -1089,7 +1209,8 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
         # one sound envelope (lineage 7 round 1).
         f'<{cfg.wrapper_tag}-review-request sha="{head}" branch="{branch}" '
         f'author="{author}" reviewer="{reviewer}" round="{round_no}" '
-        f'transport="{transport}" tool="{tool_identity()}">',
+        f'transport="{transport}" tool="{tool_identity()}" '
+        f'shape="{shape_identity()}">',
         f"Roles: author={author} · reviewer={reviewer} · relay={relay} · "
         f"transport={transport}. "
         f"Per-invocation stamp, overriding the default direction for this "

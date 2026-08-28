@@ -231,10 +231,18 @@ class TestTheContradictionIsRefused(unittest.TestCase):
     """
 
     def _git(self, remotes=""):
+        # RVW-T17: the authority is read from the commit inside
+        # `ensure_pushed`, so a scripted runner has to answer the same two
+        # calls `take` makes. A runner that could not is a runner testing a
+        # boundary the tool no longer has.
+        toml = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
         return fake_git({
             ("rev-parse", "--abbrev-ref", "HEAD"): "main",
             ("status", "--porcelain"): "",
             ("rev-parse", "HEAD"): SHA_B,
+            ("ls-tree", "--full-tree", SHA_B, "--", "review.toml"):
+                "100644 blob " + "0" * 40 + "\treview.toml",
+            ("show", f"{SHA_B}:review.toml"): toml,
             ("remote",): remotes,
         })
 

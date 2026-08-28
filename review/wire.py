@@ -15,7 +15,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from . import paths, tool_identity, vocab
+from . import paths, shape_identity, tool_identity, vocab
 from .fingerprint import compute as fp_compute
 from .fingerprint import legacy_v1 as fp_legacy_v1
 
@@ -25,6 +25,11 @@ _WRAPPER_RE = re.compile(
     re.DOTALL,
 )
 _ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
+#: The stamped install-shape digest's complete value grammar (round 1 F3).
+#: Anchored at both ends, so a value with a valid digest inside it is still
+#: refused — a substring match would admit exactly the padded and prefixed
+#: values the check exists to catch.
+_SHAPE_RE = re.compile(r"\A[0-9a-f]{16}\Z")
 _FINDING_HEAD_RE = re.compile(r"^### (?P<id>[A-Za-z0-9-]+)\s*$", re.MULTILINE)
 # First `path:line` or path-like token in an Evidence field, for the anchor.
 _CITATION_RE = re.compile(r"([\w./\-]+\.[\w]+|[\w/-]+):\d+")
@@ -257,6 +262,29 @@ def parse_attrs(attr_text: str) -> tuple[dict, tuple]:
                             f"times; every attribute is single-valued, and "
                             f"a repeat would let one declaration hide "
                             f"another (the binding SHA included)"))
+    # Round 1 F3 (lineage 12). `shape` was added as a stamped attribute
+    # with no value grammar, so an empty, truncated or non-hex value
+    # travelled and was rendered to a human as if it were a digest. It is
+    # checked HERE because this is the one attribute parser both the
+    # request and the disposition readers go through — a grammar enforced
+    # at two call sites is a grammar with two chances to drift — and
+    # because a structural defect must refuse before any git or ledger
+    # call, which everything downstream of this function is.
+    #
+    # ABSENCE IS ACCEPTED and is not a defect: envelopes emitted before the
+    # attribute existed carry none, and §3.1's rule is that an older reader
+    # meets an unknown attribute without a flag day. What is refused is a
+    # PRESENT value that is not what the emitter can produce. Lowercase
+    # only, because `sha256().hexdigest()` is lowercase and a mixed-case
+    # value did not come from this tool.
+    shape = attrs.get("shape")
+    if shape is not None and not _SHAPE_RE.match(shape):
+        defects.append(("E-SHAPE-GRAMMAR",
+                        f"wrapper attribute 'shape' is {shape!r}, which is "
+                        f"not a 16-character lowercase hex digest; an "
+                        f"install-shape identity is reported to a human as "
+                        f"a digest, and a value that is not one would be "
+                        f"read as though it were"))
     residue = _ATTR_RE.sub("", attr_text).strip()
     if residue:
         defects.append(("E-ATTR-RESIDUE",
@@ -680,7 +708,8 @@ def emit_disposition(tag: str, verdict_sha: str, head: str, author: str,
     body = json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True)
     open_tag = (
         f'<{tag}-review-disposition verdict_sha="{verdict_sha}" head="{head}" '
-        f'author="{author}" round="{round_no}" tool="{tool_identity()}">'
+        f'author="{author}" round="{round_no}" tool="{tool_identity()}" '
+        f'shape="{shape_identity()}">'
     )
     return f"{open_tag}\n{body}\n</{tag}-review-disposition>\n"
 

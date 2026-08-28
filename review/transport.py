@@ -37,8 +37,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from . import (TOOL_NAME, paths, refs, tool_identity, validate,
-               vocab, wire)
+from . import (TOOL_NAME, paths, refs, shape_identity, tool_identity,
+               validate, vocab, wire)
 from .config import Config
 from .digest import sha256_file, sha256_text
 from .fingerprint import alias_event
@@ -129,8 +129,23 @@ class Refusal(RuntimeError):
         self.items = list(items or [])
 
 
-def _git(repo_root: Path, *args: str, timeout: int = 120) -> str:
-    out = subprocess.run(["git", "-C", str(repo_root), *args],
+#: Round 1 F1 (lineage 12). `git replace` installs a ref under
+#: `refs/replace/` — or under whatever `GIT_REPLACE_REF_BASE` names — and
+#: every ordinary object lookup then transparently returns the REPLACEMENT.
+#: That is local, uncommitted, per-machine state, so it is the same class of
+#: input as a filter driver or a textconv attribute, and it defeats the
+#: property this boundary exists to create: it reaches `ls-tree` and
+#: `cat-file` exactly as it reaches `show`, so switching porcelain for
+#: plumbing would not have helped. `--no-replace-objects` is a git-wide
+#: option, evaluated before the subcommand and before any ref base is
+#: consulted, and it turns the whole mechanism off for that one invocation.
+NO_REPLACE = "--no-replace-objects"
+
+
+def _git(repo_root: Path, *args: str, timeout: int = 120,
+         no_replace: bool = False) -> str:
+    out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
+                          "-C", str(repo_root), *args],
                          capture_output=True, text=True, timeout=timeout)
     if out.returncode != 0:
         raise RuntimeError(
@@ -1007,14 +1022,27 @@ def tool_agreement(parsed) -> dict:
     """
     mine = tool_identity()
     theirs = (parsed.attrs or {}).get("tool")
+    # RVW-T18. The shape travels beside the behavioural identity and is
+    # carried through to the reader UNCOMPARED. It is put in the returned
+    # dict rather than left in `parsed.attrs` so that every renderer of this
+    # report has it without reaching back into the envelope — and it is
+    # never folded into `agreement`, because the states of `agreement` are
+    # the states a human might act on and a differing shape is not one of
+    # them. Two installs of identical code differ here as a matter of
+    # course; that is the whole reason the set was split.
+    shapes = {"reader_shape": shape_identity(),
+              "writer_shape": (parsed.attrs or {}).get("shape")}
     if not theirs:
         return {"agreement": "unstamped", "reader": mine, "writer": None,
+                **shapes,
                 "note": "the envelope was written by an installation that "
                         "predates tool identity; nothing can be compared, "
                         "which is not the same as agreement"}
     if theirs == mine:
-        return {"agreement": "match", "reader": mine, "writer": theirs}
+        return {"agreement": "match", "reader": mine, "writer": theirs,
+                **shapes}
     return {"agreement": "differs", "reader": mine, "writer": theirs,
+            **shapes,
             "note": "the envelope was written under a DIFFERENT declared "
                     "behavioural set of this tool. What it says is sound; "
                     "what this end renders from it — the relay, the "
@@ -1078,129 +1106,6 @@ def missing_dispositions(ledger: Ledger) -> dict | None:
                            for f in unanswered]}
 
 
-def prospective_authority(cfg: Config, git=None) -> None:
-    """Refuse unless the commit this emission would CREATE carries its rules.
-
-    Round 6 F1 removed the origin whose authority lives on one machine: a
-    reviewed commit carries the rules it is judged by, because an authority
-    on one machine cannot be shown to a second and a review is the act of
-    showing it to a second.
-
-    Round 7 F1: the first cut asked `ls-files`, which answers whether the
-    OLD commit tracks the path. Publication then runs `commit -a`, which
-    stages tracked working-tree deletions and type changes — so a tracked
-    `review.toml` deleted in the worktree passed, and the commit that check
-    was protecting carried none. The question is about the tree the commit
-    will have, and for `commit -a` that tree is the WORKTREE for every
-    tracked path. So the worktree is what gets asked, and both halves are
-    asked: tracked, and present as a regular file.
-
-    Round 7 F2: it is asked by every author door, not by `handoff` alone.
-    A door that emits what no supported reviewer can take is the same defect
-    round 2 F1 named — two ends accepting and refusing different states —
-    with the author's two doors as the two ends.
-    """
-    basename = _config_basename()
-    run = git or (lambda *a: _git(cfg.repo_root, *a))
-    commit_it = (f"a person commits {basename} to this repository — the same "
-                 f"values, in the artifact under review; a user-level copy "
-                 f"still governs every local verb, and only an emission needs "
-                 f"the rules to travel")
-    try:
-        run("ls-files", "--error-unmatch", basename)
-    except RuntimeError:
-        raise Refusal(
-            f"this repository tracks no {basename}, so the commit this would "
-            f"create carries no rules and a reviewer would be asked to rule "
-            f"under whatever their own machine resolves. The authority a "
-            f"verdict is judged by travels in the reviewed commit or it "
-            f"cannot be shown to the far end at all (configuration in force "
-            f"here: {cfg.source})",
-            "", remedy=commit_it)
-    path = Path(cfg.repo_root) / basename
-    if path.is_symlink() or path.is_dir() or not path.is_file():
-        state = ("a symbolic link" if path.is_symlink() else
-                 "a directory" if path.is_dir() else
-                 "deleted in the working tree" if not path.exists() else
-                 "not a regular file")
-        raise Refusal(
-            f"{basename} is tracked but is {state}, and the commit this "
-            f"would create carries the working tree — so the reviewed commit "
-            f"would declare no readable rules",
-            "", remedy=f"a person restores {basename} as a regular file "
-                       f"before emitting; {commit_it}")
-    # Round 10 F1. Round 9 asked the declared state and then read git's
-    # TEXT presentation of it: `check-attr filter` renders the sentinel
-    # `unspecified` for an absent attribute AND for an active driver named
-    # `unspecified`, so a filter could occupy the token that meant absence.
-    # A value's presentation is not the value. `--all -z` answers a
-    # different question that has no such collision: which attribute NAMES
-    # are declared for this path at all. Names come from git's own parse of
-    # the attribute file, so no driver name can occupy one, and an
-    # unspecified attribute is simply absent from the listing.
-    #
-    # Every declared `filter` refuses, whatever its value — including an
-    # explicit unset, whose presentation `unset` an active driver can also
-    # occupy. Failing closed on the whole ambiguous presentation costs a
-    # repository one attribute it did not need; reading it costs the
-    # property that both ends read the same bytes.
-    try:
-        listing = run("check-attr", "--all", "-z", "--", basename)
-    except _UNUSABLE as exc:
-        raise Refusal(
-            f"this clone cannot say which attributes are declared for "
-            f"{basename} ({exc}), so what a commit would record is not "
-            f"established",
-            "", remedy="a person repairs this clone; an object store that "
-                       "cannot be asked is not evidence that the rules "
-                       "would travel")
-    fields = [f for f in listing.split("\0") if f]
-    if len(fields) % 3:
-        raise Refusal(
-            f"the attribute listing for {basename} cannot be read "
-            f"({listing!r}), so what a commit would record is not "
-            f"established",
-            "", remedy="a person repairs this clone; an unreadable listing "
-                       "is not evidence that no filter is declared")
-    if "filter" in {fields[k + 1] for k in range(0, len(fields), 3)}:
-        raise Refusal(
-            f"a content filter attribute is declared for {basename}, so what "
-            f"a commit records for it is whatever an external program "
-            f"returns when the commit runs — which is not what this author "
-            f"read, and need not be what any earlier invocation returned",
-            "", remedy=f"a person removes the filter attribute for "
-                       f"{basename}: the rules a verdict is judged by are "
-                       f"read by both ends, so they may not be produced by "
-                       f"a program that runs between them")
-    # Built-in conversions — eol, text, working-tree-encoding — change
-    # committed bytes too, and are declared through attributes `check-attr
-    # filter` does not report. They are deterministic, so an object-id
-    # derivation settles them: one id with the path's attributes applied,
-    # one without, and they have to agree.
-    try:
-        filtered = run("hash-object", "--path", basename, "--", str(path))
-        plain = run("hash-object", "--no-filters", "--", str(path))
-    except _UNUSABLE as exc:
-        raise Refusal(
-            f"this clone cannot say what a commit would record for "
-            f"{basename} ({exc}), so what the reviewed commit would declare "
-            f"is not established",
-            "", remedy=f"a person repairs this clone; an object store that "
-                       f"cannot be asked is not evidence that the rules "
-                       f"would travel")
-    if filtered != plain:
-        raise Refusal(
-            f"a built-in conversion rewrites {basename} on the way into a "
-            f"commit, "
-            f"so the reviewed commit would carry bytes this author never "
-            f"read ({plain[:12]} here, {filtered[:12]} committed) and the "
-            f"two ends would be governed by different rules",
-            "", remedy=f"a person removes the conversion attributes for "
-                       f"{basename} — eol, text or working-tree-encoding: "
-                       f"the rules a verdict is judged by are read by both "
-                       f"ends, so they may not be transformed between them")
-
-
 def handoff_preflight(cfg: Config, ledger: Ledger) -> None:
     """Refuse a handoff the lifecycle does not permit — BEFORE the cache is
     consulted, a commit made, a push attempted, a gate run or a request
@@ -1213,21 +1118,23 @@ def handoff_preflight(cfg: Config, ledger: Ledger) -> None:
     has not been accepted must not cause the ledger to be read at all. The
     ordering is one chain — claim grammar, then lifecycle, then cache, push,
     gates, emission, ledger mutation."""
-    # Round 6 F1. Six rounds went into proving which rules governed a review
-    # when the target carried none of its own, and each proof was sound and
-    # each left a seam: a record the far end could not have, a skew no
-    # declaration reaches, a domain statement shipped only to the build that
-    # already agrees. The seam is not in any of the proofs. It is that an
-    # authority living on ONE MACHINE can never be shown to a second, and a
-    # review is the act of showing it to a second.
+    # RVW-T17. The authority question used to be asked HERE, before the
+    # commit existed, which made it a prediction about what `commit -a`
+    # would record. Rounds 7 to 11 of lineage 11 are five different ways a
+    # prediction can be wrong — the index against the worktree, a
+    # pathname's shape against its bytes, a filter's declaration against
+    # its behaviour, git's rendered attribute value against the attribute
+    # name, and a commit hook restaging after the check — and the list has
+    # no principled end, because git offers arbitrarily many ways to change
+    # what a commit records between a check and the commit.
     #
-    # So the origin goes, rather than the machinery around it. A commit put
-    # up for review must carry the rules it is to be judged by, and then
-    # there is nothing to prove: both ends read the same bytes out of the
-    # same object. User-level configuration keeps governing local operation
-    # — `brief`, `validate`, `ledger` — and stops governing what a reviewer
-    # on another machine is asked to rule on.
-    prospective_authority(cfg)
+    # It now lives in `emit.ensure_pushed`, immediately after the commit
+    # and before the push and the emission, and it asks the artifact:
+    # `git show <sha>:review.toml`, the same call `take` makes. Everything
+    # predictive stopped mattering — whatever a filter, a hook, an
+    # attribute or the index did, the commit records something and that
+    # something is read. What remains here is the lifecycle, which is what
+    # this function is for.
     owed = missing_dispositions(ledger)
     if owed is not None:
         ids = ", ".join(f"{u['id']} ({u['fp']})" for u in owed["unanswered"])
@@ -1291,7 +1198,9 @@ def handoff_preflight(cfg: Config, ledger: Ledger) -> None:
 def cached_handoff(cfg: Config, ledger: Ledger, round_no: int,
                    git=None, claim_digest: str = "",
                    roles: tuple[str, str] | None = None,
-                   transport: str | None = None) -> dict | None:
+                   transport: str | None = None,
+                   author_flag: str | None = None,
+                   reviewer_flag: str | None = None) -> dict | None:
     """§9bis.3 rule 5: re-running handoff on an unchanged tip with a warm
     request returns the same envelope without re-running gates or pushing.
 
@@ -1386,8 +1295,35 @@ def cached_handoff(cfg: Config, ledger: Ledger, round_no: int,
     # unknown — so legacy warm behaviour is unchanged. The recorded side is
     # read from the kept envelope itself, which has carried the stamp since
     # the wire format existed.
-    want_author, want_reviewer = roles if roles is not None else (
-        cfg.roles.get("author") or "", cfg.roles.get("reviewer") or "")
+    # Round 2 F1 (lineage 12). This used to fall back to the CHECKOUT's
+    # defaults, and its caller passed roles the checkout had authorised —
+    # so a checkout whose permitted list no longer contained an identity
+    # the TARGET permits could veto a warm serve, or key it on the wrong
+    # pair. By this point the tree is clean and HEAD equals the SHA the
+    # recorded request binds, so HEAD *is* the target: its authority is
+    # resolvable here, and it is the only authority entitled to answer.
+    #
+    # A caller may still pass `roles` outright — the reviewer-side
+    # falsifications do — and that is unchanged. What changed is where the
+    # value comes from when it is not passed.
+    if roles is not None:
+        want_author, want_reviewer = roles
+    else:
+        from . import emit as _emit
+        try:
+            governing, origin = resolve_authority(cfg, head, git=git)
+        except Refusal:
+            return None
+        if origin != AUTHORITY_TARGET:
+            return None
+        try:
+            want_author, want_reviewer = _emit.resolve_roles(
+                governing, author=author_flag, reviewer=reviewer_flag)
+        except Exception:
+            # A target that will not authorise these roles cannot serve a
+            # warm envelope stamped with them. Cold is the honest answer;
+            # the cold path raises the refusal with its remedy.
+            return None
     kept_request = wire.parse_request(text)
     attrs = kept_request.attrs
     if (attrs.get("author", "").lower() != want_author.lower()
@@ -1517,7 +1453,11 @@ def probe_target(cfg: Config, push: dict | None, sha: str,
     the same way `ensure_pushed`'s is, so every refusal is testable without
     a network.
     """
-    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    # Round 3 F1 (lineage 12): every read below dereferences the stamped
+    # target — presence, ancestry, the configuration — so the runner
+    # itself disables replacement. The flag is git-wide and cannot ride as
+    # a subcommand argument, so this is the only place it can go.
+    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True))
     result = {"sha": sha, "base": base}
     if push is None:
         raise Refusal("the request carries no reachability stamp: a SHA the "
@@ -1619,7 +1559,14 @@ def probe_references(cfg: Config, reference_section: str,
     as an error here, because labelling is this function's whole job; the
     caller decides what an unreadable required reference means.
     """
-    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    # Round 2 F2 (lineage 12). With a target, both reads below derive a
+    # file reference from the target OBJECT GRAPH, so both disable
+    # replacement — the emitter's half is hardened identically, or the two
+    # ends would describe one SHA from two different graphs. The
+    # working-tree branch (`sha is None`) is a different state and is left
+    # alone: there is no object graph in it to replace.
+    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=sha
+                                  is not None))
 
     def kind(path: str) -> str | None:
         """'blob' | 'tree' | None, at the target when `sha` is given, else
@@ -1635,7 +1582,7 @@ def probe_references(cfg: Config, reference_section: str,
         if sha is None:
             return sha256_file(cfg.repo_root / path)
         return refs.target_digest(
-            lambda *a: run_bytes(cfg, git, *a), sha, path)
+            lambda *a: run_bytes(cfg, git, *a, no_replace=True), sha, path)
 
     where = "in the target tree" if sha is not None else "in this checkout"
     out = []
@@ -1673,15 +1620,20 @@ def probe_references(cfg: Config, reference_section: str,
     return out
 
 
-def run_bytes(cfg: Config, git, *args: str) -> bytes:
+def run_bytes(cfg: Config, git, *args: str,
+              no_replace: bool = False) -> bytes:
     """Raw stdout of a git command, for content that must be digested as
     bytes. The injectable `git` runner returns text; a test that maps
-    `show` returns the file's text and this encodes it back."""
+    `show` returns the file's text and this encodes it back.
+
+    `no_replace` carries the same guarantee as `_git`'s: replacement
+    objects off, for the reads that decide an authority."""
     if git is not None:
         return git(*args).encode("utf-8")
     # Round 4 F3, the byte reader's half of the same normalisation.
     try:
-        out = subprocess.run(["git", "-C", str(cfg.repo_root), *args],
+        out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
+                              "-C", str(cfg.repo_root), *args],
                              capture_output=True, timeout=120)
     except subprocess.SubprocessError as exc:
         raise RuntimeError(
@@ -1743,7 +1695,11 @@ def resolve_authority(cfg: Config, sha: str,
     """
     from . import config as _config
     basename = _config.CONFIG_BASENAME
-    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    # Round 1 F1 (lineage 12): BOTH reads run with replacement objects off.
+    # This is the ONE resolver all three doors call, so hardening it here is
+    # what makes the author, `take` and `validate --from-target` inherit the
+    # guarantee — there is no second read to forget.
+    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True))
     fix = (f"the AUTHOR repairs the configuration in the target commit and "
            f"re-emits; a reviewer does not edit the rules it is judged by")
     try:
@@ -1768,6 +1724,23 @@ def resolve_authority(cfg: Config, sha: str,
     # bytes: the cross-end authority split this lineage exists to remove,
     # arriving through the one git mode whose type says `blob` and whose
     # content is a path. The mode is what says whether an entry is a file.
+    # A tree may carry the SAME path twice. `git mktree` accepts it and
+    # `git fsck` calls it `duplicateEntries`, but the object reads, and
+    # `ls-tree` then prints TWO lines. `split(maxsplit=3)` cannot tell that
+    # from one line: it yields four fields either way, so the length check
+    # below passes, only the FIRST entry's mode is examined, and the whole
+    # second entry rides along unread inside `fields[3]`. Measured on this
+    # machine. The read that follows resolves the first entry too, so no
+    # divergence between the two ends is demonstrated — but "the mode I
+    # checked is the mode of the blob I read" would be resting on an
+    # undocumented tie-break rather than on anything asked. One line asks.
+    if "\n" in entry:
+        raise Refusal(
+            f"the tree listing for {basename} in {sha[:12]} carries more "
+            f"than one entry, so which entry the rules would be read from "
+            f"is not established: a duplicated path is not a tree this "
+            f"boundary will guess about",
+            "", remedy=fix)
     fields = entry.split(maxsplit=3)
     if len(fields) < 3:
         raise Refusal(
@@ -1783,7 +1756,8 @@ def resolve_authority(cfg: Config, sha: str,
             f"presence is not absence",
             "", remedy=fix)
     try:
-        raw = run_bytes(cfg, git, "show", f"{sha}:{basename}")
+        raw = run_bytes(cfg, git, "show", f"{sha}:{basename}",
+                        no_replace=True)
     except _UNUSABLE as exc:
         raise Refusal(
             f"{basename} is PRESENT in {sha[:12]} and cannot be read "
@@ -1810,26 +1784,30 @@ def resolve_authority(cfg: Config, sha: str,
 
 def governing_for(cfg: Config, sha: str, git=None) -> Config:
     """The authority that governs an envelope about `sha`, for the verbs
-    that are not `take` — PROVED against what `take` recorded, never
-    re-derived on its own.
+    that are not `take`: the target commit's own configuration, read from
+    the commit.
 
-    Round 1 F1 made this refuse where `target_config` falls back. Round 2
-    F1 showed that made it stricter than `take`, which is its own defect:
-    a repository under review by user-level config alone — a state the
-    adapters advertise — takes fine, because `take` accepts the fallback
-    authority, and then the command `take` PRINTS refused the identical
-    state. One end accepting what the other rejects is not a safety
-    property; it is a dead end in an advertised lifecycle.
+    HISTORY, because this docstring described machinery that no longer
+    exists and shipped that way in 0.9.0. Round 1 F1 made this refuse
+    where `target_config` fell back. Round 2 F1 showed that made it
+    stricter than `take`, so rounds 2 to 5 built a proof that the rules a
+    verdict was judged by were the rules its request was judged by — a
+    recorded authority identity, matched rather than re-derived. Round 6
+    F1 deleted all of it: an authority living on one machine can never be
+    shown to a second, and a review is the act of showing it. The origin
+    went, and with it the record, the matching and the fallback.
 
-    So the rule is neither "target only" nor "whatever is lying around":
-    the authority is resolved exactly as `take` resolved it, and then
-    matched against the identity `take` recorded. Same authority, proved.
-    An absent record, a take that predates the recording, or an authority
-    whose content has moved since — changed, removed, replaced — all
-    block, because none of them can show that this verdict is being judged
-    by the rules its request was.
+    So there is nothing left to prove and nothing to fall back to. The
+    question is the one `take` asks, of the input `take` asks it of, and
+    since RVW-T17 it is also the one the AUTHOR asks: `git show
+    <sha>:review.toml`. A target that carries no configuration refuses at
+    all three doors, identically.
     """
-    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    # Round 3 F1 (lineage 12): every read below dereferences the stamped
+    # target — presence, ancestry, the configuration — so the runner
+    # itself disables replacement. The flag is git-wide and cannot ride as
+    # a subcommand argument, so this is the only place it can go.
+    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True))
     drop = ("a person validates without the declaration, accepting that "
             "whatever configuration this checkout resolves NOW is a "
             "different authority from the one the request was judged under")
@@ -2005,6 +1983,7 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
     diff_cmd = (paths.diff_command(cfg.repo_root, base, sha) if base
                 else paths.command(
                     paths.Lit("git"), paths.Lit("-C"), cfg.repo_root,
+                    paths.Lit("--no-replace-objects"),
                     paths.Lit("show"), sha))
     return _runnable({"round": round_no, "sha": sha, "reviewer": me,
             "target": target, "references": refs, "kept": kept,
@@ -2167,7 +2146,12 @@ def waive(cfg: Config, ledger: Ledger, sha: str, reason: str, by: str,
             "agent's decision to take, and `user` is not inferred from "
             "silence",
             "")
-    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    # Round 3 F1 (lineage 12), found by the read audit rather than by
+    # review: `rev-parse --verify <sha>^{commit}` PEELS, so a replacement
+    # could let a waiver name one commit while recording another — and a
+    # waiver is the record that says a commit was deliberately not
+    # reviewed, which makes it exactly the wrong place to be wrong.
+    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True))
     try:
         resolved = run("rev-parse", "--verify", f"{sha}^{{commit}}")
     except RuntimeError as exc:

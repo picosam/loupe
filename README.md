@@ -104,11 +104,8 @@ working with nothing installed.
 
 ## Status
 
-Version 0.9.0 — the version is bumped inside the reviewed round of any
+Version 0.10.0 — the version is bumped inside the reviewed round of any
 change that will be published, so `--version` discriminates publishes.
-0.9.0 is an exception and says so: the lineage behind it closed by recorded
-decision rather than clean, so no reviewed round remained to carry the bump.
-What stands open from that close is named below.
 Implemented and tested: the envelopes and validators, the
 gate manifest and attestation checks, roles and stamps (including
 per-invocation selection within the permitted lists), fingerprints with
@@ -119,6 +116,72 @@ migration, generated
 adapters. Designed but not implemented: risk tiering, path-scoped contract
 invariants, auto-execution of falsification tests, a git-notes carrier, an
 MCP facade. See design §9.
+
+Changed in 0.10.0. Two things move that a reader should know about.
+
+**The author's authority check now reads the commit instead of predicting
+it.** It runs after the commit and before the push, and asks `git show
+<sha>:review.toml` — the same call the reviewer's verbs make. Previously it
+ran before the commit existed and had to anticipate what `git commit -a`
+would record, which is unbounded: git offers arbitrarily many ways to change
+what a commit records between a check and the commit, and five separate
+review rounds each closed one of them. Consequences you may notice: a
+declared `filter` attribute on `review.toml` no longer refuses, because
+whatever the filter does the commit records something and that something is
+read; a `skip-worktree` entry whose worktree copy is absent no longer
+refuses, which was a false refusal — `commit -a` does not delete such an
+entry; and if you have `assume-unchanged` set on `review.toml`, the emission
+is now governed by the bytes in the commit rather than the bytes in your
+worktree. The last of those is a behaviour change with no error message: it
+is the case that used to emit under one set of rules and be judged under
+another.
+
+Related, and the reason the above matters beyond the check itself: what the
+envelope DECLARES — taxonomy, gate ids, token budget, blocking severities,
+round cap, roles, wrapper tag — now renders from the target commit's
+configuration rather than from the emitting checkout's. These are identical
+wherever the two agree, which is the ordinary case. They differ exactly
+where the two ends would previously have disagreed silently.
+
+**Every envelope now carries `shape` beside `tool`.** `tool` is the content
+identity of the package modules; `shape` is the identity of the launchers,
+`bin/loupe` and `pyproject.toml`. `shape` is reported and never compared.
+The reason is measured: those two artefacts are not resolvable in a wheel
+install, so including them in the compared identity made three advertised
+install paths compute three identities for one codebase, and every
+cross-machine round reported a disagreement that said nothing about what
+either end would do. `tool` is now equal across all three install paths for
+the same code. One transitional cost: an 0.9.0 envelope and an 0.10.0
+envelope built from identical code stamp different `tool` values, so the
+first cross-version round after upgrading will read `differs` for a version
+reason. An older reader ignores the unknown `shape` attribute, by design.
+
+**Rejecting a declared authority is now bounded, and narrowing a claim is a
+legitimate answer.** The 0.7.0 terminator (below) bounded instance findings
+against a declared-closed domain but left rejection of the authority itself
+unbounded, and *"a narrow authority is itself the defect"* never said narrow
+relative to what. In this tool's own review record that combination closed
+two lineages by human decision rather than by a clean verdict: *"your
+authority rests on a set one level down"* is always available and always
+true, so each round derived one more authority and the next found the next
+universe beneath it. One bound now applies, and it is about the CLAIM. The
+author states the authority's DOMAIN beside it, in the terms the authority
+enforces — and the reviewer rules on that domain BEFORE ruling under it:
+does it match the anchor's purpose and everything still relied on
+downstream? A concrete escape outside the declaration is evidence that the
+domain is too narrow, not something the declaration excludes from being
+heard. Only once the domain is accepted is coverage ruled against it, and
+only then is a demand outside it scope rather than a finding, however well
+it reproduces. So narrowing the claim until it matches what is enforced is
+an available and complete answer to a coverage finding — but only when the
+anchor's purpose and every consumer claim narrow with it; a narrowing that
+leaves a wider promise standing is the defect. Nothing here demotes a finding
+for failing to reproduce — a second bound of that shape was drafted and
+removed before shipping, because it could not be stated once and excluded
+nothing in the record; design §3.1 records why, since the same idea will
+occur to anyone reading the rule. The cost is stated there too: an author
+may declare a domain narrow enough to be trivially covered, and what holds
+that is the narrowing being visible in the claim and rulable.
 
 Changed in 0.9.0, and this one can refuse work that used to run.
 A reviewed commit now carries the rules it is judged by. `handoff`, `take`
@@ -136,17 +199,6 @@ schema is derived from the defaults rather than restated beside them; and
 every subprocess failure is typed, so a clone that cannot read its own
 objects is no longer taken as evidence that a target carries no
 configuration.
-
-Known and unfixed in 0.9.0. The author's authority check runs BEFORE the
-commit it describes, so it predicts what `commit -a` will record instead of
-reading what it did. Five rounds found five ways a prediction can be wrong —
-the index against the worktree, a pathname's shape against its bytes, a
-filter's declaration against its behaviour, git's rendered attribute value
-against the attribute name, and a commit hook restaging after the check —
-and the list has no principled end. The fix is placement, not a patch: ask
-the artifact after the commit, which is the question `take` already asks.
-Until then the author-side check is best-effort and the reviewer-side ones,
-which read the commit, are not.
 
 Changed in 0.8.0, if you are upgrading. The verdict relay of a `path`
 round now prints its command alone: the `# the author's to run` comment
