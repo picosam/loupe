@@ -63,12 +63,17 @@ supported: the shim loads exactly one `review` package and never searches
 for another.
 
 Then, in a repository you want reviewed, copy `review.toml` from this
-repository's root — it is the generic example — to that repository's root
-(or to `~/.config/loupe/<repo-id>.toml` to leave the tree untouched), and
-edit every value: severities and classifications are *your* vocabulary, gates
-are *your* commands, roles are *your* agents. Without a declared taxonomy the
-tool refuses to emit and the reviewer refuses to rule — a tool that supplies
-its own vocabulary has authored your judgment scale.
+repository's root — it is the generic example — to that repository's root,
+commit it, and edit every value: severities and classifications are *your*
+vocabulary, gates are *your* commands, roles are *your* agents. Without a
+declared taxonomy the tool refuses to emit and the reviewer refuses to
+rule — a tool that supplies its own vocabulary has authored your judgment
+scale. In-tree is required for review: a reviewed commit carries the rules
+it is judged by, so `handoff` and `take` refuse a target that tracks no
+`review.toml`. A user-level `~/.config/loupe/<repo-id>.toml` governs local
+verbs only. The full pass — gates, taxonomy, roles, and the
+approval question most onboardings skip — is
+[docs/onboarding.md](docs/onboarding.md).
 
 State lives outside the reviewed tree at `~/.local/state/loupe/<repo-id>/`
 (ledger, gate output, kept envelopes); override with `--ledger-dir` or
@@ -104,7 +109,7 @@ working with nothing installed.
 
 ## Status
 
-Version 0.10.0 — the version is bumped inside the reviewed round of any
+Version 0.11.0 — the version is bumped inside the reviewed round of any
 change that will be published, so `--version` discriminates publishes.
 Implemented and tested: the envelopes and validators, the
 gate manifest and attestation checks, roles and stamps (including
@@ -116,6 +121,43 @@ migration, generated
 adapters. Designed but not implemented: risk tiering, path-scoped contract
 invariants, auto-execution of falsification tests, a git-notes carrier, an
 MCP facade. See design §9.
+
+Changed in 0.11.0. Three fixes from the first onboarding of a repository
+with environment-sensitive git hooks, and each moves behaviour.
+
+**Every git subprocess now runs in the caller's environment.** 0.10.0's
+gate-environment fix restored the caller's `PYTHONSAFEPATH`/`PYTHONPATH`
+for gate subprocesses only; a repository's git hooks — pre-push, the
+commit hooks, reference-transaction, a configured fsmonitor — are the
+repository's own code in exactly the same trust position, and they still
+inherited the shim's hardened interpreter environment. Measured: a
+pre-push hook importing a sibling module failed with `ModuleNotFoundError`
+under `handoff` and passed in a clean shell, refusing the emission. The
+restoration is now applied at every git door, so hooks see what the
+caller's shell would have given them. If a hook of yours somehow relied on
+the leaked hardening, that reliance ends here.
+
+**`render-adapters --check-install` and `--install` no longer read the
+current repository.** Both modes ask about machine-global state (the
+installed skills under your home directory), so their default source is
+now the `adapters/` directory beside the installed package, not
+`<cwd>/adapters` — the old default existed only in the tool's own checkout
+and failed the check everywhere else, misreporting the healthy installed
+copy as `unreadable`. Where no package-sibling directory exists (a wheel
+install), the verb refuses with a remedy naming `--dir` instead of
+proceeding into a misattributed failure; and a source-side failure now
+reports the source path under its own statuses, `source_absent` /
+`source_unreadable`. `render` and `--check` keep the repo-local default;
+they generate and gate the tracked copies.
+
+**The reviewer procedure gains a falsification-anchoring rule.** Anchor
+the falsification test in the reviewed tree wherever the defect admits it;
+where the defect genuinely lives in a mutable artifact outside the tree —
+a PR body, an issue, a dashboard — the finding says so, so a later
+`cannot_execute` reads as the anticipated outcome of a stated dependency
+rather than an author evasion. Learned from a round where an external
+artifact moved, the named test became unexecutable by construction, and
+the honest disposition fired the `unverifiable` breaker.
 
 Changed in 0.10.0. Two things move that a reader should know about.
 

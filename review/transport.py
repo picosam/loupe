@@ -39,7 +39,7 @@ from pathlib import Path
 
 from . import (TOOL_NAME, paths, refs, shape_identity, tool_identity,
                validate, vocab, wire)
-from .config import Config
+from .config import Config, caller_env
 from .digest import sha256_file, sha256_text
 from .fingerprint import alias_event
 # `firing_id` is defined beside the code that MAKES the firings
@@ -144,9 +144,16 @@ NO_REPLACE = "--no-replace-objects"
 
 def _git(repo_root: Path, *args: str, timeout: int = 120,
          no_replace: bool = False) -> str:
+    # RVW-T21 D2: the caller's environment, not the shim's hardened one.
+    # `take`'s `fetch` writes refs and fires reference-transaction where a
+    # repository has one, and `status` consults a configured
+    # core.fsmonitor; both are the repository's own scripts, in the same
+    # trust position as a gate. Applied at the door rather than per
+    # subcommand.
     out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
                           "-C", str(repo_root), *args],
-                         capture_output=True, text=True, timeout=timeout)
+                         capture_output=True, text=True, timeout=timeout,
+                         env=caller_env())
     if out.returncode != 0:
         raise RuntimeError(
             f"a `git` subprocess failed: "
@@ -1631,10 +1638,12 @@ def run_bytes(cfg: Config, git, *args: str,
     if git is not None:
         return git(*args).encode("utf-8")
     # Round 4 F3, the byte reader's half of the same normalisation.
+    # RVW-T21 D2: and the caller's environment, like every other git door.
     try:
         out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
                               "-C", str(cfg.repo_root), *args],
-                             capture_output=True, timeout=120)
+                             capture_output=True, timeout=120,
+                             env=caller_env())
     except subprocess.SubprocessError as exc:
         raise RuntimeError(
             f"a `git` subprocess did not complete: "

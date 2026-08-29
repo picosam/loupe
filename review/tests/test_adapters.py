@@ -89,6 +89,26 @@ class TestOneSource(unittest.TestCase):
         for verb in ("handoff", "take", "close", "respond", "validate"):
             self.assertIn(f"`{TOOL_NAME} {verb}", text)
 
+    def test_the_rule_step_tells_the_reviewer_to_anchor_falsification(self):
+        """RVW-T21 D3: a falsification test anchored in a mutable artifact
+        outside the reviewed tree (a PR body, an issue, a dashboard) stops
+        being executable the moment that artifact moves — through no act of
+        the author's — and nothing warned the reviewer against writing one.
+        The `rule` step must now say: anchor in the tree wherever the
+        defect admits it, and say so explicitly when it cannot, so a later
+        `cannot_execute` reads as a stated dependency, not an evasion.
+
+        FALSIFICATION: drop the added sentence from the `"reviewer"` entry
+        of `procedure()`'s `"rule"` step and this fails in every kind (the
+        text is shared, per `test_bodies_are_identical_across_kinds`).
+        """
+        for kind in adapters.OUTPUTS:
+            text = adapters.render(kind)
+            rule = text[text.index("**rule**"):text.index("**validate")]
+            self.assertIn("mutable artifact outside the tree", rule, kind)
+            self.assertIn("cannot_execute", rule, kind)
+            self.assertIn("unverifiable", rule, kind)
+
 
 class TestTrackedCopiesAreCurrent(unittest.TestCase):
 
@@ -880,6 +900,59 @@ class TestInstall(unittest.TestCase):
         self.assertNotEqual(rows["claude-skill"]["source_digest"],
                             rows["claude-skill"]["target_digest"])
 
+    def test_check_install_reports_source_absent_and_names_the_source(self):
+        """RVW-T21 D1: a missing SOURCE must never surface as the healthy
+        TARGET. `source_absent` is distinct from the target-side `absent`,
+        and the row carries `source` (never omits it the way the old
+        `target`-only, no-`source` row did) — with no target-side keys,
+        since the target was never even looked at.
+
+        FALSIFICATION: revert the `is_file()` guard in `check_install` (fold
+        the branch back into the bare `try: source.read_text(...)`) and this
+        fails — the status reverts to the old undifferentiated `unreadable`
+        with no `source` key.
+        """
+        missing = self.tmp / "no-such-rendered-dir"
+        rows = {r["kind"]: r for r in adapters.check_install(
+            missing, targets=self.targets)}
+        for kind, row in rows.items():
+            self.assertEqual(row["status"], "source_absent", row)
+            self.assertEqual(row["source"],
+                             str(missing / adapters.OUTPUTS[kind]))
+            self.assertEqual(row["target"], str(self.targets[kind]))
+            self.assertNotIn("source_digest", row)
+            self.assertNotIn("target_digest", row)
+
+    def test_check_install_reports_source_unreadable_distinctly(self):
+        """The adjacent state: a source FILE that exists but cannot be read
+        (permission denied) is `source_unreadable`, not `source_absent` and
+        not the target-side `unreadable` — and it still names the `source`.
+        Self-skips under a user that ignores file-mode permissions (root,
+        some containers), following the convention in
+        `test_round4_fixes.test_an_unreadable_config_is_structured_too`.
+
+        FALSIFICATION: revert the `is_file()` guard (same mutation as
+        above) and the status reverts to plain `unreadable` with no
+        `source` key — carrying the target's healthy path instead.
+        """
+        import os
+        import stat
+        kind = "claude-skill"
+        source_path = self.rendered / adapters.OUTPUTS[kind]
+        source_path.chmod(0o000)
+        try:
+            if os.access(source_path, os.R_OK):
+                self.skipTest("this process can read a 0o000 file "
+                              "(likely running as root)")
+            rows = {r["kind"]: r for r in adapters.check_install(
+                self.rendered, targets={kind: self.targets[kind]})}
+        finally:
+            source_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        row = rows[kind]
+        self.assertEqual(row["status"], "source_unreadable", row)
+        self.assertEqual(row["source"], str(source_path))
+        self.assertIn("error", row)
+
     def test_a_partial_install_reports_every_target_it_touched(self):
         """Round-9 F2: the failure branch filtered to failed rows, so a run
         that installed one target and then failed on another reported only
@@ -1075,6 +1148,150 @@ class TestInstall(unittest.TestCase):
         code, payload = run(check_install=True)
         self.assertEqual(code, 0, payload)
         self.assertTrue(payload["ok"])
+
+
+class TestMachineGlobalDefaultDir(unittest.TestCase):
+    """RVW-T21 D1, second half: `--check-install` and `--install` ask a
+    machine-global question (what's under `~/.claude/skills/`,
+    `~/.codex/skills/`), so their default source — when `--dir` is not
+    given — must not be `<cwd repo>/adapters`: that directory exists only
+    in the tool's own checkout, and every other repository sent the check
+    looking for sources that were not there. `--check` and the bare render
+    are repo-local (a drift gate / generation for THIS repository) and keep
+    the cwd-relative default.
+
+    FALSIFICATIONS, one per test: see each docstring.
+    """
+
+    def setUp(self):
+        import argparse
+        try:
+            self.tmp = Path(tempfile.mkdtemp(prefix="adapters-default-dir-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self.tmp, ignore_errors=True))
+        # A fake cfg, decoupled from the real repo: `cwd-repo` is never
+        # created, so any code path that still reads `cfg.repo_root /
+        # "adapters"` finds nothing there — the sharpest possible signal
+        # that the default did NOT move to the package sibling.
+        self.cfg = argparse.Namespace(repo_root=self.tmp / "cwd-repo",
+                                      ledger_dir=self.tmp / "state")
+
+    def _run(self, **flags):
+        import argparse
+        modes = {"check": False, "install": False, "check_install": False,
+                 "dir": None}
+        modes.update(flags)
+        args = argparse.Namespace(**modes)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.cmd_render_adapters(args, self.cfg)
+        return code, json.loads(buf.getvalue())
+
+    def test_machine_global_dir_is_the_package_sibling(self):
+        """A pure path computation — no filesystem touched — so it is
+        testable without any install-mode plumbing at all.
+
+        FALSIFICATION: hardcode `machine_global_dir` to return
+        `installation_root() / "somewhere-else"` and this fails.
+        """
+        import unittest.mock
+        fake_root = self.tmp / "pkg-root"
+        with unittest.mock.patch.object(adapters, "installation_root",
+                                        lambda: fake_root):
+            self.assertEqual(adapters.machine_global_dir(),
+                             fake_root / adapters.ADAPTERS_DIR)
+
+    def test_check_install_and_install_default_to_the_package_sibling(self):
+        """With no `--dir`, `--check-install` and `--install` must read the
+        package's own `adapters/` sibling, never `cfg.repo_root /
+        "adapters"` — proven by leaving `cfg.repo_root` pointing at a
+        directory that does not exist at all, and putting a freshly
+        rendered, in-sync copy ONLY at the faked package sibling. Only a
+        default that actually reads the package sibling can succeed here.
+
+        FALSIFICATION: restore the old
+        `directory = Path(args.dir) if args.dir else cfg.repo_root / ADAPTERS_DIR`
+        for these two modes and this fails — `cfg.repo_root / "adapters"`
+        does not exist, so `--install` would refuse with "adapters(s) are
+        themselves stale" (missing counts as stale) instead of the `code ==
+        0` / `installed` result asserted below, and `--check-install`
+        would come back with every row `source_absent` instead of
+        `in_sync`.
+        """
+        import unittest.mock
+        pkg_adapters = self.tmp / "pkg-root" / adapters.ADAPTERS_DIR
+        adapters.render_all(pkg_adapters)
+        targets = {kind: self.tmp / "home" / kind / "SKILL.md"
+                  for kind in adapters.INSTALL}
+        with unittest.mock.patch.object(
+                adapters, "installation_root", lambda: self.tmp / "pkg-root"), \
+                unittest.mock.patch.object(
+                    adapters, "install_targets", lambda: targets):
+            code, payload = self._run(install=True)
+            self.assertEqual(code, 0, payload)
+            self.assertEqual({r["status"] for r in payload["installed"]},
+                             {"installed"})
+            for kind, target in targets.items():
+                self.assertEqual(target.read_text(encoding="utf-8"),
+                                 adapters.render(kind))
+
+            code, payload = self._run(check_install=True)
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload["ok"])
+
+    def test_check_install_and_install_blocked_when_package_sibling_absent(self):
+        """A wheel install (no `adapters/` beside the package) must refuse
+        structurally, with a remedy naming `--dir` — never proceed into a
+        misattributed drift/stale report against nothing.
+
+        FALSIFICATION: skip the `directory.is_dir()` guard for these two
+        modes and this fails — `check_install`/`install_all` would instead
+        run against a directory that does not exist, producing
+        `source_absent` rows (or, before D1's first half, the misdirected
+        `unreadable`) rather than the blocked, `--dir`-naming refusal this
+        test requires.
+        """
+        import unittest.mock
+        empty_root = self.tmp / "no-adapters-here"
+        empty_root.mkdir()
+        with unittest.mock.patch.object(adapters, "installation_root",
+                                        lambda: empty_root):
+            for flags in ({"check_install": True}, {"install": True}):
+                with self.subTest(flags=flags):
+                    code, payload = self._run(**flags)
+                    self.assertNotEqual(code, 0)
+                    self.assertEqual(payload["next_kind"], "blocked")
+                    self.assertIsNone(payload["next"])
+                    self.assertIn("--dir", payload["remedy"])
+
+    def test_check_and_render_keep_the_cwd_relative_default(self):
+        """The control: `--check` (and the bare render, which shares the
+        same `else` branch) must NOT be redirected to the package sibling —
+        it stays `cfg.repo_root / "adapters"`, repo-local by design. Proven
+        two ways: `machine_global_dir` must never even be CALLED, and the
+        result must come from `cfg.repo_root`, which here carries a
+        deliberately EMPTY `adapters/` (so a wrongly-redirected default
+        reading some other, populated directory would not silently pass).
+
+        FALSIFICATION: route `--check` through the machine-global branch
+        too (drop the `elif args.check_install or args.install`
+        distinction) and this fails on both counts — `machine_global_dir`
+        gets called (raising here), and if it were allowed to run, nothing
+        makes `cfg.repo_root/adapters` (empty) equal to whatever the
+        package sibling happens to hold.
+        """
+        import unittest.mock
+        (self.cfg.repo_root / adapters.ADAPTERS_DIR).mkdir(parents=True)
+        with unittest.mock.patch.object(
+                adapters, "machine_global_dir",
+                side_effect=AssertionError(
+                    "machine_global_dir() must not be called for --check")):
+            code, payload = self._run(check=True)
+        self.assertNotEqual(code, 0, "an empty adapters/ is all-stale")
+        self.assertEqual(payload["next"], f"{TOOL_NAME} render-adapters")
+        self.assertIn(str(self.cfg.repo_root), payload["error"])
 
 
 class TestAdapterEnumerationsAreDerived(unittest.TestCase):

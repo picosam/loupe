@@ -1528,7 +1528,26 @@ def cmd_render_adapters(args, cfg) -> int:
     gate could never be: it refuses to install adapters that are themselves
     stale, keeps whatever it replaces, and reports every target it touched.
     """
-    directory = Path(args.dir) if args.dir else cfg.repo_root / adapters.ADAPTERS_DIR
+    if args.dir:
+        directory = Path(args.dir)
+    elif args.check_install or args.install:
+        # RVW-T21 D1: these two modes are machine-global (they ask about
+        # ~/.claude/skills/, ~/.codex/skills/, not the repository underfoot),
+        # so their default source is the package's own adapters/ sibling,
+        # never the cwd repo's — that default exists only in the tool's own
+        # checkout and failed this check everywhere else. `render` and
+        # `--check` are repo-local and keep the cwd-relative default below.
+        directory = adapters.machine_global_dir()
+        if not directory.is_dir():
+            return _blocked(
+                "",
+                f"no adapters/ directory beside the installed package "
+                f"({directory}) — the machine-global install modes do not "
+                f"fall back to the current repository's adapters/",
+                remedy=f"pass --dir <path to the rendered adapters> "
+                       f"explicitly")
+    else:
+        directory = cfg.repo_root / adapters.ADAPTERS_DIR
     if args.check_install:
         rows = adapters.check_install(directory)
         drift = [r for r in rows if r["status"] != "in_sync"]
@@ -1537,8 +1556,7 @@ def cmd_render_adapters(args, cfg) -> int:
                 paths.command(*paths.lits(TOOL_NAME, "render-adapters",
                                           "--install")),
                 "installed adapter(s) differ from the rendered copies: "
-                + "; ".join(f"{r['kind']} {r['status']} at {r['target']}"
-                            for r in drift))
+                + "; ".join(_drift_line(r) for r in drift))
         _out({"ok": True, "install": rows},
              "\n".join(f"in sync  {r['target']}" for r in rows))
         return EXIT_OK
@@ -1596,6 +1614,15 @@ def cmd_render_adapters(args, cfg) -> int:
          + "; ".join(f"{k} → {v[0]} ({v[1]})"
                      for k, v in adapters.INSTALL.items()))
     return EXIT_OK
+
+
+def _drift_line(row: dict) -> str:
+    """One `check_install` drift row, rendered for a person: the failing
+    SIDE's own path, never the healthy other side (RVW-T21 D1) — a
+    `source_*` status points at `source`, everything else (including the
+    target-side `unreadable`) points at `target`, exactly as it always did."""
+    path = row["source"] if row["status"].startswith("source_") else row["target"]
+    return f"{row['kind']} {row['status']} at {path}"
 
 
 def _install_line(row: dict) -> str:
@@ -1893,7 +1920,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="report drift between the rendered copies and "
                               "the installed ones (not a gate: a machine "
                               "with no install is not a broken build)")
-    ra.add_argument("--dir", help="output directory (default: <repo>/adapters)")
+    ra.add_argument("--dir", help="output directory (default: <repo>/adapters "
+                                  "for render and --check; the installed "
+                                  "package's own adapters/ sibling for "
+                                  "--install and --check-install)")
     ra.set_defaults(func=cmd_render_adapters)
     return p
 

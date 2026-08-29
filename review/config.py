@@ -133,11 +133,103 @@ class Config:
         return [g["id"] for g in self.gates]
 
 
+def caller_env() -> dict:
+    """The environment the CALLER of the tool had, for any child process
+    that may execute the REPOSITORY's or the USER's own code.
+
+    Found on the first per-project onboarding (2026-08-19): the bin/ shim
+    hardens the tool's own interpreter with PYTHONSAFEPATH=1 and
+    PYTHONPATH=<tool root>, both
+    environment variables, so every gate subprocess inherited them — and
+    twelve of that repo's sixteen gates failed on ModuleNotFoundError under
+    `handoff` while passing by hand. PYTHONSAFEPATH strips the script
+    directory and cwd from sys.path, which is precisely what a repository's
+    ad-hoc check scripts rely on; the leaked PYTHONPATH additionally let any
+    gate import this package by accident. It failed closed (A-FAILED, a
+    refusal), but a manifest that can only attest red for repositories the
+    tool never met is a manifest nobody declares.
+
+    RVW-T21 D2 (2026-08-29) found the contract was scoped to gates and the
+    class was wider. A repository's git HOOKS are the repository's own code
+    in exactly the same trust position — `commit -a` runs pre-commit,
+    prepare-commit-msg, commit-msg and post-commit, `push` runs pre-push,
+    every ref write can reach reference-transaction, and `status` consults
+    a configured core.fsmonitor — and they inherited the hardened
+    environment because only `run_gates` passed this. On `beos` a pre-push
+    hook importing a sibling `tools` module died with ModuleNotFoundError
+    and refused a handoff; the same push in a clean environment was a
+    no-op success. So this is now applied at every `git` door as well
+    (`emit._git`, `emit._git_bytes`, `emit._is_ancestor`, `config._git`,
+    `transport._git`, `transport.run_bytes`), which after that fix is every
+    child process the tool starts. Nothing in the package relies on a git
+    child seeing the hardened values: git consumes neither variable, and the
+    tool sets no GIT_* variables of its own.
+
+    A gate — and a hook — is the REPOSITORY's command and must run in the
+    environment the caller of loupe had, not the one the shim made for the
+    tool. The shim stashes the caller's values (LOUPE_CALLER_PYTHONSAFEPATH
+    / LOUPE_CALLER_PYTHONPATH — presence distinguishes set-to-anything from
+    unset) and marks itself with LOUPE_SHIM; this restores exactly those.
+    Invoked without the shim (python3 -m review) there is no stash and no
+    exact answer, so the best available approximation is applied and named
+    as such: drop PYTHONSAFEPATH, and drop this package's own root from
+    PYTHONPATH, leaving everything else the caller set. The stash and marker
+    variables themselves stay out of the child environment either way; the
+    gate re-entrancy marker is added by `run_gates`, never here — a hook
+    that legitimately runs a loupe read verb must not see itself as nested
+    inside a gate execution (RVW-T21 D2).
+    """
+    # The two variable names are bound rather than written as literal
+    # subscript keys: the command-boundary suite's ADVISORY drift scan reads
+    # a constant-key subscript assignment in this module as a CLI egress
+    # key, and these are environment names for a child process, not keys of
+    # anything this tool prints. Classifying them as output keys to satisfy
+    # a lexical scan would weaken the schema that scan exists to guard.
+    safepath, pythonpath = "PYTHONSAFEPATH", "PYTHONPATH"
+    env = dict(os.environ)
+    ran_via_shim = env.pop(env_var("SHIM"), None)
+    stash_safe = env.pop(env_var("CALLER_PYTHONSAFEPATH"), None)
+    stash_path = env.pop(env_var("CALLER_PYTHONPATH"), None)
+    if ran_via_shim:
+        for name, stashed in ((safepath, stash_safe),
+                              (pythonpath, stash_path)):
+            if stashed is None:
+                env.pop(name, None)
+            else:
+                env[name] = stashed
+        return env
+    env.pop(safepath, None)
+    # Round-1 F1: only components EXACTLY equal to the tool root are
+    # removed; everything else keeps its value and its ordering — empty
+    # components included, because an empty PYTHONPATH component is not
+    # inert filler, it is the current working directory. The earlier
+    # truthiness filter (`if p and ...`) deleted them, which could recreate
+    # in the fallback the very gate-only import failure this function
+    # exists to end. An untouched value is not split and rejoined at all;
+    # a value that was nothing but the tool root becomes unset, since no
+    # component of the caller's remains to carry.
+    own_root = str(Path(__file__).resolve().parent.parent)
+    if pythonpath in env:
+        parts = env[pythonpath].split(os.pathsep)
+        if own_root in parts:
+            kept = [p for p in parts if p != own_root]
+            if kept:
+                env[pythonpath] = os.pathsep.join(kept)
+            else:
+                env.pop(pythonpath)
+    return env
+
+
 def _git(repo_root: Path, *args: str) -> str | None:
     try:
         out = subprocess.run(
             ["git", "-C", str(repo_root), *args],
             capture_output=True, text=True, timeout=30,
+            # RVW-T21 D2: `status` consults a configured core.fsmonitor
+            # hook, and any of these reads may fire one on a repository
+            # that has them; the caller's environment is the only one a
+            # repository's own script can be expected to run in.
+            env=caller_env(),
         )
     except OSError:
         return None

@@ -227,6 +227,22 @@ the same repair the author did not take: make the coverage claim match the
 enforced domain. Under this bound, narrowing answers them completely, and
 nothing has to be built.
 
+The second of those has since been taken, and the round it took is worth
+recording because it went the other way first. Asked again about the same
+claim, the author widened the mechanism instead — matching a callee that
+did not resolve locally against the union of every module's derived
+runners — and the next review showed that the widened axis failed in both
+directions at once: an ordinary alias refactor escaped it, and an
+unrelated method sharing a runner's name was admitted as a read. Neither
+end could be repaired without resolving import bindings, which would have
+been the fourth derived mechanism in one lineage, each of the previous
+three having become the next round's subject. So the widening was removed
+and the claim was narrowed to the module-local question the scan actually
+decides, with the excluded spellings named in the anchor and pinned by
+controls. That is the shape of the cost: narrowing is cheap in code and
+expensive in honesty, because what it deletes is a promise someone was
+entitled to read.
+
 The cost is that an author may declare a domain narrow enough to be
 trivially covered, leaving a real defect outside it unraised. That is
 close to the falsifier this clause was given when it was written: a domain
@@ -302,7 +318,12 @@ Evidence, Why, Required outcome and FALSIFICATION. Optional structured
 is **single-valued**: the first statement is the value, a repeat is a
 validation error, and a repeat's text is folded into nothing — so a second,
 empty `FALSIFICATION:` can neither erase the named test nor let an
-acceptance be recorded without a run of it.
+acceptance be recorded without a run of it. A FALSIFICATION test is anchored
+in the reviewed tree wherever the defect admits it; where the defect
+genuinely lives in a mutable artifact outside the tree — a PR body, an
+issue, a dashboard — the finding says so, so a later `cannot_execute` reads
+as the anticipated outcome of a stated dependency rather than an author
+evasion (§3.3a, the `unverifiable` breaker) (RVW-T21 D3).
 
 The author answers with a **third envelope**, the disposition, machine-emitted
 from a JSON file of the author's judgment: **exactly one disposition per

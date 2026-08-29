@@ -1,4 +1,4 @@
-"""The gate environment is the caller's, not the shim's.
+"""The CHILD environment is the caller's, not the shim's — gates and git alike.
 
 Found on the first per-project onboarding (2026-08-19): the bin/
 shim exports PYTHONSAFEPATH=1 and PYTHONPATH=<tool root> to harden the
@@ -15,12 +15,27 @@ emitter, exits 1 before the fix and must exit 0 after; and a PYTHONPATH the
 caller genuinely set must reach the gate unchanged. Mutation: removing the
 restore in `_caller_env` sends TestGateSeesCallerEnvironment red.
 
+RVW-T21 D2 (2026-08-29) widened the subject from gates to every child
+process the tool starts. A repository's git HOOKS are the repository's own
+code in the same trust position as a gate — `commit -a` runs pre-commit and
+commit-msg, `push` runs pre-push — and only `run_gates` passed the caller's
+environment, so a `beos` pre-push hook importing a sibling module died of
+the leaked PYTHONSAFEPATH and refused a handoff that the same push in a
+clean environment completed. FALSIFICATION: each of the six git doors is
+driven with a polluted ambient environment and the env it hands to
+`subprocess.run` inspected (`TestEveryGitDoorGetsTheCallerEnvironment`),
+and a real hook of exactly the pilot's shape runs through `emit._git` in a
+scratch repository (`TestARealHookRunsInTheCallerEnvironment`). Mutation:
+dropping `env=caller_env()` from any one door sends that door's test red.
+
 These tests run real subprocess gates in a temp git repository of their
 own, so they hold in the workbench and in an extracted candidate alike.
 """
 import dataclasses
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,7 +43,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from review import TOOL_NAME, config, emit, env_var
+from review import TOOL_NAME, config, emit, env_var, transport
 from review.tests.util import REPO_ROOT
 
 CFG = config.load(REPO_ROOT)
@@ -333,6 +348,226 @@ class TestShimProtocol(_GateHarness):
                         self.assertIsNone(seen[STASH_SAFE])
                         self.assertIsNone(seen[STASH_PATH])
                         self.assertEqual(seen[IN_GATE], "1")
+
+
+class _EnvRecorder:
+    """Stands in for `subprocess.run`, keeping the env each call was given.
+
+    It never executes anything: the question here is what the door HANDS to
+    the operating system, which is decided before git ever starts. The
+    return value is shaped by the `text` keyword the door itself passed, so
+    each door's own decoding path still runs.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, *a, **kw):
+        self.calls.append({"argv": list(argv), "env": kw.get("env")})
+        empty = "" if kw.get("text") else b""
+        return subprocess.CompletedProcess(argv, 0, empty, empty)
+
+
+class TestEveryGitDoorGetsTheCallerEnvironment(unittest.TestCase):
+    """RVW-T21 D2: all six git doors, not just the gate runner.
+
+    The doors are the only mechanism — no `os.system`, no `Popen`, no
+    `check_output` anywhere in the package — so covering each one covers
+    `commit`, `push`, `fetch`, `status` and every future subcommand.
+
+    FALSIFICATION: with PYTHONSAFEPATH=1 and the tool root on PYTHONPATH in
+    the ambient environment and no shim stash (the plain `python3 -m review`
+    shape, where the documented approximation applies), the env handed to
+    `subprocess.run` must carry no PYTHONSAFEPATH and no tool root, while
+    the caller's own PYTHONPATH component survives untouched. MUTATION:
+    remove `env=caller_env()` from one door and that door's test fails with
+    `env=None` — the inheriting state, which is the defect.
+    """
+
+    #: A component the caller genuinely set: it must survive, or the fix
+    #: would be "clear the environment", which is a different bug.
+    KEPT = "/kept-by-the-caller"
+
+    def setUp(self):
+        self.repo = REPO_ROOT           # never read: nothing is executed
+        self.cfg = dataclasses.replace(CFG, repo_root=self.repo)
+        self.polluted = {"PYTHONSAFEPATH": "1",
+                         "PYTHONPATH": f"{_tool_root()}{os.pathsep}"
+                                       f"{self.KEPT}"}
+
+    def env_handed_to_git(self, door) -> dict:
+        rec = _EnvRecorder()
+        base = {k: v for k, v in os.environ.items()
+                if k not in (SHIM, STASH_SAFE, STASH_PATH, IN_GATE,
+                             "PYTHONSAFEPATH", "PYTHONPATH")}
+        with unittest.mock.patch.dict(os.environ,
+                                      {**base, **self.polluted}, clear=True):
+            with unittest.mock.patch("subprocess.run", rec):
+                door()
+        self.assertEqual(len(rec.calls), 1,
+                         "the door did not reach subprocess.run exactly once")
+        return rec.calls[0]["env"]
+
+    def assert_sanitised(self, door):
+        env = self.env_handed_to_git(door)
+        self.assertIsNotNone(
+            env, "no env was passed, so the git child INHERITS the shim's "
+                 "hardened environment — this is the defect")
+        self.assertNotIn("PYTHONSAFEPATH", env)
+        self.assertEqual(env.get("PYTHONPATH"), self.KEPT)
+        # The stash protocol's own variables are never a child's business.
+        for name in (SHIM, STASH_SAFE, STASH_PATH):
+            self.assertNotIn(name, env)
+
+    def test_emit_git(self):
+        self.assert_sanitised(
+            lambda: emit._git(self.repo, "rev-parse", "HEAD"))
+
+    def test_emit_git_bytes(self):
+        self.assert_sanitised(
+            lambda: emit._git_bytes(self.repo, "show", "HEAD:review.toml"))
+
+    def test_emit_is_ancestor(self):
+        self.assert_sanitised(
+            lambda: emit._is_ancestor(self.repo, "HEAD~1", "HEAD"))
+
+    def test_config_git(self):
+        self.assert_sanitised(
+            lambda: config._git(self.repo, "rev-parse", "--show-toplevel"))
+
+    def test_transport_git(self):
+        self.assert_sanitised(
+            lambda: transport._git(self.repo, "rev-parse", "HEAD"))
+
+    def test_transport_run_bytes(self):
+        self.assert_sanitised(
+            lambda: transport.run_bytes(self.cfg, None, "show",
+                                        "HEAD:review.toml"))
+
+    def test_no_git_door_carries_the_gate_reentrancy_marker(self):
+        """The marker stays where it is: added by `run_gates`, nowhere else.
+
+        A hook may legitimately run a loupe READ verb; if a git subprocess
+        carried IN_GATE_RUN, that nested invocation would see itself as
+        running inside a gate execution and record its own gates as not
+        run. FALSIFICATION: add the marker to `caller_env` and this fails.
+        """
+        doors = {
+            "emit._git": lambda: emit._git(self.repo, "rev-parse", "HEAD"),
+            "emit._git_bytes": lambda: emit._git_bytes(self.repo, "show",
+                                                       "HEAD:review.toml"),
+            "emit._is_ancestor": lambda: emit._is_ancestor(self.repo, "a",
+                                                           "b"),
+            "config._git": lambda: config._git(self.repo, "rev-parse",
+                                               "--show-toplevel"),
+            "transport._git": lambda: transport._git(self.repo, "rev-parse",
+                                                     "HEAD"),
+            "transport.run_bytes": lambda: transport.run_bytes(
+                self.cfg, None, "show", "HEAD:review.toml"),
+        }
+        for name, door in doors.items():
+            with self.subTest(door=name):
+                env = self.env_handed_to_git(door)
+                self.assertIsNotNone(env, "no env was passed at all")
+                self.assertNotIn(IN_GATE, env)
+
+    def test_one_authority_not_a_copy(self):
+        """`emit._caller_env` is the same object as `config.caller_env`.
+
+        The helper now has three consumers. Two implementations that agree
+        today is exactly the drift this repository keeps paying for, so the
+        backward-compatible name is an alias and this says so.
+        """
+        self.assertIs(emit._caller_env, config.caller_env)
+
+
+class TestARealHookRunsInTheCallerEnvironment(unittest.TestCase):
+    """End to end: a real git hook, in a real scratch repository.
+
+    RVW-T21 D2's own reproducer, reduced to what a suite can run. The
+    `beos` pre-push hook imported a sibling module and died under
+    PYTHONSAFEPATH; a pre-commit hook of the same shape is the same defect
+    on the same handoff path (`emit._git(repo, "commit", "-a", ...)`) with
+    no remote to reach. MUTATION: drop `env=caller_env()` from `emit._git`
+    and this fails — the hook exits 1, git returns non-zero, and the door
+    raises `a git subprocess failed`.
+    """
+
+    def setUp(self):
+        try:
+            self.tmp = Path(tempfile.mkdtemp(prefix="hook-env-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        for args in (("init", "-q", "-b", "main"),
+                     ("config", "user.email", "suite@example.invalid"),
+                     ("config", "user.name", "suite"),
+                     ("config", "commit.gpgsign", "false")):
+            subprocess.run(["git", "-C", str(self.repo), *args], check=True,
+                           capture_output=True, timeout=60)
+        (self.repo / "f.txt").write_text("one\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "f.txt"],
+                       check=True, capture_output=True, timeout=60)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "-m",
+                        "base"], check=True, capture_output=True, timeout=60)
+
+    def install_hook(self, name: str):
+        """The pilot falsification's gate, as a hook: exit 1 when the
+        shim's hardening reached this process."""
+        hook = self.repo / ".git" / "hooks" / name
+        hook.write_text(
+            f"#!{sys.executable}\n"
+            "import os, sys\n"
+            "sys.exit(1 if os.environ.get('PYTHONSAFEPATH') or "
+            f"{_tool_root()!r} in os.environ.get('PYTHONPATH', '') else 0)\n",
+            encoding="utf-8")
+        hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP
+                   | stat.S_IXOTH)
+
+    def polluted(self):
+        """The post-shim ambient state, without the stash: what the caller
+        of a `python3 -m review` invocation leaves behind, and the state
+        the hook must never see."""
+        base = {k: v for k, v in os.environ.items()
+                if k not in (SHIM, STASH_SAFE, STASH_PATH, IN_GATE,
+                             "PYTHONSAFEPATH", "PYTHONPATH")}
+        return unittest.mock.patch.dict(
+            os.environ,
+            {**base, "PYTHONSAFEPATH": "1", "PYTHONPATH": _tool_root()},
+            clear=True)
+
+    def test_the_hook_the_pilot_reported_no_longer_blocks_a_commit(self):
+        self.install_hook("pre-commit")
+        (self.repo / "f.txt").write_text("two\n", encoding="utf-8")
+        with self.polluted():
+            emit._git(self.repo, "commit", "-a", "-m", "hooked")
+        subject = subprocess.run(
+            ["git", "-C", str(self.repo), "log", "-1", "--format=%s"],
+            capture_output=True, text=True, check=True, timeout=60)
+        self.assertEqual(subject.stdout.strip(), "hooked")
+
+    def test_the_control_a_hook_that_sees_the_hardening_does_refuse(self):
+        """The falsification is not passing because the hook is inert: the
+        SAME hook, handed the hardened environment, blocks the commit."""
+        self.install_hook("pre-commit")
+        (self.repo / "f.txt").write_text("three\n", encoding="utf-8")
+        with self.polluted():
+            with self.assertRaises(RuntimeError):
+                _commit_inheriting_the_ambient_environment(self.repo)
+
+
+def _commit_inheriting_the_ambient_environment(repo: Path):
+    """`emit._git`'s pre-fix body, verbatim in the one respect under test:
+    no `env`, so the child inherits. Kept here rather than mocked, because
+    a control that shares the fixed code cannot fail (RVW-T21 D2)."""
+    out = subprocess.run(["git", "-C", str(repo), "commit", "-a", "-m",
+                          "hooked"], capture_output=True, text=True,
+                         timeout=120)
+    if out.returncode != 0:
+        raise RuntimeError(f"a `git` subprocess failed: {out.stderr.strip()}")
+    return out.stdout.strip()
 
 
 if __name__ == "__main__":

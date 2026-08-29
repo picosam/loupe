@@ -3783,6 +3783,165 @@ class TestBlockedTakeRendersItsItemsToAHuman(unittest.TestCase):
 
 
 
+#: The finite liveness EFFECTS, and the whole of what an effect may be.
+#:
+#: RVW-T19 round 2 F3. Round 1 made the table's evidence cell exact against
+#: the decorator, which closed drift between the two documents and closed
+#: nothing about whether either described the measurement. The effect was
+#: free-form prose read only by the renderer: `@proves_live("checkout",
+#: "does not convert anything")` rendered a cell that compared equal while
+#: the EOL row went on measuring CRLF, so the table could still contradict
+#: what its test does.
+#:
+#: So an effect is no longer a description of the assertion. It IS the
+#: assertion. Each name maps to the surfaces it may legally describe and to
+#: the PREDICATE that `assert_live` runs over what the row observed — one
+#: definition, rendered into the table and executed by the test, with no
+#: second statement to keep in step. Declaring an effect outside this set
+#: raises at decoration time, so a free-form effect cannot reach the table;
+#: declaring one whose predicate does not hold fails the owning test.
+#:
+#: The surface set per effect is what closes the last swap: two effects may
+#: share an implementation (`converts` and `redirects the read` are both
+#: "the marker appears"), and without it one could be stamped onto the
+#: other's row and stay green while saying something false about it.
+LIVENESS_EFFECTS = {
+    "converts": (
+        frozenset({"show --textconv", "log -p", "checkout"}),
+        lambda seen, mark: mark in seen),
+    "writes CRLF": (
+        frozenset({"checkout"}),
+        lambda seen, _mark: b"\r\n" in seen),
+    "writes UTF-16LE": (
+        frozenset({"checkout"}),
+        lambda seen, _mark: b"[\x00r\x00o\x00l\x00e\x00s\x00" in seen),
+    "redirects the read": (
+        frozenset({"replace"}),
+        lambda seen, mark: mark in seen),
+}
+
+
+def assert_live(case, seen: bytes, mark: bytes) -> bytes:
+    """Assert this row's mechanism is live BY RUNNING the predicate its own
+    `@proves_live` effect names.
+
+    This is the whole of F3's repair. Before it, every row asserted its
+    liveness by hand and separately declared prose about it; the prose was
+    checked against the table and against nothing else. Now the declaration
+    performs the assertion, so a stamp that misdescribes the measurement
+    cannot be green: `writes CRLF` on a row whose surface produces no CRLF
+    fails here, at the row, before the table is ever read.
+    """
+    fn = getattr(type(case), case._testMethodName)
+    surfaces, predicate = LIVENESS_EFFECTS[fn.liveness_effect]
+    case.assertIn(
+        fn.liveness_surface, surfaces,
+        f"{case._testMethodName} declares the effect "
+        f"{fn.liveness_effect!r} at the surface {fn.liveness_surface!r}, "
+        f"which is not one that effect may describe")
+    case.assertTrue(
+        predicate(seen, mark),
+        f"{case._testMethodName} declares that {fn.liveness_surface!r} "
+        f"{fn.liveness_effect}, and it does not — so this row's negative "
+        f"proves nothing and the table's cell is false")
+    return seen
+
+
+def proves_live(surface, effect=None):
+    """Stamp the SURFACE at which a conversion row is proved live.
+
+    RVW-T19, from lineage 12 round 5 F2. The conversion table in
+    `design/lineage-12-domain-partition.md` states, per row and in prose,
+    where its mechanism is proved live. Nothing compared that cell to
+    anything: the reference check asserted only that the named test
+    EXISTS, so mutating the evidence cell alone — leaving mechanism and
+    test name intact — left every test green.
+
+    The surface is now declared here, beside the test, and the
+    declaration is LOAD-BEARING: `_live_at` builds the liveness
+    observation from it, so a wrong declaration fails this test. The
+    workbench check then requires the row's cell to name the declaration.
+    Drift fails on one side or the other, and neither side is prose.
+
+    `None` declares a row that proves no conversion live — the paired
+    control — and the check requires its cell to say so.
+
+    RVW-T19 round 2, from round 1's F3. The stamp carries the EFFECT as
+    well, because the surface alone was not enough to be the authority for
+    what the row says. The workbench check compared by containment —
+    `assertIn(surface, evidence)` — so a cell mutated to `yes — no
+    checkout occurs` still contained `checkout` and stayed green while
+    contradicting the observation it claims. A token found inside a
+    sentence proves the token is there, never that the sentence agrees. So
+    the cell is RENDERED from the declaration by `evidence_cell` below and
+    compared exactly: the prose has one source, and drift is not a thing
+    the table can express.
+    """
+    def stamp(fn):
+        # Decoration time, not test time: a free-form effect must not be
+        # able to REACH the table, and an unstamped effect on a live
+        # surface would leave the cell describing nothing. Raising here
+        # fails collection, which is louder than one red row.
+        if surface is None:
+            if effect is not None:
+                raise ValueError(
+                    f"{fn.__name__} declares that it proves no conversion "
+                    f"live and also declares the effect {effect!r}")
+        elif effect not in LIVENESS_EFFECTS:
+            raise ValueError(
+                f"{fn.__name__} declares the effect {effect!r}, which is "
+                f"not one of {sorted(LIVENESS_EFFECTS)} — an effect is a "
+                f"predicate this row runs, never a sentence about it")
+        elif surface not in LIVENESS_EFFECTS[effect][0]:
+            raise ValueError(
+                f"{fn.__name__} declares the effect {effect!r} at the "
+                f"surface {surface!r}, which is not one that effect may "
+                f"describe")
+        fn.liveness_surface = surface
+        fn.liveness_effect = effect
+        return fn
+    return stamp
+
+
+def evidence_cell(fn) -> str:
+    """The conversion table's evidence cell for a test, RENDERED from the
+    stamp that test acts on.
+
+    One value, two consumers: `_live_at` builds the liveness observation
+    from the surface, and the workbench check requires the table's cell to
+    be exactly this string. A wrong surface therefore fails the row's own
+    test, and any prose the table carries that this does not produce fails
+    the reference check — including a sentence that contains the surface
+    and denies it, which is the whole of round 1's F3.
+
+    Readable by construction rather than by permission: the sentence a
+    reader sees is the sentence generated, so keeping it readable is a
+    matter of what is declared here, not of remembering to update prose.
+
+    Round 2's F3 closed the half this did not. Exact equality made the
+    table and the decorator agree; it left the effect free-form prose that
+    only this function read, so `("checkout", "does not convert
+    anything")` rendered a cell that compared equal while the row went on
+    measuring CRLF. The effect is now a key into `LIVENESS_EFFECTS` and
+    the predicate there is what `assert_live` runs, so both halves of this
+    string are executed by the test that owns them: a false surface fails
+    through `_live_at`, and a false effect fails through its predicate.
+    """
+    surface = fn.liveness_surface
+    if surface is None:
+        if fn.liveness_effect is not None:
+            raise AssertionError(
+                f"{fn.__name__} declares that it proves no conversion "
+                f"live and also declares an effect")
+        return "n/a"
+    if not fn.liveness_effect:
+        raise AssertionError(
+            f"{fn.__name__} evidences a row of the conversion table and "
+            f"declares a surface with no effect, so its cell cannot be "
+            f"rendered and the row would be checked against nothing")
+    return f"yes — `{surface}` {fn.liveness_effect}"
+
+
 class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
     """Round 6 F1, end to end on real repositories.
 
@@ -3873,9 +4032,15 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         self.assertIn("commits review.toml", exc.remedy)
         self.assertIn("Nothing has been pushed or emitted", exc.remedy)
 
-    def _plant_blob_replacement(self):
+    def _plant_blob_replacement(self, via="replace"):
         """Commit rules saying `gemini`, then install a replacement BLOB
-        saying `claude`. Returns (sha, original_bytes)."""
+        saying `claude`. Returns (sha, original_bytes).
+
+        `via` is the git subcommand that makes the mechanism live. The row
+        of the conversion table this evidences passes its own declared
+        surface, so a declaration that does not name what plants the
+        replacement fails here rather than sailing into the table
+        (RVW-T19)."""
         committed = self.toml.replace(
             'permitted_authors = ["claude", "codex"]',
             'permitted_authors = ["gemini"]')
@@ -3885,9 +4050,10 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         original = self._git("rev-parse", f"{sha}:review.toml")
         replacement = self._git("hash-object", "-w", "--stdin",
                                 input_text=self.toml)
-        self._git("replace", original, replacement)
+        self._git(via, original, replacement)
         return sha, committed
 
+    @proves_live("replace", "redirects the read")
     def test_a_replacement_blob_cannot_change_the_committed_authority(self):
         """Round 1 F1 (lineage 12), the Blocker.
 
@@ -3903,16 +4069,15 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         the planted replacement is live and that the flag is what stops it,
         so this test can fail.
         """
-        sha, committed = self._plant_blob_replacement()
+        sha, committed = self._plant_blob_replacement(
+            via=self._declared_surface())
         governing, origin = transport.resolve_authority(self._cfg(), sha)
         self.assertEqual(origin, transport.AUTHORITY_TARGET)
         self.assertEqual(governing.roles["permitted_authors"], ["gemini"],
                          "the resolver returned the REPLACEMENT's rules")
         # The mutation: replacement processing on.
         leaked = transport._git(self.repo, "show", f"{sha}:review.toml")
-        self.assertIn("claude", leaked,
-                      "the planted replacement is not live, so the control "
-                      "above proves nothing")
+        assert_live(self, leaked.encode(), b"claude")
         self.assertNotIn("gemini", leaked.split("permitted_authors")[1][:40])
 
     def test_a_replacement_commit_cannot_change_the_committed_authority(self):
@@ -4003,6 +4168,43 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         self._git("commit", "-qm", "declare the conversion")
         return self._git("rev-parse", "HEAD")
 
+    def _declared_surface(self):
+        """The surface the RUNNING test declares, read off its own stamp.
+
+        Read rather than passed, so the declaration the workbench check
+        compares against the table is the same value this test acts on.
+        """
+        fn = getattr(type(self), self._testMethodName)
+        try:
+            return fn.liveness_surface
+        except AttributeError:
+            raise AssertionError(
+                f"{self._testMethodName} evidences a row of the conversion "
+                f"table and declares no liveness surface") from None
+
+    def _live_at(self, sha):
+        """The bytes the DECLARED surface produces, which is where this
+        row's mechanism is supposed to fire.
+
+        Every conversion row's liveness assertion runs through here, so a
+        declaration that does not match what the row measures fails the
+        row rather than passing quietly into the table.
+        """
+        surface = self._declared_surface()
+        if surface == "show --textconv":
+            return self._git("show", "--textconv",
+                             f"{sha}:review.toml").encode()
+        if surface == "log -p":
+            return self._git("log", "-p", "-1", "--format=", "--",
+                             "review.toml").encode()
+        if surface == "checkout":
+            (self.repo / "review.toml").unlink()
+            self._git("checkout", "--", "review.toml")
+            return (self.repo / "review.toml").read_bytes()
+        raise AssertionError(
+            f"{self._testMethodName} declares the liveness surface "
+            f"{surface!r}, which no observation here can produce")
+
     def _blob(self, sha):
         """The object's own bytes.
 
@@ -4015,17 +4217,17 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         return transport.run_bytes(cfg, None, "show",
                                    f"{sha}:review.toml", no_replace=True)
 
+    @proves_live("show --textconv", "converts")
     def test_textconv_is_live_and_does_not_reach_the_read(self):
         """MUTATION: remove `diff.x.textconv` and the liveness assertion
         fails; add `--textconv` to the read and the negative fails."""
         sha = self._conversion_repo(
             "review.toml diff=x\n",
             diff__x__textconv=f"sed s/claude/{self.MARK}/")
-        self.assertIn(
-            self.MARK, self._git("show", "--textconv", f"{sha}:review.toml"),
-            "textconv is not live at the surface that opts into it")
+        assert_live(self, self._live_at(sha), self.MARK.encode())
         self.assertNotIn(self.MARK.encode(), self._blob(sha))
 
+    @proves_live("log -p", "converts")
     def test_log_p_converts_and_the_read_does_not(self):
         """The `log -p` claim, EXERCISED rather than asserted in prose:
         textconv is on by default in the log/diff family, which is what
@@ -4034,13 +4236,11 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         sha = self._conversion_repo(
             "review.toml diff=x\n",
             diff__x__textconv=f"sed s/claude/{self.MARK}/")
-        patch = self._git("log", "-p", "-1", "--format=", "--",
-                          "review.toml")
-        self.assertIn(self.MARK, patch,
-                      "textconv is not applied where it IS the default, so "
-                      "this row proves nothing about the blob form")
+        patch = assert_live(self, self._live_at(sha), self.MARK.encode())
         self.assertNotIn(self.MARK.encode(), self._blob(sha))
+        self.assertTrue(patch, "the patch is empty")
 
+    @proves_live("checkout", "converts")
     def test_smudge_is_live_and_does_not_reach_the_read(self):
         """MUTATION: remove `filter.sm.smudge` and the checkout control
         fails."""
@@ -4048,30 +4248,22 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
             "review.toml filter=sm\n",
             filter__sm__smudge=f"sed s/claude/{self.MARK}/",
             filter__sm__clean="cat")
-        (self.repo / "review.toml").unlink()
-        self._git("checkout", "--", "review.toml")
-        self.assertIn(
-            self.MARK,
-            (self.repo / "review.toml").read_text(encoding="utf-8"),
-            "the smudge filter is not live on checkout")
+        assert_live(self, self._live_at(sha), self.MARK.encode())
         self.assertNotIn(self.MARK.encode(), self._blob(sha))
 
+    @proves_live("checkout", "writes CRLF")
     def test_eol_conversion_is_live_and_does_not_reach_the_read(self):
         """Proved from the WORKTREE bytes, which is what the first cut
         missed: the committed bytes are LF, so asserting the read has no
         CRLF could not fail. The row now asserts the checkout DOES produce
         CRLF and the read does not."""
         sha = self._conversion_repo("review.toml text eol=crlf\n")
-        (self.repo / "review.toml").unlink()
-        self._git("checkout", "--", "review.toml")
-        worktree = (self.repo / "review.toml").read_bytes()
-        self.assertIn(b"\r\n", worktree,
-                      "eol conversion is not live on checkout, so the "
-                      "negative below proves nothing")
+        assert_live(self, self._live_at(sha), self.MARK.encode())
         blob = self._blob(sha)
         self.assertNotIn(b"\r\n", blob)
         self.assertIn(b"\n", blob)
 
+    @proves_live("checkout", "writes UTF-16LE")
     def test_working_tree_encoding_is_live_and_does_not_reach_the_read(self):
         """`working-tree-encoding` re-encodes on checkout. UTF-16LE is used
         rather than UTF-16 because git requires a BOM for the latter and
@@ -4079,16 +4271,13 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         about."""
         sha = self._conversion_repo(
             "review.toml working-tree-encoding=UTF-16LE\n")
-        (self.repo / "review.toml").unlink()
-        self._git("checkout", "--", "review.toml")
-        worktree = (self.repo / "review.toml").read_bytes()
-        self.assertIn(b"[\x00r\x00o\x00l\x00e\x00s\x00", worktree,
-                      "working-tree-encoding is not live on checkout")
+        assert_live(self, self._live_at(sha), self.MARK.encode())
         blob = self._blob(sha)
         self.assertIn(b"[roles]", blob,
                       "the read was re-encoded")
         self.assertNotIn(b"[\x00r\x00", blob)
 
+    @proves_live(None)
     def test_no_conversion_is_the_paired_control(self):
         """The control every row above needs: with no attributes and no
         drivers, the read returns the same bytes and the authority

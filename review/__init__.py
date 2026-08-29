@@ -115,7 +115,29 @@ TOOL_NAME = "loupe"
 #     the emitting checkout's. Identical where those agree, which is the
 #     ordinary case; different exactly where the two ends would previously
 #     have disagreed without saying so.
-TOOL_VERSION = "0.10.0"
+#
+# 0.11.0 — the RVW-T21 defect fixes from the first late onboarding pass.
+# Minor, because child-process and CLI behaviour move:
+#   - every git subprocess now runs in the CALLER's environment (D2). The
+#     0.10.0 gate-environment fix covered gates only; a repository's git
+#     hooks — pre-push, the commit hooks, reference-transaction, a
+#     configured fsmonitor — are the repository's own code in the same
+#     trust position, and they inherited the shim's PYTHONSAFEPATH /
+#     PYTHONPATH hardening. A real pre-push hook refused a real handoff.
+#     `config.caller_env` is the one authority; every `_git`-family door
+#     passes it; the gate re-entrancy marker still reaches gates only.
+#   - `render-adapters --check-install` / `--install` default their source
+#     to the installed package's own adapters/ sibling instead of the cwd
+#     repository's (D1) — the modes are machine-global and the old default
+#     existed only in the tool's own checkout — refusing with a `--dir`
+#     remedy when no such directory exists (a wheel install); and a
+#     source-side failure now reports the SOURCE path under its own
+#     statuses (`source_absent`, `source_unreadable`) instead of
+#     misattributing the healthy installed target.
+#   - the reviewer procedure gains the falsification-anchoring rule (D3):
+#     anchor in the reviewed tree wherever the defect admits it, and name
+#     an external mutable dependency in the finding when it does not.
+TOOL_VERSION = "0.11.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never
@@ -244,6 +266,7 @@ IDENTITY_EXCLUDED = {
     "adapters/codex/SKILL.md": ADAPTERS,
     "adapters/instructions-block.md": ADAPTERS,
     "docs/design.md": DOCS,
+    "docs/onboarding.md": DOCS,
     "review.toml": EXAMPLE_CONFIG,
     "review/tests/__init__.py": TESTS,
     "review/tests/fixtures/legacy-verdict.md": TESTS,

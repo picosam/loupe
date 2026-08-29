@@ -25,7 +25,7 @@ from typing import Mapping
 
 from . import (TOOL_NAME, TOOL_VERSION, env_var, paths, refs,
                shape_identity, tool_identity, vocab, wire)
-from .config import Config
+from .config import Config, caller_env
 from .digest import sha256_text
 from .ledger import Ledger, render_report_md
 
@@ -52,10 +52,20 @@ def _git(repo_root: Path, *args: str, no_replace: bool = False) -> str:
     # normalised HERE, at the one place that runs git, rather than at each
     # caller: a reader that can fail in a way its callers cannot name is the
     # defect, not the individual catch that missed it.
+    #
+    # RVW-T21 D2: the environment is the CALLER's, not the shim's. This
+    # runner carries `commit -a` (pre-commit, prepare-commit-msg,
+    # commit-msg, post-commit) and `push` (pre-push) on the handoff path,
+    # and every ref update can fire reference-transaction. A hook is the
+    # repository's own code, the same trust position as a gate, and a real
+    # pre-push hook importing a sibling module died of the leaked
+    # PYTHONSAFEPATH on 2026-08-29. Applied at the door, so it covers every
+    # subcommand this runner will ever carry rather than the ones it does.
     try:
         out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
                               "-C", str(repo_root), *args],
-                             capture_output=True, text=True, timeout=120)
+                             capture_output=True, text=True, timeout=120,
+                             env=caller_env())
     except subprocess.SubprocessError as exc:
         raise RuntimeError(
             f"a `git` subprocess did not complete: "
@@ -81,9 +91,14 @@ def _git_bytes(repo_root: Path, *args: str,
 
     `no_replace` carries round 2 F2's guarantee: a digest that describes
     the target's bytes must be taken from the ORIGINAL object graph."""
+    # RVW-T21 D2: the caller's environment at every git door, uniformly.
+    # This one reads objects and fires no hook today; the rule is the
+    # door's, not the subcommand's, so a future caller cannot reintroduce
+    # the leak by passing a different argv here.
     out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
                           "-C", str(repo_root), *args],
-                         capture_output=True, timeout=120)
+                         capture_output=True, timeout=120,
+                         env=caller_env())
     if out.returncode != 0:
         raise RuntimeError(
             f"a `git` subprocess failed: "
@@ -94,10 +109,13 @@ def _git_bytes(repo_root: Path, *args: str,
 
 def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
     # Round 3 F1: ancestry is a statement about the object graph.
+    # RVW-T21 D2: and it is read in the caller's environment, like every
+    # other git door here.
     out = subprocess.run(["git", NO_REPLACE, "-C", str(repo_root),
                           "merge-base", "--is-ancestor", ancestor,
                           descendant],
-                         capture_output=True, text=True, timeout=60)
+                         capture_output=True, text=True, timeout=60,
+                         env=caller_env())
     return out.returncode == 0
 
 
@@ -397,67 +415,14 @@ def _retain_output(cfg: Config, executed_sha: str, gate_id: str,
     return record
 
 
-def _caller_env() -> dict:
-    """The environment the CALLER of the tool had, for gate subprocesses.
-
-    Found on the first per-project onboarding (2026-08-19): the bin/ shim
-    hardens the tool's own interpreter with PYTHONSAFEPATH=1 and
-    PYTHONPATH=<tool root>, both
-    environment variables, so every gate subprocess inherited them — and
-    twelve of that repo's sixteen gates failed on ModuleNotFoundError under
-    `handoff` while passing by hand. PYTHONSAFEPATH strips the script
-    directory and cwd from sys.path, which is precisely what a repository's
-    ad-hoc check scripts rely on; the leaked PYTHONPATH additionally let any
-    gate import this package by accident. It failed closed (A-FAILED, a
-    refusal), but a manifest that can only attest red for repositories the
-    tool never met is a manifest nobody declares.
-
-    A gate is the REPOSITORY's command and must run in the environment the
-    caller of loupe had, not the one the shim made for the tool. The shim
-    stashes the caller's values (LOUPE_CALLER_PYTHONSAFEPATH /
-    LOUPE_CALLER_PYTHONPATH — presence distinguishes set-to-anything from
-    unset) and marks itself with LOUPE_SHIM; this restores exactly those.
-    Invoked without the shim (python3 -m review) there is no stash and no
-    exact answer, so the best available approximation is applied and named
-    as such: drop PYTHONSAFEPATH, and drop this package's own root from
-    PYTHONPATH, leaving everything else the caller set. The stash and marker
-    variables themselves stay out of the gate environment either way; the
-    re-entrancy marker is added by the caller of this helper.
-    """
-    env = dict(os.environ)
-    ran_via_shim = env.pop(env_var("SHIM"), None)
-    stash_safe = env.pop(env_var("CALLER_PYTHONSAFEPATH"), None)
-    stash_path = env.pop(env_var("CALLER_PYTHONPATH"), None)
-    if ran_via_shim:
-        if stash_safe is None:
-            env.pop("PYTHONSAFEPATH", None)
-        else:
-            env["PYTHONSAFEPATH"] = stash_safe
-        if stash_path is None:
-            env.pop("PYTHONPATH", None)
-        else:
-            env["PYTHONPATH"] = stash_path
-        return env
-    env.pop("PYTHONSAFEPATH", None)
-    # Round-1 F1: only components EXACTLY equal to the tool root are
-    # removed; everything else keeps its value and its ordering — empty
-    # components included, because an empty PYTHONPATH component is not
-    # inert filler, it is the current working directory. The earlier
-    # truthiness filter (`if p and ...`) deleted them, which could recreate
-    # in the fallback the very gate-only import failure this function
-    # exists to end. An untouched value is not split and rejoined at all;
-    # a value that was nothing but the tool root becomes unset, since no
-    # component of the caller's remains to carry.
-    own_root = str(Path(__file__).resolve().parent.parent)
-    if "PYTHONPATH" in env:
-        parts = env["PYTHONPATH"].split(os.pathsep)
-        if own_root in parts:
-            kept = [p for p in parts if p != own_root]
-            if kept:
-                env["PYTHONPATH"] = os.pathsep.join(kept)
-            else:
-                env.pop("PYTHONPATH")
-    return env
+#: The caller-environment helper used to live here, next to its first
+#: consumer. RVW-T21 D2 gave it three consumers — this module, `transport`
+#: and `config` itself, since EVERY git subprocess must run in the caller's
+#: environment and not the shim's — so it moved to `config`, the one module
+#: the other two already import and which imports neither. ONE authority,
+#: never a copy; this name stays because the gate-environment record and
+#: this module's own callers spell it this way.
+_caller_env = caller_env
 
 
 def run_gates(cfg: Config, target_sha: str) -> list[dict]:

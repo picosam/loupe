@@ -27,7 +27,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from . import TOOL_NAME, TOOL_VERSION, paths, vocab
+from . import TOOL_NAME, TOOL_VERSION, installation_root, paths, vocab
 from .digest import sha256_text
 
 ADAPTERS_DIR = "adapters"
@@ -265,7 +265,14 @@ def procedure() -> dict:
          None,
          "Read the diff with the printed command and rule by the declared "
          "taxonomy only. Findings ordered by severity, atomic (one claim per "
-         "ID), each with every required field and a FALSIFICATION. Prior "
+         "ID), each with every required field and a FALSIFICATION. Anchor "
+         "the falsification test in the reviewed tree wherever the defect "
+         "admits it; where the defect genuinely lives in a mutable artifact "
+         "outside the tree — a PR body, an issue, a dashboard — say so in "
+         "the finding itself, so a later `cannot_execute` reads as the "
+         "anticipated outcome of a stated dependency rather than an author "
+         "evasion, and the human deciding the `unverifiable` breaker has "
+         "your own words that the dependency was known. Prior "
          "dispositions are answered under `## closures` by fingerprint. "
          "Material you could not retrieve goes under `## unavailable "
          "references` and forbids a clean verdict."),
@@ -450,6 +457,28 @@ def render_all(directory: Path) -> dict[str, str]:
     return written
 
 
+def machine_global_dir() -> Path:
+    """The `adapters/` sibling of the installed `review` package — the
+    default source for the two MACHINE-GLOBAL modes, `--check-install` and
+    `--install`, when `--dir` is not given (RVW-T21 D1).
+
+    Computed the same way `bin/loupe` computes its own ROOT: from the
+    package's `__file__`, resolved through symlinks
+    (`review.installation_root`). Those two modes ask about machine-global
+    state (`~/.claude/skills/`, `~/.codex/skills/`), not about the
+    repository underfoot, so a cwd-relative default sent the check looking
+    for sources that exist only in the tool's own checkout — failing
+    everywhere else. `render` and `--check` keep the cwd-relative default;
+    they are repo-local generation and gate operations, and in the tool's
+    own repo this path and that one are identical anyway.
+
+    Always returns the candidate path, present or not — existence is the
+    caller's question, not this function's, so it stays a pure path
+    computation a test can call without touching a filesystem.
+    """
+    return installation_root() / ADAPTERS_DIR
+
+
 def install_targets() -> dict:
     """{kind: expanded path} — where each agent actually reads its copy.
 
@@ -482,8 +511,27 @@ def _select(targets: dict | None) -> dict:
 
 
 def check_install(directory: Path, targets: dict | None = None) -> list[dict]:
-    """Per install target: `in_sync`, `stale`, `absent` or `unreadable`,
-    against the rendered file under `directory`.
+    """Per install target, one of six statuses, against the rendered file
+    under `directory`.
+
+    `kind`, `source`, `target` and `status` are common to every row (RVW-T21
+    lineage 15 round 2 F2: an earlier revision of this text claimed
+    source-side and target-side fields were mutually exclusive, which these
+    four being shared by both already contradicts — `status` is what tells
+    the two apart, not field presence). Beyond those four, per status,
+    exactly:
+
+    - `source_absent` — nothing more; no file at `directory / OUTPUTS[kind]`
+    - `source_unreadable` — `error` (the file exists but could not be read)
+    - `absent` — `source_digest` (no file at `target`)
+    - `unreadable` — `source_digest`, `error` (the installed copy exists but
+      could not be read)
+    - `in_sync` / `stale` — `source_digest`, `target_digest`
+
+    `source_digest` and `target_digest` are digests, present on every
+    TARGET-side status (i.e. every status but the two `source_*` ones) once
+    the corresponding file has actually been read; `error` appears only on
+    the two failure statuses that name it above.
 
     `render-adapters --check` guards the TRACKED copies; it says nothing
     about the ones an agent loads, and on 2026-08-19 the installed Claude
@@ -496,11 +544,23 @@ def check_install(directory: Path, targets: dict | None = None) -> list[dict]:
     rows = []
     for kind, target in _select(targets).items():
         source = directory / OUTPUTS[kind]
+        # RVW-T21 D1: a source-side failure must name the SOURCE, with a
+        # status that says which side it is. The old code caught the read
+        # failure and appended a row carrying only "target" and status
+        # "unreadable" — indistinguishable, once rendered, from the
+        # target-side failure below, so the CLI pointed a reader at a
+        # healthy installed file while the actual defect sat in the
+        # rendered source.
+        if not source.is_file():
+            rows.append({"kind": kind, "source": str(source),
+                         "target": str(target), "status": "source_absent"})
+            continue
         try:
             wanted = source.read_text(encoding="utf-8")
         except OSError as exc:
-            rows.append({"kind": kind, "target": str(target),
-                         "status": "unreadable", "error": str(exc)})
+            rows.append({"kind": kind, "source": str(source),
+                         "target": str(target),
+                         "status": "source_unreadable", "error": str(exc)})
             continue
         row = {"kind": kind, "source": str(source), "target": str(target),
                "source_digest": sha256_text(wanted)}
