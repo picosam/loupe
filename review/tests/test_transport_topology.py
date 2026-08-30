@@ -565,7 +565,7 @@ class TestBothRelaysAgreeWithTheRecord(unittest.TestCase):
                 out = brief.relay("/kept/r.md",
                                   wire.parse_request(
                                       request_text(transport_attr=declared)),
-                                  "bytes")
+                                  "bytes\n")
                 self.assertIn(present, out)
                 self.assertNotIn(absent, out)
 
@@ -582,31 +582,34 @@ class TestBothRelaysAgreeWithTheRecord(unittest.TestCase):
     def test_the_verdict_bytes_ride_the_paste_relay_and_only_it(self):
         # Round 3, live: a verdict relayed as loose prose lost its markdown
         # headings to a chat renderer. On a paste round the bytes travel
-        # fenced under the command that consumes them, exactly like the
-        # request leg; on a path round the file is the carrier and no
-        # bytes are printed.
-        bytes_ = "<x-review-verdict>\n## findings\n</x-review-verdict>"
+        # INSIDE the one block, as the stdin of the close command (a
+        # quoted heredoc), exactly like the request leg; on a path round
+        # the file is the carrier and no bytes are printed.
+        bytes_ = "<x-review-verdict>\n## findings\n</x-review-verdict>\n"
         pasted = brief.verdict_relay(self._verdict(), source="/tmp/v.md",
                                      transport="paste", envelope=bytes_)
-        self.assertIn("The verdict, to paste:", pasted)
-        self.assertIn(bytes_, pasted)
+        self.assertIn("<<'", pasted)
+        self.assertIn(bytes_.rstrip("\n"), pasted)
+        self.assertEqual(pasted.count("```"), 2, "one fence carries it all")
         pathed = brief.verdict_relay(self._verdict(), source="/tmp/v.md",
                                      transport="path", envelope=bytes_)
-        self.assertNotIn("The verdict, to paste:", pathed)
+        self.assertNotIn("<<'", pathed)
         self.assertNotIn(bytes_, pathed)
 
-    def test_only_the_paste_round_keeps_a_note(self):
-        """The note survives exactly where it carries an INSTRUCTION: a paste
-        round has to get the verdict bytes into the command. A path round's
-        note restated the block's own heading and is gone (user,
-        2026-08-26)."""
+    def test_no_transport_keeps_a_note(self):
+        """The path round's note went first (user, 2026-08-26: it restated
+        the block's own heading). The paste round's followed (user,
+        2026-08-30): its instruction — get the verdict bytes into the
+        command — is now embodied by the heredoc block itself, so a note
+        would restate what the block does."""
         for declared in vocab.TRANSPORTS:
             relay = brief.verdict_relay(self._verdict(), source="/tmp/v.md",
-                                        transport=declared)
-            if declared == vocab.TRANSPORT_PASTE:
-                self.assertIn("paste the verdict into it", relay)
-            else:
-                self.assertNotIn("the author's to run", relay)
+                                        transport=declared,
+                                        envelope="bytes\n")
+            body = relay.splitlines()[3:-1]
+            self.assertEqual([l for l in body if l.startswith("#")], [],
+                             declared)
+            self.assertNotIn("author's to run", relay, declared)
 
     def test_the_verdict_leg_defaults_when_nobody_says(self):
         self.assertIn("--verdict /tmp/v.md",
@@ -835,10 +838,10 @@ class TestTheLoopEndToEnd(unittest.TestCase):
         self.assertIn("close --verdict -", validated["relay"])
         self.assertNotIn(str(verdict), validated["relay"])
         # Round 3, live: the paste round's relay carries the verdict BYTES
-        # in their own fence — bytes outside a fence are bytes a chat
-        # surface may rewrite, which is how a validated verdict arrived
-        # unreadable.
-        self.assertIn("The verdict, to paste:", validated["relay"])
+        # inside the one fenced block, as the close command's own stdin —
+        # bytes outside a fence are bytes a chat surface may rewrite,
+        # which is how a validated verdict arrived unreadable.
+        self.assertIn("<<'", validated["relay"])
         self.assertIn(verdict.read_text(encoding="utf-8").rstrip("\n"),
                       validated["relay"])
 
@@ -1055,7 +1058,7 @@ class TestTransportDeclarationClosedWorld(unittest.TestCase):
         parsed_paste = wire.parse_request(
             request_text(transport_attr="paste"))
         self.assertIn("take - --as",
-                      brief.relay("/kept/r.md", parsed_paste, "bytes"))
+                      brief.relay("/kept/r.md", parsed_paste, "bytes\n"))
         for recorded in vocab.TRANSPORTS:
             self.assertIn("close --verdict",
                           brief.verdict_relay(

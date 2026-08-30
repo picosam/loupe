@@ -507,6 +507,39 @@ class TestDispositionValidation(unittest.TestCase):
             self.assertIsNotNone(
                 transport.answered_verdict(cfg, self._disposition(), ledger))
 
+    def test_a_kept_verdict_rewritten_to_crlf_is_not_the_recorded_one(self):
+        """Lineage 17 round 5 F1, ruled 2026-08-30: the digest gate above
+        read the kept copy through newline translation, so a CRLF rewrite
+        of the SAME verdict reproduced the recorded digest and retrieval
+        served bytes the record never digested. Raw bytes decide now:
+        every byte-distinct physical form — CRLF, CR, mixed, undecodable —
+        reads as unavailable, and the canonical copy still retrieves."""
+        with self._fixture() as (root, cfg, args, ledger):
+            original, _ = self._record_verdict(cfg, ledger)
+            path = transport.exchange_path(cfg, self.DISPOSITION_ROUND,
+                                           "verdict")
+            # Paired control first: the canonical LF copy retrieves.
+            self.assertIsNotNone(
+                transport.answered_verdict(cfg, self._disposition(), ledger))
+            mutants = (("crlf", original.replace("\n", "\r\n")),
+                       ("cr", original.replace("\n", "\r")),
+                       ("mixed", original.replace("\n", "\r\n", 3)))
+            for name, mutant in mutants:
+                path.write_bytes(mutant.encode("utf-8"))
+                self.assertIsNone(
+                    transport.answered_verdict(cfg, self._disposition(),
+                                               ledger),
+                    f"{name}: a byte-distinct copy was treated as the "
+                    f"recorded verdict")
+            # Undecodable bytes are unavailable too, never a traceback.
+            path.write_bytes(b"\xff" + original.encode("utf-8"))
+            self.assertIsNone(
+                transport.answered_verdict(cfg, self._disposition(), ledger))
+            # And the rule binds the rewrite, not the mechanism.
+            path.write_text(original, encoding="utf-8")
+            self.assertIsNotNone(
+                transport.answered_verdict(cfg, self._disposition(), ledger))
+
     def test_two_verdicts_at_one_round_are_ambiguous_not_guessed(self):
         # The third refusal the required outcome names. One round holding two
         # different verdicts is a corrupt record, and picking either is the
@@ -970,7 +1003,8 @@ class TestJSONSingleValueGrammar(unittest.TestCase):
                            '"must-read.md", "required": true}], '
                            '"references": []}', encoding="utf-8")
             good = Path(tmp) / "good.json"
-            good.write_text('{"objective": "x", "risk": "low"}',
+            good.write_text('{"objective": "x", "risk": "low", '
+                            '"references": [{"path": "review.toml"}]}',
                             encoding="utf-8")
             cfg = dataclasses.replace(CFG, ledger_dir=Path(tmp))
             # The defective claim is judged first: blocked recovery, and the
@@ -1061,7 +1095,15 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
       9. ignore `nonempty` for `objective` alone (round-8 F1);
      10. drop the UnicodeDecodeError conversion (round-8 F2);
      11. restore `Path(path) if path else None` in the CLI (round-8 F3);
-     12. drop the Unicode-scalar check on claim strings (round-8 F4).
+     12. drop the Unicode-scalar check on claim strings (round-8 F4);
+     13. drop the empty-`references` refusal, or drop `references` from
+         `CLAIM_REQUIRED` (0.11.3: a supplied claim must hand the reviewer
+         at least one reference).
+
+    Every refused body below is valid EXCEPT for the one defect under
+    test — in particular it carries a valid `references` entry unless the
+    case is about references themselves — so each case keeps falsifying
+    exactly its own mutation now that `references` is required.
     """
 
     # Every JSON kind, so "every non-object top-level kind" is enumerated
@@ -1245,8 +1287,14 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
             self._assert_refused(body, f"top-level {kind}")
 
     def test_unknown_members_are_refused(self):
-        self._assert_refused('{"objective": "x", "stop_condition_typo": []}',
-                             "unknown member")
+        # Both bodies are otherwise VALID — the top-level case carries a
+        # real references entry (round 2 F1: without it, a mutation that
+        # silently DROPS unknown members before validating still refused
+        # this body, for missing references, and the silent-erasure defect
+        # this case exists to close could return under a green run).
+        self._assert_refused(
+            '{"objective": "x", "references": [{"path": "review.toml"}], '
+            '"stop_condition_typo": []}', "unknown member")
         self._assert_refused(
             '{"objective": "x", "references": [{"path": "a.md", '
             '"requried": true}]}', "unknown nested member")
@@ -1267,7 +1315,9 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
         seen = set()
         for member, kind in vocab.CLAIM_FIELDS.items():
             for wrong in self.WRONG[kind]:
-                body = {"objective": "x", member: wrong}
+                body = {"objective": "x",
+                        "references": self.VALID["references"]}
+                body[member] = wrong
                 self._assert_refused(json.dumps(body),
                                      f"{member} = {wrong!r}")
             seen.add(member)
@@ -1304,8 +1354,22 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
                 self._assert_refused(json.dumps(body),
                                      f"{member} = {blank!r}")
         # And the nonblank control still crosses.
-        self._assert_crosses('{"objective": "a real objective"}',
-                             "nonblank objective", expect_reads=1)
+        self._assert_crosses(
+            '{"objective": "a real objective", '
+            '"references": [{"path": "review.toml"}]}',
+            "nonblank objective", expect_reads=1)
+
+    def test_required_references_may_not_be_missing_or_empty(self):
+        """0.11.3: a supplied claim must hand the reviewer at least one
+        reference — the doc had said so since it was written, the validator
+        now agrees. Empty is the missing state spelled differently."""
+        self._assert_refused('{"objective": "x"}', "references missing")
+        self._assert_refused('{"objective": "x", "references": []}',
+                             "references empty")
+        # Paired control: one reference crosses.
+        self._assert_crosses(
+            '{"objective": "x", "references": [{"path": "review.toml"}]}',
+            "one reference", expect_reads=1)
 
     def test_bytes_that_are_not_utf8_are_typed_recovery(self):
         """Round-8 F2: `read_text(encoding="utf-8")` was guarded by
@@ -1320,7 +1384,8 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
             self._assert_refused(raw, f"undecodable: {case}")
         # Paired control: valid UTF-8, including non-ASCII, crosses.
         self._assert_crosses(
-            json.dumps({"objective": "réalité — 日本語", "risk": "faible"},
+            json.dumps({"objective": "réalité — 日本語", "risk": "faible",
+                        "references": [{"path": "review.toml"}]},
                        ensure_ascii=False),
             "valid utf-8 non-ascii", expect_reads=1)
 
@@ -1349,14 +1414,16 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
         every list-of-string element, and every string member of a
         reference."""
         LONE = "\\ud800"
+        REFS = '"references": [{"path": "review.toml"}]'
         for member in vocab.CLAIM_STRING_FIELDS:
             self._assert_refused(
-                '{"objective": "x", "%s": "%s"}' % (member, LONE)
-                if member != "objective" else '{"objective": "%s"}' % LONE,
+                '{"objective": "x", %s, "%s": "%s"}' % (REFS, member, LONE)
+                if member != "objective"
+                else '{"objective": "%s", %s}' % (LONE, REFS),
                 f"surrogate in {member}")
         for member in vocab.CLAIM_LIST_FIELDS:
             self._assert_refused(
-                '{"objective": "x", "%s": ["%s"]}' % (member, LONE),
+                '{"objective": "x", %s, "%s": ["%s"]}' % (REFS, member, LONE),
                 f"surrogate in {member}[0]")
         for member, kind in vocab.CLAIM_REFERENCE_FIELDS.items():
             if kind != "string":
@@ -1368,18 +1435,21 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
                                  f"surrogate in references[0].{member}")
         # Controls: ordinary non-ASCII, and a VALID surrogate pair, which is
         # one scalar value and must cross.
-        self._assert_crosses('{"objective": "réalité"}', "non-ascii text",
-                             expect_reads=1)
-        self._assert_crosses('{"objective": "\\ud83d\\ude00"}',
-                             "valid surrogate pair", expect_reads=1)
+        self._assert_crosses(
+            '{"objective": "réalité", %s}' % REFS, "non-ascii text",
+            expect_reads=1)
+        self._assert_crosses(
+            '{"objective": "\\ud83d\\ude00", %s}' % REFS,
+            "valid surrogate pair", expect_reads=1)
 
     def test_the_controls_cross_the_boundary(self):
         """No claim, the minimal valid claim, and one carrying every member
         the authority declares — each reaches the lifecycle, and a supplied
         claim is read exactly once."""
         self._assert_crosses(None, "no claim", expect_reads=0)
-        self._assert_crosses('{"objective": "x"}', "minimal valid",
-                             expect_reads=1)
+        self._assert_crosses(
+            '{"objective": "x", "references": [{"path": "review.toml"}]}',
+            "minimal valid", expect_reads=1)
         full = {m: self.VALID[k] for m, k in vocab.CLAIM_FIELDS.items()}
         self._assert_crosses(json.dumps(full), "full valid", expect_reads=1)
 
@@ -1468,7 +1538,8 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
         # And no admitted claim captures as a non-mapping, so nothing
         # downstream can test the value for None and reopen the file.
         path = self.tmp / "shape.json"
-        for body in ('{"objective": "x"}',
+        for body in ('{"objective": "x", '
+                     '"references": [{"path": "a.md"}]}',
                      json.dumps({m: self.VALID[k]
                                  for m, k in vocab.CLAIM_FIELDS.items()})):
             path.write_text(body, encoding="utf-8")

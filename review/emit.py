@@ -355,15 +355,24 @@ def diff_shape(repo_root: Path, base: str, head: str) -> dict:
         ins += 0 if a == "-" else int(a)
         dels += 0 if d == "-" else int(d)
         areas.add(path.split("/", 1)[0] if "/" in path else "<root>")
+    # The commit count rides with the shape (ruled 2026-08-30, brief
+    # review-scope-envelope): a lineage-14 envelope swept thirteen commits
+    # of prior-session work while its claim said "one commit", and nothing
+    # showed the author the span before the human carried it. Report, not
+    # refuse — the ci-evidence precedent: the honest failure was prose the
+    # author never checked, and a refusal would only relocate it.
+    commits = int(_git(repo_root, "rev-list", "--count", f"{base}..{head}",
+                       no_replace=True))
     return {"files": len(files), "insertions": ins, "deletions": dels,
             "changed_lines": ins + dels, "areas": sorted(areas),
-            "file_list": files}
+            "commits": commits, "file_list": files}
 
 
 def shape_line(s: dict) -> str:
     return (f"{s['files']} files, {s['insertions']} insertions, "
             f"{s['deletions']} deletions = {s['changed_lines']} changed "
-            f"lines, {len(s['areas'])} areas")
+            f"lines, {len(s['areas'])} areas, spanning {s['commits']} "
+            f"commit{'' if s['commits'] == 1 else 's'}")
 
 
 def _tool_identity(repo_root: Path, argv0: str) -> str:
@@ -1077,7 +1086,8 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
                  reachability: dict | None = None,
                  author: str | None = None,
                  reviewer: str | None = None,
-                 transport: str | None = None) -> str:
+                 transport: str | None = None,
+                 debug: bool = False) -> str:
     if not cfg.taxonomy_declared:
         raise RuntimeError(
             "no taxonomy declared for this repo: refusing to emit an envelope "
@@ -1175,7 +1185,12 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
         f'<{cfg.wrapper_tag}-review-request sha="{head}" branch="{branch}" '
         f'author="{author}" reviewer="{reviewer}" round="{round_no}" '
         f'transport="{transport}" tool="{tool_identity()}" '
-        f'shape="{shape_identity()}">',
+        f'shape="{shape_identity()}"'
+        # The debug stamp rides only when asked for (2026-08-31): an
+        # unlisted attribute is tolerated by older readers, deliberately.
+        + (f' {vocab.DEBUG_ATTR}="{vocab.DEBUG_TOOL_FEEDBACK}"'
+           if debug else "")
+        + ">",
         f"Roles: author={author} · reviewer={reviewer} · relay={relay} · "
         f"transport={transport}. "
         f"Per-invocation stamp, overriding the default direction for this "
@@ -1456,6 +1471,13 @@ def validate_claim(value, path: Path) -> dict:
                 raise ClaimDefective(
                     path, f"member {member!r} must be a list of reference "
                           f"objects, not {_kind_of(item)}", defect="type",
+                    member=member)
+            if not item:
+                raise ClaimDefective(
+                    path, f"member {member!r} is an empty list; a reference "
+                          f"manifest with no entries hands the reviewer "
+                          f"nothing to read, which is the missing-member "
+                          f"state spelled differently", defect="empty",
                     member=member)
             for i, ref in enumerate(item):
                 _check_reference(path, i, ref)

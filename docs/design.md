@@ -9,6 +9,15 @@ the private history that produced the design stays where it happened. Where
 this document says "designed" without "implemented", the tool does not do it
 yet — see §Status at the end.
 
+Contents — §1 the problem; §2 ownership model (one committed file,
+everything else zero-footprint); §3 the four design questions: 3.1 the envelope, 3.2 freedom to
+think, 3.3 detecting circles ((a) mandatory falsification, (b)
+fingerprints, (c) the ledger, (d) circuit breakers, (e) tool identity),
+3.4 cost; §4 roles as envelope data; §5 transport, reachability and the
+verbs (5.1 the fetchable SHA, 5.2 envelope transport, 5.3 one verb per
+phase); §6 packaging; §7 migration path; §8 what the tool must never
+carry; §9 status.
+
 ## 1. The problem
 
 Review processes for agent-authored changes tend to become *repository
@@ -26,8 +35,11 @@ Two conclusions shape everything else:
    a repository that reviews code and one that reviews prose, so they are
    supplied by the repository, never by the tool.
 2. **The process must belong to the person running it, not to the repository
-   being reviewed.** Zero footprint in a shared tree by default; identical
-   behaviour whether the configuration is personal or committed.
+   being reviewed.** Zero footprint for the tool, the state and the
+   adapters — with one deliberate exception: a REVIEWED commit carries its
+   own `review.toml`, because rules living on one machine cannot be shown
+   to a second. User-level configuration governs local verbs only; no
+   reviewed door falls back to it.
 
 Three points taken as settled:
 
@@ -39,13 +51,13 @@ Three points taken as settled:
 - Deterministic first: anything a linter, type-checker, test or schema check
   can decide runs before any model sees the change.
 
-## 2. Ownership model — zero shared-repository footprint
+## 2. Ownership model — one committed file, everything else zero-footprint
 
 | Layer | Lives where | Footprint in a shared repo |
 |---|---|---|
 | The tool | user machine, `uvx`, or vendored in repos that opt in | zero |
 | Grammar and failure policy | inside the tool | zero |
-| Taxonomy, gate manifest, roles, limits | `review.toml` in the repo **if the repo wants it**; otherwise `~/.config/loupe/<repo-id>.toml` | zero by default |
+| Taxonomy, gate manifest, roles, limits | `review.toml` tracked at the reviewed repository's root — the one required footprint; `~/.config/loupe/<repo-id>.toml` governs local verbs only | one file |
 | Round ledger | `~/.local/state/loupe/<repo-id>/` by default | zero by default |
 | Agent adapters | user level (`~/.claude/skills/`, `~/.codex/skills/`) | zero |
 
@@ -54,9 +66,13 @@ still discovers what is *observable* (gates are commands that exist or do
 not). It must **not** invent what is *decided*: absent a declared severity and
 classification set the tool refuses to emit and the reviewer refuses to rule,
 because a taxonomy is decision vocabulary and a tool that supplies its own has
-authored the user's judgment scale. That refusal costs one file, and it is
-not a repository file: user-level config preserves the zero-footprint
-property exactly.
+authored the user's judgment scale. That refusal costs exactly one
+repository file: every reviewed door — `handoff`, `take`,
+`validate --from-target` — refuses a target that tracks no `review.toml`,
+with nothing to fall back to, because a review is the act of showing the
+target's own rules to a second machine. A user-level
+`~/.config/loupe/<repo-id>.toml` still governs local verbs (ledger
+operations, rendering), never a reviewed door.
 
 ## 3. The four design questions
 
@@ -104,12 +120,23 @@ file that `respond` reads, and the claim file that `handoff` and
 same boundary — a claim stating `"references"` twice is refused by name
 before anything is pushed, cached, run or emitted, not loaded with the
 earlier declaration erased. The handoff settles that grammar before it
-consults ledger state at all: the author's bytes are captured once, digested
-and parsed together, and only then does the lifecycle preflight read the
-ledger. Malformed input is not a lifecycle question, so it never causes a
-lifecycle to be read — and the digest that keys the emission cache attests
-the same bytes the emitted Claim was parsed from, which a second read of the
-path could not guarantee.
+consults ledger state at all: the author's claim is captured once — read
+and decoded into text — digested and parsed together, and only then does
+the lifecycle preflight read the ledger. Malformed input is not a lifecycle
+question, so it never causes a lifecycle to be read. The digest that keys
+the emission cache is deliberately a **semantic-text identity, not a byte
+identity**: it attests the decoded text the emitted Claim was parsed from —
+which a second read of the path could not guarantee — and byte-distinct
+physical forms of that same text (an LF and a CRLF file) digest equal, on
+purpose, because a claim is re-rendered into the envelope the tool emits
+and is never carried or re-served as bytes. Physical byte identity is
+promised exactly where bytes travel or are re-served, and nowhere else: a
+carried envelope has one physical form (LF — any CR refuses at every
+person-supplied reader), and a retained exchange copy is compared as raw
+bytes against the ledger's recorded digest before any reuse — a rewritten
+copy is restored from the canonical emitted text where the operation owns
+it (retention), and treated as unavailable or cold where it does not
+(verdict resolution, the emission cache).
 
 The claim's grammar is closed, not merely deduplicated, and one authority
 declares it: the members, which are required, which are strings, which are
@@ -403,6 +430,15 @@ digests, gate attestations, token counts, cap authorizations, lineage
 boundaries. Events are content-addressed (`uid` over the event minus its
 timestamp), so re-adding is a no-op. Everything reported is computed from
 events, never asserted.
+
+Ledgers are **per machine, by design** (decided 2026-08-30): the two sides
+of a cross-machine round each keep their own, there is no merge story, and
+none is planned. Metrics, breakers and the round cap are therefore computed
+from what THIS machine recorded; the two records reconcile only through the
+envelopes that actually crossed, which carry everything a round's judgment
+rests on. A shared or synchronized ledger would put an append-only record
+on a channel two writers race over — the envelopes are the protocol, and
+the ledger is each side's memory of it.
 
 **(d) Circuit breakers.** Any firing **stops the loop** and escalates to the
 human, naming the rule and the decision required. Stopping is enforced, not
@@ -815,7 +851,8 @@ carries the one carrier the round declared.
   commit's own* `review.toml` (read from the object store, never from
   whatever this checkout happens to hold — an empty or unrelated checkout is
   not evidence about the envelope; a target that carries no config is
-  governed by this checkout's, and the record says which), label every
+  refused here exactly as it is refused at `handoff`, with nothing to fall
+  back to), label every
   reference by reading it from the target tree, record the take, print the
   envelope and the exact diff command — then rule and stop. A defective
   envelope is returned, not reviewed.

@@ -131,7 +131,7 @@ NO_CLAIM = "none"
 
 # Rendered into the envelope as prose (emit.emit_request).
 CLAIM_STRING_FIELDS = (
-    "objective",        # the decision boundary; the one required member
+    "objective",        # the decision boundary; required
     "risk",             # self-assessed, with a reason
     "review_scope",     # the tier and what is in it
     "access_note",      # how the reviewer reaches the target
@@ -169,8 +169,14 @@ CLAIM_REFERENCE_REQUIRED = ("path",)
 # Required when a claim file is supplied at all. Supplying no claim is its
 # own recorded state (round-4 F1) and stays legal; supplying one that states
 # no objective is not — it renders exactly like the no-claim default, which
-# is the collapse rounds 3 and 4 spent themselves separating.
-CLAIM_REQUIRED = ("objective",)
+# is the collapse rounds 3 and 4 spent themselves separating. `references`
+# joined 2026-08-30 (0.11.3, ruled intended policy rather than advisory
+# prose): the onboarding page had always told the first round "objective AND
+# at least one references entry" while the validator required objective
+# alone. A supplied claim that hands the reviewer nothing to read is a bare
+# assertion; the manifest's whole point is digested references. An empty
+# list is refused for the same reason a missing member is (emit checks it).
+CLAIM_REQUIRED = ("objective", "references")
 
 # Members whose string value may not be empty or blank.
 CLAIM_NONEMPTY = ("objective",)
@@ -196,6 +202,21 @@ CLAIM_NONEMPTY = ("objective",)
 TRANSPORT_PATH = "path"
 TRANSPORT_PASTE = "paste"
 TRANSPORTS = (TRANSPORT_PATH, TRANSPORT_PASTE)
+
+# ---------------------------------------------------------------- debug
+
+# The debug-round stamp (2026-08-31). A round emitted with `--debug`
+# carries `debug="tool-feedback"` on the request wrapper: the reviewer is
+# asked to ALSO critique the tool's own performance that round —
+# efficiency, cost, accuracy — in an optional `## tool feedback` verdict
+# section, which `close` records as a ledger event so the critiques
+# accumulate. The section is legal on any verdict (a reviewer may always
+# volunteer it); the stamp is what asks for it. Advisory by construction:
+# it is prose about the tool, never a gate, and no check judges its
+# quality (ruled 2026-08-30, prose guards).
+DEBUG_ATTR = "debug"
+DEBUG_TOOL_FEEDBACK = "tool-feedback"
+TOOL_FEEDBACK_SECTION = "tool feedback"
 
 # --------------------------------------------------------- stamped envelopes
 # Which envelope kinds carry a tool-identity stamp, and every production seam

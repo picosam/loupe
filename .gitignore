@@ -32,3 +32,4 @@ build/
 /request*.md
 /verdict*.md
 /disposition*.md
+.DS_Store

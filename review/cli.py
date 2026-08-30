@@ -1,5 +1,7 @@
 """CLI (design §9bis.3): exit codes mean exactly one thing — 0 ok, 1 findings,
-2 usage. Every non-zero exit prints the next command, not a diagnosis.
+2 usage. Every non-zero exit declares its recovery, never a diagnosis:
+`next_kind: command` carries the next command in `next`; `next_kind: blocked`
+carries `next: null` and a `remedy` a person must act on (`_blocked` below).
 Structured output when stdout is not a TTY; the agent never parses prose.
 """
 from __future__ import annotations
@@ -84,6 +86,9 @@ PROSE_KEYS = (
     "status", "subtype", "superseded",
     "tag", "target", "taxonomy", "test_digest", "then", "threads", "title",
     "to",
+    # The debug round's recorded critique (2026-08-31): prose about the
+    # tool the agent reads, never a command.
+    "text",
     "token_budget", "tokens",
     # Lineage 7 round 1: which INSTALLATION wrote the envelope and which is
     # reading it, with the verdict on whether they agree. Read, never run —
@@ -319,8 +324,7 @@ def cmd_validate(args, cfg) -> int:
     else:
         against = None
         if args.against:
-            against = wire.parse_verdict(
-                Path(args.against).read_text(encoding="utf-8"))
+            against = wire.parse_verdict(_read_envelope(args.against))
         items = validate_disposition(parsed, governing, against)
         if against is None:
             items.append(Item("notice", "D-STANDALONE",
@@ -351,17 +355,27 @@ def cmd_validate(args, cfg) -> int:
     # would decide what the OTHER side is told to run. The value comes from
     # this machine's own record of the round instead: the reviewer's `take`
     # wrote it, and `recorded_transport` reads it back for this SHA.
-    verdict_next = (
-        brief.verdict_relay(
-            parsed, source=args.envelope,
-            transport=transport.recorded_transport(_ledger(cfg, args),
-                                                   parsed.sha),
-            # On a paste round the reviewer hands over ONE block: the
-            # command and, fenced beneath it, the verdict bytes it
-            # consumes — bytes outside a fence are bytes a chat surface
-            # may rewrite (round 3, live).
-            envelope=text)
-        if is_verdict and not errors_in(items) else None)
+    # Round-3 F2: a validated envelope that no heredoc can carry
+    # byte-identically (no terminal newline) refuses HERE, before any
+    # relay is printed — a relay that silently changed the bytes would
+    # record a different digest from the artifact just validated.
+    try:
+        verdict_next = (
+            brief.verdict_relay(
+                parsed, source=args.envelope,
+                transport=transport.recorded_transport(_ledger(cfg, args),
+                                                       parsed.sha),
+                # On a paste round the reviewer hands over ONE block: the
+                # close command consuming the verdict bytes as its own stdin
+                # (a quoted heredoc) — bytes outside a fence are bytes a chat
+                # surface may rewrite (round 3, live).
+                envelope=text)
+            if is_verdict and not errors_in(items) else None)
+    except brief.UnrelayableEnvelope as exc:
+        return _blocked("", f"{args.envelope}: {exc}",
+                        remedy=f"a person appends the terminal newline to "
+                               f"{paths.display_path(args.envelope)} and "
+                               f"re-runs this command")
     return _finish(items, "", brief_text=precis, relay_text=verdict_next,
                    agreement=agreement,
                    remedy=f"whoever authored {args.envelope} must correct the "
@@ -371,7 +385,7 @@ def cmd_validate(args, cfg) -> int:
 
 
 def cmd_fingerprint(args, cfg) -> int:
-    text = Path(args.verdict).read_text(encoding="utf-8")
+    text = _read_envelope(args.verdict)
     v = wire.parse_verdict(text)
     rows = [{"id": f.id, "fp": f.fingerprint(), "severity": f.severity,
              "classification": f.classification, "anchor_path": f.anchor_path,
@@ -566,7 +580,7 @@ def _dispositions_answered(ledger: Ledger, verdict) -> list[dict] | None:
 
 
 def cmd_ledger_add(args, cfg) -> int:
-    text = Path(args.envelope).read_text(encoding="utf-8")
+    text = _read_envelope(args.envelope)
     kind, parsed = _detect_and_parse(text)
     ledger = _ledger(cfg, args)
     digest = sha256_file(Path(args.envelope))
@@ -908,7 +922,8 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
     envelope = emit.emit_request(governing, ledger, claim, base=args.base,
                                  head=record["sha"], reachability=record,
                                  author=roles[0], reviewer=roles[1],
-                                 transport=selected_transport)
+                                 transport=selected_transport,
+                                 debug=getattr(args, "debug", False))
     parsed = wire.parse_request(envelope)
     base = args.base or max((e for e in ledger.current()
                              if e.get("event") == "verdict"),
@@ -1098,7 +1113,8 @@ def cmd_handoff(args, cfg) -> int:
         cfg, ledger, round_no, claim_digest=claim_digest,
         transport=selected_transport,
         author_flag=getattr(args, "author", None),
-        reviewer_flag=getattr(args, "reviewer", None))
+        reviewer_flag=getattr(args, "reviewer", None),
+        debug=getattr(args, "debug", False))
     if cached is not None:
         # RVW-T17, the call site the redesign had to rule on rather than
         # inherit: this branch returns BEFORE `_emit`, so it never reaches
@@ -1181,8 +1197,22 @@ def _brief_into(rec: dict, envelope: str, ledger) -> None:
 
 
 def _read_envelope(arg: str) -> str:
-    return (sys.stdin.read() if arg == "-"
-            else Path(arg).read_text(encoding="utf-8"))
+    """Envelope text, read as the BYTES it is written in (round-4 F1).
+
+    `Path.read_text` and text-mode `sys.stdin` both read in universal-newline
+    mode, which converts physical CRLF and CR to LF before the grammar, the
+    validator, the digest or the relay ever sees the document — so a CRLF
+    envelope validated successfully and then rode, and was recorded, as text
+    that differed from the file on disk. Both legs read raw here and
+    `wire.decode_envelope` rules on the physical form: LF passes, every other
+    form refuses before anything is parsed.
+
+    Every envelope reader that takes a path or `-` from a person goes through
+    this one function, so the domain has one door rather than one per verb.
+    """
+    if arg == "-":
+        return wire.decode_envelope(sys.stdin.buffer.read(), arg)
+    return wire.decode_envelope(Path(arg).read_bytes(), arg)
 
 
 def cmd_take(args, cfg) -> int:
@@ -1431,13 +1461,22 @@ def cmd_brief(args, cfg) -> int:
         # incident this mechanism exists to expose. It compares before it
         # renders, like every other cross-installation reader.
         agreement = transport.tool_agreement(as_request)
+        # Round-3 F2: an envelope no heredoc can carry byte-identically
+        # refuses before a relay is rendered, on both branches below.
+        try:
+            relay_text = brief.relay(source, as_request, text,
+                                     paste=args.paste)
+        except brief.UnrelayableEnvelope as exc:
+            return _blocked("", f"{source}: {exc}",
+                            remedy=f"a person appends the terminal newline "
+                                   f"to {paths.display_path(source)} and "
+                                   f"re-runs this command")
         rec = {"kind": "request", "source": source, "ok": True,
                "round": as_request.attrs.get("round"),
                "sha": as_request.sha, "superseded": superseded,
                "tool": agreement,
                "brief": brief.request_precis(as_request, ledger),
-               "relay": brief.relay(source, as_request, text,
-                                    paste=args.paste)}
+               "relay": relay_text}
         note = (f"\nNOTE: {superseded} earlier emission(s) of this round are "
                 f"superseded; this is the live one.\n" if superseded else "")
         _out(rec, f"{rec['brief']}\n{note}\n"
@@ -1449,15 +1488,22 @@ def cmd_brief(args, cfg) -> int:
         # Two fields, exactly as the request side has always had: the account
         # a human reads, and the commands a human copies (round 3 relay
         # split). Never one blob for a caller to divide by guesswork.
+        try:
+            relay_text = brief.verdict_relay(
+                as_verdict, source=source,
+                transport=transport.recorded_transport(ledger,
+                                                       as_verdict.sha),
+                envelope=text)
+        except brief.UnrelayableEnvelope as exc:
+            return _blocked("", f"{source}: {exc}",
+                            remedy=f"a person appends the terminal newline "
+                                   f"to {paths.display_path(source)} and "
+                                   f"re-runs this command")
         rec = {"kind": "verdict", "source": source, "ok": True,
                "sha": as_verdict.sha,
                "brief": brief.verdict_precis(as_verdict, source=source,
                                              full=args.full),
-               "relay": brief.verdict_relay(
-                   as_verdict, source=source,
-                   transport=transport.recorded_transport(ledger,
-                                                          as_verdict.sha),
-                   envelope=text)}
+               "relay": relay_text}
         _out(rec, f"{rec['brief']}\n\n{rec['relay']}")
         return EXIT_OK
 
@@ -1788,6 +1834,14 @@ def build_parser() -> argparse.ArgumentParser:
                              "same-machine loop. It is stamped on the "
                              "envelope, recorded, and decides what the "
                              "printed relay says (RVW-T11)")
+        sp.add_argument("--debug", action="store_true",
+                        help="stamp this round as a debug round "
+                             "(debug=\"tool-feedback\" on the envelope): the "
+                             "reviewer is asked to also critique the tool's "
+                             "own performance this round — efficiency, cost, "
+                             "accuracy — in a `## tool feedback` verdict "
+                             "section, recorded at close. Advisory; never a "
+                             "gate")
         sp.add_argument("--author", action=_OnceAction,
                         help="per-invocation author stamp, selecting WITHIN "
                              "the config's permitted_authors — refused "
@@ -1974,6 +2028,12 @@ def main(argv=None) -> int:
             paths.command(*paths.lits(TOOL_NAME, "--help")), str(exc))
     try:
         return args.func(args, cfg)
+    except wire.NoncanonicalLineEndings as exc:
+        # Round-4 F1: a physical form this tool cannot carry unchanged is a
+        # BLOCKED state, not a usage error — no flag repairs a file's line
+        # endings, and the generic `<verb> --help` recovery would have sent
+        # an agent looking for one. `remedy` says what a person does.
+        return _blocked("", str(exc), remedy=exc.remedy)
     except vocab.TransportDeclarationError as exc:
         # Round 2 F2: a defective transport DECLARATION is a typed, blocked
         # state, never generic usage — `<verb> --help` cannot repair a

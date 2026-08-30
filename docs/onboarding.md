@@ -77,6 +77,11 @@ attest:
 - **`blocking = true` honestly.** A blocking gate that exits non-zero makes
   the handoff refuse; a non-blocking one becomes a notice the reviewer
   reads. Do not invent gates the repository does not have.
+- **A guard over prose is advisory drift evidence by construction.** No
+  lexical check holds a semantic guarantee, so a check over prose reports
+  drift and the claims around it narrow to what the check actually owns —
+  never the other way. A prose gate whose description promises meaning is
+  the first finding a good reviewer files.
 - **Know the limits before they surprise you.** A gate is capped at 600
   seconds. And the attestation carries an exit code, so "could not run"
   and "ran and failed" both arrive as non-zero — the distinction lives in
@@ -195,7 +200,91 @@ An approval granted automatically on a verdict is a merge gate in all but
 name, built on records the platform cannot authenticate; do not build it
 casually.
 
-## 8. The first round
+## 8. Make the repository's agent instructions true
+
+Do this before the first round, not after it. An agent instruction file —
+`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, whatever the agents working here
+load — is read into **every** session, which makes a wrong one worse than
+none: an agent acts on it without checking, and the error repeats silently
+until a human happens to notice.
+
+Onboarding has just introduced roles, gates and a merge path. Make these
+true in every such file:
+
+- **which agent holds which role here** — or better, point at the
+  configuration that declares it, so the two cannot drift apart;
+- **the branch and merge discipline the repository actually enforces**;
+- **every claim that something is enforced.** This is the expensive one.
+  Remove or correct any statement that a gate, check, review or approval
+  is enforced when the live configuration does not enforce it. The
+  opening of this page describes the case: three separate documents each
+  asserted a merge gate the live ruleset did not enforce, and the first
+  round found all three. Check each claim against the live settings.
+  Where a claim is aspirational, say so in those words — an instruction
+  file that reads as a safety net and is not one is the worst outcome
+  available here.
+
+Before repairing, notice what there is to repair. **State which
+instruction files this session actually loaded** — the repository's own
+(`AGENTS.md`, `CLAUDE.md`, a rules file) and any user-level or
+machine-global file your agent surface reads (for Claude Code
+`~/.claude/CLAUDE.md`, for Codex `~/.codex/AGENTS.md`; name your
+surface's equivalent). Declare it from the session — do not probe another
+machine's filesystem, and absence on this machine is not absence
+everywhere: a collaborator's agents may load rules yours do not.
+
+Three topologies, three different answers:
+
+- **The repository carries an instruction file** — with or without
+  machine-global rules loaded beside it. The truth pass above is the
+  whole step: make what the repository states true.
+- **No repository instruction file, but the session loaded user-level or
+  machine-global rules.** Do not send repository facts there: a global
+  file does not travel with the clone, a collaborator or a different
+  agent surface never sees it, and project policy would pollute one
+  person's private defaults. Propose — as a diff the owner agrees to,
+  like every change on this page — a minimal repository instruction file
+  carrying the operating floor below. Global rules may keep covering
+  only what is genuinely generic (tone, language, personal style);
+  everything onboarding just created — roles, gates, who approves, the
+  merge path — belongs to the repository file.
+- **Nothing is loaded anywhere.** The agents working here run on no
+  contract at all, and onboarding has just created obligations nothing
+  states. Propose the same minimal repository instruction file; until
+  the owner grows it, the floor is the whole contract.
+
+The **operating floor**, for both repository-absent branches, and no
+more:
+
+1. generated files are regenerated, never hand-edited — name each
+   generated artifact and the command that regenerates it;
+2. a human sets a review round in motion; agents follow the installed
+   loupe adapter and stop where it says stop;
+3. who approves reviewed work, by name — §7's answer, written where
+   the agents will actually read it;
+4. work happens on the agreed branch in logical-unit commits; nothing
+   is pushed except through the tool's own verbs (`handoff` commits
+   and pushes the reviewed branch) or on the owner's explicit request.
+
+The floor is deliberately not a style guide: no language rules, no
+role assignments between named agents, no delegation policy — those
+are the owner's to add or not.
+
+While you are in these files, it is worth proposing — not applying
+unilaterally — a narrower pass against the criteria that make an
+instruction file cheap to load and hard to get wrong: routing rather than
+restating; one fact, one home, because a fact stated twice drifts and
+nothing detects the stale copy; pointing at the artefact that owns a
+procedure instead of duplicating it; naming what is generated and must
+never be hand-edited; and cutting what git history already carries.
+
+This is not licence to rewrite the repository's agent contract wholesale
+or to import conventions from elsewhere. Every change should trace to
+something onboarding made false, or to one of those criteria. Propose a
+diff, say what makes each change true, and get agreement — an
+instruction file encodes decisions you were not present for.
+
+## 9. The first round
 
 The pass is a precondition of the round, not a parallel activity — and it
 ends here. **A human sets the round in motion**; the adapters carry both
@@ -205,8 +294,10 @@ sides' procedure. Preconditions worth stating to whoever starts it:
   branch. Never run it in a checkout another agent or person is using, or
   on someone else's branch: it would publish their half-done work under
   your envelope.
-- The claim JSON needs `objective` **and** at least one `references` entry;
-  what could not be attested goes in `evidence_not_captured`, in words.
+- A supplied claim must hand the reviewer at least one `references`
+  entry — the validator refuses a claim without one, an empty list
+  included, and its refusals name every required member. What could not
+  be attested goes in `evidence_not_captured`, in words.
 - One note for the first reviewer, learned the expensive way: anchor every
   falsification test in the reviewed tree wherever the defect admits it. A
   test anchored in a mutable artifact outside the tree — a PR body, an

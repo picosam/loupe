@@ -254,11 +254,13 @@ class TestPrecisIsDerived(unittest.TestCase):
         fence, and a person handed the fence alone still held commands naming
         a path on someone else's machine.
 
-        The convention now: heading, one fence, and every line inside it
-        either a live command or a `#` comment. Prose is inside the block, so
-        it cannot be separated from what it qualifies or reworded in transit,
-        and the block keeps one promise a reader can rely on — paste it and
-        exactly the live lines run.
+        The convention now (relay ergonomics, 2026-08-30): heading, one
+        fence, exactly one command. On a path leg the command is the whole
+        block; on a paste leg the command opens a quoted heredoc and the
+        envelope bytes ride inside the same fence as its stdin. Either
+        way the block keeps one promise a reader can rely on — paste it
+        and exactly one command runs — and carries no commentary: nothing
+        beside the fence, no note inside it.
         """
         from review.tests.test_transport import request_text
         legs = {}
@@ -273,14 +275,12 @@ class TestPrecisIsDerived(unittest.TestCase):
                     f"\n## evidence checked\n\n- the tree\n")
                 legs[f"verdict/{declared}/{verdict}"] = (
                     brief.verdict_relay(v, source="/tmp/v.md",
-                                        transport=declared),
-                    "## What to run next")
+                                        transport=declared,
+                                        envelope="bytes\n"),
+                    "## Verdict")
             req = wire.parse_request(request_text(transport_attr=declared))
-            # `paste=False` on both: the declared-paste leg appends the bytes
-            # after the fence, and this gate is about the fence.
-            relay = brief.relay("/tmp/r.md", req, "bytes")
             legs[f"request/{declared}"] = (
-                relay.split("\n\nThe envelope, to paste:")[0],
+                brief.relay("/tmp/r.md", req, "bytes\n"),
                 "## How to carry it")
 
         for name, (relay, heading) in legs.items():
@@ -294,25 +294,23 @@ class TestPrecisIsDerived(unittest.TestCase):
                                  "one fence, opened once and closed once")
                 body = lines[3:-1]
                 self.assertTrue(body, "the fence is empty")
-                for line in body:
-                    self.assertTrue(
-                        line.startswith(TOOL_NAME) or line.startswith("#"),
-                        f"neither a command nor a comment: {line!r}")
-                # Exactly one live line: a block is one action, and the
-                # alternatives beside it are alternatives, not steps.
-                live = [l for l in body if not l.startswith("#")]
-                self.assertEqual(len(live), 1, f"expected one live line: {body}")
-                # And no comment restates what the block's own heading
-                # already says: a path round's relay carries the command
-                # alone (user, 2026-08-26). Only a paste round keeps a note,
-                # because there the note is an instruction — the verdict
-                # bytes have to reach that command.
-                named = any("author's to run" in l for l in body)
-                self.assertEqual(named,
-                                 name.startswith("verdict") and "paste" in name,
-                                 f"{name}: only the verdict leg of a PASTE "
-                                 f"round keeps a note, and only because "
-                                 f"there the note is an instruction")
+                # Exactly one command, whichever leg and whichever
+                # topology: a block is one action. On a paste leg the
+                # rest of the body is the command's own stdin.
+                commands = [l for l in body if l.startswith(TOOL_NAME)]
+                self.assertEqual(len(commands), 1,
+                                 f"expected one command: {body}")
+                self.assertEqual(commands[0], body[0],
+                                 "the command opens the block")
+                if "paste" in name:
+                    self.assertIn("<<'", body[0],
+                                  "a paste leg consumes its own bytes")
+                else:
+                    self.assertEqual(body, commands,
+                                     "a path leg is the command alone")
+                # No commentary anywhere (user, 2026-08-30): the old paste
+                # note restated what the heredoc block now does itself.
+                self.assertEqual([l for l in body if l.startswith("#")], [])
 
     def test_a_relay_block_is_valid_shell_and_runs_only_its_live_lines(self):
         """The promise, checked by a shell rather than asserted.
@@ -337,7 +335,7 @@ class TestPrecisIsDerived(unittest.TestCase):
                          brief.verdict_relay(v, source="/tmp/v.md",
                                              transport=declared)))
             legs.append((f"request/{declared}",
-                         brief.relay("/tmp/r.md", req, "bytes")))
+                         brief.relay("/tmp/r.md", req, "bytes\n")))
         for name, relay in legs:
             with self.subTest(leg=name):
                 # The bash fence, and only it. A declared-paste request leg
@@ -382,7 +380,7 @@ class TestPrecisIsDerived(unittest.TestCase):
             "request relay": (brief.relay("/tmp/r.md", req, "bytes"),
                               "## How to carry it"),
             "verdict brief": (brief.verdict_precis(v), "## Clean to advance"),
-            "verdict relay": (brief.verdict_relay(v), "## What to run next"),
+            "verdict relay": (brief.verdict_relay(v), "## Verdict"),
         }
         for name, (text, heading) in surfaces.items():
             self.assertIn(heading, text, name)
@@ -608,7 +606,7 @@ class TestPrecisIsDerived(unittest.TestCase):
         share no filesystem, the kept path is not a carrier at all — so it is
         not printed, live or commented, and the bytes travel with the command
         that consumes them rather than behind a flag."""
-        envelope = "x" * 500
+        envelope = "x" * 500 + "\n"
         out = brief.relay("/kept/path.md", self._request(transport_attr="paste"),
                           envelope, paste=False)
         self.assertIn(f"{TOOL_NAME} take - --as codex", out)
@@ -638,13 +636,415 @@ class TestPrecisIsDerived(unittest.TestCase):
         """Not the topology's doing: with nothing kept there is no path to
         offer, so both declarations reach the same carrier."""
         for declared in ("path", "paste"):
-            out = brief.relay("not kept (…)", self._request(), "e",
+            out = brief.relay("not kept (…)", self._request(), "e\n",
                               transport=declared)
             self.assertIn(f"{TOOL_NAME} take - --as codex", out, declared)
 
     def test_an_unstamped_envelope_asks_for_the_identity(self):
         out = brief.relay("/kept/path.md", None, "e", paste=False)
         self.assertIn("--as <your id>", out)
+
+
+class TestSingleBlockPasteRelay(unittest.TestCase):
+    """Relay ergonomics (user, 2026-08-30): a paste leg is ONE block.
+
+    Measured in live cross-machine use: the old shape — a command fence,
+    a prose label, and the bytes in a second fence — made the reviewing
+    agent error unless the human retyped `take - --as <id>` beside the
+    pasted envelope, and the verdict leg carried commentary and multiple
+    blocks where a single paste would do. The command is now folded INTO
+    the pasted block as a quoted heredoc: one fence, runnable exactly as
+    printed, the bytes riding as the command's own stdin.
+    """
+
+    ENVELOPE = ('<loupe-review-request sha="a" author="claude" '
+                'reviewer="codex" transport="paste">\n'
+                "## body\n\n$HOME\n`echo hazard`\n$(echo hazard)\n\n"
+                "```loupe-attestations\nx\n```\n"
+                "</loupe-review-request>")
+
+    def _request(self, **kw):
+        from review.tests.test_transport import request_text
+        return wire.parse_request(request_text(**kw))
+
+    def _verdict(self, ruling="changes requested"):
+        return wire.parse_verdict(
+            f'<loupe-review-verdict sha="abc">\n'
+            f"VERDICT: {ruling}\n\n## findings\n\nNone\n"
+            f"\n## evidence checked\n\n- the tree\n")
+
+    @staticmethod
+    def _one_fence(out, heading):
+        """The section's single fenced body, asserted to BE single."""
+        lines = out.splitlines()
+        assert lines[0] == heading, lines[0]
+        assert lines[1] == ""
+        opener = lines[2]
+        assert opener.endswith("bash"), opener
+        tick = opener[:-len("bash")]
+        assert set(tick) == {"`"} and len(tick) >= 3, opener
+        assert lines[-1] == tick, "the block closes the section"
+        assert sum(1 for l in lines if l.startswith(tick)) == 2, \
+            "one fence, opened once and closed once"
+        return lines[3:-1]
+
+    def _deliver(self, out):
+        """Run the section's fence body in a real shell against a stub tool;
+        (argv words, exact stdin bytes) is what the block delivered."""
+        lines = out.splitlines()
+        block = "\n".join(lines[3:-1])
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / TOOL_NAME
+            stub.write_text("#!/bin/sh\n"
+                            'printf \'%s \' "$@" > "$STUB_OUT/args.txt"\n'
+                            'cat > "$STUB_OUT/stdin.txt"\n',
+                            encoding="utf-8")
+            stub.chmod(0o755)
+            env = dict(os.environ,
+                       PATH=f"{tmp}:{os.environ['PATH']}", STUB_OUT=tmp)
+            run = subprocess.run(["bash", "-c", block], env=env, text=True,
+                                 capture_output=True, timeout=60)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            return ((Path(tmp) / "args.txt").read_text().split(),
+                    (Path(tmp) / "stdin.txt").read_text())
+
+    def test_a_paste_request_is_one_block_the_human_pastes_whole(self):
+        out = brief.relay("/kept/path.md",
+                          self._request(transport_attr="paste"),
+                          self.ENVELOPE + "\n")
+        body = self._one_fence(out, "## How to carry it")
+        self.assertEqual(
+            body[0], f"{TOOL_NAME} take - --as codex <<'LOUPE_REQUEST'")
+        self.assertEqual(body[-1], "LOUPE_REQUEST")
+        self.assertEqual("\n".join(body[1:-1]), self.ENVELOPE)
+        # Nothing outside the block: no label, no comment, no second fence,
+        # and no pointer into a filesystem the other side cannot open.
+        self.assertNotIn("to paste:", out)
+        self.assertNotIn("/kept/path.md", out)
+        self.assertNotIn("#", "\n".join((body[0], body[-1])))
+
+    def test_a_paste_verdict_is_one_block_titled_verdict(self):
+        bytes_ = ('<loupe-review-verdict sha="abc">\nVERDICT: x\n'
+                  "```loupe-attestations\nx\n```\n</loupe-review-verdict>")
+        for ruling in ("clean to advance", "changes requested"):
+            with self.subTest(ruling=ruling):
+                out = brief.verdict_relay(self._verdict(ruling),
+                                          source="/tmp/v.md",
+                                          transport="paste",
+                                          envelope=bytes_ + "\n")
+                body = self._one_fence(out, "## Verdict")
+                self.assertEqual(
+                    body[0],
+                    f"{TOOL_NAME} close --verdict - <<'LOUPE_VERDICT'")
+                self.assertEqual(body[-1], "LOUPE_VERDICT")
+                self.assertEqual("\n".join(body[1:-1]), bytes_)
+                # No commentary: the note that told the author to paste
+                # the verdict restated what the block now does itself.
+                self.assertNotIn("author's to run", out)
+                self.assertNotIn("to paste:", out)
+
+    def test_a_path_verdict_is_one_line_titled_verdict(self):
+        out = brief.verdict_relay(self._verdict(), source="/tmp/v.md",
+                                  transport="path")
+        body = self._one_fence(out, "## Verdict")
+        self.assertEqual(body, [f"{TOOL_NAME} close --verdict /tmp/v.md"])
+
+    def test_the_delimiter_dodges_the_bytes(self):
+        """A data line equal to the delimiter would end the heredoc there
+        and hand everything after it to the shell — so the delimiter is
+        chosen against the bytes, not assumed safe."""
+        hostile = self.ENVELOPE.replace(
+            "## body", "LOUPE_REQUEST\nLOUPE_REQUEST_2")
+        out = brief.relay("/kept/path.md",
+                          self._request(transport_attr="paste"),
+                          hostile + "\n")
+        body = self._one_fence(out, "## How to carry it")
+        self.assertTrue(body[0].endswith("<<'LOUPE_REQUEST_3'"), body[0])
+        self.assertEqual(body[-1], "LOUPE_REQUEST_3")
+        self.assertEqual("\n".join(body[1:-1]), hostile)
+
+    def test_the_pasted_block_feeds_the_exact_bytes_to_the_tool(self):
+        """The promise, checked by a shell: paste the block and exactly
+        one command runs, with the envelope as its stdin — expansion
+        hazards ($HOME, backticks, $(…)) arriving byte-identical because
+        the delimiter is quoted."""
+        envelope = self.ENVELOPE + "\n"
+        out = brief.relay("/kept/path.md",
+                          self._request(transport_attr="paste"), envelope)
+        args, stdin = self._deliver(out)
+        self.assertEqual(args, ["take", "-", "--as", "codex"])
+        self.assertEqual(stdin, envelope)
+        # And the fence outruns every backtick run the bytes carry.
+        opener = out.splitlines()[2]
+        longest = max(len(r) for r in re.findall(r"`+", out))
+        self.assertEqual(longest, len(opener) - len("bash"))
+
+    def test_terminal_newlines_ride_exactly_or_refuse(self):
+        """Round-3 F2: the terminal-newline domain, closed.
+
+        A heredoc delivers exactly one newline after its last body line,
+        so the carrier's admitted domain partitions completely: an
+        envelope ending in one or more newlines rides byte-identically
+        (exactly ONE is stripped — the one the heredoc restores; every
+        further terminal newline is an empty body line); an envelope with
+        no terminal newline is refused before any relay is printed,
+        because no heredoc can deliver it unchanged. The old rstrip
+        collapsed zero, one and two newlines into one delivered newline,
+        so the author recorded a different digest from the bytes the
+        reviewer validated.
+        """
+        import hashlib
+        base = self.ENVELOPE  # ends without a newline
+        legs = {
+            "request": lambda env: brief.relay(
+                "/kept/path.md", self._request(transport_attr="paste"), env),
+            "verdict": lambda env: brief.verdict_relay(
+                self._verdict(), source="/tmp/v.md", transport="paste",
+                envelope=env),
+        }
+        for name, render in legs.items():
+            with self.subTest(leg=name, newlines=0):
+                with self.assertRaises(brief.UnrelayableEnvelope):
+                    render(base)
+            for n in (1, 2, 3):
+                env = base + "\n" * n
+                with self.subTest(leg=name, newlines=n):
+                    _, stdin = self._deliver(render(env))
+                    self.assertEqual(stdin, env)
+                    self.assertEqual(
+                        hashlib.sha256(stdin.encode()).hexdigest(),
+                        hashlib.sha256(env.encode()).hexdigest())
+
+
+class TestPhysicalLineEndingsAtTheCLI(unittest.TestCase):
+    """Round-4 F1: the CLI reads envelope BYTES, or it carries a different
+    artefact from the one on disk.
+
+    The round-3 partition lived in `brief._heredoc_body`, which preserves the
+    terminal-newline count of the string handed to it — and every named-file
+    route handed it a string read through `Path.read_text`, whose
+    universal-newline mode had already converted physical CRLF and CR to LF.
+    A CRLF verdict therefore validated, relayed and recorded as text whose
+    SHA-256 was not the file's: `loupe validate` judged the converted form,
+    the heredoc delivered the converted form, and the approval helper could
+    publish the raw file's digest beside them.
+
+    These are end-to-end CLI tests on purpose. The round-3 regression called
+    `brief.relay` directly with constructed LF strings, so it could not see
+    the reader that was doing the converting. Here the real verbs read real
+    files, and the emitted block runs in a real shell against a stub that
+    captures its stdin as bytes.
+
+    The domain is the physical line-ending form of an envelope source
+    crossed with the terminal-newline count, on both paste legs:
+    LF rides byte-identically at every terminal count of one or more; CRLF,
+    CR and mixed forms refuse before anything is parsed, validated or
+    relayed; zero terminal newlines refuses as round 3 established.
+    """
+
+    #: The physical forms, as a function from LF text to source bytes.
+    FORMS = {
+        "lf": lambda t: t.encode("utf-8"),
+        "crlf": lambda t: t.replace("\n", "\r\n").encode("utf-8"),
+        "cr": lambda t: t.replace("\n", "\r").encode("utf-8"),
+        # Mixed is its own point of the domain, not a spelling of the other
+        # two: a converter that handled a uniform file could still leave a
+        # document whose endings disagree line by line.
+        "mixed": lambda t: "".join(
+            line + ("\r\n" if i % 3 == 0 else "\r" if i % 3 == 1 else "\n")
+            for i, line in enumerate(t.split("\n")[:-1])).encode("utf-8"),
+    }
+
+    def setUp(self):
+        try:
+            self.tmp = Path(tempfile.mkdtemp(prefix="endings-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self.tmp, ignore_errors=True))
+        self.repo = self.tmp / "repo"
+        _sh("git", "init", "-q", "-b", "main", str(self.repo))
+        for k, v in (("user.name", "a"), ("user.email", "a@example.invalid"),
+                     ("commit.gpgsign", "false")):
+            _sh("git", "-C", str(self.repo), "config", k, v)
+        from review.tests.util import REPO_ROOT
+        toml = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
+        toml = toml[:toml.index("[[gates]]")] + toml[toml.index("[roles]"):]
+        (self.repo / "review.toml").write_text(toml, encoding="utf-8")
+        (self.repo / "f.txt").write_text("one\n", encoding="utf-8")
+        _sh("git", "-C", str(self.repo), "add", ".")
+        _sh("git", "-C", str(self.repo), "commit", "-q", "-m", "init")
+        self.base = _git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "f.txt").write_text("two\n", encoding="utf-8")
+        _sh("git", "-C", str(self.repo), "commit", "-qam", "change")
+        # A declared paste round may not bind a SHA the other side cannot
+        # fetch, so the fixture carries the bare remote the rule requires.
+        bare = self.tmp / "origin.git"
+        _sh("git", "init", "-q", "--bare", str(bare))
+        _sh("git", "-C", str(self.repo), "remote", "add", "origin", str(bare))
+        _sh("git", "-C", str(self.repo), "push", "-q", "-u", "origin", "main")
+        self.head = _git(self.repo, "rev-parse", "HEAD")
+        self.state = self.tmp / "state"
+        self.claim = self.tmp / "claim.json"
+        self.claim.write_text(json.dumps({
+            "objective": "line endings",
+            "references": [{"path": "review.toml", "required": True}]}),
+            encoding="utf-8")
+        self.cwd = os.getcwd()
+        self.addCleanup(os.chdir, self.cwd)
+        code, rec = self._run("handoff", "--claim-file", str(self.claim),
+                              "--base", self.base, "--transport", "paste")
+        self.assertEqual(code, 0, rec)
+        self.request_text = Path(rec["kept"]).read_text(encoding="utf-8")
+
+    def _run(self, *argv):
+        import contextlib
+        from io import StringIO
+        os.chdir(self.repo)
+        buf = StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                code = cli.main(["--ledger-dir", str(self.state), *argv])
+        finally:
+            os.chdir(self.cwd)
+        out = buf.getvalue()
+        try:
+            return code, json.loads(out)
+        except json.JSONDecodeError:
+            return code, out
+
+    def _verdict_text(self, ruling="changes requested"):
+        return ('<loupe-review-verdict sha="%s">\n'
+                "VERDICT: %s\n\n## findings\n\n"
+                "### F1\nSeverity: Low\nClassification: design_gap\n"
+                "Title: a finding to carry\n"
+                "Evidence: f.txt:1\nWhy: the bytes must ride\n"
+                "Required outcome: ride them\n"
+                "FALSIFICATION: command: `run it`\n"
+                "\n## evidence checked\n\n- the diff\n"
+                "</loupe-review-verdict>\n" % (self.head, ruling))
+
+    def _deliver(self, relay):
+        """Run the relay's fence in a real shell against a stub tool, and
+        return the stdin it received as BYTES — the whole point being the
+        bytes, a text read here would re-normalize what the test measures."""
+        lines = relay.splitlines()
+        block = "\n".join(lines[3:-1])
+        stub_dir = Path(tempfile.mkdtemp(dir=self.tmp))
+        stub = stub_dir / TOOL_NAME
+        stub.write_text("#!/bin/sh\n"
+                        'printf \'%s \' "$@" > "$STUB_OUT/args.txt"\n'
+                        'cat > "$STUB_OUT/stdin.bin"\n',
+                        encoding="utf-8")
+        stub.chmod(0o755)
+        env = dict(os.environ, PATH=f"{stub_dir}:{os.environ['PATH']}",
+                   STUB_OUT=str(stub_dir))
+        run = subprocess.run(["bash", "-c", block], env=env, text=True,
+                             capture_output=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return ((stub_dir / "args.txt").read_text().split(),
+                (stub_dir / "stdin.bin").read_bytes())
+
+    def _assert_rides(self, rec, raw, expect_argv):
+        """An ACCEPTED source: the block delivers the source bytes, and the
+        SHA-256 the author would record is the file's own."""
+        import hashlib
+        self.assertIn("relay", rec, rec)
+        argv, stdin = self._deliver(rec["relay"])
+        self.assertEqual(argv, expect_argv, rec["relay"])
+        self.assertEqual(stdin, raw)
+        self.assertEqual(hashlib.sha256(stdin).hexdigest(),
+                         hashlib.sha256(raw).hexdigest())
+
+    def _assert_refused(self, code, rec, form):
+        """A REFUSED source: no relay exists to compare, and the refusal is
+        the typed blocked state — no flag repairs a file's line endings."""
+        self.assertNotEqual(code, 0, rec)
+        self.assertNotIn("relay", rec, rec)
+        self.assertNotIn("brief", rec, rec)
+        self.assertEqual(rec["next_kind"], "blocked", rec)
+        self.assertIsNone(rec["next"], rec)
+        self.assertIn("line endings", rec["error"])
+        self.assertIn(form, rec["error"])
+        self.assertIn("LF line endings", rec["remedy"])
+
+    def test_the_request_leg_rides_lf_and_refuses_every_other_form(self):
+        """The named-path request route, form by form."""
+        expected = {"lf": None, "crlf": "CRLF", "cr": "CR",
+                    "mixed": "mixed"}
+        for form, encode in self.FORMS.items():
+            with self.subTest(form=form):
+                raw = encode(self.request_text)
+                src = self.tmp / f"request-{form}.md"
+                src.write_bytes(raw)
+                code, rec = self._run("brief", str(src))
+                if form == "lf":
+                    self.assertEqual(code, 0, rec)
+                    self._assert_rides(rec, raw,
+                                       ["take", "-", "--as", "codex"])
+                else:
+                    self._assert_refused(code, rec, expected[form])
+
+    def test_the_verdict_leg_rides_lf_and_refuses_every_other_form(self):
+        """The named-path verdict route, form by form. `validate` is where
+        the reviewer learns whether their envelope is carriable, so it is
+        where a form this tool cannot carry has to stop."""
+        expected = {"lf": None, "crlf": "CRLF", "cr": "CR",
+                    "mixed": "mixed"}
+        for form, encode in self.FORMS.items():
+            with self.subTest(form=form):
+                raw = encode(self._verdict_text())
+                src = self.tmp / f"verdict-{form}.md"
+                src.write_bytes(raw)
+                code, rec = self._run("validate", str(src))
+                if form == "lf":
+                    self.assertEqual(code, 0, rec)
+                    self._assert_rides(rec, raw,
+                                       ["close", "--verdict", "-"])
+                else:
+                    self._assert_refused(code, rec, expected[form])
+
+    def test_the_terminal_newline_counts_hold_through_the_real_verbs(self):
+        """Round-3 F2's partition, at the CLI this time: one, two and three
+        terminal newlines ride byte-identically and zero refuses — on files
+        the real verbs read, not on strings handed to `brief.relay`."""
+        legs = (("brief", self.request_text, ["take", "-", "--as", "codex"]),
+                ("validate", self._verdict_text(),
+                 ["close", "--verdict", "-"]))
+        for verb, text, argv in legs:
+            body = text.rstrip("\n")
+            for n in (0, 1, 2, 3):
+                with self.subTest(verb=verb, newlines=n):
+                    raw = (body + "\n" * n).encode("utf-8")
+                    src = self.tmp / f"{verb}-{n}.md"
+                    src.write_bytes(raw)
+                    code, rec = self._run(verb, str(src))
+                    if n == 0:
+                        self.assertNotEqual(code, 0, rec)
+                        self.assertNotIn("relay", rec, rec)
+                        self.assertIn("newline", rec["error"])
+                    else:
+                        self.assertEqual(code, 0, rec)
+                        self._assert_rides(rec, raw, argv)
+
+    def test_a_noncanonical_envelope_reaches_no_verb_that_records(self):
+        """The refusal is at the READER, so it holds for every verb that
+        takes an envelope from a person — including the two that write to
+        the append-only ledger. A form refused at `validate` but recorded by
+        `close` would be the same defect with one more step in it."""
+        raw = self.FORMS["crlf"](self._verdict_text("clean to advance"))
+        src = self.tmp / "recordable.md"
+        src.write_bytes(raw)
+        before = (self.state / "ledger.jsonl").read_text(encoding="utf-8")
+        for argv in (["close", "--verdict", str(src)],
+                     ["fingerprint", str(src)],
+                     ["ledger", "add", str(src)],
+                     ["take", str(src), "--as", "codex"]):
+            with self.subTest(verb=" ".join(argv[:2])):
+                code, rec = self._run(*argv)
+                self._assert_refused(code, rec, "CRLF")
+        self.assertEqual((self.state / "ledger.jsonl").read_text(
+            encoding="utf-8"), before, "a refused envelope recorded nothing")
 
 
 class TestBrief(unittest.TestCase):
@@ -886,7 +1286,7 @@ class TestHandoffAlwaysCarriesTheBrief(unittest.TestCase):
             encoding="utf-8")
         code, rec = self._run("validate", str(valid))
         self.assertEqual(code, 0, rec)
-        self.assertIn("What to run next", rec["relay"])
+        self.assertIn("## Verdict", rec["relay"])
         self.assertIn(f"{TOOL_NAME} close --verdict", rec["relay"])
 
     def test_a_local_only_target_is_reported_as_unreachable(self):
@@ -1019,6 +1419,7 @@ class TestVerdictCarrier(unittest.TestCase):
         import contextlib
         import io
         import sys
+        import types
         from review.tests.synth import CFG
         try:
             tmp = Path(tempfile.mkdtemp(prefix="carrier-"))
@@ -1035,7 +1436,11 @@ class TestVerdictCarrier(unittest.TestCase):
                                   command="respond")
         buf = io.StringIO()
         stdin = sys.stdin
-        sys.stdin = io.StringIO(self._verdict_text())
+        # Round-4 F1: the envelope leg reads `sys.stdin.buffer`, because a
+        # text-mode stdin rewrites CRLF and CR before the tool sees them.
+        # The stub carries a real byte stream for the same reason.
+        sys.stdin = types.SimpleNamespace(
+            buffer=io.BytesIO(self._verdict_text().encode("utf-8")))
         try:
             with contextlib.redirect_stdout(buf):
                 code = cli.cmd_respond(args, CFG)

@@ -214,6 +214,42 @@ class Op(str):
         return super().__new__(cls, text)
 
 
+_HEREDOC_DELIM = re.compile(r"[A-Z][A-Z0-9_]*")
+
+
+class Heredoc(str):
+    """The one redirection that carries BYTES after the line: a QUOTED
+    heredoc opener, `<<'DELIM'` (relay ergonomics, 2026-08-30 — the paste
+    legs fold the command and the envelope into ONE fenced block, and the
+    heredoc is what makes that block a single runnable unit rather than a
+    command beside bytes a person must marry up).
+
+    The quotes are the safety property and they are written HERE, in
+    balanced pair: a quoted delimiter makes the body inert — no expansion,
+    no substitution, no command can be spelled by the bytes it carries —
+    and the delimiter class [A-Z][A-Z0-9_]* can spell no quote, operator,
+    separator or control character, so the rendered form is always exactly
+    one operator word. The bytes themselves never pass through this type:
+    they are fence content, and the caller chooses the delimiter AGAINST
+    them, bumped until no data line equals it — the exact-line collision
+    is the one way a heredoc ends early and hands the rest to the shell.
+    """
+
+    __init_subclass__ = classmethod(_reject_subclassing(None))
+
+    def __new__(cls, delim=""):
+        text = str(delim)
+        if not _HEREDOC_DELIM.fullmatch(text):
+            raise ValueError(
+                f"{text!r} may not open a heredoc: the delimiter class is "
+                f"[A-Z][A-Z0-9_]* and nothing else — it renders unquoted "
+                f"inside the quoted opener, so only a class that can spell "
+                f"no quote or operator keeps the opener one word")
+        rendered = super().__new__(cls, f"<<'{text}'")
+        rendered.delimiter = text
+        return rendered
+
+
 class Ph(str):
     """A placeholder a PERSON fills in — `<sha>`, `<sha>:<path>`,
     `"<why>"`, `"..."`, `[--base <sha>]`.
@@ -306,7 +342,7 @@ def command(*words):
                 f"a {kind.__name__} may not be a word of another command: "
                 f"compose words, not rendered lines — a rendered line "
                 f"re-quoted would corrupt it, and unquoted would splice it")
-        if kind in (Lit, Op):
+        if kind in (Lit, Op, Heredoc):
             parts.append(str(w))
         elif kind is Ph:
             parts.append(str(w))

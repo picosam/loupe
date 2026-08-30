@@ -137,7 +137,7 @@ TOOL_NAME = "loupe"
 #   - the reviewer procedure gains the falsification-anchoring rule (D3):
 #     anchor in the reviewed tree wherever the defect admits it, and name
 #     an external mutable dependency in the finding when it does not.
-TOOL_VERSION = "0.11.0"
+TOOL_VERSION = "0.11.3"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never
@@ -260,6 +260,7 @@ SHAPE_ARTEFACTS = (
 
 IDENTITY_EXCLUDED = {
     ".gitignore": VERSION_CONTROL,
+    "CHANGELOG.md": DOCS,
     "LICENSE": DOCS,
     "README.md": DOCS,
     "adapters/claude/SKILL.md": ADAPTERS,
@@ -278,6 +279,7 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_breakers.py": TESTS,
     "review/tests/test_command_boundary.py": TESTS,
     "review/tests/test_convergence.py": TESTS,
+    "review/tests/test_debug_round.py": TESTS,
     "review/tests/test_command_surface.py": TESTS,
     "review/tests/test_falsification_record.py": TESTS,
     "review/tests/test_fingerprint.py": TESTS,
@@ -286,6 +288,7 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_paths.py": TESTS,
     "review/tests/test_prune.py": TESTS,
     "review/tests/test_reachability.py": TESTS,
+    "review/tests/test_readme_walkthrough.py": TESTS,
     "review/tests/test_reference_binding.py": TESTS,
     "review/tests/test_reference_domain.py": TESTS,
     "review/tests/test_rename_migration.py": TESTS,

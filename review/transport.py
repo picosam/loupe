@@ -195,13 +195,20 @@ def keep_bytes(cfg: Config, round_no: int, kind: str, text: str) -> str:
     """Write the envelope bytes beside the ledger and return the path, or the
     reason there is none. Retention is best effort: the ledger event carries
     the digest either way, so a copy that could not be kept degrades the
-    pointer without losing the identity (the same rule gate output follows)."""
+    pointer without losing the identity (the same rule gate output follows).
+
+    The already-kept check compares RAW BYTES, not decoded text (lineage 17
+    round 5 F1, ruled 2026-08-30): a text read translates CRLF to LF, so a
+    kept copy rewritten under the tool compared equal to the canonical text
+    and stayed as it was. This operation owns the copy, so a copy whose
+    bytes differ — whatever rewrote them — is restored from the canonical
+    emitted text rather than trusted."""
     target = exchange_path(cfg, round_no, kind)
     if target is None:
         return "not kept (no state directory configured)"
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.is_file() and target.read_text(encoding="utf-8") == text:
+        if target.is_file() and target.read_bytes() == text.encode("utf-8"):
             return str(target)
         target.write_text(text, encoding="utf-8")
         return str(target)
@@ -642,6 +649,17 @@ def verdict_events(parsed: wire.Verdict, round_no: int, digest: str,
     if tokens is not None:
         event["tokens"] = tokens
     events = [event]
+    # A `## tool feedback` section — the debug round's ask, though a
+    # reviewer may volunteer it on any round — is recorded so the
+    # critiques of the tool's own performance accumulate somewhere a
+    # report can reach (2026-08-31). Advisory prose about loupe itself:
+    # it feeds no breaker, certifies nothing, and its absence on a
+    # debug-stamped round is between the humans, not a refusal.
+    feedback = wire._split_sections(parsed.body).get(
+        vocab.TOOL_FEEDBACK_SECTION, "").strip()
+    if feedback:
+        events.append({"event": "tool_feedback", "round": round_no,
+                       "sha": parsed.sha, "text": feedback})
     for f in parsed.findings:
         if f.legacy_fingerprint() != f.fingerprint():
             events.append(alias_event(f.legacy_fingerprint(), f.fingerprint()))
@@ -711,9 +729,18 @@ def answered_verdict(cfg: Config, parsed: wire.Disposition,
     path = exchange_path(cfg, round_no, "verdict")
     if path is None or not path.is_file():
         return None
+    # Raw bytes, decoded without newline translation (lineage 17 round 5
+    # F1, ruled 2026-08-30): `read_text` folds CRLF to LF before the
+    # digest, so a kept copy rewritten to CRLF still reproduced the
+    # recorded digest and the guard above it guarded nothing. Undecodable
+    # bytes are not the recorded verdict either; both read as unavailable.
     try:
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
     except OSError:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
         return None
     if _digest_text(text) != recorded["source_digest"]:
         return None            # the kept copy is not the recorded verdict
@@ -1207,7 +1234,8 @@ def cached_handoff(cfg: Config, ledger: Ledger, round_no: int,
                    roles: tuple[str, str] | None = None,
                    transport: str | None = None,
                    author_flag: str | None = None,
-                   reviewer_flag: str | None = None) -> dict | None:
+                   reviewer_flag: str | None = None,
+                   debug: bool = False) -> dict | None:
     """§9bis.3 rule 5: re-running handoff on an unchanged tip with a warm
     request returns the same envelope without re-running gates or pushing.
 
@@ -1290,7 +1318,15 @@ def cached_handoff(cfg: Config, ledger: Ledger, round_no: int,
     path = exchange_path(cfg, round_no, "request")
     if path is None or not path.is_file():
         return None
-    text = path.read_text(encoding="utf-8")
+    # Raw bytes, decoded without newline translation (lineage 17 round 5
+    # F1, ruled 2026-08-30): the reviewer's reproducer rewrote a kept LF
+    # request to CRLF and this cache still served warm, reporting the
+    # recorded digest for bytes that no longer carried it. Altered copy —
+    # including undecodable — is cold, which is the honest state.
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
     if _digest_text(text) != request.get("source_digest"):
         return None
     # The effective role stamp is part of the envelope's input (§4): a warm
@@ -1352,6 +1388,15 @@ def cached_handoff(cfg: Config, ledger: Ledger, round_no: int,
         "the transport this invocation resolved" if transport is not None
         else "[roles] transport in the governing config")
     if declared_transport(kept_request) != want_transport:
+        return None
+    # The debug stamp is part of the envelope's input too (2026-08-31),
+    # under the same rule as the claim, the roles and the transport: a
+    # warm copy stamped as a debug round must not answer an invocation
+    # that did not ask for one, and the other way around — the stale
+    # artifact would tell the reviewer the wrong thing about what this
+    # round asks of them. Absent on both sides is a real, matching state.
+    want_debug = vocab.DEBUG_TOOL_FEEDBACK if debug else None
+    if attrs.get(vocab.DEBUG_ATTR) != want_debug:
         return None
     # Round 1 F2 (High). The docstring above calls a proper-subset cache key
     # the defect class it exists to prevent, and then left one input out of

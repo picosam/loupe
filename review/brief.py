@@ -128,6 +128,90 @@ def _fence(*commands: str, lang: str = "bash") -> list[str]:
     return [f"{tick}{lang}", *commands, tick]
 
 
+class UnrelayableEnvelope(ValueError):
+    """An envelope whose exact bytes cannot ride a heredoc (round-3 F2).
+
+    A heredoc delivers one newline after its last body line, always — so
+    an envelope with no terminal newline cannot arrive byte-identical
+    through this carrier, and printing a relay that silently appends one
+    would hand the consuming verb different bytes from the ones the
+    validator judged. Raised BEFORE any relay is rendered; the remedy is
+    the file's, not the carrier's.
+    """
+
+
+def _heredoc_body(envelope: str) -> str:
+    """The heredoc body whose delivery is byte-identical to `envelope`.
+
+    Round-3 F2 closed the terminal-newline domain: the old code stripped
+    EVERY trailing newline and the heredoc restored exactly one, so zero,
+    one and two terminal newlines all delivered one — the author recorded
+    a different byte digest from the artifact the reviewer validated.
+    The partition now: an envelope ending in one or more newlines has
+    exactly ONE stripped — the one the heredoc's own mechanics restore —
+    so every extra terminal newline rides as an empty body line and the
+    delivered bytes equal the source bytes; an envelope with no terminal
+    newline is refused, because no heredoc can deliver it unchanged.
+    """
+    if not envelope.endswith("\n"):
+        raise UnrelayableEnvelope(
+            "this envelope does not end with a newline, and a heredoc "
+            "delivers exactly one after its last line — relaying it would "
+            "change the bytes the validator judged. A person appends the "
+            "terminal newline to the file and re-runs; every envelope the "
+            "tool itself emits already ends with one")
+    return envelope[:-1]
+
+
+def _heredoc(data: str, base: str) -> "paths.Heredoc":
+    """A quoted heredoc opener whose delimiter no line of `data` can close
+    early. The exact-line collision is the danger that matters: a data
+    line equal to the delimiter ends the heredoc THERE, and everything
+    after it would run as shell — so the delimiter is chosen against the
+    bytes, bumped with a numeric suffix until it collides with nothing."""
+    lines = set(data.split("\n"))
+    delim, n = base, 1
+    while delim in lines:
+        n += 1
+        delim = f"{base}_{n}"
+    return paths.Heredoc(delim)
+
+
+def _paste_block(command_line, data: str, delimiter: str) -> list[str]:
+    """ONE fence carrying a command and the bytes it consumes — the paste
+    legs' whole relay (relay ergonomics, 2026-08-30).
+
+    The old shape was two fences with prose between them: the command in
+    one, the bytes labelled and fenced below, and the human had to carry
+    both and the receiving agent had to marry them back up — measured
+    failing in live cross-machine use, where the reviewer errored unless
+    the human retyped the command beside the paste. Folded into one block,
+    the paste IS the command: the bytes ride as the command's own stdin
+    under a QUOTED delimiter, so nothing in them expands or executes.
+
+    The fence keeps its promise in the only form a heredoc admits: paste
+    the block and exactly one command runs, with the data as its stdin.
+    The command line is checked through the same executable door as every
+    fenced relay line; the data lines are not commands and are not checked
+    as commands — they are inert heredoc content, made inert by the quoted
+    delimiter `_heredoc` chose against them. The fence itself outruns any
+    backtick run inside, exactly as `_fence` does.
+    """
+    paths.executable(command_line, "a paste-block command line")
+    lines = [str(command_line), *data.split("\n"), delimiter]
+    longest = 0
+    for line in lines:
+        for run in re.findall(r"`+", line):
+            longest = max(longest, len(run))
+    tick = "`" * max(3, longest + 1)
+    return [f"{tick}bash", *lines, tick]
+
+
+# The heredoc delimiter bases, derived from the tool's own name so a rename
+# travels; sanitised into the Heredoc class rather than trusted to fit it.
+_DELIM_BASE = re.sub(r"[^A-Z0-9_]", "_", TOOL_NAME.upper()) or "TOOL"
+
+
 def _reference_states(section: str) -> dict[str, int]:
     """Reference lines counted by the state the grammar actually records.
 
@@ -381,11 +465,12 @@ def verdict_precis(parsed, source: str | None = None,
 def verdict_relay(parsed, source: str | None = None,
                   transport: str = vocab.TRANSPORT_DEFAULT,
                   envelope: str | None = None) -> str:
-    """The commands that follow a verdict, as one block safe to run as-is.
+    """One section, `## Verdict`, holding exactly what the human carries.
 
     On a declared paste round, `envelope` (the verdict's own bytes) travels
-    UNDER the command that consumes them, inside a fence the bytes cannot
-    close — exactly as the request leg has always carried its envelope.
+    INSIDE the one block, as the stdin of the close command that consumes
+    them — a quoted heredoc, delimiter chosen against the bytes — exactly
+    as the request leg carries its envelope.
     Round 3, live: the verdict crossed a chat surface as loose prose, the
     renderer stripped its markdown headings, and the author's `close`
     refused a mangled document the reviewer had validated byte-for-byte. A
@@ -425,7 +510,6 @@ def verdict_relay(parsed, source: str | None = None,
     # one's single assignment is the proof.
     verdict_word = (paths.Lit("-") if transport == vocab.TRANSPORT_PASTE
                     else (source if source else paths.Ph("<verdict.md>")))
-    ruling = parsed.verdict or ""
     # `respond` used to ride here as a comment. It is gone, and the reason
     # is not brevity: `close` DERIVES the next command when it records the
     # round — `changes requested` returns `respond --verdict <the recorded
@@ -449,17 +533,21 @@ def verdict_relay(parsed, source: str | None = None,
     # the one it had never run. Now the round says which it is, so the line
     # states one fact instead of two possibilities.
     #
-    # On a paste round the note carries an INSTRUCTION — the verdict bytes
-    # have to get into that command somehow — so it stays. On a path round
-    # it carried nothing the block did not already say under its own
-    # "## What to run next" heading, and a comment that restates its heading
-    # is noise on every single relay (user, 2026-08-26). Removed rather than
-    # made suppressible: an option would be one more thing to know.
-    if transport == vocab.TRANSPORT_PASTE:
-        note = ("the author's to run — this round declares no shared "
-                "filesystem, so paste the verdict into it")
-    else:
-        note = None
+    # Relay ergonomics (user, 2026-08-30): this leg is one section titled
+    # `## Verdict` containing exactly what needs to be carried — no
+    # commentary, no second block, on either transport and for either
+    # verdict. The paste round's old note ("the author's to run — paste
+    # the verdict into it") carried an instruction only because the bytes
+    # travelled in a SEPARATE fence a person had to marry up with the
+    # command; folded into one heredoc block, the instruction is embodied
+    # and the note would restate what the block already does.
+    if transport == vocab.TRANSPORT_PASTE and envelope is not None:
+        data = _heredoc_body(envelope)
+        hd = _heredoc(data, f"{_DELIM_BASE}_VERDICT")
+        close_cmd = paths.command(
+            *paths.lits(TOOL_NAME, "close", "--verdict"), paths.Lit("-"), hd)
+        return "\n".join(["## Verdict", "",
+                          *_paste_block(close_cmd, data, hd.delimiter)])
     close_cmd = paths.command(paths.Lit(TOOL_NAME), paths.Lit("close"),
                               paths.Lit("--verdict"), verdict_word)
     # F1 (lineage 6 round 1): a placeholder-bearing line is a Template, and
@@ -468,16 +556,7 @@ def verdict_relay(parsed, source: str | None = None,
     # a person's to finish, so it travels as a comment.
     if isinstance(close_cmd, paths.Template):
         close_cmd = paths.comment(close_cmd)
-    lines = [close_cmd] if note is None else [paths.comment(note), close_cmd]
-    out = ["## What to run next", "", *_fence(*lines)]
-    if transport == vocab.TRANSPORT_PASTE and envelope is not None:
-        out.append("")
-        out.append("The verdict, to paste:")
-        out.append("")
-        # Not a command: no language tag, and a fence the verdict's own
-        # backtick runs cannot close (the request leg's exact shape).
-        out.extend(_fence(envelope.rstrip("\n"), lang=""))
-    return "\n".join(out)
+    return "\n".join(["## Verdict", "", *_fence(close_cmd)])
 
 
 # ------------------------------------------------------------------- relay
@@ -507,10 +586,13 @@ def relay(kept: str | None, parsed, envelope: str,
     Now the round declares it. `path` — the two ends read the same disk —
     renders exactly one line and nothing else: the carrier that applies, no
     alternative, no caveat, nothing for a relaying agent to reword. `paste`
-    renders the other carrier live and the bytes beneath it, because a
-    reviewer who cannot open this filesystem needs the envelope itself and
-    not a pointer into it. Neither shape asks the reader to choose; the
-    round already chose, and the fence says what it chose.
+    renders ONE block in which the take command opens a quoted heredoc and
+    the envelope bytes ride as its stdin (relay ergonomics, 2026-08-30 —
+    the earlier command-fence-plus-bytes-fence shape made the human retype
+    the command beside the paste), because a reviewer who cannot open this
+    filesystem needs the envelope itself and not a pointer into it. Neither
+    shape asks the reader to choose; the round already chose, and the fence
+    says what it chose.
     """
     transport = (transport if transport is not None
                  else declared_transport(parsed))
@@ -519,6 +601,22 @@ def relay(kept: str | None, parsed, envelope: str,
     # the tool will refuse is worse than printing none — the human hands over
     # something that fails and has to debug a tool they are only carrying for.
     reviewer = (getattr(parsed, "attrs", {}) or {}).get("reviewer", "")
+    # Relay ergonomics (user, 2026-08-30): a declared paste round with a
+    # stamped reviewer is ONE block — the take command opening a quoted
+    # heredoc, the envelope bytes as its stdin, the delimiter closing them.
+    # The old shape (command fence, label, bytes fence) failed in live
+    # cross-machine use: the reviewer errored unless the human retyped the
+    # command beside the paste. Without a stamped reviewer the command is a
+    # Template no fence may run, so that case keeps the two-part shape
+    # below, where the commented command and the bytes travel separately.
+    if transport == vocab.TRANSPORT_PASTE and reviewer:
+        data = _heredoc_body(envelope)
+        hd = _heredoc(data, f"{_DELIM_BASE}_REQUEST")
+        take_cmd = paths.command(paths.Lit(TOOL_NAME), paths.Lit("take"),
+                                 paths.Lit("-"), paths.Lit("--as"),
+                                 reviewer, hd)
+        return "\n".join(["## How to carry it", "",
+                          *_paste_block(take_cmd, data, hd.delimiter)])
     # Round 4 F1: the identity is a dynamic shell WORD, not a path and not
     # therefore safe — a permitted id carrying `;` altered the command an
     # agent is instructed to run verbatim. The placeholder stays literal;

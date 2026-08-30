@@ -1101,6 +1101,51 @@ class TestTake(unittest.TestCase):
         self.assertEqual(probed, [])
 
 
+class TestSpanReport(unittest.TestCase):
+    """Ruled 2026-08-30 (brief review-scope-envelope): the diff shape the
+    envelope stamps — and the précis reprints — carries the COMMIT COUNT
+    the span sweeps, machine-computed, so an author sees a thirteen-commit
+    sweep before a human carries it. Report, never refuse."""
+
+    def setUp(self):
+        try:
+            self.tmp = Path(tempfile.mkdtemp(prefix="span-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self.tmp, ignore_errors=True))
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.tmp)],
+                       check=True, capture_output=True, timeout=60)
+        self.shas = []
+        for n in range(3):
+            (self.tmp / "f.txt").write_text(f"{n}\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(self.tmp), "-c", "user.email=s@example.invalid",
+                 "-c", "user.name=s", "add", "-A"],
+                check=True, capture_output=True, timeout=60)
+            subprocess.run(
+                ["git", "-C", str(self.tmp), "-c", "user.email=s@example.invalid",
+                 "-c", "user.name=s", "commit", "-qm", f"c{n}"],
+                check=True, capture_output=True, timeout=60)
+            self.shas.append(_git(self.tmp, "rev-parse", "HEAD"))
+
+    def test_the_shape_counts_the_commits_it_spans(self):
+        from review import emit
+        two = emit.diff_shape(self.tmp, self.shas[0], self.shas[2])
+        self.assertEqual(two["commits"], 2)
+        self.assertIn("spanning 2 commits", emit.shape_line(two))
+        one = emit.diff_shape(self.tmp, self.shas[1], self.shas[2])
+        self.assertEqual(one["commits"], 1)
+        self.assertIn("spanning 1 commit", emit.shape_line(one))
+        # The validator's machine-readable triple survives the suffix.
+        from review.validate import _DIFF_SHAPE_RE
+        line = f"What changed ({emit.shape_line(two)} — machine-computed):"
+        found = _DIFF_SHAPE_RE.search(line)
+        self.assertIsNotNone(found)
+        self.assertEqual(tuple(int(x) for x in found.groups()),
+                         (two["files"], two["insertions"], two["deletions"]))
+
+
 class TestCachedHandoff(unittest.TestCase):
 
     def test_cold_when_dirty(self):
@@ -1160,6 +1205,69 @@ class TestCachedHandoff(unittest.TestCase):
         Path(kept).write_text(text + "tampered\n", encoding="utf-8")
         self.assertIsNone(transport.cached_handoff(
             cfg, ledger, 1, git=git, claim_digest=transport.NO_CLAIM))
+
+    def test_a_kept_request_rewritten_to_crlf_is_cold(self):
+        """Lineage 17 round 5 F1 (ruled 2026-08-30): the reviewer's
+        reproducer — replace the kept LF request with CRLF bytes — came
+        back WARM, because the digest read the copy through newline
+        translation and reported the recorded digest for bytes that no
+        longer carried it. Raw bytes decide now: every byte-distinct
+        physical form is cold, and undecodable bytes are cold rather than
+        a traceback."""
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix="handoff-crlf-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            tmp, ignore_errors=True))
+        cfg = dataclasses.replace(CFG, ledger_dir=tmp)
+        text = request_text(tool_attr=tool_identity())
+        kept = transport.keep_bytes(cfg, 1, "request", text)
+        git = fake_git({("rev-parse", "HEAD"): SHA_B,
+                        ("status", "--porcelain"): "",
+                        **authority_calls()})
+        ledger = Ledger.in_memory()
+        ledger.add({"event": "request", "round": 1, "sha": SHA_B,
+                    "source_digest": transport._digest_text(text),
+                    "bytes": len(text),
+                    "claim_digest": transport.NO_CLAIM})
+        # Paired control: the canonical LF copy is warm.
+        self.assertIsNotNone(transport.cached_handoff(
+            cfg, ledger, 1, git=git, claim_digest=transport.NO_CLAIM))
+        for name, mutant in (("crlf", text.replace("\n", "\r\n")),
+                             ("cr", text.replace("\n", "\r"))):
+            Path(kept).write_bytes(mutant.encode("utf-8"))
+            self.assertIsNone(
+                transport.cached_handoff(cfg, ledger, 1, git=git,
+                                         claim_digest=transport.NO_CLAIM),
+                f"{name}: a byte-distinct kept copy served warm")
+        Path(kept).write_bytes(b"\xff" + text.encode("utf-8"))
+        self.assertIsNone(transport.cached_handoff(
+            cfg, ledger, 1, git=git, claim_digest=transport.NO_CLAIM))
+
+    def test_keep_bytes_restores_a_rewritten_copy_from_canonical_text(self):
+        """keep_bytes OWNS the retained copy (ruled 2026-08-30): the
+        already-kept check compares raw bytes, so a CRLF rewrite that a
+        text comparison read as equal is restored from the canonical
+        emitted text rather than left standing."""
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix="keep-crlf-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            tmp, ignore_errors=True))
+        cfg = dataclasses.replace(CFG, ledger_dir=tmp)
+        text = request_text(tool_attr=tool_identity())
+        kept = transport.keep_bytes(cfg, 1, "request", text)
+        # Paired control: an unmodified canonical copy is left as it is.
+        self.assertEqual(transport.keep_bytes(cfg, 1, "request", text), kept)
+        self.assertEqual(Path(kept).read_bytes(), text.encode("utf-8"))
+        # The rewrite a text comparison could not see is repaired.
+        Path(kept).write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+        self.assertEqual(transport.keep_bytes(cfg, 1, "request", text), kept)
+        self.assertEqual(Path(kept).read_bytes(), text.encode("utf-8"),
+                         "a byte-rewritten kept copy must be restored from "
+                         "the canonical emitted text")
 
     def test_an_edited_claim_at_an_unchanged_tip_is_cold(self):
         """Found while emitting round 3 of this tool's own review.
@@ -1734,7 +1842,8 @@ class TestHandoffBreakers(unittest.TestCase):
         # requires is unchanged and still asserted below: a fired breaker
         # stops the handoff, and nothing is recorded or kept.
         claim = tmp / "claim.json"
-        claim.write_text('{"objective": "x", "risk": "low"}',
+        claim.write_text('{"objective": "x", "risk": "low", '
+                         '"references": [{"path": "review.toml"}]}',
                          encoding="utf-8")
         from review.tests.test_breakers import FP
         code, payload = _cli(cli.cmd_handoff, cfg,
@@ -4031,6 +4140,41 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         self.assertIn("carries no review.toml", str(exc))
         self.assertIn("commits review.toml", exc.remedy)
         self.assertIn("Nothing has been pushed or emitted", exc.remedy)
+
+    def test_a_user_level_config_opens_no_reviewed_door(self):
+        """Lineage 18 round 1 F1, the runtime half: a VALID user-level
+        config, resolved as this repository's source, opens none of the
+        three reviewed doors while the repository tracks no review.toml.
+        The doc half — the shipped specification describing exactly this
+        three-door result — is test_adapters.TestConfigAuthorityClaims;
+        this control is what must stay refusing while any mutation of the
+        shipped prose back to the fallback claim fails that guard."""
+        from review import emit as _emit
+        home = self.tmp / "home"
+        cfg_dir = home / ".config" / TOOL_NAME
+        cfg_dir.mkdir(parents=True)
+        repo_id = config.load(self.repo).repo_id
+        (cfg_dir / f"{repo_id}.toml").write_text(self.toml,
+                                                 encoding="utf-8")
+        with unittest.mock.patch.dict(os.environ, {"HOME": str(home)}):
+            loaded = config.load(self.repo)
+            # Paired control: the user config is LIVE — it resolved as the
+            # source and declares the taxonomy — so the refusals below are
+            # about the doors, not about a config nothing read.
+            self.assertIn("user config", loaded.source)
+            self.assertTrue(loaded.taxonomy_declared)
+            cfg = dataclasses.replace(loaded,
+                                      ledger_dir=self.tmp / "user-ledger")
+            with self.assertRaises(_emit.AuthorityAbsent) as author:
+                _emit.ensure_pushed(cfg, local_only=True)
+            self.assertIn("carries no review.toml", str(author.exception))
+            head = self._git("rev-parse", "HEAD")
+            with self.assertRaises(transport.Refusal) as reviewer:
+                transport.governing_for(cfg, head)
+            self.assertIn("carries no review.toml", str(reviewer.exception))
+            code, payload = self._validate(head, "--from-target")
+            self.assertNotEqual(code, 0, payload)
+            self.assertIn("review.toml", payload["error"])
 
     def _plant_blob_replacement(self, via="replace"):
         """Commit rules saying `gemini`, then install a replacement BLOB

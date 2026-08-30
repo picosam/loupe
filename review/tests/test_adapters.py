@@ -49,11 +49,12 @@ class TestOneSource(unittest.TestCase):
             self.assertTrue(text.startswith("---\nname: " + TOOL_NAME + "\n"))
             self.assertIn("\ndescription: ", text.split("---")[1])
 
-    def test_the_trigger_covers_zero_footprint_repositories(self):
-        # The trigger named only an in-tree review.toml, and a zero-footprint
-        # onboarding (user-level config, §4) declares nothing in-tree — so
-        # the one configuration the ownership model exists to protect was
-        # the one the skill would not fire on (found by the first pilot).
+    def test_the_trigger_covers_both_config_layers(self):
+        # The trigger once named only the in-tree review.toml. It must name
+        # both layers: the in-tree file every reviewed door requires, and
+        # the user-level config that still governs local verbs — the skill
+        # fires for local-verb work too, in a repo with no open request
+        # (found by the first pilot; scoping per 0.9.0 / lineage 18 F1).
         for kind in ("claude-skill", "codex-skill"):
             description = adapters.render(kind).split("---")[1]
             self.assertIn(f"~/.config/{TOOL_NAME}/", description)
@@ -266,6 +267,240 @@ class TestAdvertisedVersionParity(unittest.TestCase):
         self.assertEqual(buf.getvalue().strip(), self._advertised())
 
 
+class TestReadmeLifecycleClaims(unittest.TestCase):
+    """Lineage 16 round 1, F2 and F4: two README sentences survived the
+    rewrite from before the recovery contract split, and both stated the
+    runtime wrong — the same hand-kept-copy drift the version-parity gate
+    above exists for, on two more facts.
+
+    F2: the README said every non-zero exit prints the next command. The
+    recovery authority is `cli._blocked`, which partitions non-zero exits
+    into `next_kind: command` (a literal `next` to run verbatim) and
+    `next_kind: blocked` (`next: null`, a `remedy` a PERSON acts on) —
+    blocked is a real state, not a gap, and a reader told otherwise
+    improvises a command exactly where the tool says none can repair the
+    state. The paired runtime controls are
+    `test_command_boundary.TestFinishIsGuardedLikeBlocked`; this half
+    binds the README's wording to that partition.
+
+    F4: the README said the agents on either side "run one command each
+    and stop", two paragraphs above a loop in which the author runs
+    `handoff`, `close` and `respond`. One command per hand-off is the
+    true claim; per side end-to-end it is false, and the loop itself is
+    the evidence — so the check derives the verb count from the loop the
+    document prints rather than restating it here.
+    """
+
+    def _readme(self):
+        readme = public_path("README.md")
+        if readme is None:
+            self.skipTest("no README shipped in this tree")
+        return readme.read_text(encoding="utf-8")
+
+    def test_the_recovery_contract_states_both_kinds(self):
+        """FALSIFICATION for F2. Mutation: restore "every non-zero exit
+        prints the next command" in the exit-code paragraph and this fails
+        while both runtime controls stay green."""
+        text = self._readme()
+        found = re.search(r"Exit codes mean exactly one thing.*?\n\n", text,
+                          re.S)
+        self.assertIsNotNone(
+            found, "the README no longer carries its exit-code paragraph "
+                   "where this check reads it")
+        region = found.group(0)
+        self.assertIsNone(
+            re.search(r"every non-zero exit prints the next command", region),
+            "the README claims a universal next command; blocked exits "
+            "intentionally have none (`cli._blocked`)")
+        for term in ("`next_kind`", "`command`", "`blocked`", "`next: null`",
+                     "`remedy`"):
+            self.assertIn(
+                term, region,
+                f"the exit-code paragraph no longer states {term}: the "
+                f"two-state recovery contract must be stated whole, or a "
+                f"reader cannot know a blocked exit is theirs to act on")
+
+    def test_no_one_command_total_claim_beside_a_multi_verb_loop(self):
+        """FALSIFICATION for F4. Mutation: restore "run one command each
+        and stop" in the opener and this fails against the unchanged loop.
+        Control: per-hand-off wording ("one command per hand-off") passes."""
+        text = self._readme()
+        fences = re.findall(r"^```[^\n]*\n(.*?)^```", text, re.S | re.M)
+        self.assertTrue(fences, "the README no longer prints the loop")
+        verbs = {}
+        for body in fences:
+            for side, verb in re.findall(r"^(author|reviewer)\s+loupe (\S+)",
+                                         body, re.M):
+                verbs.setdefault(side, set()).add(verb)
+        multi_verb = any(len(v) > 1 for v in verbs.values())
+        self.assertTrue(
+            verbs, "the loop names no author/reviewer commands where this "
+                   "check reads them")
+        if multi_verb:
+            self.assertIsNone(
+                re.search(r"one command each", text),
+                "the README claims one command per side while its own loop "
+                "prints more than one verb for a side; say one command per "
+                "hand-off, or drop the count")
+
+
+class TestConfigAuthorityClaims(unittest.TestCase):
+    """Lineage 18 round 1 F1: the shipped specification advertised a
+    configuration fallback every reviewed door refuses — "identical
+    behaviour whether the configuration is personal or committed",
+    "user-level config preserves the zero-footprint property", and a
+    `take` that falls back to this checkout's rules. The runtime says the
+    opposite and had said it since 0.9.0.
+
+    This is the DOC half of that finding's guard, finite and anchored:
+    the fallback phrasings are banned from every shipped document, and
+    the target-carried-authority rule must be stated where each document
+    explains configuration. The runtime half — a valid user-level config
+    opens none of the three reviewed doors — is
+    `test_transport.TestTheReviewedCommitCarriesItsOwnRules
+    .test_a_user_level_config_opens_no_reviewed_door`; those controls
+    must stay refusing while any mutation of the prose back to the
+    fallback claim fails here.
+
+    Mutation: restore any of the three 0.11.2 fallback paragraphs to the
+    spec (ownership conclusion, ownership table paragraph, or the `take`
+    bullet) and a banned phrase or a missing required statement fails
+    this class while the runtime controls stay green.
+    """
+
+    BANNED = (
+        "personal or committed",
+        "preserves the zero-footprint property",
+        "if the repo wants it",
+        "is governed by this checkout",
+    )
+
+    def _text(self, path, name):
+        if path is None:
+            self.skipTest(f"no {name} shipped in this tree")
+        return path.read_text(encoding="utf-8")
+
+    def _flat(self, text):
+        return re.sub(r"\s+", " ", text)
+
+    def test_no_shipped_document_claims_the_fallback(self):
+        for name, path in (("spec", spec_path()),
+                           ("readme", public_path("README.md")),
+                           ("onboarding", public_path("docs/onboarding.md"))):
+            with self.subTest(document=name):
+                flat = self._flat(self._text(path, name))
+                for phrase in self.BANNED:
+                    self.assertNotIn(
+                        phrase, flat,
+                        f"{name} claims the retired user-level fallback "
+                        f"({phrase!r}); every reviewed door refuses it")
+
+    def test_the_spec_states_the_three_door_rule(self):
+        flat = self._flat(self._text(spec_path(), "spec"))
+        ownership = re.search(r"## 2\. Ownership model.*?## 3\.", flat)
+        self.assertIsNotNone(
+            ownership, "the spec no longer carries its ownership section "
+                       "where this check reads it")
+        region = ownership.group(0)
+        self.assertIn(
+            "refuses a target that tracks no `review.toml`", region,
+            "the ownership model no longer states the reviewed-door "
+            "refusal")
+        self.assertIn(
+            "local verbs", region,
+            "the ownership model no longer scopes user-level config to "
+            "local verbs")
+        self.assertIn(
+            "refused here exactly as it is refused at `handoff`", flat,
+            "the `take` description no longer refuses a configless target "
+            "the way handoff does")
+
+    def test_readme_and_onboarding_state_the_same_rule(self):
+        readme = self._flat(self._text(public_path("README.md"), "readme"))
+        self.assertIn(
+            "refuse a target that tracks no `review.toml`", readme)
+        self.assertIn("governs local verbs only", readme)
+        onboarding = self._flat(
+            self._text(public_path("docs/onboarding.md"), "onboarding"))
+        self.assertIn("refuses a target that tracks none", onboarding)
+        self.assertIn("governs every **local** verb", onboarding)
+
+
+class TestChangelogCompatibilityClaim(unittest.TestCase):
+    """Lineage 16 round 2 F1, strengthened by round 3 F1: the 0.11.1 note
+    said "An older reader is unaffected" one sentence after disclosing
+    that a cross-version round reads `differs`. Compatibility and absence
+    of effect are different claims: the older reader accepts and
+    validates — the mismatch is reported, never refused
+    (`test_tool_identity.TestTheThreeAgreementStates` is the paired
+    runtime control) — but it reports the mismatch, records the
+    provenance, and renders its side with its own code.
+
+    Round 3 F1: the first cut required the SUBSTRING `refused`, which the
+    semantic opposite ("every envelope is refused") also contains — a
+    check that accepts the reversal of the boundary it names binds
+    nothing. So the load-bearing terms are now checked with their
+    POLARITY: every refusal stem must sit inside a "never refused"
+    collocation, and "reported" and "accepts" must not carry an immediate
+    negation. The admitted domain is stated rather than implied: polarity
+    is recognised through these stems and immediate negators only, over
+    whitespace-normalised prose — a reversal reworded without the stems
+    ("declines every envelope") escapes this check, exactly as a fence
+    that grew a member list escapes the unenumerated guard; what cannot
+    escape is any reversal that still uses the boundary's own words."""
+
+    def test_the_0_11_1_note_states_the_boundary_not_no_effect(self):
+        """FALSIFICATION for round-2 F1 and round-3 F1. Mutations, each
+        run: restore "An older reader is unaffected" and this fails;
+        state "the mismatch is reported and every envelope is refused"
+        and this fails on the refusal polarity — while both runtime
+        controls stay green either way."""
+        changelog = public_path("CHANGELOG.md")
+        if changelog is None:
+            self.skipTest("no CHANGELOG shipped in this tree")
+        text = changelog.read_text(encoding="utf-8")
+        found = re.search(r"## 0\.11\.1\n(.*?)\n## ", text, re.S)
+        self.assertIsNotNone(
+            found, "the CHANGELOG no longer carries a 0.11.1 section where "
+                   "this check reads it")
+        # One whitespace regime, so a collocation split by a line wrap is
+        # the same collocation.
+        norm = " ".join(found.group(1).split())
+        self.assertNotIn(
+            "reader is unaffected", norm,
+            "the 0.11.1 note claims no effect beside a disclosed `differs` "
+            "report; state the boundary instead — accepted and validated, "
+            "reported, rendered by the reader's own code")
+        self.assertIn("`differs`", norm,
+                      "the 0.11.1 note no longer discloses the `differs` "
+                      "report the boundary exists to explain")
+        refusals = re.findall(r"(?:\bnever\s+)?\brefus\w*", norm)
+        self.assertTrue(
+            refusals,
+            "the 0.11.1 note no longer states the refusal side of the "
+            "boundary at all")
+        for tok in refusals:
+            self.assertTrue(
+                tok.startswith("never"),
+                f"the 0.11.1 note carries a refusal claim outside the "
+                f"'never refused' collocation ({tok!r}): an older reader "
+                f"never refuses the envelope, and a note stating otherwise "
+                f"reverses the boundary "
+                f"(TestTheThreeAgreementStates is the runtime authority)")
+        self.assertRegex(
+            norm, r"(?<!never )(?<!not )\breported\b",
+            "the 0.11.1 note no longer affirms that the mismatch is "
+            "reported")
+        self.assertNotRegex(
+            norm, r"\b(?:never|not|no longer)\s+(?:reported|accepts)",
+            "the 0.11.1 note negates a side of the boundary that the "
+            "runtime affirms")
+        self.assertIn(
+            "accepts and validates", norm,
+            "the 0.11.1 note no longer states what an older reader still "
+            "does — accepts and validates the envelope")
+
+
 class TestShippedRestatements(unittest.TestCase):
     """Round-2 F3: a CLOSED inventory of every fact the shipped documents
     restate by hand, each bound to the authority that owns it.
@@ -377,6 +612,14 @@ class TestShippedRestatements(unittest.TestCase):
         "stamped_kinds (readme)": (vocab.STAMPED_KINDS, "readme",
                                    r"review tool: (.*?)\nenvelopes",
                                    "_arrow_chain"),
+        # 0.11.3: `references` joined CLAIM_REQUIRED, which armed the
+        # cross-product tripwire on the README's walkthrough — its example
+        # claim spells out exactly the required members, as any minimal
+        # claim must. Registered so the example drifts loudly if the
+        # required set moves again.
+        "claim_required (readme)": (vocab.CLAIM_REQUIRED, "readme",
+                                    r"\$ cat > \S*claim\.json <<'EOF'\n(.*?)\nEOF",
+                                    "_json_keys"),
     }
 
     #: Authorities no shipped document enumerates. Kept explicit, and kept
@@ -386,7 +629,7 @@ class TestShippedRestatements(unittest.TestCase):
     UNDOCUMENTED = {
         "BLOCKING_ILLEGAL", "FALSIFICATION_KINDS", "FALSIFICATION_RECORD",
         "LINEAGE_KINDS", "LINEAGE_MERGING", "CLAIM_STRING_FIELDS",
-        "CLAIM_LIST_FIELDS", "CLAIM_REQUIRED", "CLAIM_NONEMPTY",
+        "CLAIM_LIST_FIELDS", "CLAIM_NONEMPTY",
         "CLAIM_REFERENCE_REQUIRED", "SEAM_CLASSES", "STAMPED_PARSE_CALLS",
         # Round 4 F1: git's tree-entry modes, not this tool's vocabulary.
         # The shipped design documents what the tool decides, and which
@@ -430,6 +673,15 @@ class TestShippedRestatements(unittest.TestCase):
                 for row in region.splitlines()
                 if row.startswith("|") and "---" not in row
                 and row.split("|")[3].strip() != "—"}
+
+    @staticmethod
+    def _json_keys(region):
+        """A JSON object shown as an example: its top-level member names.
+        The walkthrough's claim is minimal by design, so its keys are
+        exactly the required set. Nested objects live inside the reference
+        list, so bracketed regions are dropped before reading keys."""
+        top = re.sub(r"\[.*?\]", "[]", region, flags=re.S)
+        return {m.group(1) for m in re.finditer(r'"(\w+)":', top)}
 
     @staticmethod
     def _bare(region):

@@ -218,6 +218,71 @@ class Disposition:
     body_defects: tuple = ()  # repeated JSON members in the body
 
 
+class NoncanonicalLineEndings(ValueError):
+    """Envelope source bytes whose physical line endings are not plain LF.
+
+    Round-4 F1: every named-file route read its envelope through
+    `Path.read_text`, whose universal-newline mode turns physical CRLF and
+    CR into LF before anything else sees the document. The grammar tolerates
+    the converted text, so a CRLF file validated successfully — and then the
+    relay, the recorded digest and the approval helper each described a
+    different artefact from the one on disk: the relay carried the
+    normalized text, `loupe validate` judged it, and the raw file kept its
+    own, different SHA-256.
+
+    The domain is closed by REFUSING the noncanonical physical forms rather
+    than carrying them. A heredoc pasted into a shell cannot deliver a CR
+    unchanged — the terminal's own line discipline translates it — so
+    "accept and carry byte-identically" is a promise this carrier cannot
+    keep for CR bytes, and the one honest partition is: LF rides, everything
+    else refuses before any parse, validation result or relay exists. Every
+    envelope the tool itself emits is LF.
+    """
+
+    def __init__(self, message: str, remedy: str = ""):
+        super().__init__(message)
+        self.remedy = remedy
+
+
+def line_ending_form(text: str) -> str:
+    """The physical line-ending form of `text`, named for a refusal message."""
+    crlf = text.count("\r\n")
+    cr = text.count("\r") - crlf
+    lf = text.count("\n") - crlf
+    present = [name for name, n in (("CRLF", crlf), ("CR", cr), ("LF", lf))
+               if n]
+    if not present:
+        return "LF"
+    if len(present) == 1:
+        return present[0]
+    return "mixed " + "/".join(present)
+
+
+def decode_envelope(data: bytes, source: str) -> str:
+    """The envelope text of `data`, or a refusal — the ONE door envelope
+    bytes enter this tool by.
+
+    Bytes in, not text: the caller must not have opened the source in a mode
+    that rewrites it. `UnicodeDecodeError` is a `ValueError` and travels the
+    same typed path it did when this was `read_text`.
+    """
+    text = data.decode("utf-8")
+    if "\r" not in text:
+        return text
+    form = line_ending_form(text)
+    where = paths.display_path(source) if source != "-" else "standard input"
+    raise NoncanonicalLineEndings(
+        f"{where} has {form} line endings, and an envelope is carried and "
+        f"digested as the bytes it is written in — reading it would convert "
+        f"them to LF, so what this tool validated, relayed and recorded "
+        f"would not be the artefact on disk. Refused before any parse",
+        remedy=("a person rewrites the envelope with LF line endings — "
+                "their editor's line-ending setting, or a converter — and "
+                "re-runs the same command; every envelope this tool emits "
+                "already ends its lines with LF, so this is an envelope some "
+                "other hand or transfer rewrote"))
+
+
 def unwrap(text: str):
     """Return (tag, kind, attrs, body, exact) or (None, None, {}, text, False).
 
