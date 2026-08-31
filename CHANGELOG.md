@@ -5,6 +5,43 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.12.1
+
+Documentation only; no behaviour changes and nothing addressed to upgraders.
+
+**Onboarding covers provisioning.** The pass ended at "`loupe --version`
+succeeds ... fix that first", which does not stick in an environment rebuilt
+for every session — a cloud development container, a CI runner, an ephemeral
+workspace. A repository could therefore carry `review.toml` with no way to run
+the tool that reads it. The new section covers where provisioning belongs (the
+repository's own tracked script), pinning the tool to an exact commit and
+reporting drift rather than acting on it, isolation from the repository's own
+environment, and staying non-fatal.
+
+It also covers the interpreter, which is where this surprises people. A current
+`uv` reads `requires-python` out of the pinned ref and provisions a matching
+interpreter itself, so naming a version in a provisioning script is a constant
+that goes wrong when the floor moves. Two things defeat that and both surface
+as the same "no interpreter found" error — an older `uv`, and downloads
+disabled by policy — so the section says read the error, which names the
+download it would have made, before hardcoding anything.
+
+**The gate manifest section gains identity.** Its environment test — rerun the
+gate in a fresh worktree carrying no ignored files and no ambient credentials —
+cannot catch a gate that passes as an unprivileged user and fails as root,
+because a worktree does not change who you are. A gate asserting file
+permissions is the common shape. This matters more than it sounds: there is no
+bypass for a blocking gate, so an author whose identity reddens one cannot emit
+at all.
+
+**The medium a person uses is not a transport** (design §5.2). `paste` names a
+topology — the bytes crossed, the two sides share no filesystem — not a window.
+A person moving them through a chat surface, a pull-request comment or a ticket
+has used the transport already provided, and the recorded stamp stays truthful;
+what remains refused is the TOOL fetching or posting them. Two conditions are
+stated for a forge-hosted medium: byte fidelity is the carrier's problem, and
+storage is not a trigger.
+
 ## 0.12.0
 
 One behaviour change, addressed to upgraders; the rest is test structure.

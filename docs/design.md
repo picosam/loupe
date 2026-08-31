@@ -806,6 +806,27 @@ different machines each need a human paste per leg, and the two-machine
 flow has never been exercised end to end. If that cost ever becomes the
 wrong one, the decision — not the code — is what changes first.
 
+**The medium a person uses is not a transport.** `paste` names a topology —
+the bytes crossed, the two sides share no filesystem — not a window. A
+person who moves them through a chat surface, a pull-request comment or a
+ticket has used the transport this section provides, and the recorded stamp
+stays truthful. What the paragraph above refuses is the TOOL fetching or
+posting them. The distinction is worth keeping visible, because a durable
+medium is attractive for a reason this design agrees with: envelope bytes
+that outlive the machine which emitted them are what let a round be rebuilt
+after an ephemeral environment is gone.
+
+Two conditions ride along with a forge-hosted medium. **Byte fidelity is the
+carrier's problem, not the tool's**: a forge may normalize what it stores,
+and the one normalization commonly applied — CRLF to LF — is inert here only
+because a carried envelope is LF-only by contract and any CR refuses at
+every person-supplied reader. A medium that rewrites more than that is not a
+carrier for these bytes. And **storage is not a trigger**: a comment is
+where bytes rest, never a signal that starts work. The moment a posted
+envelope invokes the other side, the round has been set in motion by
+something other than a person — which is the property this section exists to
+keep.
+
 ### 5.3 One verb per phase, no flag the agent must decide
 
 Every decision the agent makes is a token cost and a drift risk; the tool

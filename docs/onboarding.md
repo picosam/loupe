@@ -41,6 +41,60 @@ install, which is in the README.
 If either fails, fix that first; every command below assumes a working
 install.
 
+## When the environment is rebuilt each session
+
+The README's install is something you do once on a machine. An environment
+created fresh for every session — a cloud development container, a CI
+runner, an ephemeral workspace — does not keep it, and "fix that first"
+above does not stick there. Provision instead: make acquiring the tool part
+of what the repository does when its environment is built.
+
+Skipping this is how a repository ends up carrying the rules for a review it
+has no way to run.
+
+**It belongs in the repository's own tracked provisioning script**, not in
+per-environment configuration pasted into a web form. Tracked means
+versioned, reviewable, and unable to drift from what the environment
+actually runs. Pasted means invisible to everyone who did not paste it.
+
+**Pin the tool to an exact commit.** A round binds to a determinate tool —
+the identity it records is the tool that ran your gates. Against a floating
+ref nobody can say afterwards which build ruled a round, and the attestation
+decays into a claim about whatever happened to be current. Report drift
+rather than acting on it: compare the pin against the upstream head, print
+one line when they differ, and let a person decide. Never auto-upgrade.
+
+**Install it isolated, never into the repository's own environment.** The
+distribution and the package it installs are deliberately different names,
+and the package name is generic enough to collide with anything else
+claiming it in a shared environment. That isolation is why the README's
+`uvx` path is the one to reach for here.
+
+**Never fatal.** A repository's own harness must not depend on the review
+tool being present. Warn and continue: a missing reviewer is not a broken
+checkout.
+
+**The interpreter — the part that surprises people.** loupe declares a
+narrow `requires-python`. A current `uv` reads that constraint out of the
+pinned ref and provisions a matching interpreter itself, so naming a version
+in your script is not merely unnecessary — it is a constant that goes wrong
+the day the floor moves. Two things defeat it, and both surface as the same
+"no interpreter found" error:
+
+- **An older `uv`.** The behaviour is version-dependent, which is why it
+  should not be assumed in either direction. Measured: a recent `uv`
+  resolves the constraint from a git source and offers the managed
+  download; an older one, in a container, did not.
+- **Downloads disabled by policy.** `UV_PYTHON_DOWNLOADS=never` is a
+  reasonable setting for a locked-down environment, and it produces an
+  identical symptom from an unrelated cause.
+
+Read the error before hardcoding anything: it names the download it would
+have made, which separates the two. Prefer a current `uv` and permitted
+downloads. If you control neither, naming the floor explicitly is a last
+resort — record it beside the pin as a value that must move when the pin
+moves, because nothing else will tell you.
+
 ## 1. The configuration lives in the tree
 
 Copy `review.toml` from the loupe repository root into **your repository's
@@ -126,6 +180,18 @@ choose, deliberately, between:
 - *Two gates — offline blocking, full non-blocking*: emits when away, but a
   real live failure is also only a notice. Permanently downgrades the live
   checks.
+
+**A fresh worktree does not change who you are, and identity is part of
+the environment.** A gate asserting anything about file permissions can pass
+as an unprivileged user and fail as root — the classic shape is a test that
+makes a path unreadable and expects the read to fail, which root simply
+bypasses. The worktree check above will not catch it: it varies the
+filesystem and the ambient credentials, not the identity. So run the
+manifest as the identity that will actually run it. This bites hardest where
+the author is an ephemeral environment that happens to run as root — there
+is no bypass for a blocking gate, so an author whose identity reddens one
+cannot emit at all, and the defect is in the gate's assumptions rather than
+in the work being reviewed.
 
 Whichever you choose, write the reasoning into the config's comments — the
 next reader is someone with no memory of this decision.
