@@ -23,8 +23,9 @@ from review import brief, config, emit, transport, vocab, wire
 from review.validate import validate_request
 from review.ledger import Ledger
 from review import tool_identity
-from review.tests.test_transport import (SHA_A, SHA_B, fake_git, request_text,
-                                         TestTake)
+from review.tests._transport_fixtures import (SHA_A, SHA_B, fake_git,
+                                              ledgerless_cfg, request_text,
+                                              reviewer_clone_git)
 from review.tests.util import REPO_ROOT
 
 CFG = config.load(REPO_ROOT)
@@ -409,9 +410,15 @@ class TestTheReviewerMayCorrectIt(unittest.TestCase):
     """
 
     # The reviewer clone's fixture, borrowed rather than inherited:
-    # subclassing TestTake would re-run its whole suite under this name.
-    _cfg = TestTake._cfg
-    _git = TestTake._git
+    # 2026-08-31: these were `TestTake._cfg` / `TestTake._git`, imported
+    # from the module that defined the class. The comment below was right
+    # that subclassing would re-run TestTake's whole suite here — but the
+    # plain IMPORT did the same thing, because unittest discovery collects a
+    # TestCase in every module whose namespace holds it. TestTake's 19 tests
+    # ran twice per suite until the helpers moved to _transport_fixtures.
+    # Borrow fixtures, never a TestCase.
+    _cfg = staticmethod(ledgerless_cfg)
+    _git = staticmethod(reviewer_clone_git)
 
     def test_the_envelope_decides_when_the_reviewer_says_nothing(self):
         ledger = Ledger.in_memory()
@@ -1013,8 +1020,8 @@ class TestTransportDeclarationClosedWorld(unittest.TestCase):
     # edges: the refusal lands before anything downstream acts.
 
     def test_take_refuses_a_defective_stamp_before_git_and_the_ledger(self):
-        cfg = TestTake._cfg(self)
-        git = TestTake._git(self)
+        cfg = ledgerless_cfg()
+        git = reviewer_clone_git()
         ledger = Ledger.in_memory()
         text = request_text(transport_attr="paste").replace(
             'transport="paste"', 'transport="carrier"')
@@ -1165,7 +1172,7 @@ class TestRecordedTransportProductReaders(unittest.TestCase):
         return code, json.loads(buf.getvalue())
 
     def _verdict_file(self, verdict="changes requested", sha=SHA_B):
-        from review.tests.test_transport import verdict_text
+        from review.tests._transport_fixtures import verdict_text
         path = self.tmp / "v.md"
         path.write_text(verdict_text(sha=sha, verdict=verdict),
                         encoding="utf-8")

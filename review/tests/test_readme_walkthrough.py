@@ -12,7 +12,7 @@ base from the example, or the example drifting away from a runnable
 fresh-lineage sequence, turns this module red rather than shipping.
 
 The later-round control that legitimately omits `--base` is
-`test_transport.TestFullLoopIntegration.test_the_loop_end_to_end`
+`test_transport_integration.TestFullLoopIntegration.test_the_loop_end_to_end`
 step 4: after a recorded verdict, `handoff` derives the base from the
 ledger. This module deliberately does not duplicate that flow; it owns
 the fresh-state entry point the README prints first.

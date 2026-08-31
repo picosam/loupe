@@ -9,15 +9,16 @@ which the tool carries but never invents.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import hashlib
-from collections import Counter
 import json
 import os
 import re
 import shutil
 import subprocess
 import time
+from collections import Counter
 from pathlib import Path
 
 from types import MappingProxyType
@@ -480,20 +481,19 @@ def run_gates(cfg: Config, target_sha: str) -> list[dict]:
         binding = "bound"
 
     env = {**_caller_env(), env_var("IN_GATE_RUN"): "1"}
-    attestations = []
-    for gate in cfg.gates:
+
+    def run_one(gate: dict) -> dict:
         started = time.monotonic()
         try:
             proc = subprocess.run(gate["command"], cwd=cfg.repo_root,
                                   capture_output=True, text=True, timeout=600,
                                   env=env)
         except (OSError, subprocess.SubprocessError) as exc:
-            attestations.append({"id": gate["id"],
-                                 "blocking": gate.get("blocking", False),
-                                 "error": f"could not execute: {exc}"})
-            continue
+            return {"id": gate["id"],
+                    "blocking": gate.get("blocking", False),
+                    "error": f"could not execute: {exc}"}
         duration = time.monotonic() - started
-        attestations.append({
+        return {
             "id": gate["id"],
             "command": " ".join(gate["command"]),
             "exit_code": proc.returncode,
@@ -507,8 +507,39 @@ def run_gates(cfg: Config, target_sha: str) -> list[dict]:
             "output": _retain_output(cfg, executed_sha, gate["id"],
                                      proc.stdout + proc.stderr),
             "blocking": gate.get("blocking", False),
-        })
-    return attestations
+        }
+
+    # Gates run CONCURRENTLY (2026-08-31). Measured: 145.4s sequential ->
+    # 85.8s at four workers, all gates green in both, no coverage change —
+    # the loop becomes bounded by its slowest gate rather than their sum.
+    #
+    # Sound because every declared gate is a CHECKER: each is read-only
+    # against the working tree, and the two that build anything
+    # (candidate-standalone, park-candidate) build into their own mkdtemp.
+    # A gate that WROTE to the tree would make this unsound, so that is the
+    # rule a new gate must meet to join the manifest.
+    #
+    # Order is the manifest's, never completion order: the executor maps over
+    # cfg.gates and the results are re-sequenced by index. An attestation
+    # block whose order depended on a race would be a different document on
+    # every run, and these documents are compared byte-for-byte.
+    #
+    # duration_s is therefore WALL time under contention, not isolated cost.
+    # Four workers, because the measurement said so — eight was slower on
+    # this machine (4 performance cores, spawn-heavy work).
+    #
+    # LOUPE_GATE_WORKERS=1 forces the old sequential path. It exists because
+    # a concurrency bug in the thing that produces review evidence must have
+    # a way back that does not need a code change.
+    try:
+        workers = int(os.environ.get(env_var("GATE_WORKERS"), "4"))
+    except ValueError:
+        workers = 4
+    workers = max(1, min(workers, len(cfg.gates) or 1))
+    if workers == 1:
+        return [run_one(g) for g in cfg.gates]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(run_one, cfg.gates))
 
 
 def _attestation_block(tag: str, attestations: list[dict]) -> str:

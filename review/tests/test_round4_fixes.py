@@ -1139,7 +1139,7 @@ class TestEveryFailureExit(unittest.TestCase):
         from the source."""
         from review import transport
         from review.ledger import Ledger
-        from review.tests.test_transport import (SHA_A, SHA_B, SHA_C,
+        from review.tests._transport_fixtures import (SHA_A, SHA_B, SHA_C,
                                                  fake_git, request_text)
         cfg = dataclasses.replace(config.load(REPO_ROOT), ledger_dir=None)
         # Blocked: no stamp — a person returns the envelope.

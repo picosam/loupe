@@ -572,3 +572,71 @@ def _commit_inheriting_the_ambient_environment(repo: Path):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGatesRunConcurrentlyInManifestOrder(_GateHarness):
+    """2026-08-31: `run_gates` runs the manifest concurrently (145.4s -> 85.8s
+    measured on the real manifest). Concurrency is only admissible here if the
+    attestation block is byte-identical whatever order the gates finish in,
+    because these documents are compared byte-for-byte across machines.
+
+    So the falsification is a manifest whose completion order is deliberately
+    the REVERSE of its declared order: the first gate sleeps longest, the last
+    not at all. A results list built from completion order fails; one
+    re-sequenced by manifest index passes.
+    """
+
+    def _staggered(self, n=4):
+        # gate i sleeps (n-1-i) * 0.3s, so completion order is exactly
+        # reversed relative to declaration order.
+        return [{"id": f"g{i}",
+                 "command": [sys.executable, "-c",
+                             f"import time;time.sleep({(n - 1 - i) * 0.3})"],
+                 "blocking": True}
+                for i in range(n)]
+
+    def _run(self, gates, workers):
+        cfg = dataclasses.replace(
+            CFG, repo_root=self.repo, ledger_dir=self.state, gates=gates)
+        base = {k: v for k, v in os.environ.items() if k != IN_GATE}
+        with unittest.mock.patch.dict(
+                os.environ, {**base, "LOUPE_GATE_WORKERS": str(workers)},
+                clear=True):
+            return emit.run_gates(cfg, self.head)
+
+    def test_order_is_the_manifests_not_the_completion_order(self):
+        gates = self._staggered()
+        recs = self._run(gates, workers=4)
+        self.assertEqual([r["id"] for r in recs], ["g0", "g1", "g2", "g3"])
+        # and the stagger really did invert completion: the first-declared
+        # gate is the slowest one.
+        self.assertGreater(recs[0]["duration_s"], recs[-1]["duration_s"])
+
+    def test_concurrent_and_sequential_agree_on_everything_but_timing(self):
+        gates = self._staggered()
+        par = self._run(gates, workers=4)
+        seq = self._run(gates, workers=1)
+
+        def stable(recs):
+            return [{k: v for k, v in r.items()
+                     if k not in ("duration_s", "output")} for r in recs]
+
+        self.assertEqual(stable(par), stable(seq))
+
+    def test_workers_one_is_the_sequential_escape_hatch(self):
+        # A concurrency defect in the producer of review evidence must have a
+        # way back that needs no code change.
+        gates = self._staggered(n=3)
+        recs = self._run(gates, workers=1)
+        self.assertEqual([r["id"] for r in recs], ["g0", "g1", "g2"])
+
+    def test_an_unparsable_worker_count_falls_back_rather_than_raising(self):
+        cfg = dataclasses.replace(
+            CFG, repo_root=self.repo, ledger_dir=self.state,
+            gates=self._staggered(n=2))
+        base = {k: v for k, v in os.environ.items() if k != IN_GATE}
+        with unittest.mock.patch.dict(
+                os.environ, {**base, "LOUPE_GATE_WORKERS": "not-a-number"},
+                clear=True):
+            recs = emit.run_gates(cfg, self.head)
+        self.assertEqual([r["id"] for r in recs], ["g0", "g1"])

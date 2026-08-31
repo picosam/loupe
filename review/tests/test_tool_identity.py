@@ -500,7 +500,7 @@ class TestTheDispositionDoorCompares(unittest.TestCase):
         because a disposition may only answer a verdict whose KEPT bytes
         reproduce the recorded digest, and only `close` keeps them."""
         from review import validate
-        from review.tests.test_transport import (SHA_B, request_text,
+        from review.tests._transport_fixtures import (SHA_B, request_text,
                                                  verdict_text)
         path = self.tmp / "req.md"
         path.write_text(request_text(sha=SHA_B), encoding="utf-8")
@@ -512,7 +512,7 @@ class TestTheDispositionDoorCompares(unittest.TestCase):
         return SHA_B
 
     def _disposition(self, sha, tool=None):
-        from review.tests.test_transport import verdict_text
+        from review.tests._transport_fixtures import verdict_text
         from review import validate
         parsed_verdict = wire.parse_verdict(verdict_text(sha=sha))
         rows = [{"finding_id": f.id, "disposition": "refuted",
@@ -1276,7 +1276,7 @@ class TestEveryStampedReaderCompares(unittest.TestCase):
         delete the comparison from the cached branch of `cmd_handoff` and
         this fails while the cache still returns warm — which is the state
         it was found in."""
-        from review.tests.test_transport import request_text
+        from review.tests._transport_fixtures import request_text
         for stamp, expected in self.EXPECTED.items():
             with self.subTest(stamp=stamp):
                 text = self.synth.emitted_request()
@@ -1425,7 +1425,7 @@ class TestTheRecordSaysWhichInstallationRuled(unittest.TestCase):
     absence; the ledger states it now."""
 
     def test_the_take_event_carries_both_identities_and_the_verdict(self):
-        from review.tests.test_transport import request_text
+        from review.tests._transport_fixtures import request_text
         parsed = wire.parse_request(request_text())
         agreement = transport.tool_agreement(parsed)
         # The synthetic request predates the stamp, which is the honest

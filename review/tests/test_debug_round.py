@@ -106,7 +106,7 @@ class TestCacheKey(unittest.TestCase):
     claim, the roles and the transport in the key."""
 
     def _warm(self, text, debug):
-        from review.tests.test_transport import (SHA_B, authority_calls,
+        from review.tests._transport_fixtures import (SHA_B, authority_calls,
                                                  fake_git)
         try:
             tmp = Path(tempfile.mkdtemp(prefix="debug-cache-"))
@@ -129,8 +129,8 @@ class TestCacheKey(unittest.TestCase):
                                         debug=debug)
 
     def _texts(self):
-        from review.tests.test_transport import request_text
-        from review.tests.test_transport import tool_identity
+        from review.tests._transport_fixtures import request_text
+        from review import tool_identity
         plain = request_text(tool_attr=tool_identity())
         stamped = re.sub(
             r"^(<[^>\n]*-review-request [^>\n]*)>",

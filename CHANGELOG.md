@@ -5,6 +5,45 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.12.0
+
+One behaviour change, addressed to upgraders; the rest is test structure.
+
+**The gate manifest runs concurrently.** `run_gates` executes the declared
+gates in a four-worker thread pool instead of one at a time. Measured on
+this project's own 13-gate manifest: 137.2s sequential to 83.5s, all gates
+green in both, nothing skipped, cached or path-filtered. The loop is now
+bounded by its slowest gate rather than by their sum.
+
+*What this requires of your manifest, and it is a real requirement:* every
+gate must be a CHECKER — read-only against the working tree, building only
+into its own temporary directory. A gate that WRITES into the tree was
+always questionable and is now unsound, because two of them can run at
+once. If you have one, either make it read-only or set
+`LOUPE_GATE_WORKERS=1`, which forces the previous sequential path with no
+code change. An unparsable value falls back to the default rather than
+raising.
+
+*What does not change:* attestation order is the manifest's, never
+completion order — the results are re-sequenced by index, so the emitted
+Evidence block is byte-identical whatever order the gates finish in. That
+is falsified by a test whose manifest completes in exactly reverse order.
+
+*One field changes meaning:* `duration_s` is now wall time under
+contention, not isolated cost. On this project's manifest the two slowest
+gates read about 4% and 6% higher than when run alone. Do not read the
+attested durations as per-gate cost.
+
+**Test modules named by behaviour.** `test_transport.py` (5,308 lines, 27
+classes) is now four modules — lifecycle, events, authority, integration —
+plus a shared `_transport_fixtures.py`. No test was lost, gained or
+renamed: the `Class.method` id set is identical. The collected count drops
+19 because `TestTake` had been collected twice, in its own module and in
+`test_transport_topology.py`, which imported the class to borrow two
+helpers; unittest collects a TestCase in every module namespace that holds
+it. The helpers are functions now, and nothing imports a TestCase across
+modules.
+
 ## 0.11.3
 
 Three behaviour changes — the claim boundary, retained-copy identity, and

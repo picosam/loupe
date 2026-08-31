@@ -125,7 +125,7 @@ class TestCommandSurfaceInventory(unittest.TestCase):
     def test_request_relay_take_carries_one_path_argument(self):
         import shlex
         from review import brief
-        from review.tests.test_transport import request_text
+        from review.tests._transport_fixtures import request_text
         from review import wire
         req = wire.parse_request(request_text())
         kept = "/tmp/kept envelope.md"

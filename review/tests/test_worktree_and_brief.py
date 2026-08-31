@@ -153,7 +153,7 @@ class TestPrecisIsDerived(unittest.TestCase):
     """The précis restates the envelope; it never adds to it."""
 
     def _request(self, **kw):
-        from review.tests.test_transport import request_text
+        from review.tests._transport_fixtures import request_text
         return wire.parse_request(request_text(**kw))
 
     def test_it_names_both_sides_and_the_round(self):
@@ -262,7 +262,7 @@ class TestPrecisIsDerived(unittest.TestCase):
         and exactly one command runs — and carries no commentary: nothing
         beside the fence, no note inside it.
         """
-        from review.tests.test_transport import request_text
+        from review.tests._transport_fixtures import request_text
         legs = {}
         # RVW-T11: the shape is the shape under EITHER declaration. A
         # topology that changes which command is printed must not be able to
@@ -327,7 +327,7 @@ class TestPrecisIsDerived(unittest.TestCase):
             '<loupe-review-verdict sha="abc">\n'
             "VERDICT: changes requested\n\n## findings\n\n- F1\n"
             "\n## evidence checked\n\n- the tree\n")
-        from review.tests.test_transport import request_text
+        from review.tests._transport_fixtures import request_text
         legs = []
         for declared in ("path", "paste"):
             req = wire.parse_request(request_text(transport_attr=declared))
@@ -369,7 +369,7 @@ class TestPrecisIsDerived(unittest.TestCase):
         all four surfaces — request brief, request relay, verdict brief,
         verdict relay — while the actual machine vocabulary (the VERDICT
         line the wire grammar consumes) keeps its mandated casing."""
-        from review.tests.test_transport import request_text
+        from review.tests._transport_fixtures import request_text
         req = wire.parse_request(request_text())
         v = wire.parse_verdict(
             '<loupe-review-verdict sha="abc">\n'
@@ -664,7 +664,7 @@ class TestSingleBlockPasteRelay(unittest.TestCase):
                 "</loupe-review-request>")
 
     def _request(self, **kw):
-        from review.tests.test_transport import request_text
+        from review.tests._transport_fixtures import request_text
         return wire.parse_request(request_text(**kw))
 
     def _verdict(self, ruling="changes requested"):
@@ -1153,7 +1153,7 @@ class TestBrief(unittest.TestCase):
     def test_simple_command_fence_control(self):
         # The command relay is unchanged: one runnable line in a bash fence
         # that a chat renders as copyable.
-        from review.tests.test_transport import request_text
+        from review.tests._transport_fixtures import request_text
         req = wire.parse_request(request_text())
         out = brief.relay("/kept/r.md", req, "irrelevant", paste=False)
         self.assertIn(f"```bash\n{TOOL_NAME} take /kept/r.md", out)

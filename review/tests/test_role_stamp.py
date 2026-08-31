@@ -232,7 +232,7 @@ class TestTheTargetAuthorisesRolesNotTheCheckout(unittest.TestCase):
     survives unchanged is the OTHER half — a target-rejected role still
     stops before the push and before any gate — and that is asserted
     end-to-end, against real repositories and both author doors, in
-    `test_transport.TestTheAuthorDoorStampsTheCommittedRoles`.
+    `test_transport_lifecycle.TestTheAuthorDoorStampsTheCommittedRoles`.
     """
 
     def _reached(self, *a, **k):
@@ -398,12 +398,12 @@ class TestCacheRolesKey(unittest.TestCase):
             self.skipTest(f"filesystem writes denied ({exc})")
         self.addCleanup(lambda: __import__("shutil").rmtree(
             tmp, ignore_errors=True))
-        from review.tests.test_transport import fake_git, request_text, SHA_B
+        from review.tests._transport_fixtures import fake_git, request_text, SHA_B
         cfg = dataclasses.replace(CFG, ledger_dir=tmp)
         from review import tool_identity
         # Round 1 F2 put the tool identity in the warm key, so a fixture
         # that must REACH the check it is about stamps the current one;
-        # the identity's own cold cases live in test_transport.
+        # the identity's own cold cases live in test_transport_lifecycle.
         text = request_text(tool_attr=tool_identity())
         transport.keep_bytes(cfg, 1, "request", text)
         # Round 2 F1: the warm path resolves the TARGET's authority to

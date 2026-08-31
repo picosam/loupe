@@ -182,7 +182,7 @@ class TestPublicCommandParity(unittest.TestCase):
         # that, not against each other. (Enforced by the verb, with the §7
         # reasoning, rather than by argparse: a usage error would say
         # "required" and not why.)
-        from review.tests.test_transport import request_text
+        from review.tests._transport_fixtures import request_text
         with tempfile.TemporaryDirectory() as tmp:
             req = Path(tmp) / "r.md"
             req.write_text(request_text(), encoding="utf-8")
@@ -357,7 +357,7 @@ class TestConfigAuthorityClaims(unittest.TestCase):
     the target-carried-authority rule must be stated where each document
     explains configuration. The runtime half — a valid user-level config
     opens none of the three reviewed doors — is
-    `test_transport.TestTheReviewedCommitCarriesItsOwnRules
+    `test_transport_authority.TestTheReviewedCommitCarriesItsOwnRules
     .test_a_user_level_config_opens_no_reviewed_door`; those controls
     must stay refusing while any mutation of the prose back to the
     fallback claim fails here.
