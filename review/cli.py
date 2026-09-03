@@ -15,8 +15,9 @@ from . import (FORMER_NAMES, TOOL_NAME, TOOL_VERSION, adapters, brief, config,
                emit, paths, transport, vocab, wire)
 from .digest import sha256_file, sha256_text
 from .ledger import Ledger, render_convergence_md, render_report_md
-from .validate import (Item, errors_in, validate_disposition,
-                       validate_request, validate_verdict)
+from .validate import (Item, errors_in, scope_items, validate_authorization,
+                       validate_disposition, validate_request,
+                       validate_verdict)
 
 EXIT_OK, EXIT_FINDINGS, EXIT_USAGE = 0, 1, 2
 
@@ -37,7 +38,7 @@ def _tty() -> bool:
 # passed a rendered command, so nothing was unsafe — the defect was that
 # nothing MADE them, and the next caller inherits no such habit.
 #
-# `test_round4_fixes.py` asserts that `print` appears in exactly `_out` and
+# `test_cli_exits.py` asserts that `print` appears in exactly `_out` and
 # three exit-0 artifact writers, so this door is the structured channel's
 # only exit. What it does not reach is stated where those surfaces are
 # enforced instead: envelope stamp lines (`wire.executable_stamp`), fenced
@@ -56,17 +57,40 @@ RUNNABLE_KEYS = ("next", "reviewer_next", "diff")
 # every payload passes through it at runtime. The scan survives in
 # `test_command_boundary` as advisory drift evidence only.
 PROSE_KEYS = (
-    "absent", "agreement", "anchor_path", "at_round", "attrs", "author",
+    "absent", "agreement", "anchor_path", "answers_escalation", "at_round",
+    "attrs", "author",
     "author_next",
-    "authorized_by", "base",
+    # The authority's answer to a finding (2026-09-01): who decided, where
+    # the work went if it went anywhere, what brings it back, and the set of
+    # findings one authorization advances over. All read, never run — the
+    # commands that produce them are a human's.
+    "authorized_by", "base", "by", "destination", "trigger", "waived",
     # Round 2 F1: the emission stamp binding a disposition row to its
     # companion events; an identity the agent reads, never a command.
     "batch",
     "blocking", "breaker", "brief", "bytes",
-    "bytes_freed", "cached", "checked", "cites", "claim_digest",
+    "bytes_freed", "cached",
+    # The git ref carrier (2026-09-03): where a `git` round's envelope was
+    # put — the ref, the remote it was pushed to, and the leg it carries.
+    # Read, never run: a person checks it with git if they want to, and the
+    # command the round hands over goes through the runnable door like every
+    # other one.
+    "carrier", "ref", "remote",
+    "checked", "cites", "claim_digest",
     "classification", "classification_notes", "classifications", "closures",
     "config", "convergence", "covers", "data", "declared_transport",
     "default_cap", "digest",
+    # Round 3 F2's correction event (`ledger correct-actor`): the event
+    # uids it names, the identity it says actually acted, and who is
+    # asserting the correction. Read, never run — the correction itself is
+    # the recorded decision; nothing downstream executes it.
+    "corrects", "corrected_by", "true_actor",
+    # What this repository never declared, and what the tool applied
+    # instead (2026-09-03, brief `config-absent-asks-once`). Prose in the
+    # strictest sense: each entry carries the exact TOML LINE a person
+    # writes into review.toml, which is a thing to read and copy, never a
+    # command to run.
+    "decide",
     "disposition", "dispositions", "dry_run",
     "entry", "envelope", "error", "event", "events_added", "events_total",
     "exit", "falsification", "fetch", "files", "finding_id", "finding_ids",
@@ -82,7 +106,19 @@ PROSE_KEYS = (
     "reader", "reading", "references", "rejected_reviewers", "relay",
     "remedy", "repeated",
     "reviewer", "roles", "round", "round_cap", "severities", "severity",
-    "rounds", "sha", "source", "source_digest", "stalled_threads", "state",
+    "rounds", "sha", "source",
+    # Round-9 F2 / round-10 F2: how many legacy source PATHS the import read
+    # for itself, the anchor commit it read them at, and the remote-tracking
+    # refs that contain that anchor. Read, never run — together they are the
+    # provenance claim a person is being asked to trust, and the refs are the
+    # half that says the bytes were already shared rather than just present.
+    "source_artifacts", "source_commit", "source_refs", "source_witness",
+    "source_digest", "stalled_threads", "state",
+    # Round-9 F4 (2026-09-03): the claim's authored scope against the
+    # machine-computed changed-path span, as notice items. Prose an agent
+    # relays to the author — never a command, and never an exit: the
+    # comparison reports and does not refuse.
+    "scope",
     "status", "subtype", "superseded",
     "tag", "target", "taxonomy", "test_digest", "then", "threads", "title",
     "to",
@@ -269,6 +305,8 @@ def _detect_and_parse(text: str):
         return kind, wire.parse_verdict(text)
     if kind == "disposition":
         return kind, wire.parse_disposition(text)
+    if kind == vocab.AUTHORIZATION_KIND:
+        return kind, wire.parse_authorization(text)
     return "unknown", None
 
 
@@ -284,8 +322,9 @@ def cmd_validate(args, cfg) -> int:
             f"{args.envelope} carries no recognizable envelope wrapper",
             remedy=f"whoever authored {args.envelope} must wrap it in a "
                    f"<{cfg.wrapper_tag}-review-"
-                   f"{{request|verdict|disposition}}> tag; envelopes come "
-                   f"from `handoff`, `respond` and the reviewer, never from "
+                   f"{{request|verdict|disposition|authorization}}> tag; "
+                   f"envelopes come from `handoff`, `respond`, "
+                   f"`authorize-advance` and the reviewer, never from "
                    f"a command that rewrites this file")
     # Round-2 F2: `validate` accepts every envelope kind from anywhere —
     # it is the verb a refusal names as its next command — so it is a
@@ -321,6 +360,8 @@ def cmd_validate(args, cfg) -> int:
         items = validate_verdict(
             parsed, governing,
             answering=_dispositions_answered(_ledger(cfg, args), parsed))
+    elif kind == vocab.AUTHORIZATION_KIND:
+        items = validate_authorization(parsed, governing)
     else:
         against = None
         if args.against:
@@ -350,6 +391,40 @@ def cmd_validate(args, cfg) -> int:
     is_verdict = kind == "verdict" and parsed.wrapped
     precis = (brief.verdict_precis(parsed, source=args.envelope)
               if is_verdict else None)
+    # RVW-T11: the topology comes from this machine's own record of the
+    # round, never from the verdict document — see the note on the relay
+    # below, which this now also decides.
+    ledger = _ledger(cfg, args)
+    carrier = (transport.recorded_transport(ledger, parsed.sha)
+               if is_verdict else vocab.TRANSPORT_DEFAULT)
+    round_no = ledger.round_for_sha(parsed.sha) if is_verdict else None
+    # F1: the round's RECORDED provenance decides the lineage this verdict
+    # rides on, not this machine's own `lineage_number()` — a fresh
+    # reviewer ledger's own count has no relationship to a carried
+    # lineage the author's machine is on. `recorded_lineage_for_sha` reads
+    # back what `take` stamped for a git-carried round; None means this
+    # round was never taken over a reference (paste, or a request this
+    # same ledger wrote), where `lineage_number()` is already correct.
+    verdict_lineage = (ledger.recorded_lineage_for_sha(parsed.sha)
+                       if is_verdict else None)
+    if verdict_lineage is None:
+        verdict_lineage = ledger.lineage_number()
+    reference = _round_reference(ledger, carrier, round_no,
+                                 lineage=verdict_lineage)
+    # The verdict leg of a `git` round is pushed HERE, by the reviewer, and
+    # only here: `validate --from-target` is the reviewer's last step and
+    # the moment the ruling is established, so it is the one place that can
+    # put bytes on a ref without either end trusting an unvalidated
+    # document. A verdict that fails validation is returned to its author
+    # and nothing is published; the digest and SHA binding downstream are
+    # unchanged, because the ref is a carrier and never an authority.
+    if (is_verdict and args.from_target and reference
+            and not errors_in(items)):
+        try:
+            transport.push_envelope(cfg, verdict_lineage, round_no,
+                                    "verdict", text)
+        except transport.Refusal as exc:
+            return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
     # RVW-T11. The verdict document cannot be trusted to carry the topology —
     # its author is an agent writing prose, and a field it mis-transcribes
     # would decide what the OTHER side is told to run. The value comes from
@@ -362,9 +437,8 @@ def cmd_validate(args, cfg) -> int:
     try:
         verdict_next = (
             brief.verdict_relay(
-                parsed, source=args.envelope,
-                transport=transport.recorded_transport(_ledger(cfg, args),
-                                                       parsed.sha),
+                parsed, source=args.envelope, transport=carrier,
+                reference=reference,
                 # On a paste round the reviewer hands over ONE block: the
                 # close command consuming the verdict bytes as its own stdin
                 # (a quoted heredoc) — bytes outside a fence are bytes a chat
@@ -409,7 +483,7 @@ def cmd_respond(args, cfg) -> int:
             "stdin cannot carry two documents",
             remedy="a person passes one of them as a path: the verdict the "
                    "reviewer delivered, or the dispositions they wrote")
-    verdict_text = _read_envelope(args.verdict)
+    verdict_text = _read_envelope(args.verdict, cfg, "verdict")
     verdict = wire.parse_verdict(verdict_text)
     ledger = _ledger(cfg, args)
     # Sweep F2: a disposition is an answer to a VALID, RECORDED verdict, not
@@ -427,18 +501,20 @@ def cmd_respond(args, cfg) -> int:
                        remedy=f"{paths.display_path(args.verdict)} is not "
                               f"a valid verdict, so nothing can answer it; "
                               f"the reviewer must correct and re-issue it")
-    # And with --out — the mode that writes bytes of record and appends to
-    # the ledger — the verdict must resolve to exactly one recorded verdict
-    # of the current lineage, its just-closed round, through the same
-    # boundary `ledger add` uses for a standalone disposition. Round and SHA
-    # are then DERIVED from that record; a value supplied in the JSON may
-    # only agree. Without --out the envelope is rendered and printed, not
-    # recorded; the door it may later enter by (`ledger add`) resolves it
-    # through the same rule.
-    recorded = None
+    # The recorded verdict this response answers, resolved through the same
+    # boundary `ledger add` uses for a standalone disposition. Round 4 F1:
+    # this used to be resolved only `if args.out`, so the shared author
+    # check below never ran for the door that renders and prints instead of
+    # writing — resolved unconditionally now. With --out — the mode that
+    # writes bytes of record and appends to the ledger — round and SHA are
+    # then DERIVED from the record, and the verdict must resolve to exactly
+    # one; a value supplied in the JSON may only agree. Without --out the
+    # envelope is rendered and printed, not recorded, so a verdict that does
+    # not (yet) resolve is not itself refused here — only a resolving one
+    # whose author disagrees is, below.
+    recorded = transport.recorded_verdict(
+        ledger, digest=sha256_text(verdict_text))
     if args.out:
-        recorded = transport.recorded_verdict(
-            ledger, digest=sha256_text(verdict_text))
         if recorded is None:
             close_cmd = paths.command(
                 *paths.lits(TOOL_NAME, "close", "--verdict"), args.verdict)
@@ -473,7 +549,7 @@ def cmd_respond(args, cfg) -> int:
             f"choose between two declarations",
             remedy=f"a person removes the repeated member from "
                    f"{args.from_json} and re-runs this command")
-    if recorded is not None:
+    if args.out and recorded is not None:
         for key, derived in (("round", recorded["round"]),
                              ("verdict_sha", recorded["sha"])):
             supplied = data.get(key)
@@ -489,6 +565,30 @@ def cmd_respond(args, cfg) -> int:
                            f"author's own input file")
         data["round"] = recorded["round"]
         data["verdict_sha"] = recorded["sha"]
+    if recorded is not None:
+        # Round 3 F2: the disposition author is the identity that accepted
+        # or rejected the verdict's findings, which is the identity the
+        # RECORDED REQUEST already named as this round's author — never a
+        # value the disposition JSON supplies beside it, which a reviewer
+        # answering its own verdict could stamp as itself. Round 4 F1: this
+        # used to run only inside `if args.out:` (`recorded` was `None`
+        # otherwise), so the door that renders and prints instead of
+        # writing carried the wire author unverified — the same check now
+        # runs whenever the verdict resolves at all, through the ONE
+        # function every disposition-ingress door shares
+        # (`transport.check_disposition_author`; `ledger add` calls it too).
+        # Absent a matching request event (an older ledger, or a round that
+        # predates the field), there is nothing recorded to compare against
+        # and the tool falls back to the configured author, exactly as
+        # before this fix.
+        try:
+            transport.check_disposition_author(
+                ledger, recorded["round"], data.get("author"))
+        except transport.Refusal as exc:
+            return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
+        expected_author = transport.request_author(ledger, recorded["round"])
+        if expected_author is not None:
+            data["author"] = expected_author
     by_id = {f.id: f for f in verdict.findings}
     records = []
     for rec in data["dispositions"]:
@@ -625,8 +725,13 @@ def cmd_ledger_add(args, cfg) -> int:
         # the ledger (round-3 F3), and identity is carried across the
         # fingerprint version change rather than silently re-identified
         # (§5.3b).
-        added += ledger.add_all(transport.verdict_events(
-            parsed, round_no, digest, size, args.tokens))
+        try:
+            new_events = transport.verdict_events(
+                parsed, round_no, digest, size, args.tokens,
+                answering=ledger.standing_dispositions(round_no=round_no - 1))
+        except transport.Refusal as exc:
+            return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
+        added += ledger.add_all(new_events)
     elif kind == "request":
         # Sweep F3: this door validated nothing. A wrapped envelope carrying
         # the single word `malformed` was recorded as a round's request with
@@ -683,6 +788,27 @@ def cmd_ledger_add(args, cfg) -> int:
                        f"re-emits the response with `{paths.command(*paths.lits(TOOL_NAME, 'respond'))}`, "
                        f"which binds it to the record; a disposition is an "
                        f"answer to a recorded ruling, never to a file")
+        # Round 4 F1: the third disposition-ingress door. `respond --out`
+        # derives and refuses a mismatched author; this standalone door
+        # used to record whatever the wire stamped, unverified — the exact
+        # gap `disposition_events`' own docstring named. Same shared check,
+        # before anything is appended. Round 5 F1: this door used to pass
+        # only the wrapper attribute and discard the check's answer, so an
+        # OMITTED author reached `disposition_events` unchanged and
+        # appended `author: null` even with a recorded request author.
+        # Reconcile wrapper against body first (the two can be edited
+        # apart once the envelope is a file on disk), then record what the
+        # check derives on both stamps — `disposition_events` reads the
+        # wrapper attribute, but keeping the body member in step is the
+        # same parity `respond` gets for free from `emit_disposition`.
+        try:
+            supplied = transport.disposition_supplied_author(parsed)
+            resolved = transport.check_disposition_author(
+                ledger, int(parsed.data.get("round", 0)), supplied)
+        except transport.Refusal as exc:
+            return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
+        parsed.attrs["author"] = resolved
+        parsed.data["author"] = resolved
         items = validate_disposition(parsed, cfg, against=against)
         if errors_in(items):
             return _finish(items,
@@ -751,6 +877,34 @@ def cmd_authorize_breaker(args, cfg) -> int:
     return EXIT_OK
 
 
+def cmd_ledger_correct_actor(args, cfg) -> int:
+    """Record that one or more retained ledger events misattribute their
+    actor (round 3 F2's second half) — an append-only correction, never an
+    edit: the ledger keeps the wrong stamp AND the record of it being
+    wrong, exactly as `authorize_breaker` keeps a firing AND the decision
+    to continue past it."""
+    ledger = _ledger(cfg, args)
+    try:
+        rec = transport.correct_actor(cfg, ledger, args.event or [],
+                                      args.actor or "", args.by or "",
+                                      args.reason or "")
+    except transport.Refusal as exc:
+        report_cmd = paths.command(
+            *paths.lits(TOOL_NAME, "ledger", "report"))
+        return _blocked(exc.next_cmd, str(exc),
+                        remedy=f"a person supplies the decision — a real "
+                               f"reason, a named corrector, the true actor, "
+                               f"and at least one recorded event uid to "
+                               f"correct (`{report_cmd}` lists recent "
+                               f"events)")
+    rec["ok"] = True
+    rec["ledger"] = str(ledger.path)
+    _out(rec, f"corrected {len(rec['corrects'])} event(s) — "
+              f"{', '.join(rec['corrects'])} — true actor: "
+              f"{rec['true_actor']}, asserted by {rec['corrected_by']}")
+    return EXIT_OK
+
+
 def cmd_ledger_report(args, cfg) -> int:
     ledger = _ledger(cfg, args)
     # Round-4 F8 and F5: the declared manifest and the declared budget travel
@@ -793,6 +947,23 @@ def cmd_import_legacy(args, cfg) -> int:
     with that repository (§11); what travels is the mechanism: a ledger that
     binds pre-ledger findings by explicit import events. Whoever holds a
     legacy corpus writes the derivation and pipes its output here.
+
+    `--source-commit` is that derivation's other half (round-10 F2). Every
+    row cites a tracked path (`source_path`) and the digest it claims for
+    those bytes; this tool reads the content ITSELF from
+    `<source-commit>:<source_path>`, hashes it itself, and requires the
+    row's own claim text to occur inside it. The anchor must be contained in
+    a remote-tracking ref of this repository's remote, so a row can cite only
+    history that was already shared — never a file written in the same
+    session as the batch, which is what round 9's caller-written source
+    manifest could not tell apart.
+
+    The anchor is a REQUIRED flag rather than a ref this verb resolves for
+    itself, and that is a decision, not an omission. A moving default would
+    make one batch import today and refuse tomorrow, and would silently
+    re-point the bytes a row's digest was computed against; the anchor is a
+    fact of the derivation, so the derivation states it. It is verified
+    here, never trusted.
     """
     raw = (sys.stdin.read() if args.events == "-"
            else Path(args.events).read_text(encoding="utf-8"))
@@ -801,7 +972,17 @@ def cmd_import_legacy(args, cfg) -> int:
         if not line.strip():
             continue
         try:
-            ev = json.loads(line)
+            # Round-10 F4: `json.loads` keeps the LAST of repeated members
+            # and drops every earlier one BEFORE the closed schema sees the
+            # object, so `{"round": 999, "round": 1}` was already 1 and a
+            # conflict the grammar exists to catch never reached it.
+            # `wire.load_json` is the tool's one JSON door and refuses a
+            # repeat at any depth — the same mechanism `respond`'s
+            # disposition body has read through since lineage-3 round 4.
+            ev = wire.load_json(line)
+        except wire.DuplicateMember as exc:
+            bad.append(f"line {n}: {exc}")
+            continue
         except json.JSONDecodeError as exc:
             bad.append(f"line {n}: {exc.msg}")
             continue
@@ -814,13 +995,74 @@ def cmd_import_legacy(args, cfg) -> int:
                         "undecodable event line(s): " + "; ".join(bad[:5]),
                         remedy=f"a person must repair "
                                f"{paths.display_path(args.events)} so every "
-                               f"line is one JSON event object, then re-run "
+                               f"line is one JSON event object stating each "
+                               f"member once, then re-run "
                                f"`{paths.command(*paths.lits(TOOL_NAME, 'import-legacy'), args.events)}`")
+    if not args.source_commit:
+        return _blocked(
+            "",
+            "no --source-commit was supplied: every imported row cites bytes "
+            "at a commit of this repository's own shared history, and a batch "
+            "that substantiates its rows from a file its own author wrote "
+            "establishes nothing (round-10 F2)",
+            remedy=f"a person passes the commit the derivation read its "
+                   f"sources from — one this clone can see in a "
+                   f"remote-tracking ref — to "
+                   f"`{paths.command(*paths.lits(TOOL_NAME, 'import-legacy'), args.events, paths.Lit('--source-commit'), paths.Ph('<commit>'))}`")
+    # Shape first, and pure: a malformed batch is refused by name before
+    # the tool reads the ledger or touches Git (design §3.2; 2026-09-03).
+    shape_problems = transport.legacy_shape_problems(events)
+    if shape_problems:
+        return _blocked(
+            "", "legacy import: " + "; ".join(shape_problems[:5]),
+            remedy=f"a person corrects the derivation that produced "
+                   f"{paths.display_path(args.events)} against the closed "
+                   f"per-kind schema, then re-runs "
+                   f"`{paths.command(*paths.lits(TOOL_NAME, 'import-legacy'), args.events)}`")
+    authority, source_problems = transport.read_source_authority(
+        cfg, args.source_commit, fetch=not args.no_fetch)
+    if source_problems:
+        return _blocked(
+            "", "legacy source anchor: " + "; ".join(source_problems[:5]),
+            remedy=f"a person names an anchor commit this clone can see in a "
+                   f"remote-tracking ref; the source authority is shared "
+                   f"repository history, so nothing is imported against a "
+                   f"commit only this machine has")
     ledger = _ledger(cfg, args)
+    # Rounds 7 F2 / 8 F1-F2 / 9 F1 / 10 F1-F2-F4: this door's arbitrary
+    # pre-derived JSON cannot be trusted the way the product path's own
+    # derivation can be — a duplicate-refusing parse, a closed per-kind
+    # schema, a git-anchored source whose bytes and text this tool reads
+    # itself, batch-local identity resolution, and a lifecycle recomputation
+    # over PERSISTED answers as well as candidate ones. Checked as a whole
+    # batch, before anything is appended — a partially bad import must
+    # append zero events, not the rows that happened to come first.
+    problems = transport.legacy_import_problems(ledger, events, authority)
+    if problems:
+        return _blocked(
+            "",
+            "legacy import: " + "; ".join(problems[:5]),
+            remedy=f"a person corrects the derivation that produced "
+                   f"{paths.display_path(args.events)} — the closed per-kind "
+                   f"schema, a `source_path` and `source_digest` on every row "
+                   f"naming bytes at the anchor that CONTAIN the row's own "
+                   f"claim text, a conflict-free and acyclic alias graph, and "
+                   f"an explicit `answers_round` naming a real prior ruling "
+                   f"behind every settling answer — then re-runs "
+                   f"`{paths.command(*paths.lits(TOOL_NAME, 'import-legacy'), args.events)}`; "
+                   f"the tool will not append part of a batch it cannot "
+                   f"verify")
     added = ledger.add_all(events)
     _out({"ok": True, "events_added": added, "events_total": len(events),
+          "source_commit": authority.commit,
+          "source_refs": authority.refs,
+          "source_witness": authority.witness,
+          "source_artifacts": len(authority),
           "ledger": str(ledger.path)},
-         f"imported {added} of {len(events)} events into {ledger.path}")
+         f"imported {added} of {len(events)} events into {ledger.path} "
+         f"(from {len(authority)} source path(s) at "
+         f"{authority.commit[:12]}, carried by "
+         f"{', '.join(authority.refs)} — {authority.witness})")
     return EXIT_OK
 
 
@@ -860,10 +1102,75 @@ def _claim_defect_exit(exc: "emit.ClaimDefective") -> int:
     return _blocked("", f"the claim file {exc.detail}", remedy=remedy)
 
 
+def _round_reference(ledger, carrier: str, round_no,
+                     lineage: int | None = None) -> str | None:
+    """`git:<lineage>/<round>` for a round carried on a ref, else None.
+
+    The lineage is a fact of the ledger and the round is a fact of the
+    envelope, so neither side of a relay can derive this on its own — which
+    is why the reference is a word a person carries rather than something
+    the far end recomputes. `lineage` is a parameter for the one caller that
+    must read it BEFORE its own verb moves it: a clean verdict closes the
+    lineage, and the relay printed afterwards is about the round that just
+    ran, not the one that starts next.
+    """
+    if carrier != vocab.TRANSPORT_GIT or not round_no:
+        return None
+    if lineage is None:
+        lineage = ledger.lineage_number()
+    return transport.round_reference(lineage, int(round_no))
+
+
+def _decide(cfg, applied=None) -> list:
+    """The `decide` list for a result: one entry per key this repository
+    never declared (2026-09-03, brief `config-absent-asks-once`).
+
+    Absence used to be silent — `transport` fell to `path`, `debug` to off,
+    a budget to uncounted — and a silent default is a decision the
+    repository never made and nobody was ever told about. The tool has no
+    model and prints JSON, so it cannot ask; it can REPORT, and one adapter
+    rule turns the report into a question asked once per key, whose answer
+    is the printed line committed to `review.toml`. A declared key produces
+    no entry, which is what ends the asking permanently.
+
+    Not every undeclared key is here: the ones that REFUSE when absent —
+    the taxonomy, the roles, `review.toml` itself — are ruled refusals, not
+    defaults, and a decision has already been forced about them.
+    """
+    return cfg.decisions(applied)
+
+
+def _scope_report(items) -> dict:
+    """The claim-versus-span notice as a result FIELD, or nothing.
+
+    Its own key rather than the shared `items` list: `items` is the
+    validation channel whose errors decide the exit, and this report never
+    decides one (round-9 F4 is non-blocking). A field an agent can read and
+    relay, beside a line a human reads.
+    """
+    return {"scope": [i.as_dict() for i in items]} if items else {}
+
+
+def _scope_text(items) -> str:
+    return "".join(f"\n\nnotice: [{i.code}] {i.message}" for i in items)
+
+
+def _debug_flag(args) -> bool | None:
+    """The invocation's explicit word on the debug stamp, or None when it
+    said nothing — the state `emit.resolve_debug` hands to the
+    repository's standing `[roles] debug` declaration, then to off."""
+    if getattr(args, "debug", False):
+        return True
+    if getattr(args, "no_debug", False):
+        return False
+    return None
+
+
 def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
           selected_transport: str):
     """emit-request's body, shared with handoff: push, emit, validate.
-    Returns (envelope, parsed) or an int exit code.
+    Returns (envelope, parsed, scope) or an int exit code, where `scope` is
+    the non-blocking claim-versus-span report (`validate.scope_items`).
 
     Round 2 F1 (lineage 12): the effective roles are NOT passed in. They are
     resolved inside `ensure_pushed`, against the committed authority, from
@@ -923,7 +1230,8 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
                                  head=record["sha"], reachability=record,
                                  author=roles[0], reviewer=roles[1],
                                  transport=selected_transport,
-                                 debug=getattr(args, "debug", False))
+                                 debug=emit.resolve_debug(cfg,
+                                                          _debug_flag(args)))
     parsed = wire.parse_request(envelope)
     base = args.base or max((e for e in ledger.current()
                              if e.get("event") == "verdict"),
@@ -941,7 +1249,13 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
                               f"{args.claim_file} to satisfy the items above, "
                               f"then re-run "
                               f"`{paths.command(paths.Lit(TOOL_NAME), paths.token(args.command))}`")
-    return envelope, parsed
+    # Round-9 F4, non-blocking: the authored scope against the span that was
+    # just measured. Both halves are in hand exactly here — the claim the
+    # capture boundary closed, and `file_list` from the same `diff_shape`
+    # the envelope's own "What changed" block renders — so the comparison
+    # needs no second measurement and can disagree with neither.
+    return envelope, parsed, scope_items(captured.claim,
+                                        shape["file_list"])
 
 
 def cmd_emit_request(args, cfg) -> int:
@@ -996,11 +1310,14 @@ def cmd_emit_request(args, cfg) -> int:
     result = _emit(args, cfg, ledger, captured, selected_transport)
     if isinstance(result, int):
         return result
-    envelope, parsed = result
+    envelope, parsed, scope = result
     if args.out:
         Path(args.out).write_text(envelope, encoding="utf-8")
-        _out({"ok": True, "out": args.out, "sha": parsed.sha},
-             f"wrote {args.out}")
+        _out({"ok": True, "out": args.out, "sha": parsed.sha,
+              **_scope_report(scope),
+              "decide": _decide(cfg, {vocab.DECIDE_TRANSPORT:
+                                      selected_transport})},
+             f"wrote {args.out}{_scope_text(scope)}")
     else:
         print(envelope, end="")
     return EXIT_OK
@@ -1089,6 +1406,14 @@ def cmd_handoff(args, cfg) -> int:
     # just-closed verdict has its disposition; no fired breaker is unanswered
     # by a recorded human decision. Both are blocked states — an authored
     # answer or a decision, never a command.
+    # The declared approval pathway, before anything is committed, pushed,
+    # run or emitted (brief `approval-pathway-lock-in`, item 2). Only this
+    # verb: `emit-request` writes an envelope to a file, while `handoff` is
+    # the step that opens the round the approval would have to close.
+    try:
+        emit.check_enforcement(cfg)
+    except emit.EnforcementUnsatisfiable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
     try:
         transport.handoff_preflight(cfg, ledger)
     except transport.Refusal as exc:
@@ -1114,7 +1439,7 @@ def cmd_handoff(args, cfg) -> int:
         transport=selected_transport,
         author_flag=getattr(args, "author", None),
         reviewer_flag=getattr(args, "reviewer", None),
-        debug=getattr(args, "debug", False))
+        debug=emit.resolve_debug(cfg, _debug_flag(args)))
     if cached is not None:
         # RVW-T17, the call site the redesign had to rule on rather than
         # inherit: this branch returns BEFORE `_emit`, so it never reaches
@@ -1141,6 +1466,8 @@ def cmd_handoff(args, cfg) -> int:
                                        round_no, claim_digest=claim_digest)
         rec["cached"] = True
         rec["ok"] = True
+        rec["decide"] = _decide(cfg, {vocab.DECIDE_TRANSPORT:
+                                      selected_transport})
         rec["tool"] = agreement
         ledger.add({"event": "ingest", "kind": "request",
                     "round": round_no, "digest": rec.get("digest"),
@@ -1162,11 +1489,13 @@ def cmd_handoff(args, cfg) -> int:
     result = _emit(args, cfg, ledger, captured, selected_transport)
     if isinstance(result, int):
         return result
-    envelope, parsed = result
+    envelope, parsed, scope = result
     rec = transport.record_handoff(cfg, ledger, envelope, round_no,
                                    claim_digest=claim_digest)
+    rec.update(_scope_report(scope))
     rec["cached"] = False
     rec["ok"] = True
+    rec["decide"] = _decide(cfg, {vocab.DECIDE_TRANSPORT: selected_transport})
     if args.out:
         Path(args.out).write_text(envelope, encoding="utf-8")
         rec["out"] = args.out
@@ -1175,7 +1504,8 @@ def cmd_handoff(args, cfg) -> int:
         rec["convergence"] = ledger.convergence()
     _out(rec, f"round {round_no} request emitted for {rec['sha']}, "
               f"recorded ({rec['bytes']} bytes, sha256 {rec['digest'][:16]}…), "
-              f"kept at {paths.display_path(rec['kept'])}\n\n"
+              f"kept at {paths.display_path(rec['kept'])}"
+              f"{_scope_text(scope)}\n\n"
               f"{rec['brief']}\n\n"
               f"{render_convergence_md(rec['convergence']) if past_cap else ''}"
               f"{rec['relay']}\n\n"
@@ -1193,10 +1523,14 @@ def _brief_into(rec: dict, envelope: str, ledger) -> None:
     """
     parsed = wire.parse_request(envelope)
     rec["brief"] = brief.request_precis(parsed, ledger)
-    rec["relay"] = brief.relay(rec.get("kept"), parsed, envelope)
+    rec["relay"] = brief.relay(
+        rec.get("kept"), parsed, envelope,
+        reference=_round_reference(ledger,
+                                   transport.declared_transport(parsed),
+                                   rec.get("round")))
 
 
-def _read_envelope(arg: str) -> str:
+def _read_envelope(arg: str, cfg=None, kind: str | None = None) -> str:
     """Envelope text, read as the BYTES it is written in (round-4 F1).
 
     `Path.read_text` and text-mode `sys.stdin` both read in universal-newline
@@ -1210,6 +1544,23 @@ def _read_envelope(arg: str) -> str:
     Every envelope reader that takes a path or `-` from a person goes through
     this one function, so the domain has one door rather than one per verb.
     """
+    reference = transport.parse_round_reference(arg)
+    if reference is not None:
+        # `git:<lineage>/<round>` — a `git` round's envelope, fetched from
+        # the ref the other side pushed it to. The LEG is the verb's, not
+        # the argument's: `take` reads a request, `close --verdict` and
+        # `respond --verdict` read a verdict. That is why the reference
+        # names a round rather than a ref — a person carries one word, and
+        # the verb they are running says which envelope of that round it
+        # means.
+        lineage, round_no = reference
+        if cfg is None or kind is None:
+            raise transport.Refusal(
+                f"{arg} names a round, and this verb reads an envelope from "
+                f"a file or standard input",
+                "", remedy="a person passes the envelope's path, or `-` to "
+                           "read it from standard input")
+        return transport.fetch_envelope(cfg, lineage, round_no, kind)
     if arg == "-":
         return wire.decode_envelope(sys.stdin.buffer.read(), arg)
     return wire.decode_envelope(Path(arg).read_bytes(), arg)
@@ -1219,11 +1570,19 @@ def cmd_take(args, cfg) -> int:
     """Reviewer side, one verb: validate, probe, record, print the envelope
     and the exact diff command — then the reviewer rules and stops."""
     ledger = _ledger(cfg, args)
-    envelope = _read_envelope(args.envelope)
+    # `git:<lineage>/<round>` fetches the request from its ref; a path and
+    # `-` read as they always did. The reference is parsed a second time
+    # here (past `_read_envelope`'s own parse) because F1's fix needs the
+    # CARRIED lineage itself, not just the bytes it names — a fresh
+    # reviewer ledger has no other way to learn it.
+    carried_reference = transport.parse_round_reference(args.envelope)
+    carried_lineage = carried_reference[0] if carried_reference else None
+    envelope = _read_envelope(args.envelope, cfg, "request")
     try:
         rec = transport.take(
             cfg, ledger, envelope, args.envelope, reviewer=args.as_,
             fetch=not args.no_fetch, transport=args.transport,
+            lineage=carried_lineage,
             # Sweep F6: `governing` is the target commit's own config,
             # resolved by `take` after the fetch — not this checkout's.
             validate_items=lambda parsed, governing: validate_request(
@@ -1241,6 +1600,12 @@ def cmd_take(args, cfg) -> int:
                         lead="\n".join(f"{i.level}: [{i.code}] {i.message}"
                                         for i in exc.items))
     rec["ok"] = True
+    # F3: `decide` is already `take`'s own — built from the TARGET commit's
+    # config, the same authority `validate_items` judged the request
+    # against, not this checkout's. Overwriting it with `_decide(cfg, …)`
+    # here is exactly the split the finding names: an empty or older
+    # reviewer checkout would report the target's own declared keys as
+    # undeclared.
     refs = "\n".join(f"  {r['status']:<40} {r['path']}"
                       for r in rec["references"]) or "  (none declared)"
     rec["brief"] = brief.request_precis(wire.parse_request(envelope), ledger)
@@ -1317,6 +1682,29 @@ def cmd_waive(args, cfg) -> int:
     decision.
     """
     ledger = _ledger(cfg, args)
+    if getattr(args, "finding", None):
+        try:
+            rec = transport.waive_finding(
+                cfg, ledger, args.finding, args.reason or "", args.by,
+                destination=getattr(args, "destination", None) or "",
+                trigger=getattr(args, "trigger", None) or "")
+        except transport.Refusal as exc:
+            return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
+        rec["ok"] = True
+        where = (f"; parked at {rec['destination']}"
+                 + (f", back when {rec['trigger']}" if rec.get("trigger")
+                    else "")
+                 if rec.get("destination") else "")
+        asked = ("answering the author's escalation"
+                 if rec["answers_escalation"]
+                 else "overruled without being escalated first")
+        _out(rec, f"{rec['finding_id']} ({rec['fp']}) stands unfixed by "
+                  f"decision of {rec['authorized_by']}, {asked}: "
+                  f"{rec['reason']}{where}\n"
+                  f"recorded as the authority's answer — not an acceptance, "
+                  f"and not a reviewer withdrawal\n"
+                  f"next: {rec['next']}")
+        return EXIT_OK
     try:
         rec = transport.waive(cfg, ledger, args.sha, args.reason or "",
                               args.by)
@@ -1326,6 +1714,28 @@ def cmd_waive(args, cfg) -> int:
     _out(rec, f"waived {rec['sha'][:12]}: {rec['reason']}\n"
               f"authorized by {rec['authorized_by']}; recorded in the ledger "
               f"as a decision, which is what makes it different from silence")
+    return EXIT_OK
+
+
+def cmd_authorize_advance(args, cfg) -> int:
+    """A named human advances the lineage over findings they overruled."""
+    ledger = _ledger(cfg, args)
+    try:
+        rec = transport.authorize_advance(cfg, ledger, args.reason or "",
+                                          args.by)
+    except transport.Refusal as exc:
+        return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
+    envelope = rec.pop("envelope")
+    if args.out:
+        Path(args.out).write_text(envelope, encoding="utf-8")
+        rec["out"] = args.out
+    rec["ok"] = True
+    _out(rec, f"lineage {rec['lineage']} advanced at {rec['sha'][:12]} by "
+              f"{rec['authorized_by']}: {rec['reason']}\n"
+              f"over {len(rec['waived'])} overruled finding(s): "
+              f"{', '.join(rec['waived'])}\n"
+              f"kept at {paths.display_path(rec['kept'])} — an authorization, "
+              f"NOT a clean verdict, and it says so wherever it is carried")
     return EXIT_OK
 
 
@@ -1350,7 +1760,7 @@ def cmd_close(args, cfg) -> int:
                 remedy="a person chooses which close this is — a verdict to "
                        "record, or a lineage to end by decision — and "
                        "supplies its flag")
-        text = _read_envelope(args.verdict)
+        text = _read_envelope(args.verdict, cfg, "verdict")
         parsed_verdict = wire.parse_verdict(text)
         # Round 2 F2: the recorded transport is resolved and validated
         # BEFORE close_round writes anything. Resolved after, a defective
@@ -1361,6 +1771,9 @@ def cmd_close(args, cfg) -> int:
         # so a recorded `paste` silently became the default carrier. The
         # value is read once, here, and carried across the closure.
         carrier = transport.recorded_transport(ledger, parsed_verdict.sha)
+        # Read BEFORE the close: a clean verdict closes the lineage, and the
+        # relay below is about the round that just ran.
+        lineage = ledger.lineage_number()
         rec = transport.close_round(
             cfg, ledger, text, args.verdict, round_no=args.round,
             tokens=args.tokens,
@@ -1372,7 +1785,9 @@ def cmd_close(args, cfg) -> int:
     rec["ok"] = True
     rec["brief"] = brief.verdict_precis(parsed_verdict, source=args.verdict)
     rec["relay"] = brief.verdict_relay(
-        parsed_verdict, source=args.verdict, transport=carrier)
+        parsed_verdict, source=args.verdict, transport=carrier,
+        reference=_round_reference(ledger, carrier, rec.get("round"),
+                                   lineage))
     _out(rec, f"round {rec['round']} closed: {rec['verdict']} on {rec['sha']} "
               f"({rec['findings']} findings, {rec['closures']} closures), "
               f"kept at {paths.display_path(rec['kept'])}\n"
@@ -1464,14 +1879,18 @@ def cmd_brief(args, cfg) -> int:
         # Round-3 F2: an envelope no heredoc can carry byte-identically
         # refuses before a relay is rendered, on both branches below.
         try:
-            relay_text = brief.relay(source, as_request, text,
-                                     paste=args.paste)
+            relay_text = brief.relay(
+                source, as_request, text, paste=args.paste,
+                reference=_round_reference(
+                    ledger, transport.declared_transport(as_request),
+                    as_request.attrs.get("round")))
         except brief.UnrelayableEnvelope as exc:
             return _blocked("", f"{source}: {exc}",
                             remedy=f"a person appends the terminal newline "
                                    f"to {paths.display_path(source)} and "
                                    f"re-runs this command")
         rec = {"kind": "request", "source": source, "ok": True,
+               "decide": _decide(cfg),
                "round": as_request.attrs.get("round"),
                "sha": as_request.sha, "superseded": superseded,
                "tool": agreement,
@@ -1489,10 +1908,16 @@ def cmd_brief(args, cfg) -> int:
         # a human reads, and the commands a human copies (round 3 relay
         # split). Never one blob for a caller to divide by guesswork.
         try:
+            carrier = transport.recorded_transport(ledger, as_verdict.sha)
+            # F1: same authority as the push in `cmd_validate` — the
+            # round's recorded lineage, not this ledger's own count, so a
+            # `brief` rendered on either machine names the same reference.
+            brief_lineage = ledger.recorded_lineage_for_sha(as_verdict.sha)
             relay_text = brief.verdict_relay(
-                as_verdict, source=source,
-                transport=transport.recorded_transport(ledger,
-                                                       as_verdict.sha),
+                as_verdict, source=source, transport=carrier,
+                reference=_round_reference(
+                    ledger, carrier, ledger.round_for_sha(as_verdict.sha),
+                    lineage=brief_lineage),
                 envelope=text)
         except brief.UnrelayableEnvelope as exc:
             return _blocked("", f"{source}: {exc}",
@@ -1500,7 +1925,7 @@ def cmd_brief(args, cfg) -> int:
                                    f"to {paths.display_path(source)} and "
                                    f"re-runs this command")
         rec = {"kind": "verdict", "source": source, "ok": True,
-               "sha": as_verdict.sha,
+               "decide": _decide(cfg), "sha": as_verdict.sha,
                "brief": brief.verdict_precis(as_verdict, source=source,
                                              full=args.full),
                "relay": relay_text}
@@ -1788,6 +2213,20 @@ def build_parser() -> argparse.ArgumentParser:
     lab.add_argument("--by", required=True,
                      help="who took the decision; not inferred from silence")
     lab.set_defaults(func=cmd_authorize_breaker)
+    lca = lsub.add_parser("correct-actor",
+                          help="record that a recorded event's true actor "
+                               "differs from what it stamps (or omits), "
+                               "without rewriting the append-only record")
+    lca.add_argument("--event", action="append",
+                     help="uid of a recorded event to correct; repeatable "
+                          "for more than one")
+    lca.add_argument("--actor", required=True,
+                     help="who actually acted, correcting the named event(s)")
+    lca.add_argument("--reason", required=True)
+    lca.add_argument("--by", required=True,
+                     help="who is asserting the correction; not inferred "
+                          "from silence")
+    lca.set_defaults(func=cmd_ledger_correct_actor)
     lc = lsub.add_parser("convergence",
                          help="is this lineage closing its findings, or "
                               "hunting the same domains?")
@@ -1802,6 +2241,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "import mechanism; the derivation from a given "
                              "corpus is that corpus owner's script")
     il.add_argument("events", help="JSONL file of ledger events, or -")
+    il.add_argument("--source-commit",
+                    help="the commit whose tracked bytes every row cites "
+                         "(source_path + source_digest); read and hashed "
+                         "here, and refused unless a remote-tracking ref "
+                         "contains it")
+    il.add_argument("--no-fetch", action="store_true",
+                    help="do not reach the remote; judge the anchor against "
+                         "this clone's remote-tracking refs, which are local "
+                         "state — a WEAKER claim, recorded as such")
     il.set_defaults(func=cmd_import_legacy)
 
     ms = sub.add_parser("migrate-state",
@@ -1834,14 +2282,22 @@ def build_parser() -> argparse.ArgumentParser:
                              "same-machine loop. It is stamped on the "
                              "envelope, recorded, and decides what the "
                              "printed relay says (RVW-T11)")
-        sp.add_argument("--debug", action="store_true",
+        debug_group = sp.add_mutually_exclusive_group()
+        debug_group.add_argument("--debug", action="store_true",
                         help="stamp this round as a debug round "
                              "(debug=\"tool-feedback\" on the envelope): the "
                              "reviewer is asked to also critique the tool's "
                              "own performance this round — efficiency, cost, "
                              "accuracy — in a `## tool feedback` verdict "
                              "section, recorded at close. Advisory; never a "
-                             "gate")
+                             "gate. Precedence: this flag (either "
+                             "direction), then `[roles] debug` in the "
+                             "repository's config, then off")
+        debug_group.add_argument("--no-debug", action="store_true",
+                        dest="no_debug",
+                        help="do not stamp this round as a debug round, "
+                             "overriding a standing `[roles] debug = true` "
+                             "declaration for this invocation only")
         sp.add_argument("--author", action=_OnceAction,
                         help="per-invocation author stamp, selecting WITHIN "
                              "the config's permitted_authors — refused "
@@ -1917,11 +2373,26 @@ def build_parser() -> argparse.ArgumentParser:
                          "on another machine to paste into `take -`")
     br.set_defaults(func=cmd_brief)
 
-    w = sub.add_parser("waive", help="record that a commit was deliberately "
-                                     "NOT reviewed, with the reason")
-    w.add_argument("--sha", required=True,
-                   help="the commit that goes unreviewed; resolved here, so "
-                        "a waiver cannot name something that does not exist")
+    w = sub.add_parser("waive", help="record a human decision that something "
+                                     "goes unaddressed: a commit that is not "
+                                     "reviewed, or a finding that stands")
+    what = w.add_mutually_exclusive_group(required=True)
+    what.add_argument("--sha",
+                      help="the commit that goes unreviewed; resolved here, "
+                           "so a waiver cannot name something that does not "
+                           "exist")
+    what.add_argument("--finding",
+                      help="a finding of the current lineage that a human "
+                           "decides may stand unfixed, by id (round-scoped) "
+                           "or fingerprint. The authority's ANSWER to an "
+                           "escalation: the author cannot write it, and the "
+                           "reviewer has not changed their mind")
+    w.add_argument("--destination",
+                   help="with --finding: where the work goes instead, when "
+                        "it goes somewhere — a brief, an issue")
+    w.add_argument("--trigger",
+                   help="with --finding and a destination: what brings it "
+                        "back, so parking it is not forgetting it")
     w.add_argument("--reason", required=True,
                    help="REQUIRED and the point of the record: a waiver "
                         "without one says a decision happened and not what "
@@ -1932,6 +2403,22 @@ def build_parser() -> argparse.ArgumentParser:
                         "and this verb is run only after that named human "
                         "has taken it")
     w.set_defaults(func=cmd_waive)
+
+    aa = sub.add_parser("authorize-advance",
+                        help="a named human advances the lineage over "
+                             "findings they have overruled; emits its own "
+                             "envelope, never a derived clean verdict")
+    aa.add_argument("--reason", required=True,
+                    help="REQUIRED: why the change advances with findings "
+                         "still open")
+    aa.add_argument("--by", required=True,
+                    help="who decided — REQUIRED and asserted, never "
+                         "observed: this records attribution, not proof that "
+                         "a human rather than an agent took the decision")
+    aa.add_argument("--out",
+                    help="write the authorization envelope here as well as "
+                         "keeping it under the state directory")
+    aa.set_defaults(func=cmd_authorize_advance)
 
     c = sub.add_parser("close", help="author: ingest the verdict and close "
                                      "the round; --lineage closes a lineage "
@@ -2034,6 +2521,12 @@ def main(argv=None) -> int:
         # endings, and the generic `<verb> --help` recovery would have sent
         # an agent looking for one. `remedy` says what a person does.
         return _blocked("", str(exc), remedy=exc.remedy)
+    except transport.Refusal as exc:
+        # A refusal raised outside a verb's own catch — the envelope
+        # readers, which any verb may reach through `_read_envelope`. It
+        # carries its own recovery, and the generic `<verb> --help` below
+        # would discard it (round 2 F8's defect, one level out).
+        return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
     except vocab.TransportDeclarationError as exc:
         # Round 2 F2: a defective transport DECLARATION is a typed, blocked
         # state, never generic usage — `<verb> --help` cannot repair a

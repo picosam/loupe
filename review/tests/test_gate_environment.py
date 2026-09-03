@@ -43,7 +43,9 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from review import TOOL_NAME, config, emit, env_var, transport
+from review import TOOL_NAME, config, emit, env_var, transport, validate
+from review.ledger import Ledger
+from review.tests.synth import evidence_with
 from review.tests.util import REPO_ROOT
 
 CFG = config.load(REPO_ROOT)
@@ -114,6 +116,96 @@ class _GateHarness(unittest.TestCase):
         self.assertNotIn("error", rec, rec.get("error"))
         log = Path(rec["output"]["pointer"]).read_text(encoding="utf-8")
         return json.loads(log)
+
+
+class TestRetainedGateOutputIsPerRun(_GateHarness):
+    """FALSIFICATION (`concurrent-gates-single-flake`, measured 2026-09-02).
+
+    Retained output was keyed by the executed SHA alone, so a second run at
+    one commit overwrote the first in place. The evidence that costs is
+    always the FAILING run's, and the natural response to a failing gate is
+    to re-run it — so the act of investigating destroyed what the
+    investigation came for, twice, and the brief's own instruction ("capture
+    the retained output before anything else") could not be followed as
+    written.
+
+    A failing run then a passing run at the same commit: both logs must
+    survive, each reachable from its own attestation, with `newest` naming
+    the later one.
+
+    MUTATION: retain at `<sha>/<id>.log` again and the second run overwrites
+    the first — the pointers compare equal and the failing output is gone.
+    """
+
+    FAILS = "import sys; print('the failing run'); sys.exit(1)"
+    PASSES = "print('the passing run')"
+
+    def setUp(self):
+        super().setUp()
+        # Every test here calls run_gates, directly or through run_gate;
+        # strip the re-entrancy marker for the whole test, the way
+        # run_probe does per call, so the class stays hermetic under an
+        # emission (this suite is a declared gate).
+        base = {k: v for k, v in os.environ.items()
+                if k not in (SHIM, STASH_SAFE, STASH_PATH, IN_GATE,
+                             "PYTHONSAFEPATH", "PYTHONPATH")}
+        patch = unittest.mock.patch.dict(os.environ, base, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def run_gate(self, script):
+        # Through the harness's environment patch: this suite is itself a
+        # declared gate, so under an emission a bare run_gates inherits the
+        # re-entrancy marker and correctly returns not-run records — which
+        # is what refused lineage 21's first handoff (2026-09-03).
+        return self.run_probe({}, command=[sys.executable, "-c", script])
+
+    def test_a_failing_run_survives_the_next_run_at_that_commit(self):
+        failed = self.run_gate(self.FAILS)
+        self.assertEqual(failed["exit_code"], 1)
+        passed = self.run_gate(self.PASSES)
+        self.assertEqual(passed["exit_code"], 0)
+        self.assertNotEqual(failed["output"]["pointer"],
+                            passed["output"]["pointer"],
+                            "two runs at one commit must not write one path")
+        self.assertIn("the failing run",
+                      Path(failed["output"]["pointer"]).read_text("utf-8"))
+        self.assertIn("the passing run",
+                      Path(passed["output"]["pointer"]).read_text("utf-8"))
+
+    def test_newest_names_the_last_run(self):
+        self.run_gate(self.FAILS)
+        self.run_gate(self.PASSES)
+        newest = (self.state / "gate-output" / self.head / emit.NEWEST_RUN
+                  / "probe.log")
+        self.assertIn("the passing run", newest.read_text("utf-8"))
+
+    def test_every_gate_of_one_run_retains_together(self):
+        # The run is the unit: one manifest, one directory, whatever the
+        # gates did individually.
+        cfg = dataclasses.replace(
+            CFG, repo_root=self.repo, ledger_dir=self.state,
+            gates=[{"id": "a", "command": [sys.executable, "-c",
+                                           self.PASSES], "blocking": True},
+                   {"id": "b", "command": [sys.executable, "-c",
+                                           self.FAILS], "blocking": True}])
+        records = emit.run_gates(cfg, self.head)
+        parents = {Path(r["output"]["pointer"]).parent for r in records}
+        self.assertEqual(len(parents), 1)
+        self.assertEqual(sorted(p.name for p in parents.pop().iterdir()),
+                         ["a.log", "b.log"])
+
+    def test_prune_still_owns_the_per_sha_directory(self):
+        # The retention contract is unchanged: the pruneable unit is the
+        # per-SHA directory, and a run directory goes when its SHA does.
+        self.run_gate(self.FAILS)
+        self.run_gate(self.PASSES)
+        cfg = dataclasses.replace(CFG, repo_root=self.repo,
+                                  ledger_dir=self.state)
+        result = transport.prune_gate_output(cfg, Ledger.in_memory())
+        self.assertEqual([e["sha"] for e in result["pruned"]], [self.head])
+        self.assertEqual(result["kept_unrecognised"], [])
+        self.assertFalse((self.state / "gate-output" / self.head).exists())
 
 
 class TestGateSeesCallerEnvironment(_GateHarness):
@@ -330,7 +422,11 @@ class TestShimProtocol(_GateHarness):
             timeout=120)
         self.assertEqual(proc.returncode, 0,
                          f"emission failed:\n{proc.stdout}\n{proc.stderr}")
-        log = state / "gate-output" / self.head / "probe.log"
+        # Retained output is per RUN, and `newest` is the symlink each
+        # per-SHA directory keeps pointing at the last one — the path a
+        # person reaches for when they want "the log for this gate here".
+        log = (state / "gate-output" / self.head / emit.NEWEST_RUN
+               / "probe.log")
         return json.loads(log.read_text(encoding="utf-8"))
 
     def test_the_full_matrix_with_and_without_poisoned_protocol_state(self):
@@ -640,3 +736,77 @@ class TestGatesRunConcurrentlyInManifestOrder(_GateHarness):
                 clear=True):
             recs = emit.run_gates(cfg, self.head)
         self.assertEqual([r["id"] for r in recs], ["g0", "g1"])
+
+
+def _errs(items):
+    return {i.code for i in items if i.level == "error"}
+
+
+class TestF4GatesBindToTheExecutedTree(unittest.TestCase):
+    """Round-4 F4 — FALSIFICATION: Supplying any head other than the executed
+    checkout cannot produce a passing attestation bound to that head."""
+
+    PROBE = dataclasses.replace(
+        CFG, ledger_dir=None,
+        gates=[{"id": "tests", "command": ["true"], "blocking": True}])
+
+    def probe(self, target):
+        """Run the one-gate probe manifest with the re-entrancy guard OFF.
+
+        This suite is itself a declared gate, so when it runs during an
+        emission every test in this class inherits LOUPE_IN_GATE_RUN and
+        `run_gates` correctly returns not-run records — which made these
+        assertions pass locally and fail inside the emitter, the exact class
+        of environment-dependent test the guard exists to prevent elsewhere.
+        Clearing it here cannot recurse: this manifest runs `true`, not the
+        suite. `test_the_guard_still_fires_when_nested` holds the other half.
+        """
+        env = {k: v for k, v in os.environ.items() if k != IN_GATE}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            return emit.run_gates(self.PROBE, target)
+
+    def test_the_guard_still_fires_when_nested(self):
+        with unittest.mock.patch.dict(os.environ, {IN_GATE: "1"}):
+            [rec] = emit.run_gates(self.PROBE, "0" * 40)
+        self.assertIn("not run", rec["error"])
+        self.assertNotIn("exit_code", rec)
+        # And a not-run blocking gate is fatal, never a silent pass.
+        self.assertIn("A-NOT-RUN", _errs(validate.validate_attestations(
+            evidence_with([rec]), self.PROBE)))
+
+    def test_a_foreign_target_cannot_produce_a_bound_attestation(self):
+        # The round-4 probe verbatim: run a trivially passing command in this
+        # tree and attest it to the null SHA.
+        [rec] = self.probe("0" * 40)
+        self.assertEqual(rec["exit_code"], 0)
+        self.assertTrue(rec["binding"].startswith("unbound"), rec["binding"])
+        self.assertNotEqual(rec["executed_sha"], "0" * 40)
+        codes = _errs(validate.validate_attestations(
+            evidence_with([rec]), self.PROBE))
+        self.assertIn("A-UNBOUND", codes)
+        self.assertIn("A-SHA-MISMATCH", codes)
+
+    def test_the_recorded_sha_is_derived_from_the_executed_tree(self):
+        head = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse",
+                               "HEAD"], capture_output=True, text=True,
+                              timeout=60).stdout.strip()
+        [rec] = self.probe("0" * 40)
+        self.assertEqual(rec["executed_sha"], head)
+
+    def test_a_dirty_tree_is_recorded_and_unbound(self):
+        head = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse",
+                               "HEAD"], capture_output=True, text=True,
+                              timeout=60).stdout.strip()
+        dirty = bool(subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=60).stdout.strip())
+        [rec] = self.probe(head)
+        self.assertEqual(rec["tree"], "dirty" if dirty else "clean")
+        # Matching SHAs are necessary but not sufficient: a dirty tree is not
+        # the target commit's content, so it stays unbound.
+        self.assertEqual(rec["binding"] == "bound", not dirty)
+
+    def test_output_is_digested_even_when_it_cannot_be_retained(self):
+        [rec] = self.probe("0" * 40)
+        self.assertEqual(len(rec["output"]["sha256"]), 64)
+        self.assertIn("not retained", rec["output"]["pointer"])

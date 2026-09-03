@@ -6,21 +6,27 @@ Split from `test_transport.py` 2026-08-31; the classes are verbatim.
 """
 
 import dataclasses
+import hashlib
 import json
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
 
-from review import cli, config, transport, validate, wire
+from review import cli, config, fingerprint, transport, validate, vocab, wire
 from review import ledger as ledger_mod
 from review.emit import _git
 from review.ledger import Ledger
 from review.tests.util import REPO_ROOT
 from review.tests._transport_fixtures import (
     CFG, SHA_A, SHA_B, SHA_C, request_text, verdict_text, _cli)
+
+#: "no argument given" told apart from "the argument None was given" — the
+#: manifest tests need both.
+_UNSET = object()
 
 class TestLedgerAddRequest(unittest.TestCase):
     """Sweep F3 (Blocker): the manual ingestion door validates a request.
@@ -1653,6 +1659,1288 @@ class TestSpanReport(unittest.TestCase):
         self.assertIsNotNone(found)
         self.assertEqual(tuple(int(x) for x in found.groups()),
                          (two["files"], two["insertions"], two["deletions"]))
+
+
+class _ImportLegacyCase(unittest.TestCase):
+    """Shared plumbing for driving `cmd_import_legacy` over an in-memory
+    ledger with a JSONL fixture AND a REAL GIT ANCHOR.
+
+    Round-10 F2 replaced round 9's caller-written source manifest, so the
+    fixture is now a real repository with a real remote: two tracked files
+    committed and pushed, and the pushed commit as the anchor every row
+    cites. Nothing here is mocked — the door runs the same `git ls-tree`,
+    `git show` and `git for-each-ref --contains` it runs in production, so a
+    test that passes proves the production reads pass.
+
+    The source file is BUILT from `SOURCE_CLAIMS` because a row must now
+    name bytes that carry its own words. A fixture claim string absent from
+    that list refuses on containment, which is the point; the tests that
+    exercise containment use strings deliberately left out.
+    """
+
+    CLASSIFICATION = "design_gap"
+    ANCHOR = "review/x.py"
+
+    SPLIT_PATH = "sources/split.md"
+    VERDICT_PATH = "sources/verdict.md"
+
+    #: Every claim text the helpers below can state, as the source carries
+    #: it. One line each, in the shape a legacy split table uses.
+    SOURCE_CLAIMS = (
+        "t", "a real claim", "a claim", "a different claim",
+        "an atomic claim", "an unrelated claim", "one atomic claim",
+        "claim a", "claim b", "claim c", "claim p", "claim x",
+        "claim new", "claim old", "claim one", "claim two",
+        "x", "y", "stated", "briefs/x.md", "when it bites",
+        "R1-F1", "R1-F1a",
+        # Round 6 F1: an imported `request` row's `author`/`reviewer` are
+        # LEGACY_CONTAINMENT members too, so a legacy request naming either
+        # actor must cite bytes that carry the name.
+        "claude", "codex",
+    )
+
+    @classmethod
+    def source_text(cls) -> str:
+        return "".join(f"| R1-F1a | {c} |\n" for c in cls.SOURCE_CLAIMS)
+
+    #: `changes requested` is the verdict TERM a verdict row must contain.
+    VERDICT_TEXT = ("VERDICT: changes requested\n\n"
+                    "a legacy round-1 verdict\n")
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.src = Path(tempfile.mkdtemp(prefix="legacy-anchor-"))
+        except OSError as exc:                       # pragma: no cover
+            raise unittest.SkipTest(f"filesystem writes denied ({exc})")
+        cls.addClassCleanup(shutil.rmtree, cls.src, ignore_errors=True)
+        cls.repo = cls.src / "work"
+        bare = cls.src / "origin.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+        cls.repo.mkdir()
+        cls._git("init", "-q", "-b", "main")
+        cls._git("config", "user.email", "fixture@invalid")
+        cls._git("config", "user.name", "fixture")
+        cls._git("remote", "add", "origin", str(bare))
+        cls.split_bytes = cls.source_text().encode("utf-8")
+        cls.verdict_bytes = cls.VERDICT_TEXT.encode("utf-8")
+        (cls.repo / "sources").mkdir()
+        (cls.repo / cls.SPLIT_PATH).write_bytes(cls.split_bytes)
+        (cls.repo / cls.VERDICT_PATH).write_bytes(cls.verdict_bytes)
+        cls._git("add", cls.SPLIT_PATH, cls.VERDICT_PATH)
+        cls._git("commit", "-q", "-m", "the legacy corpus sources")
+        cls._git("push", "-q", "origin", "main")
+        cls._git("fetch", "-q", "origin")
+        cls.anchor = cls._git("rev-parse", "HEAD")
+        cls.SPLIT_DIGEST = hashlib.sha256(cls.split_bytes).hexdigest()
+        cls.VERDICT_DIGEST = hashlib.sha256(cls.verdict_bytes).hexdigest()
+        #: A commit a remote-tracking ref contains, so an envelope row has a
+        #: target it can state. The anchor itself is the obvious one.
+        cls.TARGET = cls.anchor
+
+    @classmethod
+    def _git(cls, *args):
+        out = subprocess.run(["git", "-C", str(cls.repo), *args],
+                             capture_output=True, text=True, timeout=60)
+        if out.returncode != 0:                      # pragma: no cover
+            raise AssertionError(f"git {args}: {out.stderr}")
+        return out.stdout.strip()
+
+    def local_only_commit(self, text: str) -> tuple[str, str]:
+        """A commit made and NEVER pushed, plus the digest of the split file
+        in it. Restores the branch afterwards so the class-level anchor is
+        untouched: this is the "invented in the same session" case."""
+        was = self._git("rev-parse", "HEAD")
+        (self.repo / self.SPLIT_PATH).write_bytes(text.encode("utf-8"))
+        self._git("add", self.SPLIT_PATH)
+        self._git("commit", "-q", "-m", "local only")
+        sha = self._git("rev-parse", "HEAD")
+        self.addCleanup(self._git, "reset", "-q", "--hard", was)
+        return sha, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    # ------------------------------------------------------------ fixtures
+
+    def source(self, path=None, digest=None) -> dict:
+        path = self.SPLIT_PATH if path is None else path
+        known = {self.SPLIT_PATH: self.SPLIT_DIGEST,
+                 self.VERDICT_PATH: self.VERDICT_DIGEST}
+        return {"source_path": path,
+                "source_digest": digest or known.get(path, "0" * 64)}
+
+    def finding(self, round_no, title, fid="F1", anchor_path=None,
+                digest=None, path=None, **extra):
+        """One well-formed `finding` row: the identity facts, and the
+        fingerprint they actually hash to."""
+        anchor_path = self.ANCHOR if anchor_path is None else anchor_path
+        row = {"event": "finding", "round": round_no, "id": fid,
+               "severity": "High", "classification": self.CLASSIFICATION,
+               "title": title, "anchor_path": anchor_path,
+               **self.source(path, digest)}
+        row["fp"] = fingerprint.compute(self.CLASSIFICATION, anchor_path, "",
+                                        title)
+        row.update(extra)
+        return row
+
+    def atomic(self, round_no, verbatim, legacy_id="R1-F1a", digest=None,
+               path=None, **extra):
+        row = {"event": "import", "kind": "atomic", "round": round_no,
+               "legacy_id": legacy_id, "severity": "High",
+               "classification": self.CLASSIFICATION, "verbatim": verbatim,
+               "anchor_path": self.ANCHOR, **self.source(path, digest)}
+        row["fp"] = fingerprint.compute(self.CLASSIFICATION, self.ANCHOR, "",
+                                        verbatim)
+        row.update(extra)
+        return row
+
+    def fp_of(self, title, anchor_path=None):
+        return fingerprint.compute(
+            self.CLASSIFICATION,
+            self.ANCHOR if anchor_path is None else anchor_path, "", title)
+
+    def closure(self, round_no, fp, term="withdrawn", digest=None, path=None,
+                **extra):
+        row = {"event": "closure", "round": round_no, "fp": fp,
+               "closure": term, "note": "n", **self.source(path, digest)}
+        row.update(extra)
+        return row
+
+    def alias(self, from_fp, to_fp, digest=None, path=None):
+        return {"event": "lineage", "kind": "alias", "from_fp": from_fp,
+                "to_fp": to_fp, "reason": "carried",
+                **self.source(path, digest)}
+
+    def disposition(self, round_no, fp, term="accepted", payload=None,
+                    digest=None, path=None, **extra):
+        row = {"event": "disposition", "round": round_no, "finding_id": "F1",
+               "fp": fp, "disposition": term,
+               "payload": {"change": "x", "verification": "y"}
+               if payload is None else payload,
+               **self.source(path, digest)}
+        row.update(extra)
+        return row
+
+    def request_row(self, round_no, author=None, digest=None, path=None,
+                    **extra):
+        """One well-formed legacy `request` row (round 6 F1). `author`,
+        when given, must be a word `SOURCE_CLAIMS` actually carries — the
+        row's own `author` is a `LEGACY_CONTAINMENT` member for this kind,
+        so an uncontained name refuses on containment before author-binding
+        is ever reached."""
+        row = {"event": "request", "round": round_no,
+               "sha": self.TARGET, "bytes": len(self.split_bytes),
+               **self.source(path, digest)}
+        if author is not None:
+            row["author"] = author
+        row.update(extra)
+        return row
+
+    def verdict_row(self, round_no=1, sha=None, digest=None, path=None,
+                    **extra):
+        row = {"event": "verdict", "round": round_no,
+               "sha": self.TARGET if sha is None else sha,
+               "verdict": "changes requested",
+               "bytes": len(self.verdict_bytes), "finding_ids": 1,
+               **self.source(path or self.VERDICT_PATH, digest)}
+        row.update(extra)
+        return row
+
+    # --------------------------------------------------------------- driver
+
+    def _import(self, ledger, events, commit=_UNSET, no_fetch=False):
+        text = "\n".join(json.dumps(e) for e in events)
+        return self._import_text(ledger, text, commit=commit,
+                                 no_fetch=no_fetch)
+
+    def _import_text(self, ledger, text, commit=_UNSET, no_fetch=False):
+        """The fixture's remote is a local bare repository, so the DEFAULT
+        path — fetch, then `ls-remote` and ancestry from an observed tip —
+        runs here with no network. That is the production path; `no_fetch`
+        is passed only where a case is about the weaker witness."""
+        """The RAW-TEXT door (round-10 F4): a test about the parser must feed
+        bytes, never pre-built Python dicts that can state no member twice."""
+        tmp = Path(tempfile.mkstemp(suffix=".jsonl")[1])
+        tmp.write_text(text, encoding="utf-8")
+        self.addCleanup(tmp.unlink)
+        cfg = dataclasses.replace(CFG, ledger_dir=None, repo_root=self.repo)
+        where = self.anchor if commit is _UNSET else commit
+        with unittest.mock.patch("review.cli._ledger", return_value=ledger):
+            return _cli(cli.cmd_import_legacy, cfg, events=str(tmp),
+                        source_commit=where, no_fetch=no_fetch)
+
+    def refuses(self, ledger, events, why="", **kw):
+        """Import must refuse AND append nothing — the atomicity half is
+        never separable from the refusal half."""
+        before = [dict(e) for e in ledger.events()]
+        code, payload = self._import(ledger, events, **kw)
+        self.assertNotEqual(code, 0, (why, payload))
+        self.assertEqual(ledger.events(), before,
+                         f"{why}: a refused batch must leave the ledger "
+                         f"byte-for-byte as it was")
+        return payload
+
+    def admits(self, ledger, events, **kw):
+        code, payload = self._import(ledger, events, **kw)
+        self.assertEqual(code, 0, payload)
+        return payload
+
+
+class TestTheSourcePathGrammarIsClosed(_ImportLegacyCase):
+    """Round-11 F6 — FALSIFICATION (`lineage-20-residue`).
+
+    The grammar's own comment said "non-dot segments, no leading slash, no
+    `..`" while the pattern excluded exactly three characters, so `.`, `..`
+    and every dotted spelling of a real path were legal `source_path`
+    values. They are not synonyms: git RESOLVES them, so
+    `sources/../sources/split.md` reads one blob and the ledger records
+    another path as its provenance.
+
+    Nine refused forms, derived from the grammar rather than from examples:
+    `.`, `..`, `../x`, `a/../x`, `a/./x`, `/x`, `a//x`, and the NUL and
+    newline framings. Paired with ordinary nested paths, a dot-LEADING name
+    (`.gitignore` is a tracked path, not a dot segment) and the fixture's
+    own source file.
+
+    MUTATION, run below rather than described: with the segment guard taken
+    out, `sources/../sources/split.md` reaches git and git answers with a
+    DIFFERENT tree entry — the aliasing the finding measured. The second
+    half of the repair catches it there: the entry read must be the entry
+    asked for.
+    """
+
+    REFUSED = (".", "..", "../x", "a/../x", "a/./x", "/x", "a//x",
+               "a\x00b", "a\nb")
+    #: The grammar as it shipped: the mutation, kept as a literal so the
+    #: test states what it is mutating rather than editing production.
+    PERMISSIVE = re.compile(r"\A(?!/)(?:[^/\x00\n]+/)*[^/\x00\n]+\Z")
+
+    def authority(self):
+        cfg = dataclasses.replace(CFG, ledger_dir=None, repo_root=self.repo)
+        authority, problems = transport.read_source_authority(cfg,
+                                                              self.anchor)
+        self.assertEqual(problems, [], "the fixture anchor must resolve")
+        return authority
+
+    def recording(self, authority):
+        """The authority's git runner, wrapped so the test can assert that
+        a refused path costs no git read at all."""
+        calls = []
+        inner = authority._run
+
+        def run(*args):
+            calls.append(args)
+            return inner(*args)
+
+        authority._run = run
+        return calls
+
+    def test_every_refused_form_refuses_before_any_git_read(self):
+        authority = self.authority()
+        calls = self.recording(authority)
+        for path in self.REFUSED:
+            with self.subTest(path=path):
+                self.assertIsNone(transport._SOURCE_PATH_RE.match(path),
+                                  "the grammar must not admit it")
+                data, why = authority.blob(path)
+                self.assertIsNone(data)
+                self.assertIn("not a repository path", why)
+        self.assertEqual(calls, [], "a path the grammar refuses is never "
+                                    "handed to git")
+
+    def test_the_ordinary_paths_are_the_control(self):
+        authority = self.authority()
+        for path in (self.SPLIT_PATH, "a/b/c.md", ".gitignore", "...odd",
+                     "a.b/c..d"):
+            with self.subTest(path=path):
+                self.assertIsNotNone(transport._SOURCE_PATH_RE.match(path),
+                                     "a dot INSIDE a name is not a dot "
+                                     "segment")
+        data, why = authority.blob(self.SPLIT_PATH)
+        self.assertIsNone(why)
+        self.assertEqual(data, self.split_bytes)
+
+    def test_the_alias_the_mutation_reopens_is_caught_by_the_entry_check(self):
+        # First: the aliasing is real, measured through this fixture's own
+        # git — the dotted spelling resolves to another tree entry.
+        listing = self._git("ls-tree", "--full-tree", "-z", self.anchor,
+                            "--", "sources/../sources/split.md")
+        self.assertIn(self.SPLIT_PATH, listing)
+        # Then: mutate the grammar back and the path reaches git, where the
+        # canonical-entry check refuses it by name.
+        authority = self.authority()
+        with unittest.mock.patch.object(transport, "_SOURCE_PATH_RE",
+                                        self.PERMISSIVE):
+            data, why = authority.blob("sources/../sources/split.md")
+        self.assertIsNone(data)
+        self.assertIn("not the requested", why)
+        self.assertIn(self.SPLIT_PATH, why)
+
+    def test_a_row_citing_a_dotted_path_is_refused_at_the_door(self):
+        # End to end, through the verb: the batch does not import and the
+        # ledger is untouched.
+        ledger = Ledger.in_memory()
+        payload = self.refuses(
+            ledger, [self.finding(1, "t", path="sources/../sources/split.md",
+                                  digest=self.SPLIT_DIGEST)],
+            "dotted source path")
+        self.assertIn("not a repository path", json.dumps(payload))
+
+
+class TestImportLegacySourceAuthority(_ImportLegacyCase):
+    """Round-10 F2 — FALSIFICATION. Round 9 answered "a row may not be
+    substantiated by another row in the same batch" with a source MANIFEST
+    the caller wrote: `{path, sha256}` entries the tool hashed. The party
+    who writes the batch also writes the manifest, so a throwaway file,
+    hashed by its own author, substantiated a finding titled `fabricated`
+    and emptied the standing cohort. The manifest is gone.
+
+    Two properties replace it and both are exercised here, because either
+    one alone leaves the reproduction open:
+
+      ANCHORED   the bytes are read by this tool from `<commit>:<path>`, at
+                 a commit a REMOTE-TRACKING REF contains — so history that
+                 was already shared, never a file written in the same
+                 session as the batch — and the row's `source_digest` is
+                 recomputed, never believed.
+      CONTAINED  the row's own claim text must occur in that content.
+
+    THE STATED LIMIT, so no reader over-reads the controls below. This is
+    not non-repudiation: someone able to push to the remote can commit a
+    file saying whatever a row needs and then cite it, the anchor's message
+    and authorship are unverified, and containment is a substring test over
+    the whole file. It does establish that the cited bytes are durable,
+    shared, attributable history and that the row's words are traceable into
+    them — which is exactly the pair the manifest could not supply.
+    """
+
+    def test_a_batch_with_no_anchor_is_refused(self):
+        ledger = Ledger.in_memory()
+        self.refuses(ledger, [self.finding(1, "t")], "no anchor", commit=None)
+
+    def test_the_round_10_reproduction_verbatim(self):
+        # Source content `| R1-F1a | one atomic claim |`, a row titled
+        # `fabricated`, its digest real and correctly computed over real,
+        # pushed bytes — the exact batch that imported cleanly under the
+        # manifest and emptied `standing_findings`.
+        ledger = Ledger.in_memory()
+        real = self.fp_of("a real claim")
+        self.admits(ledger, [self.finding(1, "a real claim")])
+        self.assertEqual([f["fp"] for f in ledger.standing_findings()], [real])
+        fabricated = self.fp_of("fabricated")
+        payload = self.refuses(ledger, [
+            self.finding(1, "fabricated"),
+            self.disposition(1, fabricated),
+            self.disposition(1, real, payload={"change": "x",
+                                               "verification": "y"}),
+        ], "fabricated claim over real anchored bytes")
+        self.assertIn("does not occur in", json.dumps(payload))
+        self.assertEqual([f["fp"] for f in ledger.standing_findings()], [real],
+                         "the real finding must still stand: a forged "
+                         "acceptance may not answer it")
+
+    def test_a_correctly_anchored_digest_does_not_substantiate_any_claim(self):
+        # The narrower statement of the same thing, over a REAL committed
+        # file of this fixture's repository: correct path, correct digest,
+        # unrelated words. Anchoring alone is not provenance.
+        ledger = Ledger.in_memory()
+        self.refuses(ledger, [self.finding(1, "a claim nothing says")],
+                     "anchored but uncontained")
+
+    def test_a_row_may_not_cite_a_path_the_anchor_does_not_track(self):
+        ledger = Ledger.in_memory()
+        payload = self.refuses(
+            ledger, [self.finding(1, "t", path="sources/invented.md",
+                                  digest=self.SPLIT_DIGEST)],
+            "untracked path")
+        self.assertIn("is not tracked", json.dumps(payload))
+
+    def test_the_digest_a_row_claims_is_recomputed_not_believed(self):
+        ledger = Ledger.in_memory()
+        payload = self.refuses(ledger, [self.finding(1, "t", digest="c" * 64)],
+                               "asserted digest")
+        self.assertIn("hashes to", json.dumps(payload))
+
+    def test_a_commit_that_was_never_pushed_cannot_anchor_an_import(self):
+        # The whole gain over the manifest: bytes invented in the same
+        # session as the batch. The file says exactly what the row needs and
+        # the digest is correct — and no ref carries the commit.
+        sha, digest = self.local_only_commit("| R1-F1a | invented here |\n")
+        ledger = Ledger.in_memory()
+        payload = self.refuses(
+            ledger, [self.finding(1, "invented here", digest=digest)],
+            "local-only anchor", commit=sha)
+        self.assertIn("ancestry of no ref", json.dumps(payload))
+
+    def test_a_hand_written_remote_tracking_ref_does_not_anchor_it(self):
+        """The attack on the anchor itself, measured 2026-09-02: a
+        remote-tracking ref is LOCAL, WRITABLE state. `git update-ref
+        refs/remotes/origin/main <any local commit>` exits 0 with no network
+        and no remote, and `for-each-ref --contains` then names it.
+
+        Resting the anchor on that would be round 9's mistake one level
+        down — evidence the same party can author — so the witness is
+        `ls-remote`: what the REMOTE answers for. The forged ref below is
+        live and it still refuses.
+
+        MUTATION: point `refs_containing` at `_remote_refs_containing` in
+        the fetching branch of `read_source_authority` and this passes,
+        which is the state the first cut of this mechanism was in.
+        """
+        sha, digest = self.local_only_commit("| R1-F1a | invented here |\n")
+        self._git("update-ref", "refs/remotes/origin/forged", sha)
+        self.assertIn("refs/remotes/origin/forged",
+                      self._git("for-each-ref", "--contains", sha,
+                                "--format=%(refname)", "refs/remotes/"),
+                      "the forged ref is not live, so this proves nothing")
+        # The paired control FIRST, because it is what the flag buys and
+        # because the fetch below destroys the evidence: --no-fetch reads
+        # those same local refs, admits the batch, and RECORDS that it made
+        # the weaker claim rather than passing it off as the strong one.
+        weak = Ledger.in_memory()
+        code, payload = self._import(
+            weak, [self.finding(1, "invented here", digest=digest)],
+            commit=sha, no_fetch=True)
+        self.assertEqual(code, 0, payload)
+        self.assertIn("LOCAL state", payload["source_witness"])
+        # And the door's own default refuses the same batch.
+        ledger = Ledger.in_memory()
+        payload = self.refuses(
+            ledger, [self.finding(1, "invented here", digest=digest)],
+            "anchor carried only by a hand-written remote-tracking ref",
+            commit=sha)
+        self.assertIn("ancestry of no ref", json.dumps(payload))
+        # A second fact worth recording, since the run above establishes it:
+        # `fetch --prune` DELETED the forged ref, because the remote does not
+        # carry it. The weaker witness is self-repairing the moment anyone
+        # reaches the remote at all.
+        self.assertEqual(
+            self._git("for-each-ref", "--contains", sha,
+                      "--format=%(refname)", "refs/remotes/"), "",
+            "--prune must remove a remote-tracking ref the remote disowns")
+
+    def test_the_witness_is_recorded_on_every_import(self):
+        ledger = Ledger.in_memory()
+        payload = self.admits(ledger, [self.finding(1, "a real claim")])
+        self.assertIn("ls-remote", payload["source_witness"])
+        self.assertIn("refs/heads/main", payload["source_refs"])
+
+    def test_a_forged_verdict_row_cannot_invent_a_round(self):
+        # F2's own reproduction: bare request/verdict rows at round 99 used
+        # to import and make `rounds_to_clean` report 99. Judged now against
+        # the RECORD — envelope rounds are one contiguous loop — rather than
+        # against a manifest the same author wrote.
+        ledger = Ledger.in_memory()
+        payload = self.refuses(ledger, [self.verdict_row(round_no=99)],
+                               "round 99")
+        self.assertIn("skips", json.dumps(payload))
+        self.assertEqual(ledger.metrics()["rounds_to_clean"],
+                         "open (no clean verdict in 0 rounds)")
+
+    def test_a_verdict_row_may_not_invent_a_target_commit(self):
+        ledger = Ledger.in_memory()
+        payload = self.refuses(ledger, [self.verdict_row(sha="b" * 40)],
+                               "unshared target")
+        self.assertIn("remote-tracking ref", json.dumps(payload))
+
+    def test_a_verdict_row_may_not_restate_the_byte_count(self):
+        ledger = Ledger.in_memory()
+        self.refuses(ledger, [self.verdict_row(bytes=99999)], "wrong bytes")
+
+    def test_a_verdict_row_matching_the_authority_imports(self):
+        ledger = Ledger.in_memory()
+        self.admits(ledger, [self.verdict_row()])
+        self.assertEqual(ledger.completed_rounds(), [1])
+
+    def test_a_verdict_row_must_cite_bytes_stating_its_own_verdict(self):
+        # The split table carries claims, not a verdict term. A `verdict`
+        # row citing it states a term its source never says.
+        ledger = Ledger.in_memory()
+        payload = self.refuses(
+            ledger, [self.verdict_row(path=self.SPLIT_PATH,
+                                      digest=self.SPLIT_DIGEST)],
+            "split table as a verdict")
+        self.assertIn("does not occur in", json.dumps(payload))
+
+    def test_a_ruling_fingerprint_is_recomputed_not_believed(self):
+        ledger = Ledger.in_memory()
+        row = self.finding(1, "t")
+        row["fp"] = "fp2:" + "9" * 16
+        self.refuses(ledger, [row], "free-label fingerprint")
+        atomic = self.atomic(1, "a claim")
+        atomic["fp"] = self.fp_of("a different claim")
+        self.refuses(ledger, [atomic], "borrowed fingerprint")
+
+    def test_two_findings_cannot_be_collapsed_by_an_arbitrary_alias(self):
+        # F2's second reproduction, at the strength round 10 needs. The
+        # alias is anchored to a real, pushed file with a correct digest —
+        # everything the manifest ever asked — and it still refuses, because
+        # the file it cites carries neither ruling's words.
+        ledger = Ledger.in_memory()
+        one, two = self.fp_of("claim one"), self.fp_of("claim two")
+        payload = self.refuses(ledger, [
+            self.finding(1, "claim one", fid="F1"),
+            self.finding(1, "claim two", fid="F2"),
+            self.alias(one, two, path=self.VERDICT_PATH,
+                       digest=self.VERDICT_DIGEST),
+        ], "alias sourced to bytes naming neither claim")
+        self.assertIn("ruling text", json.dumps(payload))
+
+    def test_an_alias_over_the_bytes_that_carry_both_claims_imports(self):
+        # The paired control: the same merge, cited to the source that does
+        # carry both claims, is admitted. The rule is containment, not a ban
+        # on aliases.
+        ledger = Ledger.in_memory()
+        one, two = self.fp_of("claim one"), self.fp_of("claim two")
+        self.admits(ledger, [
+            self.finding(1, "claim one", fid="F1"),
+            self.finding(1, "claim two", fid="F2"),
+            self.alias(one, two),
+        ])
+        self.assertEqual([f["fp"] for f in ledger.standing_findings()], [two])
+
+    def test_a_sourced_batch_still_imports_and_reads_back(self):
+        # The positive control: everything above refuses because of what it
+        # fails to name, not because the door stopped working.
+        ledger = Ledger.in_memory()
+        fp = self.fp_of("a real claim")
+        payload = self.admits(ledger, [
+            self.verdict_row(),
+            self.finding(1, "a real claim"),
+            self.disposition(1, fp, term="deferred",
+                             payload={"destination": "briefs/x.md",
+                                      "trigger": "when it bites"}),
+        ])
+        self.assertEqual(payload["events_added"], 3)
+        self.assertEqual(payload["source_artifacts"], 2)
+        self.assertEqual(payload["source_commit"], self.anchor)
+        self.assertTrue(payload["source_refs"])
+        self.assertEqual([f["fp"] for f in ledger.standing_findings()], [fp])
+
+
+class TestImportLegacyDuplicateMembers(_ImportLegacyCase):
+    """Round-10 F4 — FALSIFICATION: the event-line parse was `json.loads`,
+    which keeps the LAST of repeated object members and drops every earlier
+    one BEFORE the closed schema sees the object. So `{"round": 999,
+    "round": 1}` was already 1, and the conflict the grammar exists to catch
+    never reached it.
+
+    Every case here feeds RAW JSON TEXT, because a Python dict cannot state
+    a member twice and a test built from one would test nothing.
+    """
+
+    def raw(self, row: dict, member: str, first) -> str:
+        """`row` as JSON text with `member` stated TWICE — the conflicting
+        value first, the row's own value second, which is the order
+        last-write-wins hides."""
+        body = json.dumps(row)
+        assert body.startswith("{")
+        return "{" + json.dumps(member) + ": " + json.dumps(first) + ", " \
+            + body[1:]
+
+    def test_every_member_of_every_row_refuses_a_conflicting_repeat(self):
+        rows = {
+            "finding": (self.finding(1, "a real claim"),
+                        {"round": 999, "title": "fabricated",
+                         "fp": "fp2:" + "9" * 16, "severity": "Low",
+                         "source_path": "sources/invented.md",
+                         "source_digest": "c" * 64, "id": "F9",
+                         "classification": "other", "event": "closure",
+                         "anchor_path": "elsewhere.py"}),
+            "verdict": (self.verdict_row(),
+                        {"round": 99, "bytes": 99999, "sha": "b" * 40,
+                         "verdict": "clean to advance", "finding_ids": 42,
+                         "source_path": self.SPLIT_PATH,
+                         "source_digest": self.SPLIT_DIGEST,
+                         "event": "request"}),
+        }
+        for kind, (row, conflicts) in rows.items():
+            for member, first in conflicts.items():
+                with self.subTest(kind=kind, member=member):
+                    ledger = Ledger.in_memory()
+                    code, payload = self._import_text(
+                        ledger, self.raw(row, member, first))
+                    self.assertNotEqual(code, 0, (member, payload))
+                    self.assertIn("duplicate JSON member",
+                                  json.dumps(payload))
+                    self.assertEqual(ledger.events(), [],
+                                     "a duplicate member refuses the WHOLE "
+                                     "batch, atomically")
+
+    def test_a_duplicate_in_a_nested_payload_is_refused_too(self):
+        row = self.disposition(1, self.fp_of("a real claim"))
+        text = json.dumps(row).replace(
+            '"payload": {"change": "x"',
+            '"payload": {"change": "not the change", "change": "x"')
+        self.assertIn('"change": "not the change"', text)
+        ledger = Ledger.in_memory()
+        code, payload = self._import_text(ledger, text)
+        self.assertNotEqual(code, 0, payload)
+        self.assertIn("duplicate JSON member", json.dumps(payload))
+        self.assertEqual(ledger.events(), [])
+
+    def test_one_bad_line_refuses_the_lines_beside_it(self):
+        good = self.finding(1, "a real claim")
+        text = "\n".join([json.dumps(good),
+                          self.raw(self.finding(2, "claim two", fid="F2"),
+                                   "round", 999)])
+        ledger = Ledger.in_memory()
+        code, payload = self._import_text(ledger, text)
+        self.assertNotEqual(code, 0, payload)
+        self.assertEqual(ledger.events(), [])
+
+    def test_the_single_member_control_still_imports(self):
+        # Same rows, each member stated once: the refusals above are about
+        # the repeat, not about the parser having stopped working.
+        ledger = Ledger.in_memory()
+        text = "\n".join(json.dumps(e) for e in
+                         [self.verdict_row(), self.finding(1, "a real claim")])
+        code, payload = self._import_text(ledger, text)
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["events_added"], 2)
+
+
+class TestImportLegacyClosedSchema(_ImportLegacyCase):
+    """Round-9 F2 — FALSIFICATION: the door admitted any object with a
+    truthy `event` key, so `payload` could be a string (an uncaught
+    AttributeError), `round` could be a list, and an unknown member was
+    ignored in silence. The grammar is `vocab.LEGACY_EVENT_SCHEMA` and the
+    cases below are DERIVED from it, so a member added there without a type
+    fails here rather than being admitted by an omission.
+    """
+
+    #: Member TYPE -> values outside it. Every entry carries both wrong
+    #: containers, a wrong scalar, the two absences JSON can express, and
+    #: the near-misses that shape alone would let through (an uppercase
+    #: digest, a short commit, a term outside its vocabulary). Keyed by the
+    #: type rather than by the member, and proved COMPLETE against the
+    #: schema below — a new member type has no cases until someone writes
+    #: them, and that fails by name rather than passing by omission.
+    WRONG_FOR = {
+        "round": ([], {}, "1", None, True, 0, -3, 1.5),
+        "count": ([], {}, "1", None, True, -1, 1.5),
+        "text": ([], {}, 0, None, True, ""),
+        "fingerprint": ([], {}, 0, None, True, ""),
+        "digest": ([], {}, 0, None, True, "", "z" * 64, "A" * 64, "ab"),
+        "commit": ([], {}, 0, None, True, "", "b" * 39, "A" * 40),
+        "payload": ([], "x", 0, None, True, 1.5),
+        "closure_term": ([], {}, 0, None, True, "", "retracted"),
+        "disposition_term": ([], {}, 0, None, True, "", "approved"),
+        "lineage_kind": ([], {}, 0, None, True, "", "merged"),
+        "import_kind": ([], {}, 0, None, True, "", "child"),
+        "verdict_term": ([], {}, 0, None, True, "", "looks fine"),
+    }
+
+    def test_every_member_type_the_schema_uses_has_wrong_values(self):
+        used = {kind for entry in vocab.LEGACY_EVENT_SCHEMA.values()
+                for kind in entry["required"].values()} - {"event_name"}
+        self.assertEqual(sorted(used - set(self.WRONG_FOR)), [],
+                         "a required member type with no wrong-value cases: "
+                         "the matrix below would pass it by omission")
+
+    def valid_rows(self):
+        """One well-formed row per admitted kind, so the mutation matrix
+        covers the whole grammar rather than the kinds someone remembered."""
+        fp = self.fp_of("a claim")
+        return {
+            "finding": self.finding(1, "a claim"),
+            "import": self.atomic(1, "an atomic claim"),
+            "disposition": self.disposition(1, fp),
+            "closure": self.closure(2, fp, answers_round=1),
+            "lineage": self.alias(fp, self.fp_of("another claim")),
+            "request": {"event": "request", "round": 1, "sha": self.TARGET,
+                        "bytes": len(self.verdict_bytes),
+                        "source_digest": self.VERDICT_DIGEST},
+            "verdict": self.verdict_row(),
+        }
+
+    def test_the_grammar_covers_every_admitted_kind(self):
+        self.assertEqual(sorted(self.valid_rows()),
+                         sorted(transport.LEGACY_IMPORT_KINDS),
+                         "a kind the door admits has no fixture here, so "
+                         "nothing below tests its members")
+
+    def test_every_required_member_refuses_every_wrong_type(self):
+        rows = self.valid_rows()
+        for kind, row in rows.items():
+            required = vocab.LEGACY_EVENT_SCHEMA[kind]["required"]
+            for member, member_type in sorted(required.items()):
+                if member == "event":
+                    continue        # the kind itself: routed, not typed
+                for wrong in self.WRONG_FOR[member_type]:
+                    with self.subTest(kind=kind, member=member, wrong=wrong):
+                        bad = {**row, member: wrong}
+                        self.refuses(Ledger.in_memory(), [bad],
+                                     f"{kind}.{member}={wrong!r}")
+
+    def test_a_conditionally_required_member_is_typed_too(self):
+        rows = self.valid_rows()
+        for (kind, member, value), demanded in sorted(
+                vocab.LEGACY_CONDITIONAL_REQUIRED.items()):
+            row = {**rows[kind], member: value}
+            if demanded == "outcome":
+                row = {**row, "outcome": "ratified"}
+            with self.subTest(kind=kind, when=value, demanded=demanded):
+                self.admits(Ledger.in_memory(),
+                            [self.finding(1, "a claim"), row])
+                self.refuses(
+                    Ledger.in_memory(),
+                    [self.finding(1, "a claim"),
+                     {k: v for k, v in row.items() if k != demanded}],
+                    f"{kind}({value}) with no {demanded}")
+
+    def test_every_required_member_refuses_its_own_absence(self):
+        for kind, row in self.valid_rows().items():
+            for member in sorted(vocab.LEGACY_EVENT_SCHEMA[kind]["required"]):
+                if member == "event":
+                    continue
+                with self.subTest(kind=kind, member=member):
+                    bad = {k: v for k, v in row.items() if k != member}
+                    self.refuses(Ledger.in_memory(), [bad],
+                                 f"{kind} without {member}")
+
+    def test_an_unknown_member_is_refused_by_name(self):
+        for kind, row in self.valid_rows().items():
+            with self.subTest(kind=kind):
+                payload = self.refuses(
+                    Ledger.in_memory(), [{**row, "answers_round_typo": 1}],
+                    f"{kind} with a surplus member")
+                self.assertIn("answers_round_typo", json.dumps(payload))
+
+    def test_a_string_payload_is_a_refusal_not_an_attribute_error(self):
+        ledger = Ledger.in_memory()
+        fp = self.fp_of("a claim")
+        payload = self.refuses(
+            ledger, [self.finding(1, "a claim"),
+                     self.disposition(1, fp, payload="fabricated")],
+            "string payload")
+        self.assertIn("payload", json.dumps(payload))
+
+    def test_a_nested_payload_value_is_typed_too(self):
+        ledger = Ledger.in_memory()
+        fp = self.fp_of("a claim")
+        self.refuses(
+            ledger, [self.finding(1, "a claim"),
+                     self.disposition(1, fp, payload={
+                         "change": "x", "verification": "y",
+                         "falsification": {"status": ["pass"]}})],
+            "nested non-string")
+        # …and the one-level object of strings the product path writes is
+        # admitted, so the rule closes a shape rather than forbidding depth.
+        self.admits(Ledger.in_memory(), [
+            self.finding(1, "a claim"),
+            self.disposition(1, fp, payload={
+                "change": "x", "verification": "y",
+                "falsification": {"status": "pass",
+                                  "mutation": "fails_without_fix"}}),
+        ])
+
+    def test_every_disposition_carries_its_mandatory_payload(self):
+        for term, keys in sorted(vocab.DISPOSITION_PAYLOADS.items()):
+            with self.subTest(disposition=term):
+                fp = self.fp_of("a claim")
+                self.refuses(
+                    Ledger.in_memory(),
+                    [self.finding(1, "a claim"),
+                     self.disposition(1, fp, term=term, payload={})],
+                    f"{term} with no payload")
+                self.admits(
+                    Ledger.in_memory(),
+                    [self.finding(1, "a claim"),
+                     self.disposition(1, fp, term=term,
+                                      payload={k: "stated" for k in keys})])
+
+    def test_a_kind_outside_the_schema_is_refused(self):
+        ledger = Ledger.in_memory()
+        self.refuses(ledger, [{"event": "tool_feedback", "round": 1,
+                               "sha": self.TARGET, "text": "hi"}],
+                     "a kind with no schema entry")
+
+    def test_a_fabricated_human_waiver_is_never_admitted(self):
+        ledger = Ledger.in_memory()
+        self.refuses(ledger, [self.finding(1, "a claim"),
+                              {"event": "finding_waiver", "round": 1,
+                               "fp": self.fp_of("a claim"),
+                               "authorized_by": "attacker", "reason": "r",
+                               "source_digest": self.SPLIT_DIGEST}],
+                     "a minted human waiver")
+
+
+class TestImportLegacyAnswersRoundIntegrity(_ImportLegacyCase):
+    """Rounds 7 F2 and 8 F2, re-proved under the rebuilt door: a settling
+    answer must substantiate the ruling it claims, and every way of failing
+    to refuses the WHOLE batch before a row is appended.
+    """
+
+    def test_a_valid_batch_binds_and_reads_back(self):
+        ledger = Ledger.in_memory()
+        events = [
+            self.finding(1, "claim a", fid="F1"),
+            self.finding(3, "claim a", fid="F1"),
+            self.finding(2, "claim b", fid="F2"),
+            self.closure(4, self.fp_of("claim a"), answers_round=3),
+        ]
+        payload = self.admits(ledger, events)
+        self.assertEqual(payload["events_added"], 4)
+
+    def test_each_invalid_shape_refuses_the_whole_batch(self):
+        a, b = self.fp_of("claim a"), self.fp_of("claim b")
+        cases = {
+            "future": [self.finding(1, "claim a"),
+                       self.closure(1, a, answers_round=2)],
+            "nonexistent": [self.finding(1, "claim a"),
+                            self.closure(5, a, answers_round=3)],
+            "same_round": [self.finding(1, "claim a"),
+                           self.finding(2, "claim a"),
+                           self.closure(2, a, answers_round=2)],
+            "wrong_identity": [self.finding(1, "claim a"),
+                               self.finding(3, "claim a"),
+                               self.finding(2, "claim b"),
+                               self.closure(4, a, answers_round=2)],
+            "other_identitys_round": [self.finding(1, "claim a"),
+                                      self.finding(2, "claim b"),
+                                      self.closure(3, b, answers_round=1)],
+            "non_integer": [self.finding(1, "claim a"),
+                            self.closure(2, a, answers_round="1")],
+            "zero": [self.finding(1, "claim a"),
+                     self.closure(2, a, answers_round=0)],
+            "unstamped": [self.finding(1, "claim a"),
+                          self.closure(2, a)],
+            "unstamped_in_collision": [self.finding(1, "claim a"),
+                                       self.finding(2, "claim a"),
+                                       self.closure(2, a)],
+        }
+        for name, events in cases.items():
+            with self.subTest(case=name):
+                self.refuses(Ledger.in_memory(), events, name)
+
+    def test_an_accepted_disposition_still_needs_a_real_ruling(self):
+        ledger = Ledger.in_memory()
+        fp = self.fp_of("claim a")
+        self.refuses(ledger, [self.disposition(1, fp)], "no backing ruling")
+        self.refuses(ledger, [self.finding(1, "claim a"),
+                              self.disposition(2, fp)], "wrong round")
+        self.admits(ledger, [self.finding(1, "claim a"),
+                             self.disposition(1, fp)])
+        self.assertEqual(ledger.standing_findings(), [])
+
+    def test_an_open_effect_answer_needs_no_binding(self):
+        # `sustained` settles nothing (`vocab.FINDING_ANSWERS`), so it has
+        # no authorization weight to forge and is not bound to a ruling —
+        # the domain of the lifecycle pass is derived, not hand-picked.
+        ledger = Ledger.in_memory()
+        self.admits(ledger, [self.finding(1, "claim a"),
+                             self.finding(2, "claim a"),
+                             self.closure(2, self.fp_of("claim a"),
+                                          term="sustained")])
+
+
+class TestImportLegacyBatchLocalIdentity(_ImportLegacyCase):
+    """Round-8 F1 — FALSIFICATION: identity must resolve through ONE
+    authority spanning the ledger's persisted lineage AND this batch's own
+    alias rows, order-independently, failing closed on a conflicting or
+    cyclic graph exactly as `resolve_identity` does.
+    """
+
+    def test_a_stamped_closure_is_bound_under_the_batch_local_graph(self):
+        # `answers_round: 1` names a round the ORIGINAL identity was ruled
+        # in; the alias merges it into one whose only ruling is round 2, so
+        # under the resolved identity the stamp names a real ruling and the
+        # batch stands. Its mirror below is the same batch with a stamp
+        # that names nothing.
+        old, new = self.fp_of("claim old"), self.fp_of("claim new")
+        events = [self.finding(1, "claim old"), self.alias(old, new),
+                  self.finding(2, "claim new"), self.closure(3, old,
+                                                             answers_round=1)]
+        ledger = Ledger.in_memory()
+        self.admits(ledger, events)
+        standing = ledger.standing_findings()
+        self.assertEqual([f["round"] for f in standing], [2],
+                         "the round-2 ruling is unanswered and must stand")
+
+    def test_a_stamp_naming_no_ruling_of_the_merged_identity_refuses(self):
+        old, new = self.fp_of("claim old"), self.fp_of("claim new")
+        events = [self.finding(1, "claim old"), self.alias(old, new),
+                  self.finding(2, "claim new"),
+                  self.closure(3, old, answers_round=2)]
+        # Round 2 IS a ruling of the merged identity, so this one stands…
+        self.admits(Ledger.in_memory(), events)
+        # …and a round nothing was ruled in does not.
+        events[-1] = self.closure(4, old, answers_round=3)
+        self.refuses(Ledger.in_memory(), events, "no round-3 ruling")
+
+    def test_an_unstamped_collision_behind_a_batch_local_alias_refuses(self):
+        old, new = self.fp_of("claim old"), self.fp_of("claim new")
+        self.refuses(Ledger.in_memory(),
+                     [self.finding(1, "claim old"), self.alias(old, new),
+                      self.finding(2, "claim new"), self.closure(2, old)],
+                     "unstamped behind an alias")
+
+    def test_a_multi_hop_alias_collision_also_refuses(self):
+        a, b, c = (self.fp_of("claim a"), self.fp_of("claim b"),
+                   self.fp_of("claim c"))
+        self.refuses(Ledger.in_memory(),
+                     [self.finding(1, "claim a"), self.alias(a, b),
+                      self.alias(b, c), self.finding(2, "claim c"),
+                      self.closure(2, a)],
+                     "unstamped behind two hops")
+
+    def test_row_order_does_not_change_the_verdict_either_way(self):
+        # The check may not depend on meeting the alias or the re-ruling
+        # before the closure. Same graph, listed backwards, both ways round:
+        # the unbound stamp still refuses and the bound one still stands.
+        old, new = self.fp_of("claim old"), self.fp_of("claim new")
+        graph = [self.finding(2, "claim new"), self.alias(old, new),
+                 self.finding(1, "claim old")]
+        self.refuses(Ledger.in_memory(),
+                     [self.closure(4, old, answers_round=3)] + graph,
+                     "shuffled rows, no round-3 ruling")
+        self.admits(Ledger.in_memory(),
+                    [self.closure(4, old, answers_round=1)] + graph)
+
+    def test_a_conflicting_batch_local_alias_refuses(self):
+        x, y, z = (self.fp_of("claim x"), self.fp_of("claim y"),
+                   self.fp_of("claim z"))
+        self.refuses(Ledger.in_memory(),
+                     [self.finding(1, "claim x"), self.alias(x, y),
+                      self.alias(x, z)],
+                     "one identity, two canonical parents")
+
+    def test_a_cyclic_batch_local_alias_refuses(self):
+        p, q = self.fp_of("claim p"), self.fp_of("claim q")
+        self.refuses(Ledger.in_memory(),
+                     [self.finding(1, "claim p"), self.alias(p, q),
+                      self.alias(q, p)],
+                     "a cycle has no canonical member")
+
+
+class TestImportLegacyCannotReinterpretPersistedAnswers(_ImportLegacyCase):
+    """Round-9 F1 — FALSIFICATION, both halves of the repair.
+
+    THE ELIMINATION. An unstamped settling closure means whatever the
+    identity graph and the ruling set say AT READ TIME, and a later,
+    separate import can change both. Validating harder cannot fix that: the
+    validation is a statement about one moment and the meaning is
+    re-derived later. So this door admits no unstamped `withdrawn` closure
+    at all, and the round-9 evidence's own first call — which used to exit
+    0 — now refuses.
+
+    THE RECOMPUTATION. Unstamped closures still reach the ledger by the
+    PRODUCT path, which writes one whenever no disposition record named the
+    ruling (`verdict_events`). Those are the persisted answers a later
+    import can still reinterpret, so every settling answer already on disk
+    is bound twice — under the ledger as it stands, and under the ledger
+    this batch would leave — and a batch that MOVES one is refused whole.
+    """
+
+    def persist_unstamped_withdrawal(self, ledger, title="claim old"):
+        """What `close` writes when the verdict named no disposition
+        record for the closure: a withdrawal with no `answers_round`."""
+        self.admits(ledger, [self.finding(1, title)])
+        ledger.add({"event": "closure", "round": 2, "fp": self.fp_of(title),
+                    "closure": "withdrawn", "note": "the reviewer withdrew"})
+        return self.fp_of(title)
+
+    def test_the_evidences_own_first_call_no_longer_exits_zero(self):
+        ledger = Ledger.in_memory()
+        old = self.fp_of("claim old")
+        self.refuses(ledger,
+                     [self.finding(1, "claim old"), self.closure(2, old)],
+                     "an unstamped settling closure at import")
+
+    def test_a_later_batch_may_not_move_a_persisted_unstamped_closure(self):
+        ledger = Ledger.in_memory()
+        old = self.persist_unstamped_withdrawal(ledger)
+        new = self.fp_of("claim new")
+        self.assertEqual(ledger.standing_findings(), [],
+                         "the withdrawal settles round 1 today")
+        self.refuses(ledger,
+                     [self.alias(old, new), self.finding(2, "claim new")],
+                     "a second call retargeting the first call's closure")
+
+    def test_a_multi_hop_retarget_across_three_calls_refuses(self):
+        ledger = Ledger.in_memory()
+        old = self.persist_unstamped_withdrawal(ledger)
+        mid, new = self.fp_of("claim mid"), self.fp_of("claim new")
+        self.admits(ledger, [self.alias(old, mid)])
+        self.refuses(ledger,
+                     [self.alias(mid, new), self.finding(2, "claim new")],
+                     "the third call closes the loop")
+
+    def test_the_re_ruling_may_arrive_before_the_alias(self):
+        # Vary which call supplies which row: the ruling first, the alias
+        # second. Neither call is the one that "obviously" does the damage.
+        ledger = Ledger.in_memory()
+        old = self.persist_unstamped_withdrawal(ledger)
+        new = self.fp_of("claim new")
+        self.admits(ledger, [self.finding(2, "claim new")])
+        self.refuses(ledger, [self.alias(old, new)], "the alias arrives last")
+
+    def test_a_same_identity_re_ruling_alone_refuses(self):
+        # No alias at all: a later call that rules the SAME identity in the
+        # closure's own round makes the persisted closure ambiguous.
+        ledger = Ledger.in_memory()
+        self.persist_unstamped_withdrawal(ledger)
+        self.refuses(ledger, [self.finding(2, "claim old")],
+                     "a re-ruling in the closure's own round")
+
+    def test_the_explicitly_bound_closure_is_the_valid_control(self):
+        # Same three rows, one difference: the persisted closure names the
+        # ruling it answers. Nothing a later graph does can reinterpret an
+        # explicit stamp, so the later call stands AND the later ruling
+        # stands with it.
+        ledger = Ledger.in_memory()
+        old, new = self.fp_of("claim old"), self.fp_of("claim new")
+        self.admits(ledger, [self.finding(1, "claim old"),
+                             self.closure(2, old, answers_round=1)])
+        self.assertEqual(ledger.standing_findings(), [])
+        self.admits(ledger, [self.alias(old, new),
+                             self.finding(2, "claim new")])
+        standing = ledger.standing_findings()
+        self.assertEqual([f["round"] for f in standing], [2],
+                         "the round-2 ruling nobody answered must stand")
+
+    def test_an_unrelated_later_import_is_not_refused(self):
+        # The other half of not deadlocking the door: a persisted unstamped
+        # closure does not freeze the ledger — only a batch that MOVES it
+        # is refused.
+        ledger = Ledger.in_memory()
+        self.persist_unstamped_withdrawal(ledger)
+        self.admits(ledger, [self.finding(5, "an unrelated claim")])
+        self.assertEqual([f["round"] for f in ledger.standing_findings()], [5])
+
+
+class TestImportLegacyAnswersCannotAcquireASameRoundRuling(_ImportLegacyCase):
+    """Round-10 F1 — FALSIFICATION. Round 9 reduced every answer's binding to
+    `(state, round)` and compared only those two scalars before and after a
+    candidate batch. So the comparison could see the SLOT move and not its
+    OCCUPANT change.
+
+    The reproduction, in two calls: call 1 imports a round-1 finding and its
+    accepted disposition, leaving nothing standing. Call 2 imports an alias
+    from that fingerprint to a DISTINCT identity plus that identity's own
+    finding AT THE SAME ROUND. The round did not change, so the round-9
+    comparison said nothing had happened — and the persisted acceptance,
+    untouched on disk, silently began covering a ruling it never answered.
+    Both fingerprints resolved to the merged identity and the standing
+    cohort stayed empty.
+
+    An answer is now bound to the ruling MATERIAL at its target round — the
+    content uid of every ruling event there — so an added or different
+    ruling at that same round is a different binding and refuses.
+    """
+
+    def settled_ledger(self):
+        """A ledger where `claim old` was ruled in round 1 and accepted."""
+        ledger = Ledger.in_memory()
+        old = self.fp_of("claim old")
+        self.admits(ledger, [self.finding(1, "claim old"),
+                             self.disposition(1, old)])
+        self.assertEqual(ledger.standing_findings(), [],
+                         "call 1 must leave nothing standing")
+        return ledger, old
+
+    def test_an_alias_may_not_move_a_settled_answer_onto_a_new_ruling(self):
+        ledger, old = self.settled_ledger()
+        new = self.fp_of("claim new")
+        payload = self.refuses(
+            ledger,
+            [self.alias(old, new), self.finding(1, "claim new", fid="F2")],
+            "a distinct same-round ruling behind an alias")
+        self.assertIn("WHICH ruling occupies it did", json.dumps(payload))
+        self.assertEqual([f["fp"] for f in ledger.standing_findings()], [],
+                         "the refused batch changed nothing at all")
+
+    def test_the_alias_only_control_is_unaffected(self):
+        # The paired control the finding demands: the SAME alias with no new
+        # ruling at that round is a rename, and a rename may not be refused.
+        ledger, old = self.settled_ledger()
+        new = self.fp_of("claim new")
+        self.admits(ledger, [self.alias(old, new)])
+        self.assertEqual(ledger.standing_findings(), [],
+                         "an alias-only rename preserves the settlement")
+
+    def test_the_new_ruling_is_unsettled_after_the_refusal(self):
+        # What the escape bought: `claim new` looked answered. After the
+        # refusal it is not even in the ledger, and importing it WITHOUT the
+        # alias leaves it standing and unanswered, which is the true state.
+        ledger, _old = self.settled_ledger()
+        self.admits(ledger, [self.finding(1, "claim new", fid="F2")])
+        self.assertEqual([f["id"] for f in ledger.standing_findings()],
+                         ["F2"])
+
+    def test_a_second_ruling_of_the_SAME_identity_at_that_round_refuses(self):
+        # No alias at all, and no distinct identity: one more ruling event
+        # of the answered identity, in the answered round. Multiplicity is
+        # part of the material, so an acceptance that covered one ruling may
+        # not silently come to cover two.
+        ledger, _old = self.settled_ledger()
+        self.refuses(ledger,
+                     [self.finding(1, "claim old", fid="F1b",
+                                   severity="Medium")],
+                     "a second round-1 ruling of the settled identity")
+
+    def test_an_atomic_import_is_ruling_material_too(self):
+        # The ruling authority is `is_ruling`, so a legacy atomic import
+        # arriving at the answered round moves the binding exactly as a
+        # `finding` does — the two kinds cannot disagree here either.
+        ledger, old = self.settled_ledger()
+        new = self.fp_of("an atomic claim")
+        self.refuses(ledger,
+                     [self.alias(old, new), self.atomic(1, "an atomic claim")],
+                     "an atomic ruling behind the alias")
+
+    def test_a_ruling_at_another_round_is_not_this_answer_s_business(self):
+        # The bound is tight, not blunt: a new ruling of the merged identity
+        # in a DIFFERENT round does not touch the round-1 acceptance, and
+        # the batch stands with the new ruling left standing.
+        ledger, old = self.settled_ledger()
+        new = self.fp_of("claim new")
+        self.admits(ledger, [self.alias(old, new),
+                             self.finding(2, "claim new", fid="F2")])
+        self.assertEqual([f["round"] for f in ledger.standing_findings()], [2])
+
+
+class TestImportLegacyDispositionAuthor(_ImportLegacyCase):
+    """Round 6 F1 — FALSIFICATION. `LEGACY_EVENT_SCHEMA` neither required
+    nor permitted an `author` member on a `disposition` row, and none of
+    `import-legacy`'s passes called `request_author` or
+    `check_disposition_author` — the two functions rounds 3-5 built so
+    `respond --out`, `respond` without `--out`, and standalone `ledger add`
+    could never persist a disposition attributed to anyone but the round's
+    own recorded request. `import-legacy` was a fourth ingress those three
+    doors' fix never reached: a ledger holding a round-1 request stamped
+    `author=claude` still admitted a source-valid `refuted` disposition for
+    round 1 with no author at all, through the real command path.
+
+    The request-author invariant now applies over the COMPLETE candidate
+    state a batch would leave: a request PERSISTED before this call, a
+    request in the SAME batch as the disposition answering it, and a
+    request an EARLIER sequential `import-legacy` call already committed
+    all bind identically. A request that genuinely carries no author is
+    the paired legacy control, proved for the same three shapes. A
+    disposition may also SUPPLY an author now (`vocab.LEGACY_EVENT_SCHEMA`
+    admits it as optional): a matching value passes, a mismatch refuses
+    the whole batch with zero rows appended — proved for every one of the
+    five disposition terms, since the invariant does not read the term.
+    """
+
+    def _payload_for(self, term):
+        return {k: "stated" for k in vocab.DISPOSITION_PAYLOADS[term]}
+
+    def _finding_and_disposition(self, term, author=None, claim="a claim",
+                                 round_no=1):
+        fp = self.fp_of(claim)
+        finding = self.finding(round_no, claim)
+        disp = self.disposition(round_no, fp, term=term,
+                                payload=self._payload_for(term))
+        if author is not None:
+            disp["author"] = author
+        return finding, disp
+
+    def _last_disposition(self, ledger):
+        rows = [e for e in ledger.events() if e.get("event") == "disposition"]
+        self.assertEqual(len(rows), 1, "exactly one disposition must land")
+        return rows[0]
+
+    # --------------------------------------------------------- case (1)
+
+    def test_a_persisted_request_author_is_derived_onto_the_disposition(self):
+        for term in vocab.DISPOSITIONS:
+            with self.subTest(term=term):
+                ledger = Ledger.in_memory()
+                ledger.add({"event": "request", "round": 1, "sha": SHA_B,
+                           "bytes": 1, "author": "claude"})
+                finding, disp = self._finding_and_disposition(term)
+                self.assertNotIn("author", disp)
+                payload = self.admits(ledger, [finding, disp])
+                self.assertEqual(payload["events_added"], 2)
+                self.assertEqual(self._last_disposition(ledger)["author"],
+                                 "claude")
+
+    # --------------------------------------------------------- case (2)
+
+    def test_a_batch_local_request_author_is_derived_onto_its_disposition(
+            self):
+        for term in vocab.DISPOSITIONS:
+            with self.subTest(term=term):
+                ledger = Ledger.in_memory()
+                request = self.request_row(1, author="claude")
+                finding, disp = self._finding_and_disposition(term)
+                payload = self.admits(ledger, [request, finding, disp])
+                self.assertEqual(payload["events_added"], 3)
+                self.assertEqual(self._last_disposition(ledger)["author"],
+                                 "claude")
+
+    # --------------------------------------------------------- case (3)
+
+    def test_a_sequentially_imported_request_author_is_derived(self):
+        for term in vocab.DISPOSITIONS:
+            with self.subTest(term=term):
+                ledger = Ledger.in_memory()
+                request = self.request_row(1, author="claude")
+                first = self.admits(ledger, [request])
+                self.assertEqual(first["events_added"], 1)
+                finding, disp = self._finding_and_disposition(term)
+                second = self.admits(ledger, [finding, disp])
+                self.assertEqual(second["events_added"], 2)
+                self.assertEqual(self._last_disposition(ledger)["author"],
+                                 "claude")
+
+    # ----------------------------------------------- paired legacy control
+
+    def test_a_request_with_no_author_leaves_the_legacy_state(self):
+        for term in vocab.DISPOSITIONS:
+            with self.subTest(term=term, shape="persisted"):
+                ledger = Ledger.in_memory()
+                ledger.add({"event": "request", "round": 1, "sha": SHA_B,
+                           "bytes": 1})
+                finding, disp = self._finding_and_disposition(term)
+                self.admits(ledger, [finding, disp])
+                self.assertNotIn("author", self._last_disposition(ledger))
+            with self.subTest(term=term, shape="batch-local"):
+                ledger = Ledger.in_memory()
+                request = self.request_row(1)
+                finding, disp = self._finding_and_disposition(term)
+                self.admits(ledger, [request, finding, disp])
+                self.assertNotIn("author", self._last_disposition(ledger))
+            with self.subTest(term=term, shape="sequential"):
+                ledger = Ledger.in_memory()
+                request = self.request_row(1)
+                self.admits(ledger, [request])
+                finding, disp = self._finding_and_disposition(term)
+                self.admits(ledger, [finding, disp])
+                self.assertNotIn("author", self._last_disposition(ledger))
+
+    # ------------------------------------------------- supplied author
+
+    def test_a_matching_supplied_author_passes(self):
+        for term in vocab.DISPOSITIONS:
+            with self.subTest(term=term):
+                ledger = Ledger.in_memory()
+                ledger.add({"event": "request", "round": 1, "sha": SHA_B,
+                           "bytes": 1, "author": "claude"})
+                finding, disp = self._finding_and_disposition(
+                    term, author="claude")
+                payload = self.admits(ledger, [finding, disp])
+                self.assertEqual(payload["events_added"], 2)
+                self.assertEqual(self._last_disposition(ledger)["author"],
+                                 "claude")
+
+    def test_a_mismatched_supplied_author_refuses_the_whole_batch(self):
+        for term in vocab.DISPOSITIONS:
+            with self.subTest(term=term):
+                ledger = Ledger.in_memory()
+                ledger.add({"event": "request", "round": 1, "sha": SHA_B,
+                           "bytes": 1, "author": "claude"})
+                finding, disp = self._finding_and_disposition(
+                    term, author="codex")
+                payload = self.refuses(
+                    ledger, [finding, disp],
+                    f"{term}: codex disposition against a claude request")
+                self.assertIn("does not match", json.dumps(payload))
+                self.assertEqual(
+                    [e for e in ledger.events()
+                     if e.get("event") == "disposition"], [],
+                    "a refused batch must append no disposition at all")
 
 
 if __name__ == "__main__":

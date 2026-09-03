@@ -20,7 +20,8 @@ from .fingerprint import compute as fp_compute
 from .fingerprint import legacy_v1 as fp_legacy_v1
 
 _WRAPPER_RE = re.compile(
-    r"<(?P<tag>[\w-]+)-(?P<kind>review-(?:request|verdict|disposition))"
+    r"<(?P<tag>[\w-]+)-(?P<kind>review-(?:request|verdict|disposition"
+    r"|authorization))"
     r"(?P<attrs>[^>]*)>\s*(?P<body>.*?)\s*</(?P=tag)-(?P=kind)>",
     re.DOTALL,
 )
@@ -168,11 +169,20 @@ class Closure:
     def well_formed(self) -> bool:
         return not self.defects
 
-    def as_event(self, round_no: int) -> dict:
+    def as_event(self, round_no: int, answers_round: int | None = None) -> dict:
         ev = {"event": "closure", "round": round_no, "fp": self.fp,
               "closure": self.closure, "note": self.note}
         if self.outcome:
             ev["outcome"] = self.outcome
+        if answers_round is not None:
+            # Round-6 F1: the round the closure actually answers, when the
+            # recording path can derive it from the disposition record
+            # being closed — the one thing ledger round numbers alone
+            # cannot always say, since a verdict may close a prior ruling
+            # AND re-raise the same fingerprint as a new one in the same
+            # breath. Absent it, readers fall back to inferring from round
+            # comparisons, which is exactly what admits that ambiguity.
+            ev["answers_round"] = answers_round
         return ev
 
 
@@ -216,6 +226,36 @@ class Disposition:
     exact: bool = False  # the wrapper spans the whole document (F16)
     attr_defects: tuple = ()  # repeated / malformed wrapper attributes
     body_defects: tuple = ()  # repeated JSON members in the body
+
+
+@dataclass
+class Authorization:
+    """A human's recorded decision to advance with findings still open.
+
+    Deliberately its OWN kind rather than a derived clean verdict: an
+    overridden advance and a clean review are different facts, and the
+    artifact that carries one must not be mistakable for the other.
+    """
+    tag: str | None
+    attrs: dict
+    data: dict
+    wrapped: bool
+    exact: bool = False
+    attr_defects: tuple = ()
+    body_defects: tuple = ()
+
+    @property
+    def sha(self) -> str:
+        return str(self.data.get("sha") or self.attrs.get("sha") or "")
+
+    @property
+    def by(self) -> str:
+        return str(self.data.get("by") or "")
+
+    @property
+    def waived(self) -> list:
+        got = self.data.get("waived")
+        return got if isinstance(got, list) else []
 
 
 class NoncanonicalLineEndings(ValueError):
@@ -777,6 +817,90 @@ def emit_disposition(tag: str, verdict_sha: str, head: str, author: str,
         f'shape="{shape_identity()}">'
     )
     return f"{open_tag}\n{body}\n</{tag}-review-disposition>\n"
+
+
+def emit_authorization(tag: str, sha: str, round_no: int, lineage: int,
+                       by: str, reason: str, waived: list[dict]) -> str:
+    """Authorization envelope: a named human advancing a lineage over
+    findings that are still open, listing every one of them.
+
+    Stamped with the emitting installation's identity like the other
+    tool-emitted envelopes, and canonical JSON in the body for the same
+    reason the disposition is — machine-emitted, machine-read.
+    """
+    data = {
+        "sha": sha,
+        "round": round_no,
+        "lineage": lineage,
+        "by": by,
+        "reason": reason,
+        "waived": waived,
+    }
+    body = json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True)
+    open_tag = (
+        f'<{tag}-review-authorization sha="{sha}" round="{round_no}" '
+        f'lineage="{lineage}" by="{by}" tool="{tool_identity()}" '
+        f'shape="{shape_identity()}">'
+    )
+    return f"{open_tag}\n{body}\n</{tag}-review-authorization>\n"
+
+
+#: JSON's own names for the Python kinds `load_json` can return, so a body
+#: that is the wrong top-level kind is reported in the vocabulary the
+#: document is written in rather than in Python's.
+_JSON_KIND_NAMES = {type(None): "null", bool: "boolean", int: "number",
+                    float: "number", str: "string", list: "array",
+                    dict: "object"}
+
+
+def json_kind(value) -> str:
+    return _JSON_KIND_NAMES.get(type(value), type(value).__name__)
+
+
+def parse_authorization(text: str) -> Authorization:
+    """The authorization envelope, with EVERY unreadable body converted to a
+    typed defect the validator reports.
+
+    A repeated member was already typed; malformed JSON was not, and escaped
+    as a raw `json.JSONDecodeError` from the one verb whose whole promise is
+    a typed refusal — so a hand-edited authorization crashed `loupe validate`
+    instead of being refused by it. A top-level kind that is not an object is
+    the same class of defect: `[1, 2]` carries no members to judge, and
+    reading it as `{}` would report six missing members for a document whose
+    real defect is that it is not an authorization body at all.
+    """
+    tag, kind, attrs, body, exact = unwrap(text)
+    data: dict = {}
+    body_defects: tuple = ()
+    try:
+        loaded = load_json(body)
+    except DuplicateMember as exc:
+        body_defects = (("A-JSON-DUPLICATE",
+                         f"the authorization body states JSON member "
+                         f"{exc.name!r} more than once; every member is "
+                         f"single-valued and a repeat would let one "
+                         f"declaration hide another"),)
+    except json.JSONDecodeError as exc:
+        body_defects = (("A-JSON-MALFORMED",
+                         f"the authorization body is not readable JSON "
+                         f"({exc.msg} at line {exc.lineno} column "
+                         f"{exc.colno}); an envelope that can authorize an "
+                         f"approval is refused by name, never by a crash "
+                         f"inside the verb that was asked to judge it"),)
+    else:
+        if isinstance(loaded, dict):
+            data = loaded
+        else:
+            body_defects = (("A-JSON-SHAPE",
+                             f"the authorization body is a top-level "
+                             f"{json_kind(loaded)}; an authorization is a "
+                             f"JSON object stating the commit it advances, "
+                             f"who decided, why, and every finding "
+                             f"overruled"),)
+    return Authorization(
+        tag=tag, attrs=attrs, data=data,
+        wrapped=kind == "review-authorization", exact=exact,
+        attr_defects=wrapper_attr_defects(text), body_defects=body_defects)
 
 
 def parse_disposition(text: str) -> Disposition:

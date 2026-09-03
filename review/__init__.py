@@ -137,7 +137,7 @@ TOOL_NAME = "loupe"
 #   - the reviewer procedure gains the falsification-anchoring rule (D3):
 #     anchor in the reviewed tree wherever the defect admits it, and name
 #     an external mutable dependency in the finding when it does not.
-TOOL_VERSION = "0.12.1"
+TOOL_VERSION = "0.16.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never
@@ -267,6 +267,7 @@ IDENTITY_EXCLUDED = {
     "adapters/codex/SKILL.md": ADAPTERS,
     "adapters/instructions-block.md": ADAPTERS,
     "docs/design.md": DOCS,
+    "docs/overview.md": DOCS,
     "docs/onboarding.md": DOCS,
     "review.toml": EXAMPLE_CONFIG,
     "review/tests/__init__.py": TESTS,
@@ -275,11 +276,15 @@ IDENTITY_EXCLUDED = {
     "review/tests/fixtures/verdict-with-closures.md": TESTS,
     "review/tests/synth.py": TESTS,
     "review/tests/test_adapters.py": TESTS,
+    "review/tests/test_authorization_grammar.py": TESTS,
     "review/tests/test_attestation_integrity.py": TESTS,
     "review/tests/test_breakers.py": TESTS,
     "review/tests/test_command_boundary.py": TESTS,
+    "review/tests/test_cli_exits.py": TESTS,
+    "review/tests/test_config_compat.py": TESTS,
     "review/tests/test_convergence.py": TESTS,
     "review/tests/test_debug_round.py": TESTS,
+    "review/tests/test_human_override.py": TESTS,
     "review/tests/test_command_surface.py": TESTS,
     "review/tests/test_falsification_record.py": TESTS,
     "review/tests/test_fingerprint.py": TESTS,
@@ -289,13 +294,9 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_prune.py": TESTS,
     "review/tests/test_reachability.py": TESTS,
     "review/tests/test_readme_walkthrough.py": TESTS,
-    "review/tests/test_reference_binding.py": TESTS,
     "review/tests/test_reference_domain.py": TESTS,
     "review/tests/test_rename_migration.py": TESTS,
     "review/tests/test_role_stamp.py": TESTS,
-    "review/tests/test_round3_fixes.py": TESTS,
-    "review/tests/test_round4_fixes.py": TESTS,
-    "review/tests/test_round5_fixes.py": TESTS,
     "review/tests/test_shadow_round.py": TESTS,
     "review/tests/test_tool_identity.py": TESTS,
     "review/tests/_transport_fixtures.py": TESTS,

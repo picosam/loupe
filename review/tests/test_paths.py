@@ -35,10 +35,6 @@ class TestShellPath(unittest.TestCase):
                 argv = shlex.split(f"git -C {paths.shell_path(p)} diff a...b")
                 self.assertEqual(argv, ["git", "-C", p, "diff", "a...b"])
 
-    def test_diff_command_is_the_shared_renderer(self):
-        cmd = paths.diff_command("/tmp/repo with space", "a" * 7, "b" * 7)
-        self.assertEqual(shlex.split(cmd)[2], "/tmp/repo with space")
-
     def test_execution_control_against_a_metacharacter_repository(self):
         """The command must not merely split right — it must RUN. A scratch
         repository whose path carries a space and a quote is diffed through
@@ -85,13 +81,11 @@ class TestCommandSurfaceInventory(unittest.TestCase):
     centralizing only the surfaces a reproducer happened to name left the
     verdict relay with the same argv split one round later.
 
-    Two instruments. The behavioral rows exercise each reachable emitting
-    function with a metacharacter path and assert the intended argv. The
-    source scan is the drift guard for the surfaces a unit call cannot
-    cheaply reach (refusal `next` commands, recovery lines): it fails on
-    any raw path interpolation directly after a command token in the three
-    command-emitting modules, so a NEW surface added without the renderer
-    fails here before a reviewer has to find it.
+    The behavioural rows for the take relay, the diff command and the
+    placeholder form live in `test_command_surface` /
+    `test_command_boundary` (2026-09-02); what stays here is the one
+    surface those do not split back with a metacharacter path — the
+    verdict relay's `close` line.
     """
 
     META = "/tmp/verdict with space.md"
@@ -115,25 +109,6 @@ class TestCommandSurfaceInventory(unittest.TestCase):
         # when it records the round, with the path the tool kept rather than
         # the reviewer's. One fact, one source.
         self.assertNotIn("respond", relay)
-
-    def test_the_placeholder_form_stays_literal(self):
-        from review import brief
-        relay = brief.verdict_relay(self._verdict())
-        self.assertIn("--verdict <verdict.md>", relay)
-        self.assertNotIn("'<verdict.md>'", relay)
-
-    def test_request_relay_take_carries_one_path_argument(self):
-        import shlex
-        from review import brief
-        from review.tests._transport_fixtures import request_text
-        from review import wire
-        req = wire.parse_request(request_text())
-        kept = "/tmp/kept envelope.md"
-        relay = brief.relay(kept, req, "bytes")
-        take = next(l for l in relay.splitlines()
-                    if l.startswith("loupe take"))
-        self.assertEqual(shlex.split(take),
-                         ["loupe", "take", kept, "--as", "codex"])
 
 
 

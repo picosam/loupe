@@ -185,3 +185,72 @@ class TestTheReplacementCannotReachASemanticRead(GitReadFixture):
              self.target], capture_output=True, text=True, timeout=60)
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("unknown option", out.stderr)
+
+
+class TestTheLegacyAnchorIsReadFromTheOriginalGraph(GitReadFixture):
+    """Lineage 20 round 10 F2. `import-legacy`'s source authority
+    dereferences an anchor commit — its tree, one blob, and its ancestry
+    from the remote-tracking refs — and it is the one door with no
+    authentication at all, so `git replace` is exactly the attack it must
+    not be open to: a replacement would let a row cite bytes nobody else
+    sees at that SHA.
+
+    `design/git-read-boundary.toml` declares `read_source_authority` as the
+    GUARD for the four object-graph reads under it. This is the behavioural
+    half of that declaration: the argv actually executed, and the digest
+    actually computed, with a replacement live.
+
+    MUTATION: drop `no_replace=True` from `read_source_authority`'s runner
+    and `test_a_planted_replacement_cannot_change_the_anchored_bytes` fails
+    — the digest follows the planted tree.
+    """
+
+    def test_every_read_it_makes_is_hardened(self):
+        seen = []
+        real = subprocess.run
+
+        def record(argv, *a, **kw):
+            if isinstance(argv, list):
+                seen.append(subcommand_of(argv))
+            return real(argv, *a, **kw)
+
+        with mock.patch("subprocess.run", side_effect=record):
+            authority, problems = transport.read_source_authority(
+                self.cfg, self.target, fetch=False)
+            self.assertEqual(problems, [], "the fixture's target is pushed")
+            self.assertEqual(authority.digest("f.txt"),
+                             _sha256(b"two\n"))
+            self.assertTrue(authority.shared_commit(self.target))
+        hardened = {"ls-tree": True, "show": True, "cat-file": True,
+                    "for-each-ref": True}
+        for sub, flag in seen:
+            if sub in hardened:
+                self.assertTrue(
+                    flag, f"`git {sub}` dereferences the anchor and ran "
+                          f"without {NO_REPLACE}")
+        self.assertEqual(sorted({s for s, _ in seen if s in hardened}),
+                         ["cat-file", "for-each-ref", "ls-tree", "show"],
+                         "every declared object-graph read must actually run")
+
+    def test_a_planted_replacement_cannot_change_the_anchored_bytes(self):
+        authority, problems = transport.read_source_authority(
+            self.cfg, self.target, fetch=False)
+        self.assertEqual(problems, [])
+        clean = authority.digest("f.txt")
+        for base_ref in (None, "refs/altreplace/"):
+            with self.subTest(base=base_ref or "refs/replace/"):
+                self.plant_replacement(base_ref)
+                fresh, _ = transport.read_source_authority(
+                    self.cfg, self.target, fetch=False)
+                self.assertEqual(fresh.digest("f.txt"), clean,
+                                 "the anchored digest followed the "
+                                 "replacement tree")
+                self.assertEqual(fresh.blob("extra.txt")[0], None,
+                                 "a path only the replacement tree carries "
+                                 "must not become citable")
+                self.remove_replacement(base_ref)
+
+
+def _sha256(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()

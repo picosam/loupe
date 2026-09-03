@@ -74,6 +74,21 @@ target's own rules to a second machine. A user-level
 `~/.config/loupe/<repo-id>.toml` still governs local verbs (ledger
 operations, rendering), never a reviewed door.
 
+**Trust model — one principal.** The operator is the only principal, and
+every agent that runs a verb runs it for them. The ledger, the state
+directory, the clone and the remote it pushes to are the operator's own
+writable state. So the tool defends the record against **omission and
+fatigue** — a finding that dies unanswered, an answer bound to the wrong
+ruling, a stale attestation, a stamp that misdescribes who did what — and
+NOT against its owner: a party holding that write access can forge a row, a
+ref, a source file or an envelope, and no mechanism here prevents it or is
+asked to. A finding premised on such a forgery is outside the taxonomy
+unless it names a party with less than operator access who could mount it.
+Ruled 2026-09-03 after lineage 20 spent rounds 5–11 (seven rounds, ~8,000
+inserted lines, ~0.5 MB of envelopes) closing forgery routes that only the
+operator could take; the boundary-closure rule in §3.1 partitions the domain
+of mistakes a boundary admits, never the domain of adversaries.
+
 ## 3. The four design questions
 
 ### 3.1 What goes into the review envelope
@@ -99,7 +114,8 @@ like a section name (`## References`) is not that section and fails as
 absent.
 The wrapper's own attribute text is closed the same way — the attributes
 (`sha`, `branch`, `author`, `reviewer`, `round`, `transport`, `tool`,
-`shape`, and the disposition's `verdict_sha`/`head`) — occurring once each: the first
+`shape`, the disposition's `verdict_sha`/`head`, and the authorization's
+`lineage`/`by`) — occurring once each: the first
 declaration is the value, a repeat is a validation error, and text between
 the tag name and `>` that is not a `key="value"` pair is refused — so a
 defective wrapper cannot choose the SHA that validation, the fetch and the
@@ -291,6 +307,20 @@ risk with a reason. Cheap, high-signal, and explicitly not evidence: the
 validator never lets a claim satisfy a gate. It comes from a JSON claim file
 the author writes; the tool carries it and never invents it.
 
+What the claim says about scope is COMPARED with the span, at emission and
+in both author verbs. A claim once said "no other file touched" while the
+round's own machine-computed span — base to head, which is what the reviewer
+reads — carried an unrelated commit's path with no reference and no
+rationale; the diff was reviewable and was reviewed, and nothing compared
+the two scopes. Every changed path the claim names nowhere — not as a
+reference, not in the review scope, not as a stated exclusion — is reported
+back to the author by name, as a notice that never changes the exit. It
+reports rather than refuses for the reason the reachability report does: an
+unaccounted path is either a claim to fix or a rationale to add, and only
+the author knows which. A repository's generated artefacts are named there
+like any other path: which files a repository generates is identity, not
+mechanism, and does not travel with the tool (§11).
+
 **Evidence** — a machine attestation block, never raw output inline. The
 repository declares a **gate manifest** (`id`, `command`, `blocking`); the
 emitter runs every gate itself and records, per gate: exact command, exit
@@ -381,10 +411,69 @@ fails; a malformed closure line is a defective record, never a silently
 dropped one.
 
 Legacy findings that predate the ledger are bound by explicit **import
-events** (historical id, verbatim text, source digest, generated
+events** (historical id, verbatim text, source path and digest, generated
 fingerprint); closures bind to the generated fingerprint. The tool ingests
 pre-derived import events (`import-legacy`); how they are derived from a
 given corpus is that corpus owner's script.
+
+That door is unauthenticated by construction — it takes JSON somebody
+produced — so it admits nothing on the batch's own word. A derivation
+supplies two things: the events, and the **commit** its sources were read
+at (`--source-commit`). Each row names a tracked `source_path` and the
+`source_digest` it claims for those bytes; the tool reads the content
+itself through `git show <commit>:<path>`, hashes it itself, and requires
+the row's own claim text to occur inside it — a finding's title, an
+import's verbatim, a disposition's mandatory payload, a closure's `ref`, a
+verdict's term. The anchor must be ancestry of a ref the remote itself
+answers for — `ls-remote`, not the local `refs/remotes/*`, which one
+`git update-ref` can write offline — an envelope row's target commit must
+be carried by that same witness, envelope rounds must form one contiguous
+loop, a ruling's fingerprint is recomputed from the identity facts the row
+declares, and an alias whose endpoint is a known ruling must cite a source
+carrying that ruling's words. Every settling answer carries
+an explicit `answers_round` and is bound to the exact ruling MATERIAL at
+that round, because an inferred binding means whatever the identity graph
+says when it is next read — and a later import can change that graph,
+which is exactly what an append-only record may not let happen.
+
+An earlier design asked a **source manifest** the caller wrote (`{path,
+sha256}`) and hashed the files it listed. That is not verification: the
+party who writes the batch writes the manifest, so a throwaway file,
+hashed by its own author, substantiated a finding titled `fabricated`.
+What the git anchor establishes instead is that the cited bytes are
+already durable, shared, attributable history, and that the row's own
+words are traceable into them. What it still does not establish, stated so
+no reader over-reads it: it is not non-repudiation — someone able to push
+to the remote, or to rewrite this clone's remote URL, can commit a file
+saying whatever a row needs and then cite it; the anchor commit's message
+and authorship are unverified; containment is a substring test over the
+whole file, so a source that happens to contain the text substantiates it
+whatever the surrounding context meant; `--no-fetch` falls back to the
+local remote-tracking refs and the result records that it did; and the row
+is still not RE-DERIVED, which no importer can do without knowing a
+derivation it is designed not to know.
+
+A cited path is also a CANONICAL path. `source_path` is caller-supplied and
+is interpolated into `<commit>:<path>`, where git resolves `.` and `..`
+segments — so `a/../b` reads b's bytes while the record says a/../b was the
+source, and one file acquires as many recorded provenances as there are
+spellings of it. Dot segments, leading and repeated separators, and NUL or
+newline framing are refused before git is asked anything; and because a
+grammar is a claim about the string rather than about the answer, the tree
+entry git returns must be the entry that was asked for, or the bytes are
+not the bytes the row cites.
+
+**A ruling is owed an answer wherever it was made.** The handoff preflight
+derives the owed set from the ruling authority itself — the newest ruling
+of every identity in the lineage, minus every identity the record shows an
+answer for — and not from the latest verdict round. Anchoring it to that
+round meant a ruling made anywhere else could not be owed, which is not a
+corner: a semantic-only legacy corpus imports rulings at rounds that have
+no verdict artifact at all, and those were exactly the ones the check meant
+to protect. Answered means answered by whoever was entitled to: the
+author's disposition, the reviewer's closure, or a named human's waiver.
+Omission is the defect, and a ruling one of the three answered was not
+omitted.
 
 Rejected: a two-word `accepted/challenged` vocabulary (forces deferrals and
 preferences to masquerade as challenges); free-text dispositions
@@ -594,6 +683,7 @@ cache stayed silent for a round.
 |---|---|---|
 | request | `handoff` | `take`, `brief`, `validate`, `ledger add`, and the warm `handoff` cache — every verb that reads one. `brief` matters most: it renders the command a human carries, which is exactly what a stale installation gets wrong. The cache matters for the same reason and is easier to miss: re-running `handoff` on an unchanged tip returns a request RETAINED by an earlier run, so the reader and the writer are different processes and may be different installations |
 | disposition | `respond --out` | `validate` and `ledger add`. Not `respond --out` itself: it writes and records in one process, so a comparison there could only ever say `match`, and a check that cannot fail is worse than a stated absence |
+| authorization | `authorize-advance` | `validate`, and the approval companion that binds to one. It is tool-emitted like the two above, so it is stamped by the same rule rather than by exception — the verdict's exemption is about having no emitter at all, not about being the odd kind out |
 | verdict | *nobody* | — |
 
 The verdict is **not** stamped. It has no emitter: the reviewer agent
@@ -672,9 +762,14 @@ set by a person carries their authority while the identical flag set by an
 agent does not, and no tool can tell them apart — which is why flags only
 select within what the repository permits.
 
-**The human sets a review round in motion.** Whichever side an agent holds,
+**Review is the default end of an implementation session; the relay is the
+human's.** With `[roles] review_default = "on"` (the onboarding default) the
+author runs `handoff` unasked once the work is done, unless the person
+declined a review earlier in that session — a per-session fact the tool
+cannot see, so the adapter rule carries it. Whichever side an agent holds,
 it stops where the procedure says stop: the author stops when the request is
-emitted and kept; the reviewer stops at the verdict. Neither invokes the
+emitted and kept and its brief and relay are in the human's hands; the
+reviewer stops at the verdict. Neither invokes the
 other by any mechanism (CLI, subagent, hook, API), and neither decides
 whether a completed review enters the record. This binds agent behaviour; the
 tool supports it by having no verb that reaches the other side.
@@ -701,26 +796,47 @@ stamped `LOCAL-ONLY` on the envelope's face — an error when any remote
 exists, so it cannot become a bypass. Credentials embedded in a remote URL
 are scrubbed before stamping.
 
+The reviewer's side of the same sentence is **which repository is being
+made real**. `take` used to fetch the stamped ref into whatever checkout it
+was run from, and the fetch destroyed the only evidence that the checkout
+was the wrong one: the foreign commit resolved locally, the target looked
+legitimate, and another repository's round was appended to this one's
+append-only ledger — measured live 2026-08-31, unremovable by contract. So
+the probe compares repositories before it fetches. The stamp's push URL and
+this clone's own remotes are reduced to one key per repository (scheme,
+userinfo and a `.git` suffix are not identity, so an https clone may take an
+ssh stamp), and three states pass: a remote of this clone names the stamped
+repository; this clone already holds the target, so nothing foreign is being
+pulled in on the envelope's say-so; or this clone declares no remote at all,
+a scratch checkout that claims to be no repository in particular and so
+contradicts no stamp — the shape an empty CI reviewer has. Only a positive
+contradiction refuses, and it refuses before the fetch and before any event
+is written, because the ledger write is the part that cannot be undone.
+
 ### 5.2 Envelope transport
 
-Designed options: paste (always works, one human round trip per leg), git
-notes keyed by the reviewed SHA (co-location, **not** binding — the validator
-still checks the inner SHA against the object; notes are an untrusted carrier
-with rewrite, refspec and multi-writer hazards; not implemented, parked
-behind a two-clone prototype), committing the envelope on the branch
+Designed options: paste (always works, one human round trip per leg), a ref
+under `refs/<tool>/` on the remote the reviewed branch is already pushed to
+(**ruled and built** 2026-09-03 — the rest of this section), git notes keyed
+by the reviewed SHA (co-location, and rejected in favour of the ref: one
+notes ref holds every note and is rewritten on each add, so two rounds on one
+SHA, or the two ends writing at once, collide — hazards a plain ref per
+envelope simply does not have), committing the envelope on the branch
 (pollutes the change under review — rejected), PR comments (turns the
-forge into a review bus — rejected). Today the envelope crosses by whatever
-`relay` the repository declares — a kept file path on one machine, a paste
-between two — and each verb records what it did, so neither end is manual.
-Both legs read a paste: the request leg through `take -`, the verdict leg
-through `close --verdict -` and `respond --verdict -`.
+forge into a review bus, and needs a forge credential the tool deliberately
+never holds — rejected). Today the envelope crosses by whatever `relay` the
+repository declares — a kept file path on one machine, a paste between two,
+a ref both reach — and each verb records what it did, so neither end is
+manual. Both legs read a paste: the request leg through `take -`, the verdict
+leg through `close --verdict -` and `respond --verdict -`.
 
 **The topology is declared, not detected (RVW-T11).** Which of the two cases
 a round runs in is a fact about the pair of machines, and no process can
 observe it: each side can see where IT runs, while the commands each side
 prints are about where the OTHER side runs. So `transport` joins the role
 stamp as a declared, closed-vocabulary input — `path` when both ends read the
-same filesystem, `paste` when they do not — defaulting to `[roles] transport`
+same filesystem, `paste` when a person carries the bytes, `git` when they
+share no disk and both reach one remote — defaulting to `[roles] transport`
 and selected per round by `--transport`. It is stamped on the envelope's
 wrapper, recorded in the ledger by every verb that files the round, and it is
 what decides the carrier each relay prints: `path` renders the kept-path
@@ -782,7 +898,8 @@ silence it disambiguates.
 Three consequences follow from having the fact rather than guessing it. The
 same-machine round — the steady case — pays nothing: one line, no
 alternative, no prose for a relaying agent to reword. The cross-machine
-round gets exact commands instead of a hedge, and its envelope bytes ride
+round gets exact commands instead of a hedge; under `git` that is one line
+per leg naming the round, and under `paste` the envelope bytes ride
 INSIDE the printed fence on both legs — the request under `take -`, the
 verdict under `close --verdict -` — because a chat surface preserves a
 fenced region verbatim and rewrites everything else (round 3, live: a
@@ -793,18 +910,49 @@ handed to a reviewer with no access to this filesystem — so emission
 refuses it before the commit, whichever source resolved the `paste`,
 rather than stamping it for the reviewer to discover at `take`.
 
-**Decided: paste is the transport, and there is no other.** A carrier that
-reaches a party with no access to the other's filesystem — a session
-fetching the bytes itself, a forge-mediated transport — is deliberately
-NOT provided. Not "not yet": providing one means either teaching the tool
-to fetch from somewhere, which makes it a client of a service the review
-does not control, or routing envelopes through a forge, which is the
-review bus this section already rejects. A person moving bytes is a
-transport that works everywhere, needs no credential, and cannot fail
-open. The cost is stated rather than hidden: an author and a reviewer on
-different machines each need a human paste per leg, and the two-machine
-flow has never been exercised end to end. If that cost ever becomes the
-wrong one, the decision — not the code — is what changes first.
+**Decided 2026-09-03: the envelope may also ride a ref, on the remote both
+sides already use.** The previous decision here was "paste is the transport,
+and there is no other", resting on one argument: providing a carrier means
+teaching the tool to fetch from somewhere, which makes it a client of a
+service the review does not control. That argument does not reach THIS
+remote. `handoff` already pushes the reviewed branch to it and `take`
+already fetches the target from it — the round is unreviewable without both
+— so a ref beside them reaches no new service, needs no credential the loop
+did not already have, and adds no forge. The reversal is the user's, and the
+sentence it replaces anticipated it: the decision, not the code, is what
+changes first.
+
+So `transport = "git"` names a third topology: the two ends share no
+filesystem AND both reach one remote. One ref per leg, under a namespace
+nothing else writes:
+
+    refs/<tool>/<lineage>/<round>/request      pushed by `handoff`
+    refs/<tool>/<lineage>/<round>/verdict      pushed by `validate --from-target`
+    refs/<tool>/<lineage>/<round>/disposition  pushed by `respond --out`
+
+**The object is a bare blob**, not a commit wrapping a file. Both were
+measured before choosing: `push <blob>:refs/<tool>/…`, `fetch`, and
+`cat-file blob <ref>` are ordinary porcelain on a stock git, and a commit
+would have invented an author, a timestamp and a tree for a document that is
+none of those. The refspec is forced, because a blob ref has no ancestry to
+fast-forward and a re-emitted round replaces its own bytes; the force is
+bounded to that namespace and the branch push is untouched.
+
+**The ref is an untrusted carrier, exactly as notes would have been.** It
+carries bytes and confers nothing: the fetched envelope goes through the same
+readers a pasted one does, and the digest and SHA binding are unchanged —
+bytes replaced on a ref are refused by the same checks that would refuse them
+pasted. **Storage is still not a trigger**: a pushed ref starts no work, and
+the human still tells the reviewer session to take. The reference a person
+carries is one word, `git:<lineage>/<round>` — the lineage, because a round
+number alone names a different envelope in the next lineage — and each leg's
+relay is one line, `take git:<lineage>/<round> --as <id>` and `close
+--verdict git:<lineage>/<round>`, with no bytes beside it.
+
+**Paste remains, and remains the fallback.** It is what works where a remote
+cannot be pushed to or fetched from, it needs no configuration, and it cannot
+fail open. The cost that stays stated: an author and a reviewer on different
+machines who choose it need a human paste per leg.
 
 **The medium a person uses is not a transport.** `paste` names a topology —
 the bytes crossed, the two sides share no filesystem — not a window. A
@@ -832,6 +980,15 @@ keep.
 Every decision the agent makes is a token cost and a drift risk; the tool
 decides everything derivable and the agent runs one command.
 
+One thing the tool cannot decide is WHEN a round begins, and one key states
+what a project wants there: `[roles] review_default` — `on`, an
+implementation session ends with a round without anyone asking for it, or
+`off`, a round is opened when someone asks. Absent, it resolves to `on` and
+is reported in `decide` below. No verb gates on it: no invocation of this
+tool is the end of a session, so the value is a declaration the agents read
+in their own procedure. What does not move is the other half — the relay to
+the reviewer, and the reviewer's take, stay a person's.
+
 Two flags are required, and both are required precisely because they are
 *not* derivable. The first is `take --as <identity>`. The tool cannot observe who is at the
 keyboard, and the repository's `[roles] reviewer` names the permitted
@@ -847,13 +1004,19 @@ there IS a safe silence: the repository declares its standing case in
 `[roles] transport`, a cloud environment declares its own in
 `LOUPE_TRANSPORT`, and with neither the tool resolves the workflow's
 steady case, `path` — so the flag is the exception a human names when they
-know this round is different. The agent decides nothing here either — it
+know this round is different. A round that names the ref carrier is read by
+reference rather than by path: `take`, `close --verdict` and `respond
+--verdict` accept `git:<lineage>/<round>` wherever they accept a file or
+`-`, and which leg that reference means is the verb's — `take` reads the
+round's request, the two verdict readers read its verdict. The agent decides nothing here either — it
 passes what it was told or nothing at all, and the relay it hands over
 carries the one carrier the round declared.
 
 - **`handoff`** (author): a lifecycle preflight first — every finding of
-  the just-closed verdict has exactly one recorded disposition, and no fired
-  breaker lacks a recorded decision — refusing as `blocked` before anything
+  the just-closed verdict has exactly one recorded disposition, no fired
+  breaker lacks a recorded decision, and, where the repository declares
+  `[roles] enforcement = "pr-approval"` (§5.4), the branch under review is
+  not the remote's default branch — refusing as `blocked` before anything
   is committed, pushed, run or emitted (a finding never dies by omission,
   and the next round is not opened until every one is answered); then
   commit + push + observe, run the gate manifest, emit and validate the
@@ -1001,7 +1164,18 @@ rest on enumerating them. A deliberately malicious in-process author who
 forges private objects is outside this threat model; the boundary closes
 every ordinary construction route, and the claim stops there.
 
-**Retention.** The state directory's layers are not equal. The ledger is
+**Retention is per RUN, and pruning is per commit.** Gate output is kept at
+`gate-output/<sha>/<run>/<id>.log` — one directory per manifest execution,
+named by UTC second plus six random hex — with `<sha>/newest` a symlink to
+the last one. Keying it by the commit alone was measured twice, and both
+times against the same evidence: a failing run and a passing run at one
+commit wrote one path, last writer winning, and the failing run is the one
+worth keeping. Worse, the natural response to a failing gate is to re-run
+it, so investigating destroyed what the investigation came for. An
+attestation's pointer now names bytes nothing later rewrites. The pruneable
+unit is unchanged — the per-SHA directory, run directories and all.
+
+The state directory's layers are not equal. The ledger is
 append-only and is never pruned; `exchange/` — the kept envelopes — is the
 review record itself and is never pruned; retained gate output is the one
 designed-pruneable layer, because every attestation carries the sha256 and
@@ -1056,8 +1230,112 @@ too: every refusal a verb raises carries either a literal runnable line
 the enumeration is checked from the source.
 Output is structured JSON when stdout is not a TTY; the agent never parses
 prose.
-No network in the tool's own code: git performs the one publish step, with a
-timeout, so an unreachable remote fails rather than hangs.
+
+**What the repository never declared is reported, never applied in silence.**
+A local parameter is set, unset, or ABSENT, and absence means one of two
+things here. Some keys REFUSE when absent — the taxonomy, the roles, the
+configuration file itself — and those refusals are ruled and stay (§2). The
+rest carried a built-in default nobody chose and nobody was told about:
+`transport` fell to `path`, `debug` to off, a budget to uncounted. The tool
+has no model and prints JSON, so it cannot ask; what it can do is say that it
+decided something the repository never declared. Every result of a verb that
+applied such a default carries a `decide` list — one entry per undeclared
+key, with the key, its meaning in one sentence, the value applied, and the
+exact TOML line that would set it and (where the key has an off state) unset
+it. A declared key produces no entry, which is what ends the reporting
+permanently; the entries are on `handoff`, `take`, `emit-request` and `brief`,
+the results an agent reads at the moments a round is opened or picked up. The
+tool stops there by construction. Turning one report into one question asked
+once per session, and the answer into a committed line, is an adapter rule —
+the agent's side of a boundary the tool cannot cross.
+No native network client in the tool's own code: Git subprocesses perform
+the networked steps — `handoff` pushes and observes the remote ref with
+`ls-remote`, `take` fetches — each with a timeout, so an unreachable remote
+fails rather than hangs.
+
+### 5.4 The authority's answer, and advancing on it
+
+A finding dies exactly two ways above: the author accepts and verifies it,
+or the reviewer withdraws it against a refutation. The symmetry rule stays —
+it is what stops findings dying of omission or fatigue — but neither death
+is available when a **human** reads a finding and decides to live with it.
+
+The vocabulary already went half the distance. `escalated` is legal on a
+blocking finding and its payload names an `authority` and a `criterion`, so
+a finding can be routed to a named person. What was missing is the other
+half: nothing recorded what that person **answered**. The escalation
+therefore either looped, or was laundered into a reviewer withdrawal the
+reviewer did not mean — and after that laundering the record cannot separate
+*the reviewer found nothing* from *the reviewer found something a human
+waved off*. Those are different facts, and keeping them apart is the job.
+
+So the answer is an event, on the pattern the commit waiver already set.
+`waive --finding <id|fingerprint> --reason … --by …` records that one
+finding stands unfixed, optionally with the `--destination` the work moved
+to and the `--trigger` that brings it back. It refuses a silent reason or a
+silent authorizer, refuses a finding this lineage never ruled, refuses a
+second answer to a finding already answered, and refuses an id that names
+different findings in different rounds — a finding id is round-scoped, so
+the fingerprint is what disambiguates it. It is deliberately not a
+disposition: the author does not write the authority's answer. It is
+deliberately not a closure: the reviewer did not change their mind.
+
+`authorize-advance --reason … --by …` then emits an **authorization**
+envelope: the reviewed commit, the round and lineage, who advanced it, why,
+and every overruled finding with its own reason.
+
+What it enumerates is **derived**, not collected. The ledger holds the
+lifecycle authority — the standing set is every finding this lineage ruled
+whose identity carries neither of the two deaths inside the loop, an author
+acceptance or a reviewer withdrawal — and the advance refuses unless every
+member of that set carries exactly one human waiver, naming the ones that do
+not. A waiver deliberately does not shrink the set: it records that a finding
+STANDS UNFIXED, which is the opposite of resolving it, so the artifact
+enumerates it rather than losing it. Collecting waiver events instead would
+let one waiver advance a lineage with other findings still standing, killing
+them by the omission the symmetry rule exists to forbid — which is exactly
+what the first implementation did.
+
+It also refuses when the last verdict is already clean (the clean verdict is
+the artifact that advances one, and an authorization beside it would claim a
+human overruled findings that no longer stand), when nothing is open at all,
+and while a newer request is still awaiting a verdict — an advance binds to a
+ruling, and authorizing the previous one would record a decision about a
+commit the lineage has moved past.
+
+**It is its own envelope kind and never a derived clean verdict**, and that
+is the whole design rather than a packaging choice. A derived clean state
+would make an overridden review indistinguishable from one where the
+reviewer found nothing, at exactly the moment the difference matters — and
+it would let an unverifiable claim about a human's decision turn into a
+merge, which is the self-approval route this posture exists to close. The
+same reasoning as the `LOCAL-ONLY` stamp in §5.1: the escape hatch exists
+and is marked, so it cannot pass as the normal case. An approval carried
+from one says on its face that it rests on a named human's judgment with
+findings still open.
+
+**Which pathway carries the approval is declared, and only one row of it is
+the tool's.** `[roles] enforcement` states how a reviewed branch reaches the
+default branch: `pr-approval`, where the round's outcome is carried by an
+approval on a pull request, or `none`, where the project commits to its
+default branch and nothing enforces the round. Absent, it resolves to `none`
+and is reported in `decide` — the silent row of the matrix becomes an
+explicit one. Under `pr-approval` the tool does exactly one thing, at the
+author's door: `handoff` refuses when the branch under review IS the remote's
+default branch, because a commit already on it has no pull request for an
+approval to bind to, and the declared pathway would silently not apply.
+Everything else in that pathway is outside a tool that touches no forge —
+opening the pull request, posting the approval, and merging are the agents'
+steps with their own credentials, under their standing instructions.
+
+**The limit, stated rather than implied.** `by` is asserted. The tool cannot
+observe who ran a command, so none of this establishes that a human rather
+than an agent took the decision — it buys attribution and visibility, not
+proof. That is true of the commit waiver and the breaker authorization too,
+and the protection is the same one: the standing instructions each agent
+operates under make these verbs a human's, and the generated adapters say so
+in as many words. A mechanism that claimed more than this would be worse
+than the gap it closes.
 
 ## 6. Packaging
 
@@ -1138,7 +1416,8 @@ adapters rendered from one source.
 
 Designed, not implemented: risk tiering (reach × depth); path-scoped
 contract invariants; automatic execution of runnable falsification tests and
-auto-close; the git-notes carrier; an MCP facade.
+auto-close; an MCP facade. Rejected, not pending: the git-notes carrier
+(§5.2 — the ref carrier took its place).
 
 Known limits: syntactic fingerprint identity only; token counts are declared,
 never measured; the tool cannot distinguish a person from an agent using the

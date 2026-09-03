@@ -21,6 +21,12 @@ admitted class has a paired VALID control here, every refused class names
 its own state, and the two mutations at the end reintroduce the exact
 defects — the round-2 rendering and the worktree-following digest — to
 prove these checks are what stop them.
+
+Round 2's tracking-state rows (ignored, untracked, missing, absolute,
+escaping, no references, and the verbs' tripwire on an ignored reference)
+were folded in from `test_reference_binding.py` on 2026-09-02: the fixture
+here carries every state that file built, so `TestTrackingStates` and the
+extra preflight row below are those tests on this fixture.
 """
 from __future__ import annotations
 
@@ -267,6 +273,36 @@ class TestObjectMode(RepoFixture):
                 [{"path": "required file.md", "required": False}], self.head)
 
 
+class TestTrackingStates(RepoFixture):
+    """Lineage 5 round 2 F3: a REQUIRED reference must bind to bytes the
+    target commit carries. The defect was committed by this tool's own
+    review — a required reference at a gitignored path, digested from the
+    worktree, that the reviewer's `take` could only label unavailable.
+    Each refused tracking state names itself; the tracked controls, the
+    deleted-file state and the advisory three-state rendering are covered
+    by `TestObjectMode`."""
+
+    def test_an_ignored_required_reference_refuses_naming_the_state(self):
+        with self.assertRaises(emit.ReferenceUnbound) as ctx:
+            self.check("private/ignored.md")
+        self.assertIn("ignored", str(ctx.exception))
+        self.assertTrue(ctx.exception.remedy)
+
+    def test_an_untracked_required_reference_refuses_by_name(self):
+        self.assertIn("untracked", self.refusal("loose-untracked.md"))
+
+    def test_a_missing_required_reference_refuses(self):
+        self.assertIn("missing entirely", self.refusal("no-such-file.md"))
+
+    def test_absolute_and_escaping_paths_refuse(self):
+        self.assertIn("absolute", self.refusal(str(self.repo / "ordinary.md")))
+        self.assertIn("escap", self.refusal("../outside.md"))
+
+    def test_no_references_at_all_is_not_this_boundarys_business(self):
+        self.assertIsNone(emit.check_required_references(self.cfg, None))
+        self.assertIsNone(emit.check_required_references(self.cfg, []))
+
+
 class TestEmissionAndTakeAgree(RepoFixture):
     """One derivation, so the manifest the author renders and the states
     the reviewer computes cannot disagree — for every admitted row, and for
@@ -386,6 +422,20 @@ class TestPreflightPrecedesEverySideEffect(RepoFixture):
                 self.assertEqual(payload["next_kind"], "blocked")
                 self.assertIn("whitespace", payload["error"])
                 self.assertIn("advisory", payload["error"])
+
+    def test_the_emitting_verbs_refuse_before_any_side_effect(self):
+        """Round 2 F3's tripwire ('before push, gates, emission, or
+        recording'): an IGNORED required reference — the state the tool's
+        own review committed — blocks both verbs before the ledger is
+        constructed."""
+        for verb, command, patches in (
+                (cli.cmd_handoff, "handoff", self.HANDOFF_EFFECTS),
+                (cli.cmd_emit_request, "emit-request", self.EMIT_EFFECTS)):
+            with self.subTest(verb=command):
+                payload = self._blocked(verb, command, "private/ignored.md",
+                                        patches)
+                self.assertEqual(payload["next_kind"], "blocked")
+                self.assertIn("ignored", payload["error"])
 
     def test_the_valid_control_reaches_the_next_stage(self):
         # The paired control: with an admitted reference the preflight is

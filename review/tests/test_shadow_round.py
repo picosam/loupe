@@ -47,7 +47,8 @@ class TestShadowRound(unittest.TestCase):
         # and (b) make the assertion depend on whether the developer's tree
         # happens to be clean — the attestations would be legitimately
         # `unbound` mid-edit, which is round-4 F4 working, not failing. Gate
-        # execution and binding have their own tests in test_round4_fixes.
+        # execution and binding have their own tests in
+        # test_gate_environment.
         # The reachability record is synthetic for the same reason: this test
         # must not push; ensure_pushed has its own tests (test_reachability).
         from review.emit import _git

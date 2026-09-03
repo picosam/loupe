@@ -17,16 +17,16 @@ Each state has its own test; the valid controls prove the checks are live.
 from __future__ import annotations
 
 import dataclasses
+import json
+import re
 import unittest
 from pathlib import Path
 
-from review import emit, transport, wire
+from review import emit, wire
 from review.ledger import Ledger
-from review.tests.util import REPO_ROOT
-from review.tests.synth import (CFG, NO_GATES, emitted_request, head_sha,
-                                reachability, shadow_ledger)
-
-import tempfile
+from review.tests._transport_fixtures import (run_cli, scratch_loop_repo, sh)
+from review.tests.synth import (CFG, CLAIM, NO_GATES, emitted_request,
+                                head_sha, reachability, shadow_ledger)
 
 
 def cfg_with_roles(**over):
@@ -386,58 +386,215 @@ class TestEmittedStamp(unittest.TestCase):
         self.assertEqual(parsed2.attrs["author"], "claude")
 
 
+class TestRelayRendersAsAnActorNeverAsAnInstruction(unittest.TestCase):
+    """Round-3 F3. `relay` is rendered on the Roles line, not as a wrapper
+    attribute (`wire.parse_request` never sees it), so these check the
+    envelope BODY directly. The capture boundary (`test_validate.py`,
+    `TestClaimGrammarClosedWorld`) proves a non-actor value is refused
+    before an envelope like these ever exists; this proves what a value
+    that DOES cross renders as."""
+
+    def _emit(self, claim):
+        head = head_sha()
+        return emit.emit_request(NO_GATES, shadow_ledger(), claim,
+                                 base="HEAD", head="HEAD",
+                                 reachability=reachability(head))
+
+    def test_an_explicit_actor_and_an_omitted_relay_render_the_same_line(self):
+        explicit = self._emit({**CLAIM, "relay": "user"})
+        omitted = self._emit(CLAIM)
+        self.assertIn("relay=user", explicit)
+        self.assertIn("relay=user", omitted)
+        # And neither carries the claim's dict object itself — the value
+        # that reaches the line is a rendered string either way.
+        self.assertNotIn("relay=None", omitted)
+
+    def test_a_hand_back_instruction_renders_under_its_own_heading(self):
+        instruction = ("return only the generated brief and its exact "
+                       "relay; do not start another round")
+        envelope = self._emit({**CLAIM, "hand_back": [instruction]})
+        self.assertIn("## Hand-back", envelope)
+        after_heading = envelope.split("## Hand-back", 1)[1]
+        self.assertIn(instruction, after_heading)
+        # And it never reaches the Roles line — the two fields render in
+        # different places for different readers (relay: an identity every
+        # reader parses; hand_back: prose only a human acts on).
+        roles_line = next(l for l in envelope.splitlines()
+                          if l.startswith("Roles:"))
+        self.assertNotIn(instruction, roles_line)
+
+    def _set_config_relay(self, repo: Path, value: str) -> None:
+        """Overwrite the scratch repo's own `[roles] relay` (copied from
+        this repo's review.toml, which already declares one) and commit
+        it — `handoff` refuses a dirty tree, so the edit has to land in a
+        clean commit to reach the real verb at all."""
+        toml_path = repo / "review.toml"
+        original = toml_path.read_text(encoding="utf-8")
+        text, n = re.subn(r'(?m)^relay\s*=.*$', f"relay = {value!r}",
+                          original, count=1)
+        self.assertEqual(n, 1, "scratch review.toml must declare one "
+                               "[roles] relay line to overwrite")
+        toml_path.write_text(text, encoding="utf-8")
+        sh("git", "-C", str(repo), "commit", "-qam", "relay config change")
+
+    def test_a_config_relay_sentence_refuses_the_real_verb(self):
+        """Round 4 F2's real-verb falsification. The claim states no
+        `relay` of its own (the ordinary case — `CLAIM` below never sets
+        one), and the repo's OWN `[roles] relay` — the other admitted
+        source, copied onto the Roles line by `emit_request` when the claim
+        is silent — is a hand-back sentence instead of an actor. The real
+        emission verb, `handoff`, must refuse before ledger, Git, gates or
+        envelope output; the paired control, `relay = "user"`, must pass
+        and render `relay=user`.
+
+        MUTATION: removing the `("roles", "relay")` grammar check from
+        `config._check_value` (or not calling `config.check_shape` before
+        `handoff` reaches `emit_request`) lets the sentence reach the
+        config's effective roles unchecked — `handoff` then succeeds and
+        the kept request carries the sentence on its Roles line, failing
+        the assertions below.
+        """
+        scratch = scratch_loop_repo(self, "relay-cfg-", name="relay",
+                                    objective="relay config test")
+        tmp, repo = scratch.tmp, scratch.repo
+        base, claim, cwd = scratch.base, scratch.claim, scratch.cwd
+        state = tmp / "state"
+
+        self._set_config_relay(
+            repo, "After validation, return the verdict to the user")
+
+        code, refused = run_cli(repo, state, "handoff", "--claim-file",
+                                str(claim), "--base", base, "--local-only",
+                                cwd=cwd)
+
+        self.assertNotEqual(code, 0, refused)
+        self.assertIsInstance(refused, dict, refused)
+        self.assertIn("relay", refused.get("error", "").lower())
+        self.assertFalse(state.exists(),
+                         "a refused handoff must write no ledger state")
+
+        self._set_config_relay(repo, "user")
+
+        code, ok = run_cli(repo, state, "handoff", "--claim-file",
+                           str(claim), "--base", base, "--local-only",
+                           cwd=cwd)
+
+        self.assertEqual(code, 0, ok)
+        kept_text = Path(ok["kept"]).read_text(encoding="utf-8")
+        self.assertIn("relay=user", kept_text)
+
+    def test_a_config_relay_with_surrounding_whitespace_refuses_the_real_verb(
+            self):
+        """Round 5 F3's real-verb falsification, config-provided half.
+        `config._check_value` used to match `value.strip()` against the
+        actor grammar while `emit_request`'s Roles line rendered the
+        `[roles] relay` value UNSTRIPPED — so `" user"`, `"user "` and
+        `" user "` each crossed `handoff`'s config shape check and would
+        have rendered surrounding whitespace on the Roles line. Each must
+        refuse the real verb before ledger, Git, gates or envelope output;
+        `"user"` is the paired control, proved above.
+
+        MUTATION: restoring `value.strip()` in `config._check_value`'s
+        `("roles", "relay")` check lets each whitespace value below reach
+        `emit_request` and this test's refusal assertions fail.
+        """
+        scratch = scratch_loop_repo(self, "relay-cfg-ws-", name="relay-ws",
+                                    objective="relay config whitespace test")
+        tmp, repo = scratch.tmp, scratch.repo
+        base, claim, cwd = scratch.base, scratch.claim, scratch.cwd
+        state = tmp / "state"
+
+        for whitespace_relay in (" user", "user ", " user "):
+            self._set_config_relay(repo, whitespace_relay)
+
+            code, refused = run_cli(repo, state, "handoff", "--claim-file",
+                                    str(claim), "--base", base,
+                                    "--local-only", cwd=cwd)
+
+            self.assertNotEqual(code, 0, refused)
+            self.assertIsInstance(refused, dict, refused)
+            self.assertIn("relay", refused.get("error", "").lower())
+            self.assertFalse(
+                state.exists(),
+                f"relay {whitespace_relay!r}: a refused handoff must write "
+                f"no ledger state")
+
+    def test_a_claim_relay_with_surrounding_whitespace_refuses_the_real_verb(
+            self):
+        """Round 5 F3's real-verb falsification, claim-provided half —
+        the counterpart to the config case above. `validate_claim` used to
+        match `item.strip()` against the actor grammar while
+        `emit_request`'s Roles line rendered the claim's ORIGINAL,
+        unstripped `relay` member — so a claim naming `" user"`, `"user "`
+        or `" user "` crossed `handoff`'s claim boundary and would have
+        rendered surrounding whitespace on the Roles line. Each must
+        refuse the real verb before ledger, Git, gates or envelope output;
+        `"user"` is the paired control, and the kept request's Roles line
+        must carry it exactly.
+
+        MUTATION: restoring `item.strip()` in `validate_claim`'s
+        `member == "relay"` check lets each whitespace value below reach
+        `emit_request`, and this test's refusal/control assertions fail.
+        """
+        scratch = scratch_loop_repo(self, "relay-claim-ws-",
+                                    name="relay-claim-ws",
+                                    objective="relay claim whitespace test")
+        tmp, repo = scratch.tmp, scratch.repo
+        base, claim, cwd = scratch.base, scratch.claim, scratch.cwd
+        state = tmp / "state"
+
+        def _write_claim(relay):
+            claim.write_text(json.dumps({
+                "objective": "relay claim whitespace test",
+                "references": [{"path": "review.toml", "required": True}],
+                "relay": relay}), encoding="utf-8")
+
+        for whitespace_relay in (" user", "user ", " user "):
+            _write_claim(whitespace_relay)
+
+            code, refused = run_cli(repo, state, "handoff", "--claim-file",
+                                    str(claim), "--base", base,
+                                    "--local-only", cwd=cwd)
+
+            self.assertNotEqual(code, 0, refused)
+            self.assertIsInstance(refused, dict, refused)
+            self.assertIn("relay", refused.get("error", "").lower())
+            self.assertFalse(
+                state.exists(),
+                f"relay {whitespace_relay!r}: a refused handoff must write "
+                f"no ledger state")
+
+        # The control: the otherwise identical claim, naming a single-token
+        # relay, succeeds and renders it exactly on the Roles line.
+        _write_claim("user")
+
+        code, ok = run_cli(repo, state, "handoff", "--claim-file",
+                           str(claim), "--base", base, "--local-only",
+                           cwd=cwd)
+
+        self.assertEqual(code, 0, ok)
+        kept_text = Path(ok["kept"]).read_text(encoding="utf-8")
+        self.assertIn("relay=user", kept_text)
+
+
 class TestCacheRolesKey(unittest.TestCase):
     """The effective stamp joins the warm-key: a kept envelope emitted
     under one direction must not answer an invocation that selected
     another."""
 
     def _warm_fixture(self):
-        try:
-            tmp = Path(tempfile.mkdtemp(prefix="handoff-roles-"))
-        except OSError as exc:
-            self.skipTest(f"filesystem writes denied ({exc})")
-        self.addCleanup(lambda: __import__("shutil").rmtree(
-            tmp, ignore_errors=True))
-        from review.tests._transport_fixtures import fake_git, request_text, SHA_B
-        cfg = dataclasses.replace(CFG, ledger_dir=tmp)
-        from review import tool_identity
-        # Round 1 F2 put the tool identity in the warm key, so a fixture
-        # that must REACH the check it is about stamps the current one;
-        # the identity's own cold cases live in test_transport_lifecycle.
-        text = request_text(tool_attr=tool_identity())
-        transport.keep_bytes(cfg, 1, "request", text)
-        # Round 2 F1: the warm path resolves the TARGET's authority to
-        # decide the role key, so a scripted runner must answer it.
-        git = fake_git({("rev-parse", "HEAD"): SHA_B,
-                        ("status", "--porcelain"): "",
-                        ("ls-tree", "--full-tree", SHA_B, "--",
-                         "review.toml"):
-                            "100644 blob " + "0" * 40 + "\treview.toml",
-                        ("show", f"{SHA_B}:review.toml"):
-                            (REPO_ROOT / "review.toml").read_text(
-                                encoding="utf-8"),
-                        })
-        ledger = Ledger.in_memory()
-        ledger.add({"event": "request", "round": 1, "sha": SHA_B,
-                    "source_digest": transport._digest_text(text),
-                    "bytes": len(text),
-                    "claim_digest": transport.NO_CLAIM})
-        return cfg, ledger, git
+        from review.tests._transport_fixtures import warm_cache_fixture
+        return warm_cache_fixture(self, prefix="handoff-roles-")
 
     def test_same_roles_stay_warm_explicit_and_defaulted(self):
-        cfg, ledger, git = self._warm_fixture()
-        self.assertIsNotNone(transport.cached_handoff(
-            cfg, ledger, 1, git=git, claim_digest=transport.NO_CLAIM,
-            roles=("claude", "codex")))
+        w = self._warm_fixture()
+        self.assertIsNotNone(w.cached(roles=("claude", "codex")))
         # None means "no selection", which resolves to the config default —
         # a derivable state, so legacy behaviour is unchanged.
-        self.assertIsNotNone(transport.cached_handoff(
-            cfg, ledger, 1, git=git, claim_digest=transport.NO_CLAIM))
+        self.assertIsNotNone(w.cached())
 
     def test_a_different_selection_is_cold(self):
-        cfg, ledger, git = self._warm_fixture()
-        self.assertIsNone(transport.cached_handoff(
-            cfg, ledger, 1, git=git, claim_digest=transport.NO_CLAIM,
+        self.assertIsNone(self._warm_fixture().cached(
             roles=("codex", "claude")))
 
 

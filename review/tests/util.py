@@ -1,9 +1,23 @@
 import ast
+import dataclasses
 from pathlib import Path
 
 from review import vocab
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@dataclasses.dataclass
+class CliArgs:
+    """The argparse namespace the `ledger` subcommands read, for driving
+    `cmd_ledger_add` / `cmd_ledger_report` directly over an in-memory ledger
+    (the product function `main` dispatches to, minus the filesystem)."""
+    envelope: str = ""
+    round: int | None = None
+    tokens: int | None = None
+    against: str | None = None
+    format: str | None = "json"
+    ledger_dir: str | None = None
 
 
 #: The evaluation-scope grammar, and the AUTHORITY it is closed against.
@@ -333,3 +347,21 @@ def public_path(*names: str) -> Path | None:
             if candidate.is_file():
                 return candidate
     return None
+
+
+def cli_report(test, ledger, cfg):
+    """`ledger report` driven over a supplied ledger — the product function
+    `main` dispatches to, with an in-memory backend so the check holds in a
+    read-only sandbox. Shared by the corpus report tests (stay behind) and
+    the gate-manifest metric tests (travel)."""
+    import contextlib
+    import io
+    import json
+    import unittest.mock
+    from review.cli import cmd_ledger_report
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        with unittest.mock.patch("review.cli._ledger", return_value=ledger):
+            code = cmd_ledger_report(CliArgs(format="json"), cfg)
+    test.assertEqual(code, 0)
+    return json.loads(buf.getvalue())

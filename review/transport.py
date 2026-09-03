@@ -8,10 +8,12 @@ by whatever `relay` the repo declares — a file path on one machine, a paste
 between two — and each verb records what it did in the ledger, so neither
 end of the loop is manual any more.
 
-  handoff  author side: emit-request, then record the request event, keep
-           the envelope bytes in the exchange directory (outside the tree,
-           §4), and stop — the human sets the round in motion (the agents'
-           standing instructions).
+  handoff  author side: emit-request — which an author agent runs unasked
+           once implementation work is done, per the agents' standing
+           instructions — then record the request event, keep the
+           envelope bytes in the exchange directory (outside the tree,
+           §4), and stop; carrying the envelope to the reviewer is the
+           human's relay, never the round's start.
            Idempotent on an unchanged tip (§9bis.3 rule 5).
   take     reviewer side: validate the request, PROBE the target (fetch,
            cat-file, base ancestry) and every reference (digest), record
@@ -30,6 +32,7 @@ manual `ledger add` afterwards is a no-op, never a duplicate.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -41,12 +44,14 @@ from . import (TOOL_NAME, paths, refs, shape_identity, tool_identity,
                validate, vocab, wire)
 from .config import Config, caller_env
 from .digest import sha256_file, sha256_text
-from .fingerprint import alias_event
+from .fingerprint import LineageError, alias_event, resolve_identity
+from .fingerprint import compute as fp_compute
 # `firing_id` is defined beside the code that MAKES the firings
 # (round-4 F1: identity travels with the thing it identifies);
 # it stays reachable here because this is the module that owns
 # the authorization boundary reading it.
-from .ledger import Ledger, firing_id
+from .ledger import Ledger, firing_id, is_ruling, ruling_facts
+from .ledger import _uid as _event_uid
 
 EXCHANGE_DIR = "exchange"
 
@@ -214,6 +219,198 @@ def keep_bytes(cfg: Config, round_no: int, kind: str, text: str) -> str:
         return str(target)
     except OSError as exc:
         return f"not kept ({exc.strerror})"
+
+
+# ------------------------------------------------------- the git ref carrier
+
+# `transport = "git"` (ruled 2026-09-03, brief `git-ref-carrier`). The
+# envelope rides a ref under `refs/<tool>/` on the SAME remote the reviewed
+# branch was already pushed to, one ref per leg:
+#
+#     refs/loupe/<lineage>/<round>/request      pushed by `handoff`
+#     refs/loupe/<lineage>/<round>/verdict      pushed by `validate --from-target`
+#     refs/loupe/<lineage>/<round>/disposition  pushed by `respond --out`
+#
+# THE OBJECT IS A BARE BLOB, not a commit wrapping a file. Measured before
+# choosing: `git push <remote> +<blob>:refs/loupe/...` creates and
+# force-updates the ref, `git fetch <remote> +<ref>:<ref>` brings it into the
+# reviewer's clone, and `git cat-file blob <ref>` returns the bytes — every
+# step ordinary porcelain, on a stock git, with no commit object, tree,
+# author identity or timestamp invented to carry a document that is none of
+# those things. A commit would have added three fabricated fields and a
+# second object per leg for nothing.
+#
+# THE REF IS AN UNTRUSTED CARRIER and stays one. Nothing here validates,
+# and nothing downstream trusts the ref: the fetched bytes go through the
+# same readers a pasted envelope does, and the digest and SHA binding are
+# unchanged. A ref is where bytes rest — storage is not a trigger, so a
+# pushed ref starts nothing and the human still tells the reviewer to take.
+#
+# The reference a person carries is `git:<lineage>/<round>` — one word,
+# because the lineage is not derivable on the far side and the round alone
+# would name a different envelope in the next lineage.
+CARRIER_PREFIX = "git:"
+_ROUND_REFERENCE_RE = re.compile(r"^(\d+)/(\d+)$")
+
+
+def carrier_ref(lineage: int, round_no: int, kind: str) -> str:
+    """The ref one leg of one round rides on."""
+    return f"refs/{TOOL_NAME}/{int(lineage)}/{int(round_no)}/{kind}"
+
+
+def round_reference(lineage: int, round_no: int) -> str:
+    """What a person carries for a `git` round: `git:<lineage>/<round>`."""
+    return f"{CARRIER_PREFIX}{int(lineage)}/{int(round_no)}"
+
+
+def parse_round_reference(value: str):
+    """`(lineage, round)` for a round reference, or None for anything else.
+
+    None rather than a raise: every envelope reader is handed a path, `-`,
+    or this, and "not a round reference" is the ordinary case, not a fault.
+    """
+    if not isinstance(value, str) or not value.startswith(CARRIER_PREFIX):
+        return None
+    m = _ROUND_REFERENCE_RE.match(value[len(CARRIER_PREFIX):])
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _carrier_refusal(why: str, remedy: str) -> "Refusal":
+    return Refusal(why, "", remedy=remedy)
+
+
+def carrier_remote(cfg: Config, git=None) -> str:
+    """The remote the envelope refs ride on.
+
+    The reviewed branch's upstream remote, else the one configured remote.
+    Two remotes and no upstream is not derivable and the tool never invents
+    a decision (§9bis.3) — the same rule, and the same refusal, that
+    `ensure_pushed` applies to the branch push this rides beside.
+    """
+    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    try:
+        remotes = [r for r in run("remote").splitlines() if r.strip()]
+    except RuntimeError as exc:
+        raise _carrier_refusal(
+            f"the configured remotes could not be read: {exc}",
+            remedy="a person runs this inside a repository whose remotes "
+                   "can be read; the round rides one of them") from exc
+    if not remotes:
+        raise _carrier_refusal(
+            f"transport={vocab.TRANSPORT_GIT!r} carries the envelope on a "
+            f"ref of the remote both sides reach, and this clone has no "
+            f"remote",
+            remedy=f"a person adds the remote, or declares "
+                   f"`{vocab.toml_line('roles.transport', vocab.TRANSPORT_PASTE)}`"
+                   f" under [roles] — the carrier that needs no remote")
+    if len(remotes) == 1:
+        return remotes[0]
+    branch = ""
+    try:
+        branch = run("rev-parse", "--abbrev-ref", "HEAD")
+    except RuntimeError:
+        branch = ""
+    if branch and branch != "HEAD":
+        upstream = run("for-each-ref", "--format=%(upstream:remotename)",
+                       f"refs/heads/{branch}").strip()
+        if upstream:
+            return upstream
+    if "origin" in remotes:
+        return "origin"
+    upstream_cmd = paths.command(*paths.lits("git", "push", "-u"),
+                                 paths.Ph("<remote>"), paths.Ph("<branch>"))
+    raise _carrier_refusal(
+        f"{len(remotes)} remotes exist ({', '.join(remotes)}) and none is "
+        f"derivable as the one carrying this round's envelope refs",
+        remedy=f"a person sets the branch's upstream with `{upstream_cmd}`, "
+               f"then re-runs")
+
+
+def _blob_of(cfg: Config, text: str, git=None) -> str:
+    """Write the envelope bytes into this clone's object store as a blob.
+
+    Bytes, not text: the envelope's physical form is part of what the
+    digest binds, and a text-mode write would translate line endings on
+    the way in — the same defect `_read_envelope` closed on the way out.
+    """
+    if git is not None:
+        return git("hash-object", "-w", "--stdin")
+    out = subprocess.run(
+        ["git", "-C", str(cfg.repo_root), "hash-object", "-w", "--stdin"],
+        input=text.encode("utf-8"), capture_output=True, timeout=120,
+        env=caller_env())
+    if out.returncode != 0:
+        raise _carrier_refusal(
+            f"the envelope could not be written to the object store: "
+            f"{out.stderr.decode('utf-8', 'replace').strip()}",
+            remedy="a person makes this repository writable to this "
+                   "process, then re-runs")
+    return out.stdout.decode("utf-8").strip()
+
+
+def push_envelope(cfg: Config, lineage: int, round_no: int, kind: str,
+                  text: str, git=None) -> dict:
+    """Push one leg's envelope to its ref, and return what was pushed.
+
+    Force by refspec, deliberately: a blob ref has no ancestry to fast
+    forward, and a re-emitted round legitimately replaces the bytes at its
+    own ref. The force is bounded to `refs/<tool>/…`, a namespace nothing
+    else writes — the branch push `ensure_pushed` performs is untouched by
+    this and stays non-forced.
+    """
+    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    remote = carrier_remote(cfg, git=git)
+    ref = carrier_ref(lineage, round_no, kind)
+    blob = _blob_of(cfg, text, git=git)
+    try:
+        run("push", remote, f"+{blob}:{ref}")
+    except RuntimeError as exc:
+        raise _carrier_refusal(
+            f"the {kind} envelope could not be pushed to {ref} at "
+            f"{remote}: {exc}",
+            remedy=f"a person makes {remote} writable to this process — the "
+                   f"reviewed branch was pushed there, so the envelope ref "
+                   f"can be too — or declares "
+                   f"`{vocab.toml_line('roles.transport', vocab.TRANSPORT_PASTE)}`"
+                   f" under [roles] and carries the bytes by hand") from exc
+    return {"ref": ref, "remote": remote, "kind": kind, "round": round_no}
+
+
+def fetch_envelope(cfg: Config, lineage: int, round_no: int, kind: str,
+                   git=None) -> str:
+    """The bytes of one leg, fetched from its ref into this clone.
+
+    The ref is mirrored locally under the same name before it is read, so
+    the read names an exact ref rather than `FETCH_HEAD`, which any other
+    fetch in the same clone would overwrite.
+    """
+    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    remote = carrier_remote(cfg, git=git)
+    ref = carrier_ref(lineage, round_no, kind)
+    reference = round_reference(lineage, round_no)
+    try:
+        run("fetch", remote, f"+{ref}:{ref}")
+    except RuntimeError as exc:
+        raise _carrier_refusal(
+            f"{remote} carries no {kind} envelope for {reference} ({ref}): "
+            f"{exc}",
+            remedy=f"the other side runs its own step first — the round's "
+                   f"{kind} is pushed by the verb that produces it — or a "
+                   f"person passes the envelope file itself") from exc
+    try:
+        # Replacement off: `git replace` is local state that rewrites what
+        # any object read returns, and this one decides the bytes a round is
+        # judged on. The bytes stay untrusted either way — every binding
+        # downstream is computed from them — but they must at least be the
+        # bytes the fetch brought in.
+        data = run_bytes(cfg, git, "cat-file", "blob", ref, no_replace=True)
+    except _UNUSABLE as exc:
+        raise _carrier_refusal(
+            f"{ref} was fetched from {remote} but its bytes could not be "
+            f"read: {exc}",
+            remedy="a person re-runs; if it repeats, the ref does not name "
+                   "an envelope blob and the other side re-pushes it") from exc
+    return wire.decode_envelope(data, reference)
 
 
 # ------------------------------------------------------------------- prune
@@ -638,10 +835,32 @@ def evidence_events(parsed: wire.Request, round_no: int) -> list[dict]:
 
 
 def verdict_events(parsed: wire.Verdict, round_no: int, digest: str,
-                   size: int, tokens: int | None = None) -> list[dict]:
+                   size: int, tokens: int | None = None,
+                   answering: list[dict] | None = None) -> list[dict]:
     """Verdict, alias, finding and closure events, exactly as `ledger add`
     records them (moved here from the CLI so `close` and `ledger add` cannot
-    drift into two shapes of the same fact)."""
+    drift into two shapes of the same fact).
+
+    `answering` is the disposition record set this verdict's closures
+    answer (round-6 F1) — the same set `_required_closures` validates
+    against, one round before this one. Each closure is stamped with the
+    round of the matching disposition, so a later reader never has to
+    infer what a closure answers from round arithmetic alone: a verdict
+    that both closes fp X and re-raises fp X as a new finding in the same
+    breath is otherwise indistinguishable, by round number, from one
+    closure answering its own round's finding.
+
+    Round-7 F1: that inference is not just unnecessary when `answering`
+    is supplied, it is UNSAFE when it is not, for exactly one admitted
+    shape — a closure whose fingerprint is ALSO among this verdict's own
+    findings. There the round-comparison fallback every OTHER closure may
+    still fall back to (`Ledger._answer_target_round`, for legacy or
+    hand-built events whose domain is provably a single ruling) would
+    resolve to this verdict's own new finding, silently making a closure
+    of the PRIOR ruling settle the one it cannot possibly answer. This
+    function refuses before returning or appending anything rather than
+    emit that closure unstamped.
+    """
     event = {"event": "verdict", "round": round_no,
              "sha": parsed.sha, "verdict": parsed.verdict,
              "source_digest": digest, "bytes": size,
@@ -689,9 +908,1073 @@ def verdict_events(parsed: wire.Verdict, round_no: int, digest: str,
                            "fp": f.fingerprint(),
                            "digest": sha256_text(f.evidence.strip()),
                            "source": "verdict", "of": f.id})
+    answering_by_fp = {}
+    for rec in (answering or []):
+        fp = rec.get("fp") or rec.get("fingerprint") or ""
+        if fp:
+            answering_by_fp[fp] = rec
+    reraised_fps = {f.fingerprint() for f in parsed.findings}
     for c in parsed.closures:
-        events.append(c.as_event(round_no))
+        rec = answering_by_fp.get(c.fp)
+        # Scoped to `withdrawn` (round-7 F1): it is the one closure term
+        # that SETTLES a ruling (`vocab.FINDING_ANSWERS`) — the only kind
+        # whose mistargeting has any observable effect (`sustained` and
+        # the other OPEN-effect terms are read for their own round, never
+        # for the ruling they target, so a collision there settles
+        # nothing and is not the authorization gap this finding names).
+        if rec is None and c.closure == "withdrawn" and c.fp in reraised_fps:
+            raise Refusal(
+                f"{c.fp}: this verdict both closes it and re-raises it as "
+                f"a new finding in the same round, and no disposition "
+                f"record names which ruling the closure answers — the "
+                f"prior one it closes, or this round's own new one. Round "
+                f"arithmetic cannot tell those apart (round-7 F1), so "
+                f"binding it by inference would silently settle whichever "
+                f"one the fallback happens to prefer",
+                next_cmd="",
+                remedy="a person supplies the disposition record the "
+                       "closure answers (the prior round's standing "
+                       "dispositions), or the reviewer re-issues the "
+                       "verdict without raising the identical fingerprint "
+                       "as a new finding in the same verdict that closes it")
+        answers_round = (int(rec["round"])
+                         if rec is not None and rec.get("round") is not None
+                         else None)
+        events.append(c.as_event(round_no, answers_round=answers_round))
     return events
+
+
+#: Event kinds `import-legacy` admits — DERIVED from the closed schema
+#: rather than restated beside it (round-9 F2: the allowlist was a
+#: hand-written set with no external authority, so a kind could be admitted
+#: here and described nowhere). `finding_waiver` is absent for a reason no
+#: schema entry could carry: a human waiver is a decision `loupe waive`
+#: records against a name a person supplies to that command, never a JSON
+#: row a generic importer cannot authenticate at all (round-8 F2).
+LEGACY_IMPORT_KINDS = frozenset(vocab.LEGACY_EVENT_SCHEMA)
+
+_HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+_HEX40 = re.compile(r"\A[0-9a-f]{40}\Z")
+_HEX16 = re.compile(r"\A[0-9a-f]{16}\Z")
+
+
+def _is_int(value) -> bool:
+    # `True` is an int in Python and is not a round number. Every numeric
+    # member here is a canonical integer or it is a defect.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _payload_problem(value) -> str | None:
+    """A disposition payload's TYPES, closed; its key set deliberately not.
+
+    The payload is the author's own record, and §5.2 fixes only its floor
+    (`DISPOSITION_PAYLOADS`) — a legacy corpus's extra key is vocabulary,
+    not a forgery surface, since nothing outside the mandatory keys carries
+    authorization weight. What IS closed is the shape a reader can assume:
+    an object of strings, or of one-level objects of strings. That is the
+    half `payload: "fabricated"` walked through into an AttributeError.
+    """
+    if not isinstance(value, dict):
+        return f"is {type(value).__name__}, not an object"
+    for key, item in value.items():
+        if not isinstance(key, str):
+            return f"has a non-string key {key!r}"
+        if isinstance(item, str):
+            continue
+        if isinstance(item, dict) and all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in item.items()):
+            continue
+        return (f"member {key!r} is {type(item).__name__}, not a string or "
+                f"an object of strings")
+    return None
+
+
+#: Member type -> the closed vocabulary a value of it must belong to. Pairs
+#: rather than a literal mapping so the type names stay what they are —
+#: names of member TYPES, never keys of a result payload.
+_LEGACY_ENUM_TYPES = (
+    ("closure_term", vocab.CLOSURES),
+    ("disposition_term", vocab.DISPOSITIONS),
+    ("amendment_outcome", vocab.TEST_AMENDMENT_OUTCOMES),
+    ("lineage_kind", vocab.LINEAGE_KINDS),
+    ("import_kind", vocab.LEGACY_IMPORT_ROW_KINDS),
+    ("verdict_term", vocab.VERDICTS),
+    ("envelope_kind", vocab.legacy_envelope_kinds()),
+)
+
+
+def _type_problem(value, kind: str) -> str | None:
+    """What is wrong with `value` as a member of type `kind`, or None.
+
+    One table for every admitted member of every admitted kind, so a
+    container where a scalar belongs is refused by the same rule that
+    refuses a string where a round number belongs.
+    """
+    enums = dict(_LEGACY_ENUM_TYPES)
+    if kind in enums:
+        return (None if value in enums[kind]
+                else f"is {value!r}, not one of {list(enums[kind])}")
+    if kind == "subtype_or_null":
+        return (None if value is None or value in vocab.ACCEPTED_SUBTYPES
+                else f"is {value!r}, not null or one of "
+                     f"{list(vocab.ACCEPTED_SUBTYPES)}")
+    if kind == "round":
+        return (None if _is_int(value) and value > 0
+                else f"is {value!r}, not a positive integer")
+    if kind == "count":
+        return (None if _is_int(value) and value >= 0
+                else f"is {value!r}, not a non-negative integer")
+    if kind in ("text", "fingerprint", "event_name"):
+        return (None if isinstance(value, str) and value.strip()
+                else f"is {value!r}, not a non-empty string")
+    if kind == "text_or_blank":
+        return (None if isinstance(value, str)
+                else f"is {value!r}, not a string")
+    if kind == "text_or_null":
+        return (None if value is None or isinstance(value, str)
+                else f"is {value!r}, not a string or null")
+    if kind == "text_list":
+        return (None if isinstance(value, list)
+                and all(isinstance(x, str) for x in value)
+                else f"is {value!r}, not a list of strings")
+    if kind == "digest":
+        return (None if isinstance(value, str) and _HEX64.match(value)
+                else f"is {value!r}, not a 64-character lowercase hex digest")
+    if kind == "commit":
+        return (None if isinstance(value, str) and _HEX40.match(value)
+                else f"is {value!r}, not a 40-character lowercase hex commit")
+    if kind == "stamp":
+        return (None if isinstance(value, str) and _HEX16.match(value)
+                else f"is {value!r}, not a 16-character lowercase hex uid")
+    if kind == "payload":
+        return _payload_problem(value)
+    raise AssertionError(f"no check declared for member type {kind!r}")
+
+
+def _closed_shape_problems(row: dict, where: str, required: dict,
+                           optional: dict) -> list[str]:
+    """One object against one closed field grammar: every required member
+    present and of its type, every optional member of its type, and every
+    OTHER member refused by name."""
+    problems = []
+    for member, kind in sorted(required.items()):
+        if member not in row:
+            problems.append(f"{where}: required member {member!r} is absent")
+            continue
+        bad = _type_problem(row[member], kind)
+        if bad:
+            problems.append(f"{where}: {member} {bad}")
+    for member, kind in sorted(optional.items()):
+        if member in row:
+            bad = _type_problem(row[member], kind)
+            if bad:
+                problems.append(f"{where}: {member} {bad}")
+    unknown = sorted(set(row) - set(required) - set(optional))
+    if unknown:
+        problems.append(
+            f"{where}: unknown member(s) {unknown} — the legacy grammar is "
+            f"closed, and a member nobody reads is a member whose meaning "
+            f"the record cannot state")
+    return problems
+
+
+#: A `source_path` this boundary will even ASK git about. The value is
+#: caller-controlled and is interpolated into `<commit>:<path>`, so the
+#: shape is closed rather than the escapes enumerated: one or more
+#: non-empty, non-dot segments, no leading slash, no `..`, no NUL and no
+#: newline (a newline would also make `ls-tree`'s one-entry check a lie).
+#:
+#: Round-11 F6, closed 2026-09-03: the sentence above was the whole claim
+#: and the pattern delivered half of it. `[^/\x00\n]+` excludes exactly
+#: three characters, so a `.` or `..` segment was a legal segment and
+#: `a/../x`, `a/./x` and `.` itself resolved through git to some OTHER
+#: tree path than the one the row named — a path the record then reported
+#: as the cited source. The per-segment lookaheads reject a segment that
+#: IS `.` or `..`; a name that merely starts with a dot (`.gitignore`,
+#: `...odd`) is an ordinary tracked path and stays legal. Leading,
+#: trailing and repeated separators were already excluded and still are.
+_SOURCE_PATH_RE = re.compile(
+    r"\A(?!/)(?:(?!\.\.?/)[^/\x00\n]+/)*(?!\.\.?\Z)[^/\x00\n]+\Z")
+
+
+class SourceAuthority:
+    """The source bytes an imported batch may derive from: THIS repository's
+    own shared git history, at one anchor commit (lineage 20 round 10 F2).
+
+    Round 9's authority was a manifest file the CALLER wrote — `{path,
+    sha256}` entries this tool hashed. It read like external verification
+    and was not: the party who writes the batch also writes the manifest, so
+    a throwaway file, hashed by its own author, "substantiated" a finding
+    titled `fabricated`. The manifest is gone. Two properties replace it,
+    and neither alone would have closed that reproduction:
+
+    ANCHORED. A row names `source_path`, a tracked path, and the content is
+    read from `<commit>:<path>` where `commit` was verified to be ancestry
+    of a ref the REMOTE ITSELF answers for — `ls-remote`, the observation
+    `emit.ensure_pushed` makes after a push, for the same reason: history
+    one machine can show a second. The row's `source_digest` is NEVER
+    believed; it is recomputed here and compared, so it is a commitment the
+    caller can be held to rather than an input.
+
+    Measured while designing this, and it is why the check is `ls-remote`
+    rather than `refs/remotes/*`: a remote-tracking ref is LOCAL, WRITABLE
+    state. `git update-ref refs/remotes/origin/main <any local commit>`
+    exits 0 with no network and no remote, and `for-each-ref --contains`
+    then names it. Resting the anchor on that would have been round 9's
+    mistake one level down — evidence the same party can author.
+
+    CONTAINED. The row's own claim text must occur IN that content
+    (`vocab.LEGACY_CONTAINMENT`, `contains` below). This is the half that
+    makes the citation about the row: an anchored digest alone proves only
+    that some real file was named beside an arbitrary claim, which is
+    exactly what round 10 walked through.
+
+    THE STATED LIMIT, precisely. This is not non-repudiation. Someone able
+    to push to this remote — or to rewrite this clone's remote URL — can
+    commit a file saying whatever a row needs and then cite it; the anchor
+    commit's message and authorship are not verified; containment is a
+    SUBSTRING test over the whole decoded file, so a source that happens to
+    contain the text substantiates it whatever the surrounding context
+    meant; and a legitimate derivation is still not RE-DERIVED here — a
+    generic importer does not know any repository's derivation (§11).
+    `--no-fetch` weakens the anchor deliberately and says so on the result
+    (`source_witness`). What it does establish, and the manifest did not:
+    the cited bytes are already durable, shared, attributable history rather
+    than a scratch file written in the same terminal session as the import,
+    and the row's own words are traceable into those bytes rather than
+    merely consistent with a sibling field the same author wrote.
+    """
+
+    def __init__(self, commit: str, refs: list[str], witness: str,
+                 refs_containing, run, read):
+        self.commit = commit
+        #: The refs that carry the anchor. Reported, not just counted: which
+        #: shared branch carries it is the fact a person auditing the import
+        #: needs.
+        self.refs = list(refs)
+        #: HOW those refs were established — observed at the remote, or read
+        #: from local remote-tracking refs under `--no-fetch`. The record
+        #: says which, because they are not the same claim.
+        self.witness = witness
+        self._refs_containing = refs_containing
+        self._run = run
+        self._read = read
+        self._blobs: dict[str, tuple[bytes | None, str | None]] = {}
+        self._commits: dict[str, bool] = {}
+
+    def __len__(self) -> int:
+        return len([p for p, (data, _) in self._blobs.items()
+                    if data is not None])
+
+    def paths(self) -> list[str]:
+        return sorted(p for p, (data, _) in self._blobs.items()
+                      if data is not None)
+
+    def blob(self, path) -> tuple[bytes | None, str | None]:
+        """The bytes at `<anchor>:<path>`, or why there are none. Cached, so
+        a batch of 162 rows over 20 artifacts asks git 20 times."""
+        if not isinstance(path, str) or not _SOURCE_PATH_RE.match(path):
+            return None, (f"source_path {path!r} is not a repository path "
+                          f"this boundary will resolve")
+        if path in self._blobs:
+            return self._blobs[path]
+        self._blobs[path] = _anchored_blob(self._run, self._read,
+                                           self.commit, path)
+        return self._blobs[path]
+
+    def digest(self, path: str) -> str:
+        """The sha256 THIS TOOL computes over the anchored bytes."""
+        return hashlib.sha256(self.blob(path)[0]).hexdigest()
+
+    def size(self, path: str) -> int:
+        return len(self.blob(path)[0])
+
+    def contains(self, path: str, needle: str) -> bool | None:
+        """Whether `needle` occurs in the decoded source content. None means
+        the question could not be asked — the bytes are not UTF-8 — which
+        the caller must treat as a refusal, never as a pass."""
+        try:
+            text = self.blob(path)[0].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        return needle in text
+
+    def shared_commit(self, sha: str) -> bool:
+        """Whether `sha` is carried by the same witness the anchor answered
+        to. A legacy corpus of THIS repository reviewed THIS repository's
+        commits, so a request/verdict row's target is checkable rather than
+        assertable — and it is checked against the SAME evidence, never a
+        weaker one, or the door would have two bars."""
+        if sha not in self._commits:
+            self._commits[sha] = bool(self._refs_containing(sha))
+        return self._commits[sha]
+
+
+def _anchored_blob(run, read, commit: str,
+                   path: str) -> tuple[bytes | None, str | None]:
+    """The bytes at `<commit>:<path>`, or why there are none.
+
+    A module-level function taking its runners as parameters, not a method
+    reading them off `self`, because that is the shape `bin/loupe-git-read-audit`
+    resolves: an object-graph read reached through an attribute is a read the
+    boundary file cannot classify, and an unclassified read is an unmade
+    decision (lineage 12 round 3 F1).
+    """
+    at = commit[:12]
+    try:
+        # `-z` (round-11 F6): without it git QUOTES a name it considers
+        # unusual, so the entry's name field is a rendering rather than the
+        # path, and the check below would compare a path against a
+        # C-escaped picture of one. NUL-terminated records also make the
+        # more-than-one-entry test exact, where `\n` was a proxy for it.
+        listing = run("ls-tree", "--full-tree", "-z", commit, "--", path)
+    except _UNUSABLE as exc:
+        return None, f"{path} cannot be listed at {at} ({exc})"
+    entries = [e for e in listing.split("\0") if e.strip()]
+    if not entries:
+        return None, (f"{path} is not tracked at {at} — an imported row "
+                      f"cites this repository's shared history, and this "
+                      f"path is not in it")
+    # Round 3 F2's lesson, one boundary over: a tree may carry one path
+    # twice, and then WHICH entry was read is not established.
+    if len(entries) > 1:
+        return None, f"{path} has more than one tree entry at {at}"
+    meta, tab, name = entries[0].partition("\t")
+    fields = meta.split()
+    if not tab or len(fields) < 3:
+        return None, f"the tree entry for {path} at {at} cannot be read"
+    # Round-11 F6: git ANSWERS about a path of its own choosing. `a/./x`
+    # and `a/../x` are legal arguments that resolve to other tree paths,
+    # and the grammar above now refuses those — but the grammar is a claim
+    # about the string, and this is the claim about what git returned. The
+    # entry read must be the entry asked for, or the digest, the size and
+    # the containment test below all describe a file the row does not name.
+    if name != path:
+        return None, (f"the tree entry at {at} is {name!r}, not the "
+                      f"requested {path!r}: the bytes read must be the "
+                      f"bytes the row cites")
+    if fields[0] not in vocab.GIT_FILE_MODES:
+        # Round 4 F1: type `blob` covers a symlink, whose content is a path,
+        # not the bytes a reader would see.
+        return None, (f"{path} at {at} is {vocab.git_mode_name(fields[0])}, "
+                      f"not a regular file")
+    try:
+        return read("show", f"{commit}:{path}"), None
+    except _UNUSABLE as exc:
+        return None, f"{path} at {at} cannot be read ({exc})"
+
+
+def _present(run, sha: str) -> bool:
+    try:
+        run("cat-file", "-e", f"{sha}^{{commit}}")
+        return True
+    except _UNUSABLE:
+        return False
+
+
+def _observed_refs_containing(run, remote: str, sha: str) -> list[str]:
+    """Every ref THE REMOTE ITSELF answers for whose history contains `sha`.
+
+    `ls-remote` is the remote's own statement about its refs — the exact
+    observation `emit.ensure_pushed` makes after a push (§9bis.4), and the
+    reason it is that call and not `for-each-ref refs/remotes/`: a
+    remote-tracking ref is local, writable state. `git update-ref
+    refs/remotes/origin/main <any local commit>` exits 0 offline, and
+    `--contains` then names it, so the anchor would rest on evidence its own
+    author can write. Measured, 2026-09-02.
+
+    Ancestry is still computed locally, against the object store, which is
+    why the caller runs with replacement objects off: the TIP comes from the
+    remote, and what that tip's history contains is read from the original
+    graph. A tip whose object this clone does not have vouches for nothing —
+    fail-closed, and the fetch is what supplies it.
+    """
+    if not _present(run, sha):
+        return []
+    out = []
+    for line in run("ls-remote", remote).splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2 or not _HEX40.match(parts[0].strip()):
+            continue
+        tip, ref = parts[0].strip(), parts[1].strip()
+        if not _present(run, tip):
+            continue
+        try:
+            run("merge-base", "--is-ancestor", sha, tip)
+        except _UNUSABLE:
+            continue
+        out.append(ref)
+    return out
+
+
+def _remote_refs_containing(run, sha: str) -> list[str]:
+    """Every `refs/remotes/*` ref whose history contains `sha`, or [].
+
+    The `--no-fetch` witness, and the WEAKER one: these refs are local state
+    a person with a shell can write, so this says the bytes were fetched
+    from somewhere at some point, not that a remote attests them now. The
+    flag is the only way to reach it and the result records that it was
+    used (`source_witness`).
+    """
+    if not _present(run, sha):
+        return []
+    try:
+        out = run("for-each-ref", "--contains", sha, "--format=%(refname)",
+                  "refs/remotes/")
+    except _UNUSABLE:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _anchor_remote(remotes: list[str]) -> str | None:
+    """`origin` when it exists, else the single remote. More than one and
+    neither named `origin`, and the tool does not invent a decision
+    (§9bis.3)."""
+    if "origin" in remotes:
+        return "origin"
+    return remotes[0] if len(remotes) == 1 else None
+
+
+def read_source_authority(cfg: Config, commit_ref: str, fetch: bool = True,
+                          git=None) -> tuple[SourceAuthority | None,
+                                             list[str]]:
+    """Resolve and VERIFY the anchor commit: (authority, problems).
+
+    Every defect is reported as prose, never raised — the caller refuses the
+    whole import atomically and a person names a different anchor.
+
+    `git` is injectable exactly as `take`'s and `probe_target`'s are, so
+    every refusal below is testable without a network or a remote.
+    """
+    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True))
+    read = (lambda *a: run_bytes(cfg, git, *a, no_replace=True))
+    try:
+        remotes = [r for r in run("remote").splitlines() if r.strip()]
+    except _UNUSABLE as exc:
+        return None, [f"this clone cannot be asked about its remotes ({exc}), "
+                      f"so no shared history can anchor an import"]
+    if not remotes:
+        return None, [
+            "no remote is configured: an imported row cites bytes that are "
+            "already shared history, and a clone with no remote has none. "
+            "There is no --local-only here on purpose — that flag would be "
+            "the manifest's hole again, one level down (round-10 F2)"]
+    remote = _anchor_remote(remotes)
+    if remote is None:
+        return None, [
+            f"{len(remotes)} remotes exist ({', '.join(remotes)}) and none is "
+            f"named `origin`, so which one this repository's shared history "
+            f"lives at is not derivable, and the tool does not invent a "
+            f"decision"]
+    if fetch:
+        try:
+            # --prune matters even here: the fetch is what brings the
+            # observed tips into the object store, and a pruned clone is the
+            # one whose local refs cannot outlive what the remote carries.
+            run("fetch", "--prune", remote)
+        except _UNUSABLE as exc:
+            return None, [
+                f"cannot fetch {remote} ({exc}): the anchor is judged against "
+                f"refs the remote answers for, and a clone that could not "
+                f"reach it has nothing to judge against. Restore access, or "
+                f"re-run with --no-fetch to fall back to the remote-tracking "
+                f"refs as they stand — a weaker claim the record will say was "
+                f"made"]
+    try:
+        commit = run("rev-parse", "--verify", "--end-of-options",
+                     f"{commit_ref}^{{commit}}").strip()
+    except _UNUSABLE as exc:
+        return None, [f"--source-commit {commit_ref!r} resolves to no commit "
+                      f"in this clone ({exc})"]
+    if not _HEX40.match(commit):
+        return None, [f"--source-commit {commit_ref!r} resolved to {commit!r}, "
+                      f"which is not a commit id"]
+    if fetch:
+        def refs_containing(sha):
+            return _observed_refs_containing(run, remote, sha)
+        witness = f"observed at {remote} (ls-remote), ancestry from this clone"
+    else:
+        def refs_containing(sha):
+            return _remote_refs_containing(run, sha)
+        witness = ("remote-tracking refs as they stand (--no-fetch): LOCAL "
+                   "state, which a person with a shell can write")
+    try:
+        refs_with = refs_containing(commit)
+    except _UNUSABLE as exc:
+        return None, [f"cannot ask {remote} which refs carry "
+                      f"{commit[:12]} ({exc})"]
+    if not refs_with:
+        return None, [
+            f"--source-commit {commit_ref} ({commit[:12]}) is ancestry of no "
+            f"ref this clone accepts as shared — witness: {witness}. It is "
+            f"local history, and an import may cite only bytes that were "
+            f"already shared. This is the whole gain over the source manifest "
+            f"round 9 shipped: a file invented in the same session as the "
+            f"batch cannot be anchored (round-10 F2)"]
+    return SourceAuthority(commit, refs_with, witness, refs_containing,
+                           run, read), []
+
+
+def _identity_problems(row: dict, where: str) -> list[str]:
+    """A ruling row's fingerprint, RECOMPUTED from the identity inputs the
+    row itself declares (round-9 F2).
+
+    `fp` is otherwise a free label: nothing stopped two fabricated findings
+    from claiming any two identities an alias could then collapse, or one
+    row from claiming an identity that belongs to a real standing finding.
+    The fingerprint function is the tool's own (§5.3b) and any corpus whose
+    identities are meaningful here computed them with it, so requiring the
+    row to carry its inputs and hash to what it claims costs a real
+    derivation nothing and makes the identity machine-derived rather than
+    asserted.
+    """
+    text = row.get("title") if row.get("event") == "finding" \
+        else row.get("verbatim")
+    computed = fp_compute(
+        row.get("classification", ""), row.get("anchor_path", ""),
+        row.get("anchor", ""), text or "",
+        invariant_id=row.get("invariant_id", ""),
+        citations=row.get("citations", ""))
+    if computed != row.get("fp"):
+        return [f"{where}: fp {row.get('fp')!r} is not the fingerprint of "
+                f"the identity facts this row declares — those hash to "
+                f"{computed}. An imported ruling's identity is recomputed, "
+                f"never taken on the batch's word (round-9 F2)"]
+    return []
+
+
+def _claimed_texts(e: dict) -> list[tuple[str, str]]:
+    """(member, text) pairs whose words this row claims come from its source.
+
+    Derived from `vocab.LEGACY_CONTAINMENT` plus, for a disposition, the
+    mandatory substantiation `vocab.DISPOSITION_PAYLOADS` already names per
+    term — so what a disposition must prove and what it must contain are one
+    table, never two that drift. Absent, null and blank members claim
+    nothing and are not checked; that they are PRESENT where the grammar
+    demands them is a separate rule, above.
+    """
+    out = []
+    for member in vocab.LEGACY_CONTAINMENT.get(e.get("event"), ()):
+        value = e.get(member)
+        if isinstance(value, str) and value.strip():
+            out.append((member, value))
+    if e.get("event") == "disposition":
+        payload = e.get("payload") or {}
+        for key in vocab.DISPOSITION_PAYLOADS.get(e.get("disposition"), ()):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                out.append((f"payload.{key}", value))
+    return out
+
+
+def _containment_problems(where: str, path: str, texts,
+                          authority: SourceAuthority) -> list[str]:
+    """Every claimed text that does NOT occur in the anchored source bytes.
+
+    Round-10 F2's whole reproduction, in one function: the source content
+    was `| R1-F1a | one atomic claim |`, the row's title was `fabricated`,
+    the digest was real and correctly computed, and the import went through.
+    A digest binds a row to bytes; only this binds the row's WORDS to them.
+    """
+    problems = []
+    for member, text in texts:
+        held = authority.contains(path, text)
+        if held is None:
+            return [f"{where}: {path} at {authority.commit[:12]} is not UTF-8, "
+                    f"so whether it contains this row's {member} cannot be "
+                    f"asked — and an unaskable question is not a pass"]
+        if not held:
+            problems.append(
+                f"{where}: {member} {_excerpt(text)} does not occur in "
+                f"{path} at {authority.commit[:12]}, the source this row "
+                f"cites — an anchored digest says some real file was named, "
+                f"never that this claim came out of it (round-10 F2)")
+    return problems
+
+
+def _excerpt(text: str, width: int = 60) -> str:
+    return repr(text if len(text) <= width else text[:width] + "…")
+
+
+def _row_shape_problems(e: dict, n: int) -> list[str]:
+    """One row against the closed schema alone — pure, no ledger, no git.
+
+    Split out 2026-09-03: the door used to read the git source authority
+    (a fetch, an ls-remote, tree reads) BEFORE this check, so every
+    malformed row paid a round of subprocesses to be refused by name —
+    41 s of a 156 s suite in one wrong-type matrix, and a door that did
+    not do what the design said (shape refused before Git is touched)."""
+    kind = e.get("event")
+    where = f"line {n} ({kind})"
+    schema = vocab.LEGACY_EVENT_SCHEMA[kind]
+    optional = {**schema["optional"], **vocab.LEGACY_COMMON_OPTIONAL}
+    required = dict(schema["required"])
+    for (k, member, value), demanded in \
+            vocab.LEGACY_CONDITIONAL_REQUIRED.items():
+        if k == kind and e.get(member) == value:
+            required[demanded] = optional.pop(
+                demanded, required.get(demanded, "text"))
+    problems = _closed_shape_problems(e, where, required, optional)
+    if e.get("event") != kind:                       # unreachable by routing
+        problems.append(f"{where}: event {e.get('event')!r} is not {kind!r}")
+    return problems
+
+
+def legacy_shape_problems(events: list[dict]) -> list[str]:
+    """Pass 1 of `legacy_import_problems` on its own: the kind domain and
+    every row's closed shape, for the caller to run before it reads any
+    source authority. Empty means the batch may proceed to provenance."""
+    bad_kinds = sorted({str(e.get("event")) for e in events
+                        if e.get("event") not in LEGACY_IMPORT_KINDS})
+    if bad_kinds:
+        return [f"event kind(s) {bad_kinds} are not in the legacy import "
+                f"domain {sorted(LEGACY_IMPORT_KINDS)}; a human waiver in "
+                f"particular is recorded only by the dedicated waive "
+                f"command, never imported (round-8 F2)"]
+    problems: list[str] = []
+    for n, e in enumerate(events, 1):
+        problems.extend(_row_shape_problems(e, n))
+    return problems
+
+
+def _row_problems(e: dict, n: int, authority: SourceAuthority) -> list[str]:
+    """One row against the closed schema and the git-anchored source."""
+    problems = _row_shape_problems(e, n)
+    if problems:
+        return problems
+    kind = e.get("event")
+    where = f"line {n} ({kind})"
+    path = e["source_path"]
+    data, unreadable = authority.blob(path)
+    if unreadable:
+        return [f"{where}: {unreadable} (anchor {authority.commit[:12]}, "
+                f"contained in {', '.join(authority.refs)})"]
+    actual = authority.digest(path)
+    if actual != e["source_digest"]:
+        return [f"{where}: {path} at {authority.commit[:12]} hashes to "
+                f"{actual}, this row claims {e['source_digest']} — the digest "
+                f"is recomputed from the anchored bytes, never taken from the "
+                f"row that cites them (round-10 F2)"]
+    problems.extend(_containment_problems(where, path, _claimed_texts(e),
+                                          authority))
+    if kind in vocab.legacy_envelope_kinds():
+        # An envelope row states two facts about bytes rather than about a
+        # claim, and both are machine-checkable here: how many bytes the
+        # source is, and whether the commit it says was reviewed is a commit
+        # this repository actually shares. The round the envelope belongs to
+        # is checked over the whole batch (`_round_shape_problems`).
+        if e["bytes"] != authority.size(path):
+            problems.append(
+                f"{where}: bytes {e['bytes']} but {path} at "
+                f"{authority.commit[:12]} is {authority.size(path)} bytes")
+        if not authority.shared_commit(e["sha"]):
+            problems.append(
+                f"{where}: target {e['sha'][:12]} is contained in no "
+                f"remote-tracking ref of this clone — a legacy corpus of this "
+                f"repository reviewed this repository's commits, so a "
+                f"{kind} row's target is checkable rather than assertable")
+    if kind in ("finding", "import"):
+        problems.extend(_identity_problems(e, where))
+    if kind == "disposition":
+        payload = e["payload"]
+        missing = [k for k in vocab.DISPOSITION_PAYLOADS.get(
+            e["disposition"], ()) if not str(payload.get(k, "")).strip()]
+        if missing:
+            problems.append(
+                f"{where}: {e['disposition']} disposition is missing "
+                f"mandatory payload {missing} — the same substantiation the "
+                f"product path's validator demands")
+    return problems
+
+
+#: What one settling answer resolves to. `bound` is the only admissible
+#: state; the rest name why an answer settles nothing a reader can trust.
+_BOUND = "bound"
+
+
+def _answer_binding(kind: str, event: dict, rulings) -> tuple:
+    """Which ruling MATERIAL `event` answers under a given ruling set —
+    (state, detail), where `state` is `_BOUND` or the defect's name.
+
+    `rulings` is round -> the uids of the rulings of this identity AT that
+    round, so a bound answer's detail is `(round, uids)` and not a round
+    number alone. Round-10 F1: reducing the binding to `(state, round)` made
+    the comparison in `_lifecycle_problems` blind to WHICH ruling occupies
+    the round. A second import could alias a settled identity onto a
+    distinct new finding at the SAME round, and a persisted acceptance —
+    unchanged, already on disk, its round unchanged — silently began
+    covering a ruling it never answered. The round number is the slot; the
+    uid set is what is in it, and an answer is bound to what is in it.
+
+    The target itself comes from `Ledger._answer_target_round`, the same
+    function the ledger reads with, so the importer's idea of what an
+    answer targets cannot drift from the reader's. What is layered on top
+    are the states a reader has no way to represent: a stamp that is not a
+    round number, a stamp naming a round the closure predates, an unstamped
+    answer whose own round ALSO carries a ruling of this identity (round-7
+    F1's collision), and a target that is no ruling at all.
+    """
+    own = int(event.get("round") or 0)
+    raw = event.get("answers_round")
+    rounds = set(rulings)
+    if kind != "disposition":
+        if raw is not None and (not _is_int(raw) or raw <= 0):
+            return ("malformed", raw)
+        if raw is not None and raw >= own:
+            return ("future", raw)
+        if raw is None and own in rounds:
+            return ("ambiguous", own)
+    target = Ledger._answer_target_round(kind, event, rounds)
+    if target is None or target not in rulings:
+        return ("unbound", target)
+    return (_BOUND, (target, rulings[target]))
+
+
+def _answer_term(e: dict):
+    """The (kind, term) pair `vocab.FINDING_ANSWERS` classifies this event
+    by, whatever kind of answer it is."""
+    kind = e.get("event")
+    if kind == "closure":
+        return (kind, e.get("closure"))
+    if kind == "disposition":
+        return (kind, e.get("disposition"))
+    if kind == vocab.FINDING_WAIVER_EVENT:
+        return (kind, None)
+    return None
+
+
+def _rulings_by_identity(events, resolve) -> dict[str, dict[int, tuple]]:
+    """Resolved identity -> round -> the ruling MATERIAL at that round: the
+    content uid of every ruling event, in recorded order (round-10 F1).
+
+    `ledger._uid` is the same content identity the breakers use to say what
+    a human decided about (`material_id`), and for the same reason: a slot's
+    occupant changing is not the slot changing. Order-preserving rather than
+    a set, so two rulings that happen to be byte-identical still count as
+    two — multiplicity is part of what an answer would newly cover.
+    """
+    rounds: dict[str, dict[int, list]] = {}
+    for e in events:
+        if is_ruling(e):
+            fp = resolve(e.get("fp", ""))
+            if fp:
+                by_round = rounds.setdefault(fp, {})
+                by_round.setdefault(int(e.get("round") or 0),
+                                    []).append(_event_uid(e))
+    return {fp: {r: tuple(uids) for r, uids in by_round.items()}
+            for fp, by_round in rounds.items()}
+
+
+def _lifecycle_problems(ledger: Ledger, events: list[dict]) -> list[str]:
+    """Every settling or overruling answer — PERSISTED and candidate —
+    recomputed under the identity graph and ruling set this batch would
+    leave behind (round-9 F1).
+
+    Round 8 validated the rows the CURRENT call supplied and stopped there,
+    which is a statement about one moment. The meaning of an unstamped
+    answer is re-derived on every read from the graph and the ruling set,
+    and a LATER, separate import can change both: call 1 imported a round-1
+    ruling and a round-2 withdrawal that correctly settled round 1; call 2
+    added an alias and a round-2 re-ruling, and the closure appended by
+    call 1 — already validated, already on disk — became an answer to a
+    ruling that did not exist when it was recorded.
+
+    So an import may not retroactively change what a persisted answer
+    answers. Each answer is bound twice — once under the ledger as it
+    stands, once under the ledger this batch would create — and a
+    persisted answer that WAS bound must come out bound to the same ruling.
+    An answer already broken before this call is not made this call's
+    fault: refusing it would deadlock a door on damage a later import
+    cannot repair, and the state it is in is unchanged either way.
+
+    Candidate rows have no `before`, so they must simply come out bound.
+    Their unstamped case is already gone: `LEGACY_CONDITIONAL_REQUIRED`
+    admits no unstamped `withdrawn` closure at all, which is what makes the
+    whole cross-batch vector unreachable for anything this door appends —
+    an explicit stamp means the same thing under every future graph.
+    """
+    persisted = ledger.events()
+    batch_lineage = [e for e in events if e.get("event") == "lineage"]
+    before_lineage = [e for e in persisted if e.get("event") == "lineage"]
+    after_lineage = before_lineage + batch_lineage
+
+    def resolver(lineage_events):
+        def resolve(fp):
+            return resolve_identity(fp, lineage_events)
+        return resolve
+
+    resolve_before = resolver(before_lineage)
+    resolve_after = resolver(after_lineage)
+    before_rounds = _rulings_by_identity(persisted, resolve_before)
+    after_rounds = _rulings_by_identity(persisted + events, resolve_after)
+
+    problems: list[str] = []
+    for e in events:
+        pair = _answer_term(e)
+        if pair is None or pair not in vocab.SETTLING_ANSWERS:
+            continue
+        fp_after = resolve_after(e.get("fp", ""))
+        after = _answer_binding(pair[0], e, after_rounds.get(fp_after, {}))
+        if after[0] != _BOUND:
+            problems.append(_unbound_prose(e, pair, fp_after, after))
+    for e in persisted:
+        pair = _answer_term(e)
+        if pair is None or pair not in vocab.SETTLING_ANSWERS:
+            continue
+        fp_before = resolve_before(e.get("fp", ""))
+        before = _answer_binding(pair[0], e, before_rounds.get(fp_before, {}))
+        if before[0] != _BOUND:
+            continue
+        fp_after = resolve_after(e.get("fp", ""))
+        after = _answer_binding(pair[0], e, after_rounds.get(fp_after, {}))
+        if after != before:
+            problems.append(_rebind_prose(e, pair, fp_before, before,
+                                          fp_after, after))
+    return problems
+
+
+def _rebind_prose(e: dict, pair, fp_before: str, before: tuple,
+                  fp_after: str, after: tuple) -> str:
+    """Why a persisted answer may not be moved — naming WHICH of the two
+    things changed, the slot or its occupant (round-10 F1).
+
+    The second is the case the round-number comparison could not see, and
+    it is the one that reads as nothing having happened: same identity, same
+    round, a different ruling underneath.
+    """
+    was_round, was_material = before[1]
+    head = (f"{fp_before}: a persisted {pair[0]} ({pair[1] or 'waiver'}) at "
+            f"round {e.get('round')!r} answers the round-{was_round} ruling "
+            f"of this identity today")
+    if after[0] != _BOUND:
+        return (f"{head}; after this batch it would answer nothing "
+                f"({after[0]}, {after[1]!r} of {fp_after}). An import may not "
+                f"reinterpret an answer already on disk (round-9 F1)")
+    now_round, now_material = after[1]
+    if now_round != was_round:
+        return (f"{head}; after this batch it would answer round {now_round} "
+                f"of {fp_after} instead. An import may not reinterpret an "
+                f"answer already on disk (round-9 F1)")
+    added = [u for u in now_material if u not in was_material]
+    gone = [u for u in was_material if u not in now_material]
+    return (f"{head} — {len(was_material)} ruling event(s) "
+            f"[{', '.join(was_material)}]. After this batch that same round "
+            f"of {fp_after} would carry {len(now_material)} "
+            f"[{', '.join(now_material)}]"
+            + (f", adding {', '.join(added)}" if added else "")
+            + (f", dropping {', '.join(gone)}" if gone else "")
+            + ". The round did not move; WHICH ruling occupies it did, and a "
+              "persisted answer may not silently start covering a ruling it "
+              "never answered (round-10 F1)")
+
+
+def _lineage_containment_problems(ledger: Ledger, events: list[dict],
+                                  authority: SourceAuthority) -> list[str]:
+    """A lineage row whose ENDPOINT is a known ruling must cite a source
+    that carries that ruling's claim text (round-10 F2).
+
+    A lineage row has no claim text of its own — it is two fingerprints, and
+    a fingerprint occurs in no prose — so `vocab.LEGACY_CONTAINMENT` leaves
+    it empty and this is the check that stands in its place. Without it, an
+    alias merging two REAL standing findings into one could be sourced to
+    any real, anchored file in the repository, which is the same shape as
+    the hole round 10 found: a true citation beside an unrelated claim. F1's
+    own escape came in through an alias, so this is deliberately not left to
+    anchoring alone.
+
+    THE LIMIT, stated: an endpoint that is not a ruling in ledger+batch — a
+    derivation's legacy-scheme fingerprint, a pre-split parent — is anchored
+    and nothing more, because there is no claim text to look for.
+    """
+    ruling_texts: dict[str, list[str]] = {}
+    for e in ledger.events() + events:
+        if not is_ruling(e):
+            continue
+        text = ruling_facts(e).get("title")
+        fp = e.get("fp")
+        if isinstance(fp, str) and isinstance(text, str) and text.strip():
+            ruling_texts.setdefault(fp, []).append(text)
+    problems: list[str] = []
+    for n, e in enumerate(events, 1):
+        if e.get("event") != "lineage":
+            continue
+        claims = [(f"{member} ruling text", text)
+                  for member in ("from_fp", "to_fp")
+                  for text in dict.fromkeys(
+                      ruling_texts.get(e.get(member), []))]
+        problems.extend(_containment_problems(
+            f"line {n} (lineage {e.get('kind')})", e["source_path"], claims,
+            authority))
+    return problems
+
+
+def _envelope_round_problems(ledger: Ledger, events: list[dict]) -> list[str]:
+    """Envelope rounds must be the contiguous sequence 1..N over ledger and
+    batch together.
+
+    This is what replaces the round-9 manifest's per-artifact `round`
+    declaration, and it is a property of the RECORD rather than of a second
+    file the same author wrote. The harm it guards is the one F2 measured: a
+    bare `verdict` row at round 99 imported and made `rounds_to_clean`
+    report 99. A round is an ordinal of one loop, so a record stating round
+    99 with no rounds 3..98 describes a loop that never ran.
+
+    THE LIMIT: a corpus whose earliest rounds left no artifact cannot state
+    its later envelope rounds either. That is fail-closed and deliberate —
+    such a corpus imports its semantic rows, which carry their own rounds,
+    and states no envelopes it cannot place.
+    """
+    kinds = vocab.legacy_envelope_kinds()
+    rounds = {int(e["round"]) for e in ledger.events() + events
+              if e.get("event") in kinds and _is_int(e.get("round"))}
+    if not rounds:
+        return []
+    missing = sorted(set(range(1, max(rounds) + 1)) - rounds)
+    if not missing:
+        return []
+    return [f"the request/verdict rounds this batch would leave are "
+            f"{sorted(rounds)}, which skips {missing}: a round is an ordinal "
+            f"of one review loop, and a record that names round {max(rounds)} "
+            f"without {missing} describes a loop that never ran (round-9 F2's "
+            f"round-99 verdict, now judged against the record itself rather "
+            f"than a manifest the same author wrote)"]
+
+
+def _legacy_disposition_author_problems(ledger: Ledger,
+                                        events: list[dict]) -> list[str]:
+    """Every imported `disposition` row through the ONE shared author
+    check every other disposition ingress already uses (round 6 F1).
+
+    `import-legacy` is a fourth door a disposition can reach the ledger by,
+    beside `respond --out`, `respond` without `--out`, and standalone
+    `ledger add` — and it read `check_disposition_author` never: the
+    legacy schema neither required nor permitted an `author` member, and
+    the door appended whatever the batch supplied, unchanged. A round
+    whose recorded request named an author could still receive an
+    imported disposition with none.
+
+    `check_disposition_author` already derives or refuses correctly for a
+    round's PERSISTED request; `events` is passed through as its
+    `extra_events` so a request row imported in this very batch — and, by
+    the time a later batch runs this same pass, a request row an earlier
+    sequential batch already committed and `ledger.current()` now carries
+    — both bind exactly the same way a long-persisted one does.
+
+    Mutates each disposition row's `author` in place to whatever the check
+    returns, the same working-copy mutation `respond` and `ledger add`
+    already make to their own JSON before it is emitted or appended. Safe
+    here too: the whole batch is appended only when `legacy_import_problems`
+    returns no problems at all, from any pass, so a mutation made ahead of
+    that gate is discarded along with the rest of `events` on any refusal.
+    """
+    problems: list[str] = []
+    for n, e in enumerate(events, 1):
+        if e.get("event") != "disposition":
+            continue
+        try:
+            resolved = check_disposition_author(
+                ledger, e.get("round"), e.get("author"), extra_events=events)
+        except Refusal as exc:
+            problems.append(f"line {n} (disposition): {exc}")
+            continue
+        if resolved is not None:
+            e["author"] = resolved
+    return problems
+
+
+def _unbound_prose(e: dict, pair, fp: str, state: tuple) -> str:
+    """Why one answer binds to no ruling a reader can trust, in the words
+    the person repairing the derivation needs."""
+    name, detail = state
+    if name == "malformed":
+        why = (f"answers_round {detail!r} is not a canonical positive "
+               f"integer")
+    elif name == "future":
+        why = (f"answers_round {detail} does not precede this event's own "
+               f"round {e.get('round')!r} — nothing can answer a ruling "
+               f"that did not exist yet, or its own round's")
+    elif name == "ambiguous":
+        why = (f"carries no answers_round and this identity is ALSO ruled "
+               f"at its own round {detail} — which ruling it answers cannot "
+               f"be inferred (round-7 F1's collision)")
+    else:
+        why = (f"targets round {detail!r}, which is no ruling of this "
+               f"identity — an imported answer must substantiate the "
+               f"finding relation it claims, never assert one")
+    return f"{fp}: {pair[0]} ({pair[1] or 'waiver'}) {why}"
+
+
+def legacy_import_problems(ledger: Ledger, events: list[dict],
+                           authority: SourceAuthority) -> list[str]:
+    """Every violation `events` carries against the closed schema, the
+    source authority and the lifecycle rules `import-legacy` must enforce
+    before appending anything (rounds 7 F2, 8 F1-F2, 9 F1-F2).
+
+    Six passes, each a precondition of the next, over the WHOLE batch:
+
+    1. CLOSED SHAPE (`vocab.LEGACY_EVENT_SCHEMA`) — an admitted kind, its
+       required members, every member's type including nested payload
+       values, and refusal by name of anything else. Round-9 F2: the door
+       admitted any object with a truthy `event`, so a string payload
+       reached an uncaught AttributeError and `round: []` imported.
+    2. PROVENANCE (`SourceAuthority`) — every row cites a tracked path at a
+       git anchor this tool verified is contained in a remote-tracking ref;
+       the tool reads those bytes and recomputes the digest the row claims;
+       and the row's own claim TEXT must occur inside them. Round 9 asked a
+       manifest the caller wrote whether the caller's own file hashed as the
+       caller said, which round 10 walked through in one step. A ruling's
+       fingerprint is recomputed from its declared identity facts, an
+       envelope row's byte count and target commit are checked against the
+       source and against shared history, and envelope rounds must form one
+       contiguous loop.
+    3. DISPOSITION AUTHOR (`_legacy_disposition_author_problems`) — every
+       imported disposition through the same `check_disposition_author`
+       every other disposition ingress shares: a round whose recorded
+       request — persisted, batch-local, or an earlier sequential batch
+       already committed — names an author derives or refuses a matching
+       row before anything is appended; only a round whose request truly
+       has no author leaves the imported disposition authorless (round
+       6 F1).
+    4. IDENTITY (`fingerprint.resolve_identity`) — one canonical graph over
+       the ledger's persisted lineage AND this batch's alias rows, failing
+       closed on a cycle or a conflicting merge exactly as the reader does
+       (round-8 F1).
+    5. LINEAGE CONTAINMENT (`_lineage_containment_problems`) — an alias or
+       split whose endpoint is a known ruling must cite a source carrying
+       that ruling's text, since a fingerprint occurs in no prose and
+       anchoring alone would let any real file substantiate any merge.
+    6. LIFECYCLE (`_lifecycle_problems`) — every settling or overruling
+       answer, persisted and candidate, bound under the graph and the exact
+       ruling MATERIAL this batch would leave behind (rounds 9 F1, 10 F1).
+
+    The domain of pass 5 is `vocab.SETTLING_ANSWERS`, derived from the
+    effect table rather than hand-picked: every OTHER admitted term maps to
+    `ANSWER_OPEN` and can forge no lifecycle state, which is why an
+    `ANSWER_OPEN` closure is checked for shape and provenance and for
+    nothing further.
+
+    Returns every violation found; empty means the whole batch is clean.
+    The caller must append NONE of `events` when this is non-empty — this
+    is an atomic, before-the-fact property of the whole batch, never a
+    per-row best effort.
+    """
+    problems = legacy_shape_problems(events)
+    if problems:
+        return problems
+    for n, e in enumerate(events, 1):
+        problems.extend(_row_problems(e, n, authority))
+    problems.extend(_envelope_round_problems(ledger, events))
+    if problems:
+        return problems
+    problems = _legacy_disposition_author_problems(ledger, events)
+    if problems:
+        return problems
+    try:
+        problems = _lineage_containment_problems(ledger, events, authority)
+        return problems or _lifecycle_problems(ledger, events)
+    except LineageError as exc:
+        return [f"batch-local lineage: {exc}"]
 
 
 def answered_verdict(cfg: Config, parsed: wire.Disposition,
@@ -804,6 +2087,126 @@ def recorded_verdict(ledger: Ledger, round_no: int | None = None,
     return recorded
 
 
+def request_author(ledger: Ledger, round_no: int,
+                   extra_events=()) -> str | None:
+    """The author the CURRENT lineage's request event for `round_no`
+    stamped, or None when no such event is recorded — an older ledger, a
+    round opened before the field existed, or (defensively) no request
+    event at all for that round.
+
+    Round 3 F2: a disposition answers the round a REQUEST opened, and that
+    request already named its author (`request_event`, above) before any
+    reviewer verdict or author response existed to contest it. That is the
+    one fact a disposition may not re-assert on its own behalf — `respond`
+    derives the expected author from here rather than from the JSON it was
+    handed, the same way it already derives round and verdict_sha from the
+    recorded verdict rather than trusting a caller-supplied copy.
+
+    Several request events can share one round (a re-emission after a
+    correction); the most recently recorded one is authoritative, mirroring
+    `recorded_verdict`'s own "newest decides" rule.
+
+    `extra_events` folds in rows not yet part of the ledger (round 6 F1):
+    `import-legacy` validates a whole batch before anything is appended, so
+    a request and the disposition answering it can both be candidate rows
+    of the SAME unappended batch. Appended last, same as any other match.
+    """
+    matches = [e for e in list(ledger.current()) + list(extra_events)
+              if e.get("event") == "request" and e.get("round") == round_no]
+    if not matches:
+        return None
+    author = matches[-1].get("author")
+    return str(author) if author else None
+
+
+def check_disposition_author(ledger: Ledger, round_no: int, author,
+                             extra_events=()) -> str | None:
+    """The ONE disposition-ingress author check, shared by every door a
+    disposition can enter the ledger by (round 4 F1, round 5 F1).
+
+    Round 3 F2 bound a disposition's author to the request that opened its
+    round — but the check lived inline in `respond --out` alone. Round 4 F1
+    found the other two doors the same disposition can reach: `respond`
+    without `--out`, which still emitted an envelope carrying a mismatched
+    author, and standalone `ledger add`, which recorded one — both read
+    `request_author` never, and so both persisted whatever actor the wire
+    supplied. One function now, called before anything is emitted or
+    appended, at all three: `respond --out`, `respond` without `--out`, and
+    `ledger add`.
+
+    Round 5 F1: an OMITTED author used to pass through unchanged, the same
+    as the genuine no-recorded-request state — so a disposition naming no
+    author at all still appended `author: null` even when the round's
+    request named one, at the one door (`ledger add`) that never derives it
+    itself. This function now derives that case too, so every door can
+    just use what it returns rather than re-deriving.
+
+    `author` is the value the caller already has in hand — the disposition
+    JSON's `author` member, an already-parsed envelope's `attrs["author"]`,
+    or (`ledger add`'s ingested envelope carries both independently)
+    `disposition_supplied_author`'s reconciliation of the two.
+
+    `extra_events` (round 6 F1) is forwarded to `request_author` unchanged
+    — `import-legacy`'s own batch, so a request row imported alongside the
+    disposition it opens still binds it, before either is appended.
+
+    Returns the author the caller should record. No recorded request for
+    `round_no` (an older ledger, or a round that predates the field) is
+    silence with nothing to derive from — the declared legacy state — and
+    `author` passes through unchanged, `None` included. A recorded request
+    with an omitted `author` derives to the request's author. A recorded
+    request with a matching `author` returns it unchanged. A mismatch
+    raises `Refusal`; nothing is derived past that point.
+    """
+    expected = request_author(ledger, round_no, extra_events)
+    if expected is None:
+        return author
+    if author is None:
+        return expected
+    if str(author) != str(expected):
+        raise Refusal(
+            f"supplied author {author!r} does not match round {round_no}'s "
+            f"recorded request author {expected!r} — a response is "
+            f"attributed to whoever the request that opened the round "
+            f"named as its author, never to a value the disposition "
+            f"supplies beside it (round 3 F2, round 4 F1)",
+            "",
+            remedy="remove the author from the disposition and re-run the "
+                   "command that produced it; the tool derives the author "
+                   "from the recorded request and will not edit the "
+                   "author's own input file")
+    return author
+
+
+def disposition_supplied_author(parsed) -> str | None:
+    """The author a disposition envelope supplies, reconciled across its two
+    independent stamps (round 5 F1).
+
+    `emit_disposition` writes one `author` value to both the wrapper tag's
+    `author` attribute and the JSON body's `author` member — but an
+    envelope arriving at standalone `ledger add` is a file on disk, and
+    nothing stops the two from being edited apart. Absent from both is
+    silence, exactly like a disposition `respond` composes fresh, whose
+    body member is the only stamp that exists before `emit_disposition`
+    writes the wrapper. Present in only one names that one. Present in
+    both, disagreeing, refuses outright, before `check_disposition_author`
+    ever runs — an envelope names one author, not two, and there is no
+    single value yet to compare against the recorded request.
+    """
+    wrapper = parsed.attrs.get("author")
+    body = parsed.data.get("author")
+    if wrapper is not None and body is not None and str(wrapper) != str(body):
+        raise Refusal(
+            f"the disposition's wrapper tag stamps author {wrapper!r} but "
+            f"its body states {body!r} — an envelope names one author, not "
+            f"two",
+            "",
+            remedy="a person corrects the envelope so the wrapper tag and "
+                   "the JSON body name the same author, or removes one of "
+                   "the two; the tool will not choose between them")
+    return wrapper if wrapper is not None else body
+
+
 def verdict_conflict(ledger: Ledger, round_no: int, digest: str) -> dict | None:
     """The recorded verdict that a NEW verdict for `round_no` would
     contradict, or None (round-2 F1). A round is ruled once: the same bytes
@@ -900,6 +2303,16 @@ def disposition_events(parsed: wire.Disposition,
         "payload": rec.get("payload", {}),
         "verdict_sha": parsed.attrs.get("verdict_sha"),
         "head": parsed.attrs.get("head"),
+        # Round 3 F2: the actor this answer is attributed to, carried
+        # explicitly rather than left implicit in the kept exchange file —
+        # the round-2 record predates this field and carries none, which is
+        # exactly the gap the finding named. Round 4 F1: every caller of
+        # this function now calls `check_disposition_author` first — both
+        # `respond` (with and without `--out`) and the standalone `ledger
+        # add` door verify the wire author against the recorded request
+        # before this event is ever built, so what this function reads off
+        # `parsed.attrs` here has already been checked, not merely carried.
+        "author": parsed.attrs.get("author"),
         "batch": batch,
         **({"tool": wrote} if wrote else {})}
         for rec in parsed.data.get("dispositions", [])]
@@ -955,7 +2368,7 @@ def disposition_events(parsed: wire.Disposition,
 
 
 def record_response(cfg: Config, ledger: Ledger, envelope: str,
-                    against: wire.Verdict) -> dict:
+                    against: wire.Verdict, git=None) -> dict:
     """`respond --out`: keep the disposition bytes and record the events, so
     the author's half of the round is in the ledger without a manual add.
     Only when a file was written: an envelope printed to stdout has no bytes
@@ -964,7 +2377,24 @@ def record_response(cfg: Config, ledger: Ledger, envelope: str,
     round_no = int(parsed.data.get("round", 0))
     kept = keep_bytes(cfg, round_no, "disposition", envelope)
     added = ledger.add_all(disposition_events(parsed, against, cfg))
-    return {"kept": kept, "events_added": added, "round": round_no}
+    # The disposition leg of a `git` round. The topology is the round's own,
+    # read from THIS end's record of it (`recorded_transport`) rather than
+    # from the disposition document, for the reason the verdict leg states:
+    # an envelope's prose is written by an agent, and a field it
+    # mis-transcribes would decide where the other side is told to look.
+    carrier = None
+    if recorded_transport(ledger, against.sha) == vocab.TRANSPORT_GIT:
+        # F1: same authority as the verdict push — a round's RECORDED
+        # lineage first, this ledger's own count only when nothing was
+        # recorded (a request this same ledger wrote, where the two
+        # already agree).
+        disposition_lineage = ledger.recorded_lineage_for_sha(against.sha)
+        if disposition_lineage is None:
+            disposition_lineage = ledger.lineage_number()
+        carrier = push_envelope(cfg, disposition_lineage, round_no,
+                                "disposition", envelope, git=git)
+    return {"kept": kept, "events_added": added, "round": round_no,
+            "carrier": carrier}
 
 
 # ------------------------------------------------------------------- handoff
@@ -1021,6 +2451,70 @@ def authorize_breaker(cfg: Config, ledger: Ledger, breaker: str,
     added = ledger.add(event)
     return {"recorded": bool(added), "breaker": breaker, "covers": covers,
             "authorized_by": authorized_by.strip()}
+
+
+CORRECTION = "correction"
+
+
+def correct_actor(cfg: Config, ledger: Ledger, event_uids: list,
+                  true_actor: str, corrected_by: str, reason: str) -> dict:
+    """Record that one or more retained events misattribute their actor —
+    without rewriting the append-only record they name.
+
+    Round 3 F2's second half. `respond` now refuses a mismatched author
+    going forward, but the ledger is append-only, and this repository's own
+    round-2 disposition already recorded five events under the reviewer's
+    identity when the request they answer named the author. There is no
+    way to un-stamp them truthfully — only to say, in the same append-only
+    record, what the truth actually was. This is the shape the design
+    already trusts for exactly that kind of stepping-outside-the-record
+    decision — reason-bearing, actor-bearing, appended — `authorize_breaker`
+    and `waive` immediately above use the same three refusals for the same
+    reason: an empty value proves only that a flag was supplied, and the
+    tool cannot observe who is asserting a correction; it can only carry
+    what a named human asserts.
+
+    `event_uids` must each resolve to an event this ledger's CURRENT
+    lineage actually holds — a correction binds to a recorded fact, never
+    to an identifier the tool cannot verify — and the correction is
+    additionally refused when the ledger already carries EVERY named uid
+    stamped with the asserted true actor, since a correction that changes
+    nothing records a decision that was never taken.
+    """
+    uids = sorted({str(u).strip() for u in (event_uids or []) if str(u).strip()})
+    if not uids:
+        raise Refusal("no event named: a correction with nothing to "
+                      "correct records nothing", "")
+    by_uid = {e.get("uid"): e for e in ledger.current()}
+    missing = [u for u in uids if u not in by_uid]
+    if missing:
+        raise Refusal(
+            f"event(s) not found in the current lineage's ledger: "
+            f"{', '.join(missing)} — a correction binds to a recorded "
+            f"event, never to an identifier the tool cannot verify", "")
+    if not (true_actor or "").strip():
+        raise Refusal("no true actor was named: a correction that does not "
+                      "say who actually acted corrects nothing", "")
+    if not (reason or "").strip():
+        raise Refusal("a correction is a recorded decision and the reason "
+                      "IS the record: an empty reason says a correction "
+                      "happened and not what it was; nothing is appended",
+                      "")
+    if not (corrected_by or "").strip():
+        raise Refusal("no corrector was declared: this tool cannot observe "
+                      "who is asserting a correction — it can only carry "
+                      "what is asserted; silence appends nothing", "")
+    true_actor = true_actor.strip()
+    if all(by_uid[u].get("author") == true_actor for u in uids):
+        raise Refusal(
+            f"every named event already carries author {true_actor!r}: a "
+            f"correction that asserts what is already recorded changes "
+            f"nothing and would itself misdescribe what happened", "")
+    event = {"event": CORRECTION, "corrects": uids, "true_actor": true_actor,
+             "reason": reason.strip(), "corrected_by": corrected_by.strip()}
+    added = ledger.add(event)
+    return {"recorded": bool(added), "corrects": uids,
+            "true_actor": true_actor, "corrected_by": corrected_by.strip()}
 
 
 def tool_agreement(parsed) -> dict:
@@ -1097,7 +2591,7 @@ def unauthorized_breakers(cfg: Config, ledger: Ledger) -> list[dict]:
 
 
 def missing_dispositions(ledger: Ledger) -> dict | None:
-    """The just-closed round's findings that have no disposition, if any.
+    """Every ruling of this lineage that no recorded answer answers.
 
     Sweep F4. `next_round` derived the next round from verdict events
     alone, so `handoff` opened round N+1 the moment round N had a verdict —
@@ -1119,25 +2613,55 @@ def missing_dispositions(ledger: Ledger) -> dict | None:
     exactly as `recorded_transport` reads its records; every event stays in
     the file as audit history, and a duplicate WITHIN one envelope remains
     the validation defect it always was (D-DUPLICATE).
+
+    Round-10 F3: this was the last lifecycle reader still filtering
+    `_by("finding")` after round 9 unified the others onto `is_ruling`. So a
+    round whose only unanswered ruling was a legacy ATOMIC IMPORT was
+    reported as owing nothing, and `handoff_preflight` opened the next round
+    over a finding that had died by omission — the exact state this function
+    exists to make impossible. It reads `findings_in_round`, the one ruling
+    authority, and translates display fields through `ruling_facts`, which
+    is where a legacy row's `legacy_id`/`verbatim` become the `id`/`title` a
+    refusal payload names.
+
+    Lineage 20 round 11 F5, landed 2026-09-03. The round SELECTION was the
+    last thing here still anchored to the verdict: the maximum verdict round
+    was taken and rulings were looked for in that round alone, so a ruling
+    made in any other round could not be owed. That is not a corner: an
+    atomic ruling imported at a round with no verdict artifact of its own —
+    exactly what `import-legacy` writes — was invisible to the one check
+    whose job is that a finding never dies by omission, and so was any
+    ruling of an earlier round the loop had walked past. The owed set is
+    now derived from the ruling AUTHORITY: `latest_rulings` (the newest
+    ruling of every identity in this lineage) minus every identity that
+    `current_answers` shows an answer for. Both are the lifecycle's own
+    round-binding, so an answer recorded against an earlier ruling of a
+    re-raised identity still does not answer the later one.
+
+    ANSWERED, here, means any recorded answer, not a disposition alone:
+    the author's disposition, the reviewer's closure, or a named human's
+    waiver. What this function guards is omission — a ruling nobody
+    responded to — and a ruling the reviewer withdrew or a human overruled
+    by name has been responded to. Reading only dispositions would refuse
+    a handoff over findings the record shows were answered by the two
+    parties entitled to answer them.
     """
-    verdicts = ledger._by("verdict")
-    if not verdicts:
+    rulings = ledger.latest_rulings()
+    if not rulings:
         return None
-    last = max(e["round"] for e in verdicts if "round" in e)
-    findings = [e for e in ledger._by("finding") if e.get("round") == last]
-    if not findings:
-        return None
-    answered = {ledger.resolve(d.get("fp"))
-                for d in ledger.standing_dispositions(round_no=last)}
-    unanswered = [f for f in findings
-                  if ledger.resolve(f.get("fp")) not in answered]
+    answers = ledger.current_answers()
+    unanswered = sorted(
+        ((fp, r) for fp, r in rulings.items() if not answers.get(fp)),
+        key=lambda item: (int(item[1].get("round") or 0),
+                          str(item[1].get("id") or "")))
     if not unanswered:
         return None
-    return {"round": last,
-            "findings": len(findings),
-            "unanswered": [{"id": f.get("id"), "fp": f.get("fp"),
-                            "severity": f.get("severity")}
-                           for f in unanswered]}
+    return {"round": max(int(r.get("round") or 0) for _, r in unanswered),
+            "findings": len(rulings),
+            "unanswered": [{"id": r.get("id"), "fp": fp,
+                            "round": int(r.get("round") or 0),
+                            "severity": r.get("severity")}
+                           for fp, r in unanswered]}
 
 
 def handoff_preflight(cfg: Config, ledger: Ledger) -> None:
@@ -1171,10 +2695,10 @@ def handoff_preflight(cfg: Config, ledger: Ledger) -> None:
     # this function is for.
     owed = missing_dispositions(ledger)
     if owed is not None:
-        ids = ", ".join(f"{u['id']} ({u['fp']})" for u in owed["unanswered"])
+        ids = ", ".join(f"{u['id']} (round {u['round']}, {u['fp']})"
+                        for u in owed["unanswered"])
         parts = [f"{len(owed['unanswered'])} of {owed['findings']} "
-                 f"finding(s) of the round-{owed['round']} verdict "
-                 f"have no disposition: {ids}"]
+                 f"ruling(s) in this lineage have no disposition: {ids}"]
         # The placeholder is the tool's own word; the round it refers to
         # is stated in the prose around the command rather than rendered
         # into a slot no shell ever sees (round 5 F1).
@@ -1186,9 +2710,9 @@ def handoff_preflight(cfg: Config, ledger: Ledger) -> None:
         raise Refusal(
             "; ".join(parts) + " — one disposition per finding, and a "
             "finding never dies by omission (§5.2); the next round is not "
-            f"opened until every finding is answered. Answer the recorded "
-            f"round-{owed['round']} verdict with `{answer_cmd}`, then hand "
-            f"off",
+            f"opened until every finding is answered. Answer the verdict "
+            f"each unanswered ruling was made in — the newest is round "
+            f"{owed['round']} — with `{answer_cmd}`, then hand off",
             "")
     # The ROUND COUNT is a threshold, not an observed anomaly (user decision
     # 2026-08-25). Round-4 F2: the first cut of this exempted every `budget`
@@ -1414,7 +2938,8 @@ def cached_handoff(cfg: Config, ledger: Ledger, round_no: int,
             "kept": str(path), "digest": request["source_digest"]}
 
 
-def _reviewer_next(parsed, kept: str, reviewer: str):
+def _reviewer_next(parsed, kept: str, reviewer: str,
+                   reference: str | None = None):
     """The one command the reviewer runs, in the topology this round declared.
 
     Three states, and the transport decides between the first two rather than
@@ -1438,9 +2963,18 @@ def _reviewer_next(parsed, kept: str, reviewer: str):
     """
     take = (paths.Lit(TOOL_NAME), paths.Lit("take"))
     as_words = (paths.Lit("--as"), reviewer)
+    declared = declared_transport(parsed)
+    # The `git` round is the fourth state, and the only one whose command
+    # names neither a local path nor a paste: the envelope is on a ref both
+    # sides reach, so the reviewer fetches it by round reference. It is
+    # the one state that answers ahead of the not-kept check: the push
+    # carries the EMITTED text, not the kept copy, so a round whose local
+    # copy could not be kept still has a carrier and a runnable line.
+    if declared == vocab.TRANSPORT_GIT and reference:
+        return paths.command(*take, reference, *as_words)
     if kept.startswith("not kept"):
         return None
-    if declared_transport(parsed) == vocab.TRANSPORT_PASTE:
+    if declared == vocab.TRANSPORT_PASTE:
         return paths.command(*take, paths.Lit("-"), *as_words)
     return paths.command(*take, kept, *as_words)
 
@@ -1461,11 +2995,24 @@ def _reviewer_note(parsed, kept: str, reviewer: str) -> str | None:
 
 
 def record_handoff(cfg: Config, ledger: Ledger, envelope: str,
-                   round_no: int, claim_digest: str = "") -> dict:
+                   round_no: int, claim_digest: str = "", git=None) -> dict:
     parsed = wire.parse_request(envelope)
     digest = _digest_text(envelope)
     size = len(envelope.encode("utf-8"))
     kept = keep_bytes(cfg, round_no, "request", envelope)
+    # The request leg of a `git` round: the envelope goes to its ref on the
+    # remote the reviewed branch was just pushed to, and the relay becomes
+    # one line naming the round instead of a block of bytes. Both handoff
+    # paths reach this function — the cold one and the warm cache — so a
+    # re-run re-pushes identical bytes to the same ref, which is a no-op
+    # the same way the warm serve is.
+    lineage = ledger.lineage_number()
+    reference = None
+    carrier = None
+    if declared_transport(parsed) == vocab.TRANSPORT_GIT:
+        carrier = push_envelope(cfg, lineage, round_no, "request", envelope,
+                                git=git)
+        reference = round_reference(lineage, round_no)
     # The request event, then (round 1 F6) the evidence the request carries,
     # content-addressed, so the repetition breaker's documented escape
     # condition is observable — one shape with `take` and `ledger add`.
@@ -1475,18 +3022,25 @@ def record_handoff(cfg: Config, ledger: Ledger, envelope: str,
     return _runnable({"round": round_no, "sha": parsed.sha, "digest": digest,
             "bytes": size, "kept": kept, "recorded": bool(added),
             "reviewer": reviewer,
+            # Where the envelope was put, when it was put anywhere: the ref
+            # and the remote a person can check for themselves. Null on
+            # every other topology, which is the honest answer — the bytes
+            # went nowhere but the kept path.
+            "carrier": carrier,
             # --as is part of the literal command, not an option to discover:
             # round 1 F4 made the declaration mandatory, and the adapters tell
             # agents to run what the tool printed without improvising flags.
-            "reviewer_next": _reviewer_next(parsed, kept, reviewer),
+            "reviewer_next": _reviewer_next(parsed, kept, reviewer,
+                                            reference),
             # Prose for the not-kept state, where no runnable line exists
             # (F1: a placeholder template may not ride a runnable field).
             "then": _reviewer_note(parsed, kept, reviewer),
             # Prose, not a command: it says STOP, and the command it
             # mentions is the one that comes after the verdict arrives.
-            "author_next": "stop: hand the envelope to the reviewer — the "
-                           "human sets the round in motion (standing "
-                           "instructions); nothing else runs on this side until "
+            "author_next": "stop: hand the envelope to the reviewer — "
+                           "carrying it is the human's relay, not a "
+                           "round they start; nothing else runs on "
+                           "this side until "
                            f"the verdict arrives, then "
                            f"`{paths.command(*paths.lits(TOOL_NAME, 'close', '--verdict'), paths.Ph('<file>'))}`"},
                      "reviewer_next")
@@ -1494,9 +3048,51 @@ def record_handoff(cfg: Config, ledger: Ledger, envelope: str,
 
 # ---------------------------------------------------------------------- take
 
+#: A remote URL reduced to the repository it names, so the two ends can be
+#: compared across the spellings git accepts for one repository:
+#: `git@host:owner/repo.git`, `https://host/owner/repo`, `ssh://git@host/
+#: owner/repo.git` and `file:///path/repo.git` all reduce to the same key.
+#: Userinfo goes (the emitter already scrubs it out of the stamp), the `.git`
+#: suffix goes, and the comparison is case-insensitive — a key that differs
+#: only in case is not a different repository on any host this tool meets.
+_URL_SCHEME_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]*@)?")
+_URL_SCP_RE = re.compile(r"\A(?:[^@/]*@)?(?P<host>[^/:]+):(?P<path>.+)\Z")
+
+
+def remote_key(url: str) -> str:
+    """The repository a remote URL names, normalised for comparison."""
+    text = (url or "").strip().rstrip("/")
+    stripped = _URL_SCHEME_RE.sub("", text)
+    if stripped == text:
+        m = _URL_SCP_RE.match(text)
+        if m:
+            stripped = f"{m.group('host')}/{m.group('path')}"
+    if stripped.endswith(".git"):
+        stripped = stripped[:-len(".git")]
+    return stripped.strip("/").lower()
+
+
+def clone_remotes(repo_root) -> list[str]:
+    """Every remote URL this clone is configured with, in `git remote -v`
+    order. A clone with none returns the empty list, which is a state and
+    not an error: a local-only round is taken in the clone that emitted it.
+    """
+    try:
+        out = _git(repo_root, "remote", "-v")
+    except RuntimeError:
+        return []
+    urls = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] not in urls:
+            urls.append(parts[1])
+    return urls
+
+
 def probe_target(cfg: Config, push: dict | None, sha: str,
                  base: str | None, fetch: bool = True, git=None,
-                 retake: tuple[str, str] | None = None) -> dict:
+                 retake: tuple[str, str] | None = None,
+                 remotes: list[str] | None = None) -> dict:
     """Make the target real in THIS clone before a token is spent (§5.1).
 
     Every state is recorded distinctly: fetched (the stamp's fetch command
@@ -1504,6 +3100,17 @@ def probe_target(cfg: Config, push: dict | None, sha: str,
     fetch skipped or unnecessary), absent (refused). `git` is injectable
     the same way `ensure_pushed`'s is, so every refusal is testable without
     a network.
+
+    Measured 2026-08-31 and fixed here: the clone is checked BEFORE the
+    fetch. `take` used to fetch the stamped ref into whatever checkout the
+    caller happened to be standing in, and the fetch then removed the only
+    signal that anything was wrong — the foreign commit resolved locally,
+    the target looked legitimate, and the reviewer leg of another
+    repository's round was appended to THIS repository's append-only
+    ledger, where it cannot be removed. So a stamped target whose remote
+    this clone does not know, and whose object this clone does not already
+    hold, refuses here: before the fetch, and before any event is written.
+    `remotes` is injectable for the same reason `git` is.
     """
     # Round 3 F1 (lineage 12): every read below dereferences the stamped
     # target — presence, ancestry, the configuration — so the runner
@@ -1517,6 +3124,43 @@ def probe_target(cfg: Config, push: dict | None, sha: str,
                       f"(§9bis.4); return the envelope to the author — "
                       f"`{TOOL_NAME} handoff` stamps it",
                       "")
+
+    def present(obj: str) -> bool:
+        try:
+            run("cat-file", "-e", f"{obj}^{{commit}}")
+            return True
+        except RuntimeError:
+            return False
+
+    if push["state"] == "pushed":
+        # Which repository is this? The stamp names one by its URL, this
+        # clone names its own by its remotes, and the two are compared as
+        # repositories rather than as strings (`remote_key`), because one
+        # repository is reached by several spellings and a reviewer who
+        # cloned over https must not be refused an ssh stamp. Three states
+        # pass: a remote of this clone names the stamped repository; this
+        # clone already holds the target (an object that is here was not
+        # fetched by this take, so no foreign history is pulled in on the
+        # envelope's say-so); or this clone declares NO remote at all —
+        # a scratch checkout dedicated to the review, which the empty-CI
+        # reviewer is, and which contradicts no stamp because it claims
+        # to be no repository in particular. The refusal fires only where
+        # the contradiction is positive: this clone says it is some other
+        # repository, and the target is not here.
+        urls = clone_remotes(cfg.repo_root) if remotes is None else remotes
+        known = {remote_key(u) for u in urls}
+        if urls and remote_key(push["url"]) not in known and not present(sha):
+            raise Refusal(
+                f"this checkout is not the repository the envelope names: "
+                f"the stamp points at {push['url']}, this clone's remotes "
+                f"are {', '.join(urls)}, and {sha[:12]} is not here. "
+                f"Fetching it would make a foreign commit resolve locally "
+                f"and append this round to THIS repository's append-only "
+                f"ledger, where it cannot be removed (2026-08-31, measured)",
+                "", remedy="a person runs the take from a checkout of the "
+                           "repository the stamp names — the ledger a round "
+                           "is recorded in is the repository's, not the "
+                           "caller's")
     if push["state"] == "pushed" and fetch:
         try:
             run("fetch", push["url"], push["ref"])
@@ -1534,13 +3178,6 @@ def probe_target(cfg: Config, push: dict | None, sha: str,
     else:
         result["fetch"] = ("not attempted: LOCAL-ONLY target, fetchable "
                            "from no other machine")
-
-    def present(obj: str) -> bool:
-        try:
-            run("cat-file", "-e", f"{obj}^{{commit}}")
-            return True
-        except RuntimeError:
-            return False
 
     if not present(sha):
         where = ("this is not the clone it was emitted from"
@@ -1888,8 +3525,22 @@ def governing_for(cfg: Config, sha: str, git=None) -> Config:
 
 def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
          reviewer: str | None = None, fetch: bool = True,
-         validate_items=None, git=None, transport: str | None = None) -> dict:
+         validate_items=None, git=None, transport: str | None = None,
+         remotes: list[str] | None = None,
+         lineage: int | None = None) -> dict:
     """The reviewer's one command. Returns the record; raises Refusal.
+
+    `lineage` is the lineage CARRIED by a `git:<lineage>/<round>` reference
+    (F1). A fresh reviewer ledger's own `lineage_number()` is unrelated to
+    the author's — it counts closures on THIS machine's ledger, which on a
+    second clone is 1 regardless of what the author's lineage actually is.
+    Recording the carried value on the take event lets every later reader
+    of this round (`validate --from-target`'s verdict push, `brief`'s
+    relay) use the round's real identity instead of re-deriving a number
+    that happens to be a coincidence on a fresh ledger. None for every
+    other carrier — `path` and `paste` name no lineage, and this ledger's
+    own progression already answers correctly for a request it wrote
+    itself.
 
     `transport` is the reviewer's correction of what the envelope declares,
     and it exists because the author's declaration can be wrong in exactly
@@ -1964,6 +3615,23 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
 
     round_no = int(parsed.attrs.get("round", "0") or 0)
     sha = parsed.sha or ""
+    # F1: a stored lineage for this SHA (a prior take of the same round,
+    # itself carried) disagreeing with what THIS take carries is not a
+    # choice the tool makes silently — the later value winning would move
+    # the round's verdict ref out from under whoever already has the
+    # earlier reference.
+    if lineage is not None:
+        stored = ledger.recorded_lineage_for_sha(sha)
+        if stored is not None and stored != lineage:
+            raise Refusal(
+                f"{sha[:12]} was already taken under lineage {stored}, and "
+                f"this take carries lineage {lineage} for the same commit — "
+                f"a round's lineage is fixed by the take that first records "
+                f"it, and the tool will not move a verdict's destination "
+                f"between two lineages for one round",
+                "", remedy="carry the same round reference every time this "
+                           "round is taken; a genuinely different lineage "
+                           "for this commit is a new request, not a retake")
     base_m = _BASE_LINE_RE.search(parsed.body)
     base = base_m.group(1) if base_m else None
     push = wire.parse_push_line(parsed.body)
@@ -1977,7 +3645,7 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
     # target's review.toml, then validate against THAT — never against
     # unrelated working-tree bytes.
     target = probe_target(cfg, push, sha, base, fetch=fetch, git=git,
-                          retake=(source, me))
+                          retake=(source, me), remotes=remotes)
     governing, origin = resolve_authority(cfg, sha, git=git)
     if origin != AUTHORITY_TARGET:
         raise Refusal(
@@ -2033,6 +3701,12 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
         take_event["tool_writer"] = agreement["writer"]
     if effective != declared:
         take_event["declared_transport"] = declared
+    if lineage is not None:
+        # F1: recorded round provenance, read back by
+        # `Ledger.recorded_lineage_for_sha` so the verdict and disposition
+        # refs and relays this round produces name the lineage it was
+        # actually carried on, not this fresh ledger's own count.
+        take_event["lineage"] = lineage
     ledger.add(take_event)
     diff_cmd = (paths.diff_command(cfg.repo_root, base, sha) if base
                 else paths.command(
@@ -2043,6 +3717,15 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
             "target": target, "references": refs, "kept": kept,
             "digest": digest, "diff": diff_cmd, "envelope": envelope,
             "transport": effective, "tool": agreement,
+            # F3: `decide` names what the TARGET's own committed
+            # `review.toml` never declared — `governing` is that config,
+            # already resolved above to judge this request. The caller's
+            # own checkout config is not this take's authority for
+            # anything, and reporting ITS silence here told an empty or
+            # older reviewer checkout that keys the target repository has
+            # long since declared were still open questions.
+            "decide": governing.decisions(
+                {vocab.DECIDE_TRANSPORT: effective}),
             # The flag is not decoration: this `take` resolved the
             # governing configuration from the target commit, and the
             # command it hands over must resolve the SAME authority or the
@@ -2119,8 +3802,9 @@ def close_round(cfg: Config, ledger: Ledger, verdict_text: str, source: str,
                                     paths.Lit("report")))
     size = len(verdict_text.encode("utf-8"))
     kept = keep_bytes(cfg, round_no, "verdict", verdict_text)
-    added = ledger.add_all(verdict_events(parsed, round_no, digest, size,
-                                          tokens))
+    added = ledger.add_all(verdict_events(
+        parsed, round_no, digest, size, tokens,
+        answering=ledger.standing_dispositions(round_no=round_no - 1)))
     clean = parsed.verdict == "clean to advance"
     record = {"round": round_no, "sha": parsed.sha, "verdict": parsed.verdict,
               "findings": len(parsed.findings), "closures": len(parsed.closures),
@@ -2237,6 +3921,289 @@ def waive(cfg: Config, ledger: Ledger, sha: str, reason: str, by: str,
     return {"sha": resolved, "reason": reason, "authorized_by": by,
             "recorded": bool(added),
             "next": None}
+
+
+def _finding_records(ledger: Ledger) -> list[dict]:
+    """Every finding ruled in the current lineage, newest round first."""
+    out = []
+    for r in sorted(ledger.rounds(), reverse=True):
+        out.extend(ledger.findings_in_round(r))
+    return out
+
+
+def waive_finding(cfg: Config, ledger: Ledger, ref: str, reason: str, by: str,
+                  destination: str = "", trigger: str = "") -> dict:
+    """Record a named human's answer to a finding: it stands, unfixed.
+
+    This is the third way a finding can die, and it exists because the other
+    two could not express what was happening. A finding dies when the author
+    accepts and verifies it, or when the reviewer withdraws it against a
+    refutation — neither of which is true when a human reads the finding and
+    decides to live with it. `escalated` already ROUTES a finding to a named
+    authority; nothing recorded what that authority answered, so the
+    escalation either looped or got laundered into a reviewer withdrawal the
+    reviewer did not mean. After that laundering the record cannot separate
+    "the reviewer found nothing" from "the reviewer found something a human
+    waved off", and keeping those apart is the point of the whole loop.
+
+    It is deliberately not a disposition: the author does not get to write
+    the authority's answer. It is deliberately not a closure: the reviewer
+    did not change their mind. And `by` is asserted rather than observed —
+    this buys attribution, never proof that a human took the decision.
+    """
+    if not reason.strip():
+        raise Refusal(
+            "overruling a finding is a recorded decision and the reason IS "
+            "the record: without it the ledger says a finding was set aside "
+            "and cannot say why, which is the silence this event replaces",
+            "")
+    if not (by or "").strip():
+        raise Refusal(
+            "no authorizer was declared: this records WHO decided a finding "
+            "may stand unfixed, and the tool cannot observe that — it can "
+            "only carry what is asserted. Overruling a reviewer is not an "
+            "agent's decision to take, and `user` is not inferred from "
+            "silence",
+            "")
+    _refuse_unrepresentable_name(by)
+    known = _finding_records(ledger)
+    if not known:
+        raise Refusal(
+            "the current lineage has no ruled findings, so there is nothing "
+            "to overrule",
+            paths.command(*paths.lits(TOOL_NAME, "ledger", "report")))
+    matched = [e for e in known
+               if ref == e.get("fp") or ref == e.get("id")]
+    if not matched:
+        raise Refusal(
+            f"no finding in this lineage is {ref!r}; a waiver naming a "
+            f"finding that was never ruled records a decision about nothing",
+            paths.command(*paths.lits(TOOL_NAME, "ledger", "report")))
+    # A finding id is round-scoped and a fingerprint is not: `F1` in round 2
+    # and `F1` in round 3 are different findings that share a label. Refusing
+    # rather than picking the newest is the same rule the rest of the tool
+    # follows — the identity is computed, never guessed at by a reader.
+    fps = {e.get("fp") for e in matched}
+    if len(fps) > 1:
+        raise Refusal(
+            f"{ref!r} names {len(fps)} different findings across this "
+            f"lineage's rounds ({', '.join(sorted(f for f in fps if f))}); "
+            f"a finding id is round-scoped, so name the fingerprint",
+            paths.command(*paths.lits(TOOL_NAME, "ledger", "report")))
+    fp = ledger.resolve(matched[0].get("fp", ""))
+    # The ruling a waiver answers is the NEWEST one of this identity, and
+    # the record binds to its round (lineage 20 round 4 F1): an id names a
+    # round-scoped ruling, a fingerprint names an identity, and either way
+    # the human is answering the finding as it currently stands.
+    finding = ledger.latest_rulings()[fp]
+    # Every answer that bears on this ruling NOW — round-bound, from the
+    # one lifecycle derivation. A withdrawal or an acceptance of an EARLIER
+    # ruling of the same identity is not an answer to this one (round 4
+    # F2), so it neither blocks the waiver nor settles the finding.
+    answers = ledger.current_answers().get(fp, [])
+    withdrawn = [e for effect, e in answers
+                 if e.get("event") == "closure"]
+    if withdrawn:
+        raise Refusal(
+            f"{finding.get('id')} ({fp}) was already withdrawn by the "
+            f"reviewer, so it is answered and needs no authorization",
+            "")
+    # Round 3 F2: an ACCEPTED finding could still be waived, so the record
+    # could say a human let something stand unfixed that the author had
+    # already fixed and verified. Both are answers; a second answer over the
+    # top of one describes a lineage that did not happen.
+    accepted = [e for effect, e in answers
+                if effect == vocab.ANSWER_SETTLES
+                and e.get("event") == "disposition"]
+    if accepted:
+        raise Refusal(
+            f"{finding.get('id')} ({fp}) was accepted by the author, whose "
+            f"falsification record the validator already checked, so it is "
+            f"answered and does not stand unfixed",
+            paths.command(*paths.lits(TOOL_NAME, "ledger", "report")))
+    already = ledger.current_waivers().get(fp)
+    if already is not None:
+        raise Refusal(
+            f"{finding.get('id')} ({fp}) is already overruled by "
+            f"{already.get('authorized_by')!r}: {already.get('reason')}. "
+            f"One finding takes one answer — a second would let one reason "
+            f"hide another",
+            "")
+    # Whether the author put this finding to the authority, or the authority
+    # reached for it unprompted. Both are legitimate and they are different
+    # facts, so the record carries which one happened rather than leaving a
+    # reader to assume the tidier of the two.
+    escalated = any(
+        d.get("disposition") == "escalated"
+        and ledger.resolve(d.get("fp", "")) == fp
+        for d in ledger.standing_dispositions())
+    event = {"event": vocab.FINDING_WAIVER_EVENT, "fp": fp,
+             "finding_id": finding.get("id"), "round": finding.get("round"),
+             "severity": finding.get("severity"),
+             "title": finding.get("title"),
+             "reason": reason, "authorized_by": by,
+             "answers_escalation": escalated}
+    if destination.strip():
+        event["destination"] = destination.strip()
+    if trigger.strip():
+        event["trigger"] = trigger.strip()
+    added = ledger.add(event)
+    return {"fp": fp, "finding_id": finding.get("id"),
+            "severity": finding.get("severity"), "title": finding.get("title"),
+            "reason": reason, "authorized_by": by,
+            "answers_escalation": escalated,
+            "destination": event.get("destination"),
+            "trigger": event.get("trigger"),
+            "recorded": bool(added),
+            "next": paths.command(*paths.lits(TOOL_NAME, "authorize-advance"))}
+
+
+_AUTHORIZER_NAME = re.compile(vocab.AUTHORIZER_NAME_RE)
+
+
+def _refuse_unrepresentable_name(by: str) -> None:
+    """An authorizer name the wrapper cannot carry is refused BEFORE any
+    record is written (lineage 20 round 4 F4). `by` is stamped into a
+    double-quoted attribute with no escape, so `Alice "The Decider"` and
+    `Alice > Bob` were accepted, recorded, and then emitted as bytes the
+    validator refused — an advance reported as success with no usable
+    artifact. The grammar is `vocab.AUTHORIZER_NAME_RE`, the same one the
+    validator judges the stamp by, so the two cannot disagree."""
+    if not _AUTHORIZER_NAME.match(by or ""):
+        bad = sorted({c for c in (by or "") if not _AUTHORIZER_NAME.match(c)})
+        raise Refusal(
+            f"the authorizer {by!r} carries {bad!r}, and an authorizer is "
+            f"{vocab.AUTHORIZER_NAME_WANT}: the authorization stamps this "
+            f"name into a quoted wrapper attribute, which has no escape, so "
+            f"a name the wrapper cannot carry is refused here rather than "
+            f"recorded and then emitted as an artifact the validator "
+            f"rejects",
+            "")
+
+
+def authorize_advance(cfg: Config, ledger: Ledger, reason: str,
+                      by: str) -> dict:
+    """Advance a lineage over findings a human has overruled.
+
+    It emits its OWN envelope kind rather than deriving a clean verdict, and
+    that is the whole design. A derived clean state would make an overridden
+    review indistinguishable from one where the reviewer found nothing — at
+    exactly the moment the difference matters — and would let an
+    unverifiable claim about a human's decision turn into a merge. This
+    stamps the claim instead: the artifact says who advanced it, why, and
+    every finding still open, so the approval it can carry says the same.
+    """
+    if not reason.strip():
+        raise Refusal(
+            "advancing over open findings is a recorded decision and the "
+            "reason IS the record", "")
+    if not (by or "").strip():
+        raise Refusal(
+            "advancing over open findings is a NAMED human's decision; who "
+            "took it is not inferred from silence", "")
+    _refuse_unrepresentable_name(by)
+    # Round 3 F2: an advance is about a RULING, so it may not be taken while
+    # a newer request is awaiting one — closing at the older ruled SHA would
+    # bind the authorization to a commit the loop has already moved past.
+    pending = ledger.open_round()
+    if pending is not None:
+        raise Refusal(
+            f"round {pending} is emitted and awaiting a verdict: an advance "
+            f"binds to a ruling, and authorizing the previous one now would "
+            f"record a decision about a commit this lineage has moved past",
+            paths.command(*paths.lits(TOOL_NAME, "close", "--verdict")))
+    verdicts = [e for e in ledger.current() if e.get("event") == "verdict"]
+    if not verdicts:
+        raise Refusal(
+            "this lineage has no recorded verdict, so there is no ruling to "
+            "advance past",
+            paths.command(*paths.lits(TOOL_NAME, "close", "--verdict")))
+    last = max(verdicts, key=lambda e: e.get("round", 0))
+    if last.get("verdict") == vocab.VERDICT_CLEAN:
+        raise Refusal(
+            f"round {last.get('round')} is already {vocab.VERDICT_CLEAN!r}: "
+            f"the clean verdict is the artifact that advances it, and an "
+            f"authorization beside one would claim a human overruled "
+            f"findings that no longer stand",
+            "")
+    # Round 3 F2: the authorization is DERIVED from the lifecycle authority,
+    # never from the mere existence of waiver events. Asking only "has any
+    # finding been overruled?" let a single waiver advance a lineage with
+    # other findings still standing, and emit an envelope naming one of them
+    # while the rest died of omission — the death the symmetry rule forbids,
+    # reintroduced by the mechanism built to make overrides visible.
+    standing = ledger.standing_findings()
+    if not standing:
+        raise Refusal(
+            "no finding in this lineage is still open, so there is nothing "
+            "for a human to authorize: a clean verdict is the artifact that "
+            "advances a lineage nobody had to overrule",
+            paths.command(*paths.lits(TOOL_NAME, "handoff")))
+    # Only a waiver answering the NEWEST ruling of an identity answers it
+    # (round 4 F1): one recorded against an earlier ruling is stale, and an
+    # authorization built on it would carry a decision taken before the
+    # current finding existed, under that older finding's id.
+    waived = ledger.current_waivers()
+    unanswered = [f for f in standing
+                  if ledger.resolve(f.get("fp", "")) not in waived]
+    if unanswered:
+        named = ", ".join(f"{f.get('id')} ({f.get('severity')})"
+                          for f in unanswered)
+        raise Refusal(
+            f"{len(unanswered)} finding(s) are still open and unanswered: "
+            f"{named}. An advance names EVERY finding it advances over — a "
+            f"partial authorization would let the ones it does not name die "
+            f"of omission, which is the death this record exists to prevent",
+            paths.command(*paths.lits(TOOL_NAME, "waive", "--finding")))
+    # What the finding IS comes from the standing ruling; what was decided
+    # about it comes from the waiver. The waiver also recorded the ruling's
+    # facts as it saw them, but the artifact enumerates the standing set,
+    # so the set is where its display facts are read from.
+    records = []
+    for ruling in sorted(standing,
+                         key=lambda f: ledger.resolve(f.get("fp", ""))):
+        fp = ledger.resolve(ruling.get("fp", ""))
+        waiver = waived[fp]
+        record = {"finding_id": ruling.get("id"), "fp": fp,
+                  "severity": ruling.get("severity"),
+                  "title": ruling.get("title"),
+                  "reason": waiver.get("reason"),
+                  "by": waiver.get("authorized_by")}
+        for k in ("destination", "trigger", "answers_escalation"):
+            if waiver.get(k) is not None:
+                record[k] = waiver.get(k)
+        records.append({k: v for k, v in record.items() if v is not None})
+    sha = last.get("sha", "")
+    round_no = int(last.get("round", 0))
+    lineage = ledger.lineage_number()
+    envelope = wire.emit_authorization(
+        cfg.wrapper_tag, sha=sha, round_no=round_no, lineage=lineage,
+        by=by, reason=reason, waived=records)
+    # The artifact is judged by the tool's own validator BEFORE anything is
+    # kept or recorded (round 4 F4). An advance that reports success and
+    # closes the lineage on bytes `loupe validate` then refuses leaves no
+    # usable authorization to carry the decision — and no emitter drift,
+    # now or later, may commit that terminal state.
+    defects = [i for i in validate.validate_authorization(
+        wire.parse_authorization(envelope), cfg) if i.level == "error"]
+    if defects:
+        raise Refusal(
+            "the emitted authorization does not validate ("
+            + "; ".join(f"{i.code}: {i.message}" for i in defects)
+            + "); nothing was kept or recorded, because an advance whose "
+            "artifact the tool's own validator refuses is not an advance",
+            "")
+    kept = keep_bytes(cfg, round_no, "authorization", envelope)
+    ledger.add({"event": vocab.ADVANCE_EVENT, "at_round": round_no,
+                "sha": sha, "reason": reason, "authorized_by": by,
+                "waived": len(records)})
+    ledger.add({"event": Ledger.LINEAGE_CLOSED, "at_round": round_no,
+                "outcome": "authorization", "reason": reason,
+                "authorized_by": by, "open_request": False})
+    return {"sha": sha, "round": round_no, "lineage": lineage,
+            "authorized_by": by, "reason": reason,
+            "waived": [r.get("finding_id") for r in records],
+            "envelope": envelope, "kept": str(kept), "next": None}
 
 
 def close_lineage(ledger: Ledger, reason: str, by: str) -> dict:

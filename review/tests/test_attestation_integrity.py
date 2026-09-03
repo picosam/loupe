@@ -11,8 +11,7 @@ import dataclasses
 import unittest
 
 from review import validate
-from review.tests.test_round4_fixes import (ONE_GATE, complete_attestation,
-                                            evidence_with)
+from review.tests.synth import ONE_GATE, complete_attestation, evidence_with
 
 REQUEST_SHA = "9" * 40
 OTHER_SHA = "b" * 40
@@ -20,6 +19,10 @@ OTHER_SHA = "b" * 40
 
 def codes(items, level=None):
     return {i.code for i in items if level is None or i.level == level}
+
+
+def errs(items):
+    return codes(items, "error")
 
 
 class TestRequestBinding(unittest.TestCase):
@@ -137,6 +140,100 @@ class TestNotRunRecordsMeetEvidenceRequirements(unittest.TestCase):
         items = validate.validate_attestations(evidence_with([rec]), ONE_GATE)
         self.assertNotIn("A-NOT-RUN-SHAPE", codes(items))
         self.assertIn("A-NOT-RUN", codes(items, "error"))
+
+
+class TestF3AttestationSignalsAreIndependentlyRequired(unittest.TestCase):
+    """Round-4 F3 — FALSIFICATION: Removing or corrupting each §5.1
+    attestation field independently produces a specific error, while one
+    complete record validates."""
+
+    REQUIRED = ("id", "command", "exit_code", "tool_version", "target_sha",
+                "executed_sha", "tree", "binding", "duration_s", "output")
+
+    def _errs(self, records, cfg=ONE_GATE):
+        return errs(validate.validate_attestations(
+            evidence_with(records), cfg))
+
+    def test_one_complete_record_validates(self):
+        self.assertEqual(self._errs([complete_attestation()]), set())
+
+    def test_removing_each_required_field_fails_on_its_own(self):
+        for field in self.REQUIRED:
+            rec = complete_attestation()
+            del rec[field]
+            with self.subTest(removed=field):
+                self.assertTrue(self._errs([rec]),
+                                f"removing {field} produced no error")
+
+    def test_corrupting_each_required_field_fails_on_its_own(self):
+        corruptions = {
+            "id": "", "command": "", "exit_code": "0",
+            "tool_version": "", "target_sha": "not-a-sha",
+            "executed_sha": "not-a-sha", "tree": "probably clean",
+            "binding": "", "duration_s": "fast",
+            "output": {"sha256": "a" * 64},  # no pointer, no size
+        }
+        for field, bad in corruptions.items():
+            with self.subTest(corrupted=field):
+                self.assertTrue(self._errs([complete_attestation(**{field: bad})]),
+                                f"corrupting {field} produced no error")
+
+    def test_the_defect_this_finding_names_is_gone(self):
+        # The round-4 Evidence: "Removing exit-code and target-SHA text from
+        # the emitted round-4 request still produced zero validation errors."
+        stripped = complete_attestation()
+        del stripped["exit_code"]
+        del stripped["target_sha"]
+        self.assertEqual(self._errs([stripped]), {"A-EXIT", "A-TARGET-SHA",
+                                                  "A-SHA-MISMATCH"})
+
+    def test_a_missing_block_is_not_a_clean_block(self):
+        self.assertIn("A-BLOCK", errs(validate.validate_attestations(
+            "Machine attestations: everything passed.\nNOT captured: none",
+            ONE_GATE)))
+
+    def test_a_declared_gate_with_no_attestation_fails(self):
+        two = dataclasses.replace(ONE_GATE, gates=[
+            {"id": "tests", "command": ["true"], "blocking": True},
+            {"id": "whitespace", "command": ["true"], "blocking": True}])
+        self.assertIn("A-MISSING", self._errs([complete_attestation()], two))
+
+    def test_a_blocking_gate_that_could_not_run_is_fatal(self):
+        self.assertIn("A-NOT-RUN", self._errs(
+            [{"id": "tests", "blocking": True,
+              "error": "not run: nested inside a gate execution"}]))
+
+    def test_a_blocking_gate_that_ran_and_failed_is_fatal(self):
+        # Found by the first real emission under this validator, not by
+        # design: the nested suite exited 1, the attestation recorded
+        # `exit_code: 1` accurately, and the request validated CLEAN. Reporting
+        # a failure faithfully is not the same as the failure not counting —
+        # the same container-versus-contents defect F3 named, committed by the
+        # fix for it.
+        self.assertIn("A-FAILED",
+                      self._errs([complete_attestation(exit_code=1)]))
+
+    # Rewritten for RVW-T2(b): the original versions declared blocking=False
+    # in the RECORD while the manifest said True, and asserted a notice —
+    # asserting the exact self-downgrade the finding names. Non-blocking now
+    # means the MANIFEST says so.
+    SOFT_GATE = dataclasses.replace(
+        ONE_GATE,
+        gates=[{"id": "tests", "command": ["true"], "blocking": False}])
+
+    def test_a_nonblocking_gate_that_failed_is_a_notice(self):
+        items = validate.validate_attestations(evidence_with(
+            [complete_attestation(exit_code=1, blocking=False)]),
+            self.SOFT_GATE)
+        self.assertEqual(errs(items), set())
+        self.assertIn("A-FAILED", {i.code for i in items})
+
+    def test_a_nonblocking_gate_that_could_not_run_is_a_notice(self):
+        items = validate.validate_attestations(evidence_with(
+            [{"id": "tests", "blocking": False, "error": "could not execute"}]),
+            self.SOFT_GATE)
+        self.assertEqual(errs(items), set())
+        self.assertIn("A-NOT-RUN", {i.code for i in items})
 
 
 if __name__ == "__main__":

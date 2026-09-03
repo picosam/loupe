@@ -85,6 +85,21 @@ class TestOneSource(unittest.TestCase):
         self.assertIn("human", text[text.index("both sides"):
                                     text.index("author stamp")])
 
+    def test_procedure_states_the_trust_model_on_both_sides(self):
+        """The one-principal trust model (design §2, ruled 2026-09-03 after
+        lineage 20) lives in the both-sides rules of every rendered surface,
+        and in the contract; a forgery finding is out of taxonomy unless it
+        names a party with less than operator access."""
+        for surface in ("instructions-block", "claude-skill", "codex-skill"):
+            text = adapters.render(surface)
+            both = text[text.index("both sides"):text.index("author stamp")]
+            self.assertIn("Trust model.", both)
+            self.assertIn("LESS than operator access", both)
+            self.assertIn("OMISSION and FATIGUE", both)
+        # spec_path() resolves the design text in the workbench (public/docs)
+        # and in the published candidate (docs/) alike.
+        self.assertIn("Trust model — one principal", spec_path().read_text())
+
     def test_transport_verbs_are_the_procedure(self):
         text = adapters.render("claude-skill")
         for verb in ("handoff", "take", "close", "respond", "validate"):
@@ -636,6 +651,30 @@ class TestShippedRestatements(unittest.TestCase):
         # modes carry file bytes is git's rule — restating it here would
         # publish a second copy of someone else's specification.
         "GIT_FILE_MODES",
+        # 2026-09-01, the authorization body. The specification documents
+        # the ARTIFACT — that it exists, what it is for, that it is never a
+        # derived clean verdict — and the validator owns its member
+        # grammar, exactly as it owns the claim's. Publishing the member
+        # list beside the argument would restate a grammar that only one
+        # verb writes, and that verb is a human's.
+        "AUTHORIZATION_REQUIRED", "WAIVED_REQUIRED",
+        # 2026-09-01, round 3 F3 closed the authorization grammar; every
+        # constant it added falls under the same rule as the two above. The
+        # specification documents the ARTIFACT and the validator owns its
+        # member grammar, exactly as it does for the claim.
+        "AUTHORIZATION_WRAPPER_FIELDS", "AUTHORIZATION_FIELDS",
+        "AUTHORIZATION_NONEMPTY", "AUTHORIZATION_DUPLICATED",
+        "WAIVED_FIELDS",
+        # Round-9 F2, the legacy import door's closed grammar. The shipped
+        # specification documents the MECHANISM — that a legacy corpus is
+        # ingested as pre-derived events bound to verified source bytes —
+        # and the importer owns the member grammar, exactly as the
+        # validator owns the claim's and the authorization's. Publishing
+        # the row schema beside it would restate a grammar only one verb
+        # reads, and whose other half (any given corpus's derivation) is
+        # per-repository by construction.
+        "LEGACY_IMPORT_ROW_KINDS", "LEGACY_SOURCE_REQUIRED",
+        "LEGACY_SOURCE_ENVELOPE_FACTS", "LEGACY_MANIFEST_REQUIRED",
     }
 
     @classmethod
@@ -655,11 +694,11 @@ class TestShippedRestatements(unittest.TestCase):
 
     @staticmethod
     def _arrow_chain(region):
-        """`request → verdict → disposition`: the loop's three envelopes,
-        of which two are stamped. `verdict` is named there for the same
-        reason it has a row in the specification's table — it is the third
-        envelope and the unstamped one — so the reader drops it rather than
-        the sentence being reworded to suit a test."""
+        """`request → verdict → disposition → authorization`: the loop's
+        four envelope kinds, of which three are stamped. `verdict` is named
+        there for the same reason it has a row in the specification's table
+        — it is the one with no emitter — so the reader drops it rather
+        than the sentence being reworded to suit a test."""
         return {part.strip() for part in region.split("→")
                 if part.strip() and part.strip() != "verdict"}
 
@@ -703,8 +742,35 @@ class TestShippedRestatements(unittest.TestCase):
     # accidentally quadruplicated by earlier edits — four byte-identical
     # definitions, the last silently winning. Dead weight, no behaviour
     # change.)
+    #: PURPOSE (shared by every use below): `RESTATEMENTS`' locators anchor
+    #: on a literal phrase before their capture group — `"closed vocabulary
+    #: of five..."`, `"the breakers\s*\("`, `"**Reviewer closure events**
+    #: —"` — written with ordinary single spaces between words. A
+    #: restructuring REFLOWS running prose, the same words wrapped at a
+    #: different column, and three locators broke on exactly that (measured
+    #: 2026-08-31, briefs/guards-that-read-prose-adjacency.md, instance 1):
+    #: the phrase was intact but a newline had moved into the middle of it,
+    #: which a literal space does not match. A fourth guard here,
+    #: `test_the_stated_count_matches_the_mechanisms_it_counts`, failed the
+    #: same way and reported "says five and enumerates 0". Coupling a
+    #: locator to the exact column a phrase happened to wrap at is prose
+    #: ADJACENCY, the same class of defect as the deferral guard converted
+    #: in review/tests/test_deferral_resolution.py.
+    #:
+    #: The fix widens the LOCATOR, not the document: every literal space in
+    #: an anchor pattern becomes `\s+` (one or more whitespace characters,
+    #: which — unlike `.` — already matches a newline with no flag needed),
+    #: so the same anchor matches whether its words share a line or a wrap
+    #: put a newline between them. The document text is read verbatim,
+    #: never rewritten, so nothing here can corrupt a fenced code block, a
+    #: table, or a JSON capture the way collapsing the whole document's
+    #: whitespace would.
+    @staticmethod
+    def _ws_tolerant(pattern):
+        return pattern.replace(" ", r"\s+")
+
     def _members(self, text, pattern, reader):
-        found = re.search(pattern, text, re.S)
+        found = re.search(self._ws_tolerant(pattern), text, re.S)
         self.assertIsNotNone(
             found, f"the shipped document no longer carries this "
                    f"restatement where the inventory says it is; a "
@@ -852,16 +918,54 @@ class TestShippedRestatements(unittest.TestCase):
             with self.subTest(restatement=name):
                 text = self._document(document)
                 self.assertIsNotNone(
-                    re.search(pattern, text, re.S),
+                    re.search(self._ws_tolerant(pattern), text, re.S),
                     f"{name}: the locator matches nothing in {document}")
+
+    def test_control_the_widened_locator_survives_a_reflowed_anchor(self):
+        """CONTROL for `_ws_tolerant`: a minimal reproduction of the real
+        defect it fixes. `raw_pattern` below is `dispositions`' own anchor
+        text; `reflowed` puts a newline exactly where a restructuring put
+        one in the real document 2026-08-31 — in the middle of "of five",
+        not touching a single word. The un-widened pattern is proved to be
+        the one that breaks (so this is testing the actual failure mode,
+        not a strawman); `_ws_tolerant` is proved to survive it and still
+        read the table correctly."""
+        raw_pattern = r"closed vocabulary of five.*?\n\n(\|.*?)\n\n"
+        # Table shape matches `_table_keys`' own contract: one member per
+        # row, named in the first column.
+        reflowed = ("closed vocabulary of\nfive, stated below.\n\n"
+                    "| `a` | x |\n|---|---|\n| `b` | y |\n\n")
+        self.assertIsNone(
+            re.search(raw_pattern, reflowed, re.S),
+            "setup is wrong: the raw pattern must be the one that breaks "
+            "on this reflow, or the control proves nothing")
+        found = re.search(self._ws_tolerant(raw_pattern), reflowed, re.S)
+        self.assertIsNotNone(found, "the widened locator must survive a "
+                             "reflow that moved only whitespace")
+        self.assertEqual(self._table_keys(found.group(1)), {"a", "b"})
+
+    def test_mutation_a_genuinely_missing_member_is_still_caught(self):
+        """MUTATION, paired with the control above: widening the locator
+        must not also widen what counts as a complete restatement. Reflow
+        AND drop member `b` from the same synthetic table, and the
+        widened locator must still report only `a` — not silently accept
+        the reflow as cover for a real omission."""
+        raw_pattern = r"closed vocabulary of five.*?\n\n(\|.*?)\n\n"
+        reflowed_missing_b = ("closed vocabulary of\nfive, stated below."
+                              "\n\n| `a` | x |\n|---|---|\n\n")
+        found = re.search(self._ws_tolerant(raw_pattern), reflowed_missing_b,
+                          re.S)
+        self.assertIsNotNone(found)
+        self.assertEqual(self._table_keys(found.group(1)), {"a"})
 
     def test_the_stated_count_matches_the_mechanisms_it_counts(self):
         """§3.3's count, derived from the headings it counts. Kept from
         round 1: a count is a restatement whose authority is the document's
         own structure rather than a vocabulary."""
         section = self._section()
-        stated = re.search(r"^(\w+) mechanisms, all deterministic", section,
-                           re.M)
+        stated = re.search(
+            self._ws_tolerant(r"^(\w+) mechanisms, all deterministic"),
+            section, re.M)
         self.assertIsNotNone(stated, "§3.3 no longer opens with a count")
         words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
                  "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
@@ -1181,7 +1285,7 @@ class TestInstall(unittest.TestCase):
         not the target-side `unreadable` — and it still names the `source`.
         Self-skips under a user that ignores file-mode permissions (root,
         some containers), following the convention in
-        `test_round4_fixes.test_an_unreadable_config_is_structured_too`.
+        `test_cli_exits.test_an_unreadable_config_is_structured_too`.
 
         FALSIFICATION: revert the `is_file()` guard (same mutation as
         above) and the status reverts to plain `unreadable` with no
@@ -1615,6 +1719,30 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
     NOT_ENUMERATED = {
         "ACCEPTED_SUBTYPES": "the subtype grammar is the validator's; the "
                              "procedure never lists subtypes",
+        "AUTHORIZATION_REQUIRED": "the authorization body's grammar belongs "
+                                  "to the verb a HUMAN runs, and the "
+                                  "procedure's only word about that verb is "
+                                  "that it is never the agent's to run — "
+                                  "spelling out the body it emits would "
+                                  "read as instructions for producing one",
+        "WAIVED_REQUIRED": "same reason as AUTHORIZATION_REQUIRED: the "
+                           "record of one overruled finding is emitted by a "
+                           "human's verb, and the procedure states the "
+                           "boundary rather than the shape",
+        "AUTHORIZATION_WRAPPER_FIELDS": "the authorization's wrapper "
+                                        "attribute grammar; the procedure "
+                                        "names no wrapper attribute of any "
+                                        "kind",
+        "AUTHORIZATION_FIELDS": "the authorization body's member/type map — "
+                                "the validator's domain, like the claim's",
+        "AUTHORIZATION_NONEMPTY": "which authorization members may not be "
+                                  "blank; a validator rule, never procedure "
+                                  "text",
+        "AUTHORIZATION_DUPLICATED": "the facts the wrapper and body both "
+                                    "state and must agree on; enforced, not "
+                                    "narrated",
+        "WAIVED_FIELDS": "the member/type map of one overruled-finding "
+                         "record, for the same reason as WAIVED_REQUIRED",
         "BREAKERS": "the procedure names the breaker MECHANISM, never the "
                     "member list; the shipped documents' breaker "
                     "enumerations are registered in RESTATEMENTS",
@@ -1625,18 +1753,61 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
                                "string/list split is described "
                                "structurally ('the rest are strings'), "
                                "never as a list",
+        "DECIDE_KEYS": "the keys a repository may leave undeclared "
+                       "(2026-09-03). Every verb result carries the entries "
+                       "for the keys THIS repository never declared, with "
+                       "the meaning and the exact line beside each, so the "
+                       "procedure names the FIELD and what to do when one "
+                       "arrives — enumerating the keys in it would restate "
+                       "a list the tool already hands the agent, per result "
+                       "and already filtered to what is undecided",
         "CLOSURES": "the procedure tells the reviewer WHERE closures are "
                     "answered, not the closure vocabulary",
         "FALSIFICATION_KINDS": "not stated anywhere in the procedure",
         "GIT_FILE_MODES": "git's tree-entry modes, not this tool's "
                           "vocabulary: the procedure tells an agent what a "
                           "refusal means, never which modes git writes",
+        "FINDING_ANSWERS": "the lifecycle table the ledger derives the "
+                           "standing set from (lineage 20 round 4): what "
+                           "each recorded answer does to the finding it "
+                           "answers. The adapters tell an agent how to "
+                           "record an answer, never how the ledger "
+                           "settles one; the effect is the tool's to "
+                           "compute, and stating it in prose would be a "
+                           "second copy of a rule one module owns",
         "GIT_MODE_NAMES": "the plain-language name each git mode is "
                           "reported by; it exists so a refusal reads as "
                           "prose, and the procedure never lists modes",
         "FINDING_FIELDS": "the procedure says 'every required field', "
                           "never the field list; the design document's "
                           "enumeration is registered in RESTATEMENTS",
+        # Round-9 F2: the legacy import door's closed grammar, one entry
+        # per constant so a new one still fails by name. The adapters tell
+        # an agent that a legacy corpus is ingested through one verb with
+        # its own verified source manifest; the row schema, the manifest
+        # schema and the conditional members are the importer's to enforce,
+        # and every corpus's own derivation is per-repository by
+        # construction, so narrating the shape would publish a grammar no
+        # agent writes by hand.
+        "LEGACY_EVENT_SCHEMA": "the imported row grammar; the importer "
+                               "enforces it and no agent authors a row",
+        "LEGACY_CONDITIONAL_REQUIRED": "which member one stated value makes "
+                                       "mandatory; an enforcement rule, "
+                                       "never procedure text",
+        "LEGACY_COMMON_OPTIONAL": "the ledger's own bookkeeping members, "
+                                  "admitted on any imported row",
+        "LEGACY_IMPORT_ROW_KINDS": "what an `import` row can be; internal "
+                                   "to the legacy door",
+        "LEGACY_SOURCE_FIELDS": "the two members every imported row carries "
+                                "to name the bytes it cites — the importer's "
+                                "domain, like the claim's",
+        "LEGACY_CONTAINMENT": "which member of each row kind must OCCUR in "
+                              "the cited source content; an enforcement "
+                              "rule, and one no agent authors a row against",
+        "SETTLING_ANSWERS": "the subset of FINDING_ANSWERS that carries "
+                            "authorization weight, derived from that table "
+                            "for the same reason it is not enumerated: the "
+                            "effect is the tool's to compute",
         "LINEAGE_KINDS": "fingerprint-lineage grammar; not in the "
                          "procedure",
         "LINEAGE_MERGING": "fingerprint-lineage grammar; not in the "

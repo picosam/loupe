@@ -176,6 +176,84 @@ class TestOnlyTheRoundThresholdAdvises(unittest.TestCase):
         self.assertEqual(limits, ["rounds"])
         transport.handoff_preflight(CFG, ledger)  # no raise
 
+    def test_the_public_overview_states_the_round_cap_exception(self):
+        """Lineage 20 round 1, F4: the overview called the round-count
+        firing advisory and then said "Any firing stops the loop" — two
+        opposite operational answers for the same admitted state. The
+        published enforcement claim is bound here, beside the runtime
+        controls above: it must carry the exception, and the unqualified
+        universal cannot return.
+
+        MUTATION: restore "Any firing stops the loop" in docs/overview.md
+        and this fails while the round-only, under-token and over-token
+        controls above stay the paired valid controls."""
+        from review.tests.util import public_path
+        doc = public_path("docs/overview.md")
+        if doc is None:
+            self.skipTest("no overview shipped in this tree")
+        text = " ".join(doc.read_text(encoding="utf-8").split())
+        self.assertNotIn("Any firing stops the loop", text,
+                         "the overview flattens `budget` back into one "
+                         "behaviour; only the round threshold advises")
+        self.assertIn("Every firing except one stops the loop", text)
+        self.assertIn("it advises rather than refuses", text)
+        self.assertIn("A measured token breach refuses like every other "
+                      "firing", text)
+
+
+class TestRoundCapOverride(unittest.TestCase):
+    """The cap default belongs to the repo; raising it belongs to one lineage.
+
+    Decided 2026-08-13: the default stays 3 because round 4 discharged only
+    half its findings and left more open than it started with. A single loop
+    is authorized past it by a recorded, reason-bearing ledger event, so the
+    authorization is auditable and does not become the next review's default.
+    """
+
+    def test_default_applies_with_no_override(self):
+        led = Ledger.in_memory()
+        self.assertEqual(led.effective_round_cap(3), 3)
+
+    def test_override_raises_this_lineage_only(self):
+        led = Ledger.in_memory()
+        led.add({"event": "cap_override", "round_cap": 5,
+                 "reason": "user decision", "authorized_by": "user"})
+        self.assertEqual(led.effective_round_cap(3), 5)
+        # A different lineage has its own ledger and is unaffected.
+        self.assertEqual(Ledger.in_memory().effective_round_cap(3), 3)
+
+    def test_latest_authorization_wins_and_history_is_kept(self):
+        led = Ledger.in_memory()
+        led.add({"event": "cap_override", "round_cap": 4, "reason": "r1",
+                 "authorized_by": "user"})
+        led.add({"event": "cap_override", "round_cap": 5, "reason": "r2",
+                 "authorized_by": "user"})
+        self.assertEqual(led.effective_round_cap(3), 5)
+        self.assertEqual(
+            len([e for e in led.events() if e["event"] == "cap_override"]), 2,
+            "every authorization stays on the record")
+
+    def test_the_effective_cap_is_what_the_advisory_reads(self):
+        """The override still decides WHICH number the notice is measured
+        against — that half is unchanged. What changed (2026-08-25) is that
+        being past it advises rather than refuses."""
+        text = synth.emitted_request()  # round 2 over a one-round ledger
+        over = text.replace('round="2"', 'round="6"')
+        items = validate.validate_request(wire.parse_request(over), synth.CFG,
+                                          round_cap=5)
+        self.assertNotIn("R-BUDGET", {i.code for i in items
+                                      if i.level == "error"})
+        notice = [i for i in items if i.code == "R-BUDGET"]
+        self.assertEqual(len(notice), 1)
+        self.assertIn("5", notice[0].message, "the notice names the "
+                                              "EFFECTIVE cap, not the repo "
+                                              "default")
+        at_cap = text.replace('round="2"', 'round="5"')
+        self.assertEqual(
+            [i for i in validate.validate_request(
+                wire.parse_request(at_cap), synth.CFG, round_cap=5)
+             if i.code == "R-BUDGET"], [])
+
 
 class TestConvergenceReadsDirectionNotDuration(unittest.TestCase):
 
@@ -226,6 +304,70 @@ class TestConvergenceReadsDirectionNotDuration(unittest.TestCase):
         c = ledger.convergence()
         self.assertEqual(c["stalled_threads"], [])
         self.assertTrue(c["threads"][fp]["withdrawn"])
+
+    def test_a_stale_withdrawal_does_not_hide_a_reraised_stalled_thread(self):
+        """Round-5 F2 — FALSIFICATION: a round-1 withdrawal is stale once
+        the identity is re-raised and sustained in rounds 2 and 3 — it must
+        not hide the stalled thread. Adding a withdrawal that answers the
+        latest (round-3) ruling must then clear it. Mutation: compute
+        `withdrawn` as `any(closure == "withdrawn")` across the whole
+        identity again and the first assertion fails."""
+        ledger = Ledger.in_memory()
+        fp = "fp2:00000000deadbeef"
+        for r in (1, 2, 3, 4):
+            _round(ledger, r, chr(96 + r) * 40)
+        ledger.add(_finding(1, fp))
+        ledger.add(_closure(1, fp, "withdrawn"))
+        ledger.add(_finding(2, fp))
+        ledger.add(_closure(2, fp, "sustained"))
+        ledger.add(_finding(3, fp))
+        ledger.add(_closure(3, fp, "sustained"))
+        c = ledger.convergence()
+        self.assertEqual(c["stalled_threads"], [fp])
+        self.assertEqual(c["threads"][fp]["closures"],
+                         ["withdrawn", "sustained", "sustained"])
+
+        ledger.add(_closure(4, fp, "withdrawn"))
+        c2 = ledger.convergence()
+        self.assertEqual(c2["stalled_threads"], [])
+        self.assertTrue(c2["threads"][fp]["withdrawn"])
+
+    def test_a_completed_withdrawal_does_not_make_a_fresh_reraise_stalled(self):
+        """Round-6 F3 — FALSIFICATION: a thread sustained twice, then
+        VALIDLY withdrawn, then re-raised with no current closure yet, must
+        not be reported stalled from history that a completed withdrawal
+        already closed — even though its complete closure history stays
+        displayed. Two sustains recorded IN the new segment are the paired
+        threshold control and must make it stalled. Mutation: sum sustained
+        closures over the identity's whole lifetime again (drop the
+        segment scoping) and the first assertion fails."""
+        ledger = Ledger.in_memory()
+        fp = "fp2:00000000deadbeef"
+        for r in (1, 2, 3, 4, 5):
+            _round(ledger, r, chr(96 + r) * 40)
+        ledger.add(_finding(1, fp))
+        ledger.add(_finding(2, fp))
+        ledger.add(_closure(2, fp, "sustained"))
+        ledger.add(_finding(3, fp))
+        ledger.add(_closure(3, fp, "sustained"))
+        ledger.add(_closure(4, fp, "withdrawn"))  # closes round 3's ruling
+        ledger.add(_finding(5, fp))  # re-raised; no closure answers it yet
+        c = ledger.convergence()
+        self.assertEqual(c["stalled_threads"], [])
+        self.assertFalse(c["threads"][fp]["withdrawn"])
+        self.assertEqual(c["threads"][fp]["closures"],
+                         ["sustained", "sustained", "withdrawn"],
+                         "the complete history stays displayed")
+
+        for r in (6, 7):
+            _round(ledger, r, chr(96 + r) * 40)
+        ledger.add(_finding(6, fp))
+        ledger.add(_closure(6, fp, "sustained"))
+        ledger.add(_finding(7, fp))
+        ledger.add(_closure(7, fp, "sustained"))
+        c2 = ledger.convergence()
+        self.assertEqual(c2["stalled_threads"], [fp])
+        self.assertEqual(c2["threads"][fp]["sustained"], 2)
 
     def test_one_anchor_producing_new_findings_each_round_is_hunting(self):
         """FALSIFICATION for the second signal, and the shape lineage 7 was

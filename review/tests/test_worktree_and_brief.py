@@ -22,17 +22,7 @@ import unittest
 from pathlib import Path
 
 from review import TOOL_NAME, brief, cli, config, wire
-
-
-def _sh(*args):
-    subprocess.run(args, check=True, capture_output=True, text=True,
-                   timeout=60)
-
-
-def _git(where, *args):
-    out = subprocess.run(["git", "-C", str(where), *args], check=True,
-                         capture_output=True, text=True, timeout=60)
-    return out.stdout.strip()
+from review.tests._transport_fixtures import git_out as _git, sh as _sh
 
 
 class TestWorktreeIdentity(unittest.TestCase):

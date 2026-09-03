@@ -28,7 +28,8 @@ from review.emit import _git
 from review.ledger import Ledger
 from review.tests.util import REPO_ROOT
 from review.tests._transport_fixtures import (
-    reviewer_clone_git, CFG, SHA_A, SHA_B, fake_git, request_text)
+    ledgerless_cfg, reviewer_clone_git, CFG, SHA_A, SHA_B, fake_git,
+    request_text)
 
 
 #: The finite liveness EFFECTS, and the whole of what an effect may be.
@@ -197,6 +198,11 @@ class TestProbeTarget(unittest.TestCase):
 
     PUSH = {"state": "pushed", "ref": "refs/heads/main", "sha": SHA_B,
             "remote": "origin", "url": "ssh://example.invalid/x.git"}
+    #: What the reviewer clone is a clone OF. Declared rather than read
+    #: from the machine, so these tests state the two-repository question
+    #: they are answering instead of inheriting the answer from whatever
+    #: checkout the suite happens to run in.
+    REMOTES = ["ssh://example.invalid/x.git"]
 
     def happy_map(self, overrides=None):
         m = {("fetch", "ssh://example.invalid/x.git", "refs/heads/main"): "",
@@ -208,42 +214,48 @@ class TestProbeTarget(unittest.TestCase):
 
     def test_happy_path_fetches_then_resolves(self):
         git = fake_git(self.happy_map())
-        rec = transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A, git=git)
+        rec = transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A, git=git,
+                                     remotes=self.REMOTES)
         self.assertEqual(rec["target"], "present")
         self.assertEqual(rec["base"], "ancestor of target")
         self.assertEqual(git.calls[0][0], "fetch")
 
     def test_no_stamp_refuses(self):
         with self.assertRaises(transport.Refusal):
-            transport.probe_target(CFG, None, SHA_B, SHA_A, git=fake_git({}))
+            transport.probe_target(CFG, None, SHA_B, SHA_A, git=fake_git({}),
+                                     remotes=self.REMOTES)
 
     def test_fetch_failure_refuses(self):
         git = fake_git(self.happy_map({
             ("fetch", "ssh://example.invalid/x.git", "refs/heads/main"):
                 RuntimeError("git fetch: could not read")}))
         with self.assertRaises(transport.Refusal) as ctx:
-            transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A, git=git)
+            transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A, git=git,
+                                     remotes=self.REMOTES)
         self.assertIn("cannot fetch", str(ctx.exception))
 
     def test_target_absent_after_fetch_refuses(self):
         git = fake_git(self.happy_map({
             ("cat-file", "-e", f"{SHA_B}^{{commit}}"): RuntimeError("no")}))
         with self.assertRaises(transport.Refusal) as ctx:
-            transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A, git=git)
+            transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A, git=git,
+                                     remotes=self.REMOTES)
         self.assertIn("not present", str(ctx.exception))
 
     def test_base_absent_refuses(self):
         git = fake_git(self.happy_map({
             ("cat-file", "-e", f"{SHA_A}^{{commit}}"): RuntimeError("no")}))
         with self.assertRaises(transport.Refusal) as ctx:
-            transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A, git=git)
+            transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A, git=git,
+                                     remotes=self.REMOTES)
         self.assertIn("base", str(ctx.exception))
 
     def test_base_not_ancestor_refuses(self):
         git = fake_git(self.happy_map({
             ("merge-base", "--is-ancestor", SHA_A, SHA_B): RuntimeError("1")}))
         with self.assertRaises(transport.Refusal) as ctx:
-            transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A, git=git)
+            transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A, git=git,
+                                     remotes=self.REMOTES)
         self.assertIn("not an ancestor", str(ctx.exception))
 
     def test_no_fetch_skips_the_fetch_but_still_requires_presence(self):
@@ -251,7 +263,8 @@ class TestProbeTarget(unittest.TestCase):
         del m[("fetch", "ssh://example.invalid/x.git", "refs/heads/main")]
         git = fake_git(m)
         rec = transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A,
-                                     fetch=False, git=git)
+                                     fetch=False, git=git,
+                                     remotes=self.REMOTES)
         self.assertEqual(rec["fetch"], "skipped (--no-fetch)")
         self.assertNotIn("fetch", [c[0] for c in git.calls])
 
@@ -260,7 +273,8 @@ class TestProbeTarget(unittest.TestCase):
         del m[("fetch", "ssh://example.invalid/x.git", "refs/heads/main")]
         git = fake_git(m)
         rec = transport.probe_target(CFG, {"state": "local-only"}, SHA_B,
-                                     SHA_A, git=git)
+                                     SHA_A, git=git,
+                                     remotes=self.REMOTES)
         self.assertIn("LOCAL-ONLY", rec["fetch"])
 
     def test_local_only_absent_names_the_clone(self):
@@ -268,8 +282,113 @@ class TestProbeTarget(unittest.TestCase):
                         RuntimeError("no")})
         with self.assertRaises(transport.Refusal) as ctx:
             transport.probe_target(CFG, {"state": "local-only"}, SHA_B,
-                                   None, git=git)
+                                   None, git=git, remotes=self.REMOTES)
         self.assertIn("not the clone", str(ctx.exception))
+
+
+
+class TestTheClonesRepositoryIsCheckedBeforeTheFetch(unittest.TestCase):
+    """FALSIFICATION (`take-binds-to-caller-checkout`, measured 2026-08-31):
+    an envelope whose target is absent from the caller's repository refuses
+    before the fetch and writes no event; the paired control — the same
+    envelope in a clone that knows the stamped repository — reaches the
+    fetch, and a taken round is recorded in that repository's ledger.
+
+    MUTATION: drop the `remote_key(...) not in known` guard (accept every
+    caller) and the foreign case is taken here exactly as it was live.
+    """
+
+    PUSH = {"state": "pushed", "ref": "refs/heads/main", "sha": SHA_B,
+            "remote": "origin",
+            "url": "ssh://tester@example.invalid/beos.git"}
+
+    def happy_map(self):
+        return {("fetch", "ssh://tester@example.invalid/beos.git",
+                 "refs/heads/main"): "",
+                ("cat-file", "-e", f"{SHA_B}^{{commit}}"): "",
+                ("cat-file", "-e", f"{SHA_A}^{{commit}}"): "",
+                ("merge-base", "--is-ancestor", SHA_A, SHA_B): ""}
+
+    def absent_map(self):
+        m = self.happy_map()
+        m[("cat-file", "-e", f"{SHA_B}^{{commit}}")] = RuntimeError("no")
+        return m
+
+    def test_a_foreign_target_refuses_before_the_fetch(self):
+        runner = fake_git(self.absent_map())
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A, git=runner,
+                                   remotes=["ssh://example.invalid/other-repo.git"])
+        self.assertIn("not the repository the envelope names",
+                      str(ctx.exception))
+        self.assertNotIn("fetch", [c[0] for c in runner.calls],
+                         "the fetch is what removes the signal: it must not "
+                         "have run")
+
+    def test_the_paired_control_is_a_clone_that_knows_the_remote(self):
+        runner = fake_git(self.absent_map())
+        # Same envelope, same absent object — a clone of the repository the
+        # stamp names fetches it, which is the whole cross-machine flow.
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.probe_target(
+                CFG, self.PUSH, SHA_B, SHA_A, git=runner,
+                remotes=["https://example.invalid/beos"])
+        self.assertIn("not present in this clone", str(ctx.exception))
+        self.assertIn("fetch", [c[0] for c in runner.calls])
+
+    def test_a_present_target_is_taken_in_any_clone_that_holds_it(self):
+        # The second passing state: the object is already here, so nothing
+        # foreign is pulled in on the envelope's say-so.
+        runner = fake_git(self.happy_map())
+        rec = transport.probe_target(
+            CFG, self.PUSH, SHA_B, SHA_A, git=runner,
+            remotes=["ssh://example.invalid/other-repo.git"])
+        self.assertEqual(rec["target"], "present")
+
+    def test_a_clone_with_no_remote_contradicts_no_stamp(self):
+        # The third passing state, and the one the empty-CI reviewer is:
+        # a checkout that declares no remote claims to be no repository in
+        # particular, so there is nothing for the stamp to disagree with.
+        runner = fake_git(self.absent_map())
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.probe_target(CFG, self.PUSH, SHA_B, SHA_A, git=runner,
+                                   remotes=[])
+        self.assertIn("not present in this clone", str(ctx.exception))
+        self.assertIn("fetch", [c[0] for c in runner.calls])
+
+    def test_take_writes_no_event_when_the_clone_is_foreign(self):
+        # The part that cannot be undone: the ledger. The live incident
+        # recorded request/evidence/take for another repository's round.
+        ledger = Ledger.in_memory()
+        runner = fake_git({("cat-file", "-e", f"{SHA_B}^{{commit}}"):
+                           RuntimeError("no")})
+        with self.assertRaises(transport.Refusal):
+            transport.take(ledgerless_cfg(), ledger, request_text(), "r.md",
+                           reviewer="codex", git=runner,
+                           remotes=["ssh://example.invalid/other.git"])
+        self.assertEqual(ledger.events(), [])
+
+    def test_take_records_the_round_in_the_clone_that_knows_the_remote(self):
+        ledger = Ledger.in_memory()
+        transport.take(ledgerless_cfg(), ledger, request_text(), "r.md",
+                       reviewer="codex", git=reviewer_clone_git(),
+                       remotes=["https://example.invalid/x"])
+        self.assertEqual([e["event"] for e in ledger.events()],
+                         ["request", "evidence", "take"])
+
+    def test_one_repository_is_one_key_across_the_spellings_accepted(self):
+        keys = {transport.remote_key(u) for u in (
+            "tester@example.invalid:owner/widget.git",
+            "https://example.invalid/owner/widget",
+            "https://tester:token@example.invalid/owner/widget.git",
+            "ssh://tester@example.invalid/owner/widget.git",
+            "https://example.invalid/owner/widget/")}
+        self.assertEqual(keys, {"example.invalid/owner/widget"})
+        self.assertNotEqual(
+            transport.remote_key("tester@example.invalid:x/widget.git"),
+            transport.remote_key("tester@example.invalid:y/widget.git"))
+        self.assertEqual(transport.remote_key("file:///tmp/r.git"),
+                         transport.remote_key("/tmp/r"))
 
 
 class TestGoverningAuthorityReachesTheVerdictLeg(unittest.TestCase):

@@ -16,8 +16,9 @@ the workbench's evidence suite, which stays behind with the corpus.
 from __future__ import annotations
 
 import dataclasses
+import json
 
-from review import config
+from review import config, wire
 from review.emit import _attestation_block, _git, emit_request
 from review.ledger import Ledger
 from review.tests.util import REPO_ROOT
@@ -84,6 +85,45 @@ def attestation_records(target_sha: str, gate_id: str = "probe",
 
 def attestation_block(tag: str, target_sha: str, **kw) -> str:
     return _attestation_block(tag, attestation_records(target_sha, **kw))
+
+
+def complete_attestation(**over) -> dict:
+    """One complete ran-record in the shape the emitter writes (round-4 F3),
+    every §5.1 field present; `over` mutates or corrupts single fields."""
+    rec = {
+        "id": "tests",
+        "command": "python3 -m unittest discover -s review/tests -t .",
+        "exit_code": 0,
+        "tool_version": "python3 -> /usr/bin/python3 sha256:0123456789abcdef",
+        "runner": "loupe/0.2.0",
+        "target_sha": SHA,
+        "executed_sha": SHA,
+        "tree": "clean",
+        "binding": "bound",
+        "duration_s": 12.3,
+        "output": {"sha256": "a" * 64, "bytes": 42,
+                   "pointer": "/state/gate-output/tests.log"},
+        "blocking": True,
+    }
+    rec.update(over)
+    return rec
+
+
+def evidence_with(records: list[dict]) -> str:
+    """A request Evidence section carrying `records` as its machine
+    attestation block, under this checkout's fence."""
+    return ("Machine attestations:\n\n"
+            f"```{wire.attestation_fence(CFG.wrapper_tag)}\n"
+            f"{json.dumps(records, indent=2)}\n```\n\n"
+            "NOT captured — this handoff cannot vouch for these:\n"
+            "  - nothing else\n")
+
+
+#: A one-gate blocking manifest with no state directory: what the
+#: attestation validator is judged against.
+ONE_GATE = dataclasses.replace(
+    CFG, gates=[{"id": "tests", "command": ["true"], "blocking": True}],
+    ledger_dir=None)
 
 
 def finding(n: int = 1, severity: str = "Low",

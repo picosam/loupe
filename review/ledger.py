@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import vocab
+
+from . import vocab
 from .fingerprint import resolve_identity
 
 LEDGER_BASENAME = "ledger.jsonl"
@@ -78,6 +80,59 @@ def firing_id(firing: dict) -> str:
     ident = f"{firing.get('breaker')}@{firing.get('round', '?')}:{tail}"
     material = firing.get("material")
     return f"{ident}#{material}" if material else ident
+
+
+#: The `import` row kind that records a pre-ledger atomic claim — a RULING
+#: made before this tool existed, carried in through the legacy import door.
+ATOMIC_IMPORT_KIND = "atomic"
+
+
+def is_ruling(event: dict) -> bool:
+    """THE definition of a ruling, and the only one (lineage 20 round 9 F3).
+
+    A ruling is what an ANSWER answers: the reviewer's finding, or a legacy
+    atomic import standing in for one ruled before this ledger existed.
+    `findings_in_round` has said exactly that since the corpus was imported,
+    and the round-8 import preflight repeated the same two clauses in its
+    own words — but the OPERATIONAL readers (`latest_rulings`,
+    `_finding_rounds_by_identity`, `convergence`) each filtered `finding`
+    alone. So the real corpus ruled 27 atomic claims in round 1 and
+    `standing_findings` — the cohort `authorize_advance` makes a human
+    account for by name — silently omitted the two nobody had settled.
+
+    Three definitions of one thing are three chances to disagree, and this
+    disagreement fell on the side that DROPS open findings. There is one
+    predicate now, every reader goes through it, and a kind added here
+    reaches the whole lifecycle at once instead of half of it.
+    """
+    kind = event.get("event")
+    return kind == "finding" or (kind == "import"
+                                 and event.get("kind") == ATOMIC_IMPORT_KIND)
+
+
+#: Display fact of an ordinary finding -> the field a legacy atomic import
+#: carries the same fact under. A legacy row has no `id` and no `title`; it
+#: has the historical `legacy_id` and the `verbatim` claim text, which are
+#: those facts in the vocabulary of the corpus it came from.
+RULING_DISPLAY_ALIASES = (("id", "legacy_id"), ("title", "verbatim"))
+
+
+def ruling_facts(event: dict) -> dict:
+    """One ruling as its DISPLAY consumers read it — a waiver record, an
+    advance's enumeration by name, the standing cohort's ordering.
+
+    Only facts the row ALREADY carries under another name are filled in
+    (`RULING_DISPLAY_ALIASES`). Nothing is invented: a legacy atomic import
+    carries no anchor, so this does not give it one, and a reader asking for
+    an anchor still gets the absence that is true. An ordinary finding comes
+    back unchanged — the same object — so `_uid` over a raw event and every
+    identity comparison elsewhere are untouched.
+    """
+    missing = [(name, alt) for name, alt in RULING_DISPLAY_ALIASES
+               if not event.get(name) and event.get(alt)]
+    if not missing:
+        return event
+    return {**event, **{name: event[alt] for name, alt in missing}}
 
 
 class Ledger:
@@ -346,6 +401,25 @@ class Ledger:
                 seen.append(e["round"])
         return seen
 
+    def recorded_lineage_for_sha(self, sha: str | None) -> int | None:
+        """The lineage a `take` (or a local `request`) recorded for `sha`,
+        or None when nothing recorded one (F1: the git carrier's lineage).
+
+        A `take` fetched over `git:<lineage>/<round>` stamps the CARRIED
+        lineage on its event, because a fresh reviewer ledger's own
+        `lineage_number()` has no relationship to the lineage the author's
+        machine is on. A locally emitted request stamps none — its round
+        was written under this same ledger's own progression, so
+        `lineage_number()` already answers correctly for it. Callers use
+        this as the first authority and fall back to `lineage_number()`
+        only when it returns None.
+        """
+        for e in reversed(self.current()):
+            if (e.get("sha") == sha and e.get("event") in ("request", "take")
+                    and e.get("lineage") is not None):
+                return int(e["lineage"])
+        return None
+
     def round_for_sha(self, sha: str | None):
         """The OPEN round whose request binds `sha`, or None — never a guess.
 
@@ -388,12 +462,22 @@ class Ledger:
         return sorted({e["round"] for e in self._by("verdict")
                        if "round" in e})
 
+    def _all_rulings(self) -> list[dict]:
+        """Every ruling of the current lineage, in recorded order — THE
+        ruling authority (`is_ruling`, round-9 F3).
+
+        Every lifecycle reader goes through this: `findings_in_round`,
+        `latest_rulings`, `_finding_rounds_by_identity` (and so
+        `current_answers`, `standing_findings` and `_ruling_withdrawn`),
+        `convergence` and the breakers. Raw events, never display copies —
+        the breakers identify a firing's material by `_uid` of the event
+        itself, so what they hash has to be what the file holds.
+        """
+        return [e for e in self.current() if is_ruling(e)]
+
     def findings_in_round(self, r: int) -> list[dict]:
         """Findings ruled in round r: verdict findings plus atomic imports."""
-        out = [e for e in self._by("finding") if e.get("round") == r]
-        out += [e for e in self._by("import")
-                if e.get("round") == r and e.get("kind") == "atomic"]
-        return out
+        return [e for e in self._all_rulings() if e.get("round") == r]
 
     # -------------------------------------------------------------- breakers
 
@@ -434,7 +518,11 @@ class Ledger:
                      if e.get("source") != "disposition"]
                     + [e for b in batches for e in b["evidence"]])
         runs = [x for b in batches for x in b["runs"]]
-        all_findings = self._by("finding")
+        # Round-9 F3: the ruling authority, not `finding` alone — a run
+        # recorded against a legacy atomic ruling has a severity to be
+        # judged by, and reading only `finding` events made it unjudgeable
+        # and so silently non-blocking.
+        all_findings = self._all_rulings()
 
         first_seen: dict[str, int] = {}
         for r in rounds:
@@ -508,9 +596,25 @@ class Ledger:
             round_dispositions = [d for d in dispositions
                                   if d.get("round") == r]
             round_runs = [x for x in runs if x.get("round") == r]
+            # Round-5 F1 / round-6 F2: a closure or disposition that
+            # SETTLES the current ruling of some identity is progress,
+            # even for an identity that does not return this round at
+            # all. Scored `as_of_round=r` — the ruling current AT ROUND
+            # r, never the lineage's eventual final ruling — so a LATER
+            # re-raise of the same fingerprint cannot reach back and turn
+            # an already-settled historical round into a spinning one; a
+            # STALE withdrawal (one that does not target r's ruling) is
+            # excluded either way and so still cannot suppress this
+            # breaker.
+            round_settles = [event for pairs in
+                             self.current_answers(as_of_round=r).values()
+                             for effect, event in pairs
+                             if effect == vocab.ANSWER_SETTLES
+                             and event.get("round") == r]
             if (r > min(rounds, default=r)
                     and not new_fps and not round_dispositions
-                    and not new_digests and not round_runs):
+                    and not new_digests and not round_runs
+                    and not round_settles):
                 fired.append({
                     "breaker": "no-progress", "round": r,
                     "material": material_id("no-progress", r),
@@ -659,16 +763,28 @@ class Ledger:
         rich domain being worked through in order. What the report gives a
         human is the shape of the loop over its whole length, which no
         single round shows.
+
+        Round-9 F3: the rulings it counts come from the ONE ruling authority
+        (`_all_rulings`), so a lineage whose first round was imported is
+        measured over the claims it actually ruled. An anchor-less ruling —
+        which every legacy atomic import is — joins `threads` and the
+        per-round counts and joins NO anchor group: `hunted` asks which
+        anchor keeps producing new fingerprints, and a ruling that names no
+        anchor is evidence about none. Grouping them under a shared absent
+        key would invent exactly the anchor data the row does not carry.
         """
         rounds = sorted(self.rounds())
-        findings = [e for e in self.current() if e.get("event") == "finding"]
+        findings = self._all_rulings()
         closures = [e for e in self.current() if e.get("event") == "closure"]
 
-        first_seen, per_round, anchors = {}, {}, {}
+        first_seen, last_seen, per_round, anchors = {}, {}, {}, {}
+        finding_rounds: dict[str, list[int]] = {}
         for f in findings:
             ident = self.resolve(f.get("fp", ""))
             r = f.get("round", 0)
             first_seen.setdefault(ident, r)
+            last_seen[ident] = max(last_seen.get(ident, r), r)
+            finding_rounds.setdefault(ident, []).append(r)
             per_round.setdefault(r, []).append(ident)
             if f.get("anchor_path"):
                 anchors.setdefault(f["anchor_path"], {}).setdefault(r, set()
@@ -676,15 +792,44 @@ class Ledger:
 
         threads = {}
         for ident, opened in sorted(first_seen.items()):
-            outcomes = [(c.get("round", 0), c.get("closure"))
-                        for c in closures
-                        if self.resolve(c.get("fp", "")) == ident]
-            outcomes.sort()
+            ident_closures = sorted(
+                (c for c in closures if self.resolve(c.get("fp", "")) == ident),
+                key=lambda c: c.get("round", 0))
+            fr = finding_rounds.get(ident, [])
+            # Round-5 F2 / round-6 F1: withdrawn is relative to the
+            # identity's NEWEST ruling, judged by what each closure
+            # actually TARGETS (`_answer_target_round`) rather than by
+            # round arithmetic alone — a withdrawal answering an earlier
+            # ruling, or one sharing a round with a same-fingerprint
+            # re-raise, has no say over the current one. The full
+            # `closures` history below is untouched, so a stale
+            # withdrawal still displays; it just stops immunizing the
+            # thread from `stalled_threads`.
+            withdrawn = any(
+                c.get("closure") == "withdrawn"
+                and self._answer_target_round("closure", c, fr)
+                == last_seen[ident]
+                for c in ident_closures)
+            # Round-6 F3: a valid withdrawal closes a SEGMENT of this
+            # thread's life, and a freshly re-raised identity starts a
+            # new one. Sustained closures from a segment the reviewer
+            # already ended must not carry into the new segment and make
+            # a just-reopened thread instantly stalled — only sustains
+            # recorded AFTER the most recent validly-targeted withdrawal
+            # count toward the current segment's threshold.
+            segment_start = max(
+                (int(c.get("round") or 0) for c in ident_closures
+                 if c.get("closure") == "withdrawn"
+                 and self._answer_target_round("closure", c, fr) is not None),
+                default=0)
+            sustained = sum(1 for c in ident_closures
+                            if c.get("closure") == "sustained"
+                            and int(c.get("round") or 0) > segment_start)
             threads[ident] = {
                 "opened_round": opened,
-                "closures": [o for _, o in outcomes],
-                "sustained": sum(1 for _, o in outcomes if o == "sustained"),
-                "withdrawn": any(o == "withdrawn" for _, o in outcomes),
+                "closures": [c.get("closure") for c in ident_closures],
+                "sustained": sustained,
+                "withdrawn": withdrawn,
                 "anchor": next((f.get("anchor_path") for f in findings
                                 if self.resolve(f.get("fp", "")) == ident), None),
             }
@@ -818,9 +963,219 @@ class Ledger:
 
     # --------------------------------------------------------------- metrics
 
+    def latest_rulings(self) -> dict[str, dict]:
+        """The NEWEST ruling of every finding identity in this lineage:
+        resolved fingerprint -> the finding event of its latest round.
+
+        The identity is what makes a finding one finding across rounds and
+        aliases; the newest ruling is what an answer must answer, and whose
+        display facts (id, severity, title) an artifact naming it carries.
+        A finding id is round-scoped, so it is never the key here.
+
+        Every RULING (`_all_rulings`), not `finding` events alone (round-9
+        F3), and each one carried with its display facts (`ruling_facts`) —
+        a legacy atomic ruling names itself `legacy_id`/`verbatim`, and a
+        consumer that renders `id` and `title` was reading None off the
+        exact rows this method had been dropping.
+        """
+        latest: dict[str, dict] = {}
+        for event in self._all_rulings():
+            fp = self.resolve(event.get("fp", ""))
+            if not fp:
+                continue
+            if (fp not in latest
+                    or int(event.get("round") or 0)
+                    >= int(latest[fp].get("round") or 0)):
+                latest[fp] = ruling_facts(event)
+        return latest
+
+    def _finding_rounds_by_identity(self, as_of_round: int | None = None
+                                    ) -> dict[str, list[int]]:
+        """Resolved identity -> every round it was RULED in (`_all_rulings`,
+        round-9 F3: a legacy atomic import is a ruling, and an answer bound
+        by round arithmetic over a ruling set missing half its members
+        binds to the wrong ruling or to none)."""
+        result: dict[str, list[int]] = {}
+        for f in self._all_rulings():
+            r = int(f.get("round") or 0)
+            if as_of_round is not None and r > as_of_round:
+                continue
+            fp = self.resolve(f.get("fp", ""))
+            if fp:
+                result.setdefault(fp, []).append(r)
+        return result
+
+    @staticmethod
+    def _answer_target_round(kind: str, event: dict,
+                             finding_rounds) -> int | None:
+        """The finding round `event` (a disposition, closure or waiver)
+        actually answers for its identity (round-6 F1).
+
+        A disposition answers its own round's ruling exactly — `respond`
+        derives its round from the finding it responds to, so the two are
+        always the same round by construction. A closure or waiver instead
+        answers whatever ruling was standing at or before its own round:
+        `answers_round`, stamped by the recording path from the specific
+        disposition record the closure closes, is authoritative when
+        present — the one case ledger round numbers alone cannot resolve,
+        because a verdict may close a prior ruling AND re-raise the same
+        fingerprint as a new one in the same breath, landing both events
+        at the identical round. Absent it (hand-built or legacy events),
+        the latest finding round at or before the event's own round is the
+        best available answer, matching every case that is not that
+        collision.
+        """
+        r = int(event.get("round") or 0)
+        if kind == "disposition":
+            return r
+        explicit = event.get("answers_round")
+        if explicit is not None:
+            return int(explicit)
+        at_or_before = [fr for fr in finding_rounds if fr <= r]
+        return max(at_or_before) if at_or_before else None
+
+    def current_answers(self, as_of_round: int | None = None
+                        ) -> dict[str, list[tuple[str, dict]]]:
+        """Every recorded answer that answers the NEWEST ruling of its
+        identity, as (effect, event) pairs per resolved fingerprint, with
+        the effect read from `vocab.FINDING_ANSWERS`.
+
+        THE LIFECYCLE DERIVATION (lineage 20 rounds 3-4). An answer is
+        round-bound: recorded at round r, it answers the newest ruling only
+        if it targets that ruling's round (`_answer_target_round`). Before
+        this existed the three answer kinds were bound three different
+        ways — an acceptance to its round, a withdrawal and a waiver to the
+        identity for all time — so a finding withdrawn or waived in round 1
+        and re-raised in round 2 was silently answered, and an advance
+        closed over a ruling nobody had answered. One binding rule for
+        every kind is the repair, and the table is what makes the kind set
+        closed.
+
+        `as_of_round`, when given, computes this AS IF the lineage ended
+        there (round-6 F2): only findings at or before it exist, so a
+        LATER re-raise cannot retroactively make an earlier round's
+        genuine settlement disappear when a historical round is scored
+        against this same method (`breakers`'s no-progress check).
+
+        Dispositions come through `standing_dispositions`, so a re-emission
+        within a round supersedes as it does everywhere else; closures and
+        waivers are the raw events, which the tool never re-emits.
+        """
+        finding_rounds = self._finding_rounds_by_identity(as_of_round)
+        latest = {fp: max(rounds) for fp, rounds in finding_rounds.items()}
+        answers: dict[str, list[tuple[str, dict]]] = {}
+
+        def consider(kind: str, term, event: dict) -> None:
+            if as_of_round is not None \
+                    and int(event.get("round") or 0) > as_of_round:
+                return
+            fp = self.resolve(event.get("fp", ""))
+            if fp not in latest:
+                return
+            target = self._answer_target_round(kind, event,
+                                               finding_rounds.get(fp, ()))
+            if target is None or target != latest[fp]:
+                return
+            effect = vocab.FINDING_ANSWERS.get((kind, term))
+            if effect is None:
+                return
+            answers.setdefault(fp, []).append((effect, event))
+
+        for event in self._by("closure"):
+            consider("closure", event.get("closure"), event)
+        for event in self.standing_dispositions():
+            consider("disposition", event.get("disposition"), event)
+        for event in self._by(vocab.FINDING_WAIVER_EVENT):
+            consider(vocab.FINDING_WAIVER_EVENT, None, event)
+        return answers
+
+    def standing_findings(self) -> list[dict]:
+        """Findings of this lineage that are still OPEN, newest ruling first.
+
+        THE LIFECYCLE AUTHORITY for advancing over open findings (lineage 20
+        round 3 F2), derived from `current_answers` and nothing else: the
+        newest ruling of each identity stands unless a CURRENT answer to it
+        SETTLES it. Before this existed, `authorize_advance` asked only
+        whether ANY human waiver had been recorded, so waiving one of two
+        open findings emitted an authorization naming one and silently
+        killed the other — the omission the symmetry rule exists to
+        prohibit, reintroduced by the mechanism meant to make overrides
+        visible.
+
+        A human waiver deliberately does NOT remove a finding from this set.
+        It records that the finding STANDS UNFIXED, which is the opposite of
+        resolving it — and the set is what an authorization must enumerate,
+        so a waiver that shrank it would hide the very findings the artifact
+        exists to name. `authorize_advance` requires every member of this
+        set to carry exactly one current waiver (`current_waivers`).
+
+        Every OPEN answer leaves the finding here, and that is deliberate
+        rather than an omission: `refuted` awaits the reviewer; `deferred`,
+        `preference` and `escalated` record where the work went or who must
+        decide; a sustained or reclassified identity has not been withdrawn.
+        None of them is a finding resolved, so an advance over one is
+        exactly what a human must be asked to authorize by name.
+        """
+        answers = self.current_answers()
+        standing = [ruling for fp, ruling in self.latest_rulings().items()
+                    if not any(effect == vocab.ANSWER_SETTLES
+                               for effect, _ in answers.get(fp, []))]
+        return sorted(standing,
+                      key=lambda e: (-int(e.get("round") or 0),
+                                     str(e.get("id") or "")))
+
+    def current_waivers(self) -> dict[str, dict]:
+        """Resolved fingerprint -> the human waiver answering its NEWEST
+        ruling. A waiver recorded against an earlier ruling of the same
+        identity is stale and is not here (lineage 20 round 4 F1): an answer
+        to an older ruling is not an answer to a later one."""
+        return {fp: event
+                for fp, pairs in self.current_answers().items()
+                for effect, event in pairs
+                if effect == vocab.ANSWER_OVERRULES}
+
+    def open_round(self) -> int | None:
+        """A round whose request is recorded and whose verdict is not.
+
+        An advance is about a ruling, so it may not be taken while a newer
+        request is awaiting one: closing at the older ruled SHA would bind
+        an authorization to a commit that is no longer what the loop is
+        working on (lineage 20 round 3 F2).
+        """
+        requested = {e.get("round") for e in self.current()
+                     if e.get("event") == "request"}
+        ruled = {e.get("round") for e in self.current()
+                 if e.get("event") == "verdict"}
+        pending = [r for r in requested - ruled if r is not None]
+        return max(pending) if pending else None
+
     def _withdrawn_identities(self) -> set[str]:
         return {self.resolve(e["fp"]) for e in self._by("closure")
                 if e.get("closure") == "withdrawn"}
+
+    def _ruling_withdrawn(self, ident: str, ruling_round: int) -> bool:
+        """Whether a withdrawal answers the ruling `ident` carried at
+        `ruling_round` SPECIFICALLY — the one it TARGETS
+        (`_answer_target_round`), never merely one recorded somewhere in
+        its history (round-5 F3, round-6 F1).
+
+        `_withdrawn_identities` answers "was this identity ever withdrawn",
+        which binds a withdrawal to every ruling the identity has ever
+        carried rather than the one it actually answers: a round-1
+        withdrawal that predates a round-2 re-ruling is not an answer to
+        that later ruling, and a round-2 withdrawal with no intervening
+        re-ruling is still the answer to a round-1 refutation — and a
+        withdrawal that shares its own round with a same-fingerprint
+        re-raise answers whichever ruling its stamped `answers_round`
+        names, never whichever one round arithmetic would guess.
+        """
+        finding_rounds = self._finding_rounds_by_identity().get(ident, [])
+        return any(
+            self._answer_target_round("closure", e, finding_rounds)
+            == ruling_round
+            for e in self._by("closure")
+            if e.get("closure") == "withdrawn"
+            and self.resolve(e.get("fp", "")) == ident)
 
     def _round_tokens(self, r: int, requests: dict, verdicts: dict):
         """Tokens for one round, or the reason there are none (round-4 F5)."""
@@ -872,7 +1227,6 @@ class Ledger:
             # by every product report path rather than only by a unit test —
             # ids are what the repo declared and what a finding can name, and
             # they survive the command changing underneath them.
-            withdrawn = self._withdrawn_identities()
             labelled = [f for f in findings if f.get("preventable_by")]
             if gate_manifest and labelled and len(labelled) < len(findings):
                 # Round 2 F7: a PARTIAL set of labels was divided by the full
@@ -923,11 +1277,14 @@ class Ledger:
                 }
             # §5.4 defines the numerator as refuted findings with evidence
             # that the reviewer then withdrew. Round-3 F14: counting raw
-            # `refuted` reported unresolved disagreements as false positives.
+            # `refuted` reported unresolved disagreements as false
+            # positives. Round-5 F3: the withdrawal must answer THIS
+            # round's ruling — `_ruling_withdrawn` binds it there rather
+            # than to any withdrawal the identity has ever carried.
             refuted_withdrawn = [
                 d for d in r_disp
                 if d["disposition"] == "refuted"
-                and self.resolve(d["fp"]) in withdrawn
+                and self._ruling_withdrawn(self.resolve(d["fp"]), r)
                 and str(d.get("payload", {}).get("evidence", "")).strip()]
             accepted = [b for b in r_batches
                         if b["disposition"]["disposition"] == "accepted"]
@@ -1112,12 +1469,24 @@ def render_convergence_md(c: dict) -> str:
     return "\n".join(lines)
 
 
-def render_report_md(report: dict) -> str:
-    """Markdown rendering of report(); every number comes from the dict."""
+def render_report_md(report: dict, pending_round: int | None = None) -> str:
+    """Markdown rendering of report(); every number comes from the dict.
+
+    `pending_round` names the round whose request is being emitted FROM this
+    snapshot and is therefore not in it (lineage 20 round 4 tool feedback:
+    a request read `Round 4 of 3` beside `Breakers fired: 0`, because
+    handoff renders the report before it records the request). The line
+    says so rather than leaving a reader to reconcile the two numbers.
+    """
     lines = ["## Ledger report — breakers and metrics (§5.3–5.4)", ""]
     fired = report["breakers_fired"]
     lines.append(f"Breakers fired: **{len(fired)}** "
                  f"(round cap {report['round_cap']})")
+    if pending_round is not None:
+        lines.append(f"Snapshot taken before round {pending_round} is "
+                     f"recorded: a breaker this round's request trips "
+                     f"fires when the request is recorded, and reaches the "
+                     f"next envelope, not this one.")
     for b in fired:
         fp = f" `{b['fp']}`" if b.get("fp") else ""
         # The firing identity is what an authorization binds to, so the

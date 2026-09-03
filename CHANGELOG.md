@@ -5,6 +5,333 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.16.0
+
+**An unknown section or key now says that a version skew is possible.**
+`[tool] requires` (0.15.0) lets a repository state the floor it was written
+for, and closes the class for every pair of installations that both know the
+key. What it cannot reach is a config written for a newer tool that declares
+no floor: from an older reader that looks exactly like a misspelling, and the
+remedy sent a person to repair a file that may be correct. The reader cannot
+tell the two apart, so the refusal now names both — the defect and the skew —
+along with its own version and the `[tool] requires` declaration that would
+make the diagnosis exact. Only for an UNDECLARED name; a declared key with
+the wrong kind is the config's own defect in every version and says nothing
+about versions. Forward-only, like every fix on this seam: it reaches the
+skews that come after it, never a reader already deployed.
+
+**The claim's scope is compared with the span it was measured against.**
+A claim can assert "no other file touched" while the machine-computed
+base-to-head span carries another commit's paths — that happened, and only a
+reader noticing caught it. Both author verbs now report every changed path
+the claim names nowhere: not a reference, not in the review scope, not a
+stated exclusion. It rides out as a `scope` field beside the record and a
+notice line beside the text, and it NEVER changes the exit — an unaccounted
+path is a claim to fix or a rationale to add, and the author is the one who
+knows which. Paths are matched whole, so `data.txt` does not account for
+`a.txt`; a claim that states nothing reports nothing, since it asserts no
+scope to contradict.
+
+**Retained gate output is per run, so a failure survives the next run.**
+It was keyed by the executed SHA alone — `gate-output/<sha>/<id>.log` — so
+a second run at one commit overwrote the first in place, and the copy that
+matters is always the failing run's. Measured twice, most recently
+2026-09-02: a handoff refused on a failing gate, the re-run passed, and the
+log a person then opened was the passing run's. Each run now writes under
+`gate-output/<sha>/<run>/`, named by UTC second plus six hex characters, and
+`<sha>/newest` is a symlink to the last one. Every attestation's pointer
+names its own run's bytes. `prune` is unchanged: the pruneable unit is
+still the per-SHA directory.
+
+**A ruling is owed an answer wherever it was made.** The handoff preflight
+took the latest verdict round and looked for unanswered rulings only there,
+so a ruling made in any other round could not be owed — and a semantic-only
+legacy corpus imports rulings at rounds with no verdict artifact at all.
+The owed set is now derived from the ruling authority: the newest ruling of
+every identity in the lineage, minus every identity the record shows an
+answer for, with the lifecycle's own round-binding on both sides. Answered
+means any recorded answer — the author's disposition, the reviewer's
+closure, or a named human's waiver — because omission is what this check
+guards and a ruling one of the three answered was not omitted.
+
+**A cited legacy source path is a canonical path.** `source_path` is
+caller-supplied and interpolated into `<commit>:<path>`, and git resolves
+`.` and `..` — so `a/../b` read b's bytes while the record named a/../b as
+the source. Dot segments (a dot INSIDE a name, `.gitignore`, is untouched),
+leading and repeated separators, and NUL or newline framing now refuse
+before git is asked anything, and the tree entry git returns must be the
+entry that was requested.
+
+**`take` no longer fetches a foreign target into the checkout you are
+standing in.** Measured live 2026-08-31: run from the wrong directory, `take`
+resolved the round against the CALLER's repository, fetched the reviewed SHA
+into it — which made the foreign commit resolve locally and removed the only
+signal that anything was wrong — and appended another repository's round to
+this one's append-only ledger, where it cannot be removed. The reviewer-side
+probe now compares repositories BEFORE the fetch: the stamp's push URL
+against this clone's remotes, normalised so one repository is one key across
+the spellings git accepts (`ssh`, `https`, `scp`-style, with or without
+`.git` or userinfo). Three states pass — a remote of this clone names the
+stamped repository, this clone already holds the target, or this clone
+declares no remote at all (a scratch checkout, which is what an empty CI
+reviewer is, and which contradicts no stamp). Anything else refuses before
+the fetch and before any event is written, naming both URLs.
+
+**The envelope can ride a ref now, on the remote both sides already use.**
+`transport = "git"` joins `path` and `paste` as a third topology: the two
+ends share no filesystem AND both reach the remote the reviewed branch is
+pushed to. `handoff` pushes the request to
+`refs/<tool>/<lineage>/<round>/request`, `validate --from-target` pushes the
+verdict beside it, `respond --out` pushes the disposition; `take`, `close
+--verdict` and `respond --verdict` accept `git:<lineage>/<round>` wherever
+they accept a file or `-`, and fetch the leg the verb needs. Each leg's relay
+becomes ONE line naming the round instead of a block of bytes. The object is
+a bare blob rather than a commit wrapping a file — no invented author, tree
+or timestamp — and the refspec is forced inside that namespace alone, because
+a blob ref has no ancestry to fast-forward. The ref is an untrusted carrier
+and confers nothing: bytes replaced on it are refused by the same digest and
+SHA bindings that would refuse them pasted, and storage is still not a
+trigger — a pushed ref starts no work, and a person still tells the reviewer
+to take. Paste is unchanged and stays the fallback for a remote that cannot
+be reached; `--local-only` refuses `git` exactly as it refuses `paste`. This
+reverses one sentence of design §5.2 by the user's decision, and only that
+one: PR comments, a commit on the branch, and git notes stay rejected, with
+their reasons.
+
+**The configuration says what it never said.** Two keys were ruled the same
+day. `[roles] review_default` (`on` | `off`, undeclared `on`) declares
+whether an implementation session ends with a round unasked; no verb gates on
+it — no invocation of this tool is the end of a session — so it is a
+declaration the agents read. `[roles] enforcement` (`pr-approval` | `none`,
+undeclared `none`) declares how the approval reaches the default branch, and
+the tool does exactly one thing with it: `handoff` refuses when
+`pr-approval` is declared and the branch under review IS the remote's default
+branch, since a commit already there has no pull request for an approval to
+bind to. Opening the pull request, posting the approval and merging stay
+outside a tool that touches no forge. **Upgraders:** both keys are a
+cross-installation contract — a repository that declares one becomes
+unreadable to any installation older than 0.16.0, which refuses with
+`[roles] states unknown key` — so declare them only once the readers that
+parse them are in place, and use `[tool] requires` to make the refusal say
+so.
+
+**A built-in default is now reported instead of applied in silence.** Absence
+means one of two things in this tool: a refusal that is ruled and stays — the
+taxonomy, the roles, the config file itself — or a default nobody chose and
+nobody was told about. Every `handoff`, `take`, `emit-request` and `brief`
+result now carries a `decide` list: one entry per key THIS repository never
+declared, with its meaning in a sentence, the value applied, and the exact
+TOML line that sets it and (where there is one) unsets it. Six keys are
+covered: `[roles] transport`, `debug`, `review_default`, `enforcement`, and
+`[limits] round_cap`, `token_budget`. A declared key produces no entry, which
+is what ends the reporting permanently. The tool stops there by construction:
+it has no model and prints JSON, so turning one report into one question
+asked once is the adapters' side of the boundary.
+
+**The trust model is stated, and it has one principal.** Lineage 20 spent
+seven rounds closing ways the operator's own agents could forge the
+operator's own ledger — a fabricated import row, a hand-written remote ref, a
+substring that substantiates an acceptance — each answered with a mechanism
+that the next round found another way around, because there is no bottom to
+defending a record against its owner. The contract now says what the tool
+guards: the record against omission and fatigue, never against a party with
+operator access. Both adapters carry the rule beside boundary closure, which
+partitions the domain of mistakes a boundary admits, not the domain of
+adversaries; a forgery finding must name a party with less than operator
+access who could mount it, or it is not a finding for the round. No
+behaviour changed; the two residual non-security items from that lineage's
+last verdict are parked in the workbench backlog.
+
+**Imported disposition rows may carry `author`, and only a reader at or
+after this change accepts them.** The closed import schema refuses an
+unknown member by name, so a reader older than this change — 0.15.0, or a
+0.16.0 build before the field existed — REJECTS a row that carries `author`
+rather than ignoring it. That is safe failure, not additive interoperability:
+a derivation that states the field needs the new reader, and the release
+note says so instead of promising an older one will preserve the rest. A
+row without `author` is accepted by every reader, unchanged.
+
+## 0.15.0
+
+**A named human can now answer a finding, and advance over it.** A finding
+died exactly two ways — the author accepts and verifies it, or the reviewer
+withdraws it against a refutation — and neither is what happens when a person
+reads a finding and decides to live with it. `escalated` already routed a
+blocking finding to a named authority; nothing recorded what that authority
+answered, so an escalation either looped or was laundered into a reviewer
+withdrawal the reviewer did not mean. After that laundering the record cannot
+separate "the reviewer found nothing" from "the reviewer found something a
+human waved off", which is the distinction the whole loop exists to keep.
+
+`waive --finding <id|fingerprint> --reason … --by …` records that one finding
+stands unfixed, with an optional `--destination` and `--trigger` for work that
+moved rather than vanished. It refuses a silent reason or authorizer, a
+finding this lineage never ruled, a second answer to a finding already
+answered, and an id that names different findings in different rounds — ids
+are round-scoped, so the fingerprint disambiguates. `authorize-advance
+--reason … --by …` then emits an **authorization** envelope naming the commit,
+who advanced it, why, and every overruled finding with its own reason — a set
+DERIVED from the ledger's lifecycle authority rather than collected from
+whatever waivers happen to exist, so an advance refuses while any standing
+finding is unanswered, and refuses while a newer request awaits a verdict.
+
+**It is a fourth envelope kind, never a derived clean verdict.** A derived
+clean state would make an overridden review indistinguishable from one where
+the reviewer found nothing, at the exact moment the difference matters, and
+would turn an unverifiable claim about a human's decision into a merge. The
+authorization is stamped with the emitting installation's `tool` identity by
+the same rule as the request and the disposition — it is tool-emitted, and the
+verdict's exemption is about having no emitter at all, so the stamped-kind set
+is now three. The approval companion binds to one and posts an approval whose
+first line says it is not a clean review, listing every finding still open.
+
+**Every answer to a finding is bound to the ruling it answers.** The
+standing set is derived from one table, `vocab.FINDING_ANSWERS`: each closure
+term, each disposition and the waiver, with what it does to the finding it
+answers (settles it, overrules it, or leaves it open), and one binding rule
+for all of them — an answer recorded at round r answers the newest ruling of
+its identity only if r is not earlier than that ruling. Before this, an
+acceptance was bound to its round while a withdrawal and a waiver were bound
+to the identity for all time, so a finding withdrawn or waived in round 1 and
+re-raised in round 2 was treated as answered, and an advance could close over
+a ruling nobody had answered — emitting the older finding's id, severity and
+title from the stale waiver. The authorization now carries the CURRENT
+ruling's facts, and a stale waiver leaves the re-raised finding unanswered
+until a human answers it again.
+
+**The authorization's closed grammar counts findings by identity.** Two
+overruled records are one finding when they share a fingerprint, whatever
+their round-scoped ids say, and two findings when they share a label across
+rounds; `A-WAIVED-REPEAT` was keyed by the label and had both polarities
+wrong, refusing an envelope the tool itself emits.
+
+**An authorizer name is one grammar, refused before anything is recorded.**
+`--by` is stamped into a quoted wrapper attribute with no escape, so a name
+carrying a double quote, an angle bracket or a control character was
+accepted, recorded, and then emitted as bytes the validator refused — an
+advance reported as success with no usable artifact. Both `waive --finding`
+and `authorize-advance` now refuse such a name by the same rule the validator
+judges the stamp by, and `authorize-advance` validates the artifact it
+emitted BEFORE keeping it or writing either ledger event, so no emitter drift
+can commit an unusable terminal state. The emitted request's ledger report
+now says it is a snapshot taken before the request it travels in is recorded.
+
+**The limit is published rather than implied**: `by` is asserted. The tool
+cannot observe who ran a command, so this buys attribution and visibility, not
+proof that a human rather than an agent decided. The generated adapters now
+tell every agent that `waive` and `authorize-advance` are never theirs to run.
+
+**A forward-compatible version floor for config evolution — which does not
+help any reader already deployed.** The narrow claim is deliberate: an earlier
+draft of this entry said config evolution "no longer accuses a valid config",
+and that was false for the case that prompted it. A repository may declare
+`[tool] requires = "<version>"`, checked BEFORE schema validation — the
+ordering is the feature, not an implementation detail — so a reader that knows
+the key refuses with the required and installed versions instead of `unknown
+key` and a remedy telling a person to repair a correct file.
+
+What this does NOT do: a reader older than the `[tool]` section itself still
+refuses with `unknown section [tool]` and still blames a valid config, because
+the diagnosis it would need is in a release it does not have. The originating
+defect — a published installation refusing a valid target it was handed by the
+advertised relay — is therefore still open on that path, and this release
+narrows the deliverable rather than claiming it. The floor pays only for skews
+between this release and later ones, after a repository has adopted it, which
+is an argument for adopting it early and not a reason to read it as a fix for
+deployed readers. Unknown keys and sections still refuse exactly as before —
+the closed grammar is why a misspelling cannot silently erase what it meant to
+declare.
+
+## 0.14.0
+
+**A repository can declare that every round is a debug round.** The
+debug stamp — the reviewer's standing invitation to critique the tool's
+own performance in a `## tool feedback` verdict section — was flag-only,
+so it reached a round only when whoever ran `handoff` remembered to type
+it, and a default that depends on memory is not a default. It now
+resolves like the transport, strongest declaration first: `--debug` or
+the new `--no-debug` for one invocation (together they are a usage
+refusal), then `[roles] debug = true` in the repository's config, then
+off. The built-in default stays off on purpose: the stamp spends
+reviewer attention, so it is asked for by declaration, never assumed.
+This is the first boolean config key, and it found the shape checker's
+bool branch accepting any value without a check — a wanted bool now
+takes only a real bool.
+
+**The overview's claims were reviewed against the tree, and eight were
+repaired.** The tool-identity stamp is carried by the two tool-emitted
+envelopes (requests and dispositions) — the verdict deliberately carries
+none, and the overview no longer says "every envelope". The waiver
+record for skipped development rounds lives in the author's per-machine
+ledger and does not travel; the overview now says a public reader is
+trusting that paragraph, not inspecting the events. The breaker
+enforcement claim carries its one exception where it is made: the
+round-count threshold advises while every other firing, the measured
+token breach included, blocks the next handoff. "No vocabulary of its
+own" became "no repository taxonomy of its own" — the protocol's enums
+are the tool's; the judgment scale is yours. The network boundary is
+stated as measured: no native network client, with Git subprocesses
+performing the networked steps — `handoff` pushes and observes the
+remote ref with `ls-remote`, `take` fetches — consistently across the
+overview, the README and the specification. And the overview no longer
+enumerates the breaker or verdict vocabularies at all — 0.13.0 claimed
+it restated none while a bold table listed every breaker and a wrapped
+code span held both verdict strings, unseen by a guard that read only
+single-line backtick spans; the guard now normalizes whitespace, reads
+bold table cells, and matches members as word-bounded substrings.
+
+0.13.0's own rationale for its minor bump is corrected in place: it
+claimed a shipped document joins the compared tool identity, which
+teaches the identity boundary backwards.
+
+## 0.13.0
+
+Documentation only; no behaviour changes.
+
+**The argument now has its own document.** `docs/design.md` was a single
+1,145-line specification carrying two jobs: making the case for the tool to
+someone deciding whether to adopt it, and specifying the mechanism for someone
+implementing against it. Those readers want opposite things, and the first was
+being served badly.
+
+**`docs/overview.md`** (new) is the case: the problem, why writing a better
+reviewer prompt does not fix it, the core idea, then each mechanism presented
+as the EVIDENCE for trusting the tool rather than as an implementation detail
+— fetchable SHAs, attested gate output, fingerprint identity, the append-only
+ledger, the breakers, tool identity, convergence reporting. It ends with what
+the design deliberately refuses to do and what those refusals cost, and with
+what is designed but not built. Start there if you have not decided.
+
+**`docs/design.md` is unchanged in this release.** A restructuring of the
+specification was drafted alongside the overview and NOT shipped: the
+specification is bound to the adapters by locators and derived counts that a
+prose reorganisation breaks, and those bindings exist to stop the shipped
+documents and the instruction blocks drifting apart. Reworking it is worth
+doing on its own, against those guards, rather than riding along with a
+document split.
+
+Nothing in the overview restates a closed vocabulary. Where it would have
+listed one — the five dispositions — it describes the shape and sends the
+reader to the specification, so there is still exactly one place each
+vocabulary is written down. That exclusion is measured rather than asserted:
+the guard that keeps `docs/onboarding.md` honest about enumerating nothing now
+walks the overview too, and it caught this document's disposition table on its
+first run.
+
+Every designed-but-not-implemented marker travels with the claim it qualifies:
+risk tiering, path-scoped contract invariants, automatic execution of
+falsification tests, the git-notes carrier and the MCP facade are all still
+marked as not built.
+
+The minor bump rather than a patch: a new shipped document is a new surface,
+and every shipped document must be explicitly accounted for in the identity
+boundary — this one as documentation, EXCLUDED from the compared behavioural
+identity, whose set is the package modules and only the package modules. The
+`tool` digest on the two tool-emitted envelopes (requests and dispositions;
+verdicts are deliberately unstamped) moves with this release because the
+version bump edits `TOOL_VERSION` in `review/__init__.py`, which is compared
+— not because documentation bytes are hashed.
+
 ## 0.12.1
 
 Documentation only; no behaviour changes and nothing addressed to upgraders.

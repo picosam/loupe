@@ -464,7 +464,8 @@ def verdict_precis(parsed, source: str | None = None,
 
 def verdict_relay(parsed, source: str | None = None,
                   transport: str = vocab.TRANSPORT_DEFAULT,
-                  envelope: str | None = None) -> str:
+                  envelope: str | None = None,
+                  reference: str | None = None) -> str:
     """One section, `## Verdict`, holding exactly what the human carries.
 
     On a declared paste round, `envelope` (the verdict's own bytes) travels
@@ -508,6 +509,14 @@ def verdict_relay(parsed, source: str | None = None,
     # interpolated after a command token is either paths.shell_path(...)
     # at the site or a local whose name declares it pre-quoted — and this
     # one's single assignment is the proof.
+    # A `git` round's verdict is already on a ref both sides reach — the
+    # reviewer's own `validate --from-target` pushed it — so the word is the
+    # round reference and the block is one line with no bytes beside it.
+    # The reference is the caller's to supply, because the lineage is a fact
+    # of the ledger and not of the verdict document.
+    if transport == vocab.TRANSPORT_GIT and reference:
+        return "\n".join(["## Verdict", "", *_fence(paths.command(
+            *paths.lits(TOOL_NAME, "close", "--verdict"), reference))])
     verdict_word = (paths.Lit("-") if transport == vocab.TRANSPORT_PASTE
                     else (source if source else paths.Ph("<verdict.md>")))
     # `respond` used to ride here as a comment. It is gone, and the reason
@@ -562,7 +571,8 @@ def verdict_relay(parsed, source: str | None = None,
 # ------------------------------------------------------------------- relay
 
 def relay(kept: str | None, parsed, envelope: str,
-          paste: bool = False, transport: str | None = None) -> str:
+          paste: bool = False, transport: str | None = None,
+          reference: str | None = None) -> str:
     """The exact thing the human carries — one block, same shape as the
     verdict side.
 
@@ -601,6 +611,20 @@ def relay(kept: str | None, parsed, envelope: str,
     # the tool will refuse is worse than printing none — the human hands over
     # something that fails and has to debug a tool they are only carrying for.
     reviewer = (getattr(parsed, "attrs", {}) or {}).get("reviewer", "")
+    # `git` (ruled 2026-09-03): the envelope is on a ref both sides reach, so
+    # this leg is ONE line naming the round — no bytes, no path, nothing for
+    # the carrier to rewrite in transit. It is the shape `paste` would have
+    # had if a person had not been the only carrier available, and it keeps
+    # the same promise as the other two: the round already chose, and the
+    # fence says what it chose.
+    if transport == vocab.TRANSPORT_GIT and reference:
+        take_line = paths.command(
+            paths.Lit(TOOL_NAME), paths.Lit("take"), reference,
+            paths.Lit("--as"),
+            reviewer if reviewer else paths.Ph("<your id>"))
+        if isinstance(take_line, paths.Template):
+            take_line = paths.comment(take_line)
+        return "\n".join(["## How to carry it", "", *_fence(take_line)])
     # Relay ergonomics (user, 2026-08-30): a declared paste round with a
     # stamped reviewer is ONE block — the take command opening a quoted
     # heredoc, the envelope bytes as its stdin, the delimiter closing them.

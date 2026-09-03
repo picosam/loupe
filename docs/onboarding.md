@@ -140,7 +140,7 @@ attest:
   seconds. And the attestation carries an exit code, so "could not run"
   and "ran and failed" both arrive as non-zero — the distinction lives in
   the retained output under
-  `~/.local/state/loupe/<repo-id>/gate-output/<sha>/<id>.log`. There is no
+  `~/.local/state/loupe/<repo-id>/gate-output/<sha>/<run>/<id>.log`. There is no
   bypass for a blocking gate that cannot run: it refuses the handoff
   exactly as a failure does. Design the manifest so every blocking gate
   can run wherever you emit from.
@@ -253,18 +253,130 @@ So close the question now, not on a blocked PR:
   can reach, plus the repo's own CI. If approvals are required and the
   answer is a machine account or app you operate, install it now, as a
   deliberate admin action.
+- **Declare the enforcement in `review.toml`**: `[roles] enforcement =
+  "pr-approval"` when a protected branch needs an approving review that
+  a verdict will carry, `"none"` when the repository merges without one
+  (a direct-to-default-branch repository says so here rather than
+  silently). Under `pr-approval` work is always on a branch, an open pull
+  request exists for it before `handoff` (the author opens one with the
+  forge's CLI if none does — the tool touches no forge), and `handoff`
+  refuses the default branch.
 - **Write the approval policy into the repository** — who approves what,
   and what a loupe verdict authorizes them to do. A rule that exists only
   in an operator's head is exactly the class of defect the review round
   exists to catch, and it will be found there.
 
+### On GitHub, here is the checklist, not just the principle
+
+The four bullets above are the invariant; this is what satisfies it on
+GitHub in practice, deterministic enough for an agent to run where it can
+and to hand off cleanly where it cannot. Each step names who can execute
+it: an agent holding an admin-scoped `gh` login runs it directly, and an
+agent without one hands the printed command or setting to the repository
+owner rather than guessing or skipping it.
+
+1. **Check whether you can act.**
+
+   ```console
+   $ gh api repos/<owner>/<repo> --jq .permissions.admin
+   ```
+
+   `true` means the invoking `gh` identity can create and edit rulesets and
+   install GitHub Apps on this repository; run the rest of this checklist
+   directly. `false` means every remaining step is a handoff: print the
+   command or setting for the owner and stop there — do not attempt a
+   privileged call you have already been told will be refused.
+
+2. **Read what the default branch currently requires**, so you create or
+   edit a rule rather than duplicating one:
+
+   ```console
+   $ gh api repos/<owner>/<repo>/rules/branches/<default-branch>
+   ```
+
+   Look for a rule of `"type": "pull_request"`. None means nothing enforces
+   an approving review yet; one present means read its parameters before
+   changing anything — editing a ruleset you did not read is how a review
+   posture regresses silently.
+
+3. **Create or update a ruleset that closes the approval requirement**, one
+   required approving review with the two settings that keep it bound to
+   the exact commit a verdict was issued for:
+
+   ```console
+   $ gh api repos/<owner>/<repo>/rulesets --method POST --input - <<'JSON'
+   {
+     "name": "require-approval",
+     "target": "branch",
+     "enforcement": "active",
+     "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+     "rules": [
+       { "type": "pull_request",
+         "parameters": {
+           "required_approving_review_count": 1,
+           "dismiss_stale_reviews_on_push": true,
+           "require_last_push_approval": true
+         } }
+     ],
+     "bypass_actors": []
+   }
+   JSON
+   ```
+
+   This is the minimal shape, not the operator's taste: squash-only merges,
+   required status checks and required conversation resolution are yours to
+   add if you want them, each is its own line in the same JSON, and none of
+   them is required for the approval requirement itself to hold.
+   `require_last_push_approval: true` is not optional — without it, an
+   author can push after an approval lands and merge on an approval nobody
+   gave to that commit. Where a ruleset already exists (step 2 found one),
+   `--method PATCH` against `repos/<owner>/<repo>/rulesets/<id>` edits it in
+   place instead of adding a second one.
+
+4. **Install an identity that can post the approval.** loupe touches no
+   forge and holds no forge credentials of its own (`docs/design.md` §5.4);
+   the approving review is posted by **the project's own approval
+   tooling** — a GitHub App or
+   machine account you or your organization operates, installed on this
+   repository with pull-request write access and nothing wider. Building
+   or choosing that tooling is outside loupe's scope; installing an App on
+   a repository is an admin action taken in GitHub's own settings (or, once
+   the App exists, `gh api` against the installation), so it is always the
+   owner's step when the invoking identity is not itself that owner. Where
+   the project's approval tooling's credentials are present on the
+   reviewing machine, the reviewer-side procedure uses them, under a
+   standing grant, to record the approval once a verdict validates as
+   `clean to advance` and a pull request is open for the reviewed branch;
+   where they are absent, the procedure says so once and points here
+   instead of guessing.
+
+5. **Declare `[roles] enforcement = "pr-approval"`** in `review.toml`
+   (bullet three, above) — this is the step that turns the ruleset from a
+   GitHub-side fact into one `handoff` itself checks: with it declared,
+   `handoff` refuses to hand off work committed straight to the default
+   branch, because the pathway just installed would silently not apply to
+   it.
+
+6. **Record the closure**, in the repository's own agent instruction file
+   — who approves, and by what tooling — per §8 below. A ruleset and an App
+   that exist only in GitHub's settings, with no line in the repository
+   saying so, is exactly the undocumented rule this whole section exists to
+   replace.
+
 A useful discipline where a machine identity approves on the strength of a
 clean verdict: the approval is granted by a person, per approval, on the
 exact reviewed SHA — and branch protection's "require approval of the most
 recent push" makes GitHub enforce the same SHA discipline the verdict has.
-An approval granted automatically on a verdict is a merge gate in all but
-name, built on records the platform cannot authenticate; do not build it
-casually.
+**What this checklist deliberately does not do: wire an approval to fire
+automatically off a posted verdict, with no person in that loop.** An
+approval granted automatically on a verdict is a merge gate in all but
+name, built on records the platform cannot authenticate — nothing on
+GitHub's side can tell an authentic verdict from a fabricated file with
+valid-looking digests, and the party best positioned to fabricate one is
+the author of the PR it would approve. Every step above ends with a
+person's own credentials granting the approval, or a person reading this
+page and choosing to install what grants it; that is the boundary, not an
+oversight to close later.
 
 ## 8. Make the repository's agent instructions true
 
@@ -324,17 +436,45 @@ more:
 
 1. generated files are regenerated, never hand-edited — name each
    generated artifact and the command that regenerates it;
-2. a human sets a review round in motion; agents follow the installed
-   loupe adapter and stop where it says stop;
+2. review is the default end of an implementation session (`[roles]
+   review_default = "on"`): the author runs `handoff` unasked when the
+   work is done unless the person declined a review that session; the
+   person carries the relay; agents follow the installed loupe adapter and
+   stop where it says stop;
 3. who approves reviewed work, by name — §7's answer, written where
    the agents will actually read it;
 4. work happens on the agreed branch in logical-unit commits; nothing
    is pushed except through the tool's own verbs (`handoff` commits
-   and pushes the reviewed branch) or on the owner's explicit request.
+   and pushes the reviewed branch) or on the owner's explicit request;
+5. **speak to the user in plain language.** Project-specific keys, enum
+   values, identifiers and status codes are how this project's artifacts
+   talk to each other and keep their exact form there. When one reaches
+   the user in prose, give its plain meaning beside it on first use in
+   that reply, and never make the user decode a token to follow a
+   sentence or take a decision. Prose only: no licence to rename,
+   translate or soften identifiers inside artifacts.
 
-The floor is deliberately not a style guide: no language rules, no
-role assignments between named agents, no delegation policy — those
-are the owner's to add or not.
+Item 5 is injected into EVERY topology, the repository-present one
+included: a deterministic project makes its agents set and read keys and
+values nobody outside it knows, and the only surface reaching every agent
+working here is the repository's own file. Beyond that the floor is
+deliberately not a style guide: no house style, no role assignments
+between named agents, no delegation policy — those are the owner's to add
+or not.
+
+**Conformity, compatibility, efficiency — one table per file.** For each
+repository instruction file present (`AGENTS.md`, `CLAUDE.md`,
+`GEMINI.md`; a symlinked pair counts once), report three checks and act
+on each:
+
+| check | passes when | on failure |
+|---|---|---|
+| conformity | the file names the review tool, points at `review.toml` for roles, and carries floor items 1–5 | add what is missing |
+| compatibility | no rule contradicts the installed adapter (an agent forbidden to push when `handoff` pushes; a different tool named as the reviewer; a round started by the reviewer) | repair the repository file, never the adapter |
+| efficiency | no sentence restates the user-level or machine-global file the session loaded, except a project-specific override that says so in those words | delete the restatement; the global file is read here, never edited — it travels with nobody |
+
+The table, then the diff, then agreement — the same discipline as every
+change on this page.
 
 While you are in these files, it is worth proposing — not applying
 unilaterally — a narrower pass against the criteria that make an
@@ -353,8 +493,8 @@ instruction file encodes decisions you were not present for.
 ## 9. The first round
 
 The pass is a precondition of the round, not a parallel activity — and it
-ends here. **A human sets the round in motion**; the adapters carry both
-sides' procedure. Preconditions worth stating to whoever starts it:
+ends here. **The author emits the first round when the pass is done and
+the person carries the relay**; the adapters carry both sides' procedure. Preconditions worth stating to whoever starts it:
 
 - `handoff` commits outstanding tracked work and pushes the reviewed
   branch. Never run it in a checkout another agent or person is using, or

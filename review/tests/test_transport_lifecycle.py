@@ -24,7 +24,8 @@ from review.emit import _git
 from review.ledger import Ledger
 from review.tests.util import REPO_ROOT, spec_path
 from review.tests._transport_fixtures import (
-    ledgerless_cfg, reviewer_clone_git, CFG, SHA_A, SHA_B, SHA_C, fake_git, authority_calls, request_text, verdict_text, lineage_ledger, _cli)
+    ledgerless_cfg, reviewer_clone_git, CFG, SHA_A, SHA_B, SHA_C, fake_git, authority_calls, request_text, verdict_text, lineage_ledger, _cli,
+    warm_cache_fixture, REVIEWER_REMOTES)
 
 class TestLineageScoping(unittest.TestCase):
     """FALSIFICATION: a cap override authorized for one lineage must not be
@@ -617,7 +618,8 @@ class TestTake(unittest.TestCase):
         # order, and the record names the target's config as governing.
         git = self._git()
         rec = transport.take(self._cfg(), Ledger.in_memory(), text, "r.md",
-                             git=git, reviewer="codex")
+                             git=git, reviewer="codex",
+                             remotes=REVIEWER_REMOTES)
         self.assertEqual(git.calls[0][0], "fetch")
         self.assertIn(("show", f"{SHA_B}:review.toml"), git.calls)
         self.assertTrue(rec["target"]["config"].startswith(
@@ -674,7 +676,7 @@ class TestTake(unittest.TestCase):
         git = self._git()
         ledger = Ledger.in_memory()
         rec = transport.take(self._cfg(), ledger, text, "r.md", git=git,
-                             reviewer="codex")
+                             reviewer="codex", remotes=REVIEWER_REMOTES)
         self.assertEqual(git.calls[0][0], "fetch")
         self.assertEqual(rec["sha"], SHA_B)
         self.assertIn("take", [e["event"] for e in ledger.events()])
@@ -723,7 +725,7 @@ class TestTake(unittest.TestCase):
         git = self._git()
         transport.take(self._cfg(), Ledger.in_memory(),
                        with_shape("0123456789abcdef"), "r.md", git=git,
-                       reviewer="codex")
+                       reviewer="codex", remotes=REVIEWER_REMOTES)
         self.assertEqual(git.calls[0][0], "fetch",
                          "the canonical control must still be taken")
 
@@ -903,35 +905,14 @@ class TestCachedHandoff(unittest.TestCase):
         self.assertIsNone(transport.cached_handoff(cfg, ledger, 1, git=git))
 
     def test_warm_and_altered_copy(self):
-        try:
-            tmp = Path(tempfile.mkdtemp(prefix="handoff-"))
-        except OSError as exc:
-            self.skipTest(f"filesystem writes denied ({exc}); warm-cache "
-                          f"leg runs only in the writable pass")
-        self.addCleanup(lambda: __import__("shutil").rmtree(
-            tmp, ignore_errors=True))
-        cfg = dataclasses.replace(CFG, ledger_dir=tmp)
-        text = request_text(tool_attr=tool_identity())
-        kept = transport.keep_bytes(cfg, 1, "request", text)
-        self.assertTrue(Path(kept).is_file())
-        git = fake_git({("rev-parse", "HEAD"): SHA_B,
-                        ("status", "--porcelain"): "",
-                        **authority_calls()})
-        ledger = Ledger.in_memory()
-        # A recorded claim state, because round 5 F1 made "neither side says
-        # anything" cold: this test is about the KEPT COPY, so it has to get
-        # past the claim check to reach its own subject.
-        ledger.add({"event": "request", "round": 1, "sha": SHA_B,
-                    "source_digest": transport._digest_text(text),
-                    "bytes": len(text),
-                    "claim_digest": transport.NO_CLAIM})
-        warm = transport.cached_handoff(cfg, ledger, 1, git=git,
-                                        claim_digest=transport.NO_CLAIM)
-        self.assertEqual(warm["envelope"], text)
+        # This test is about the KEPT COPY; the scaffold records the claim
+        # state and stamps the identity so it can reach its own subject.
+        w = warm_cache_fixture(self, prefix="handoff-")
+        self.assertTrue(Path(w.kept).is_file())
+        self.assertEqual(w.cached()["envelope"], w.text)
         # Adjacent: the kept copy altered → cold, never a stale envelope.
-        Path(kept).write_text(text + "tampered\n", encoding="utf-8")
-        self.assertIsNone(transport.cached_handoff(
-            cfg, ledger, 1, git=git, claim_digest=transport.NO_CLAIM))
+        Path(w.kept).write_text(w.text + "tampered\n", encoding="utf-8")
+        self.assertIsNone(w.cached())
 
     def test_a_kept_request_rewritten_to_crlf_is_cold(self):
         """Lineage 17 round 5 F1 (ruled 2026-08-30): the reviewer's
@@ -1431,6 +1412,149 @@ class TestHandoffBreakers(unittest.TestCase):
         self.assertEqual(ns.by, "user")
 
 
+class TestCorrectActorAppendsWithoutRewriting(unittest.TestCase):
+    """Round 3 F2's second half: `ledger correct-actor`.
+
+    The ledger is append-only, so a disposition event stamped with the
+    wrong actor is not un-stamped — this records the true actor beside it,
+    the same shape `authorize_breaker` uses for a decision that steps
+    outside a recorded state: reason-bearing, actor-bearing, refused on
+    every empty value, and bound only to events the ledger actually holds.
+    """
+
+    def _cfg(self, tmp=None):
+        return dataclasses.replace(CFG, ledger_dir=tmp)
+
+    def _ledger_with_one_disposition(self, tmp, author=None):
+        ledger = Ledger(tmp)
+        ledger.add({"event": "request", "round": 1, "sha": "a" * 40,
+                   "author": "claude", "bytes": 1})
+        event = {"event": "disposition", "round": 1, "finding_id": "F1",
+                "fp": "fp2:1", "disposition": "accepted"}
+        if author is not None:
+            event["author"] = author
+        ledger.add(event)
+        uid = next(e["uid"] for e in ledger.events()
+                  if e.get("event") == "disposition")
+        return ledger, uid
+
+    def test_an_unnamed_event_is_refused(self):
+        with self.assertRaises(transport.Refusal):
+            transport.correct_actor(self._cfg(), Ledger.in_memory(), [],
+                                    "claude", "user", "reason")
+
+    def test_an_unrecorded_uid_is_refused(self):
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix="correction-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            tmp, ignore_errors=True))
+        ledger, uid = self._ledger_with_one_disposition(tmp, author="codex")
+        with self.assertRaises(transport.Refusal) as ctx:
+            transport.correct_actor(self._cfg(tmp), Ledger(tmp),
+                                    ["not-a-real-uid"], "claude", "user", "r")
+        self.assertIn("not-a-real-uid", str(ctx.exception))
+        self.assertEqual(len(Ledger(tmp).events()), 2, "nothing appended")
+
+    def test_requires_nonempty_actor_reason_and_corrector(self):
+        """FALSIFICATION: an argparse-required flag proves a token was
+        supplied, not that a decision was taken — `authorize_breaker`'s own
+        F2/F3 lesson. Mutation: drop any one of the three empty-value
+        checks in `correct_actor` and its row below succeeds instead of
+        raising, and the still-two-event assertion after it fails."""
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix="correction-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            tmp, ignore_errors=True))
+        ledger, uid = self._ledger_with_one_disposition(tmp, author="codex")
+        before = list(Ledger(tmp).events())
+        for actor, by, reason in (
+                ("", "user", "r"), ("  ", "user", "r"), (None, "user", "r"),
+                ("claude", "", "r"), ("claude", "  ", "r"),
+                ("claude", None, "r"), ("claude", "user", ""),
+                ("claude", "user", "  "), ("claude", "user", None)):
+            with self.assertRaises(transport.Refusal,
+                                   msg=(actor, by, reason)):
+                transport.correct_actor(self._cfg(tmp), Ledger(tmp), [uid],
+                                        actor, by, reason)
+            self.assertEqual(Ledger(tmp).events(), before)
+
+    def test_a_correction_matching_the_record_is_refused(self):
+        """A correction that asserts what is already stamped changes
+        nothing and would itself misdescribe what happened."""
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix="correction-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            tmp, ignore_errors=True))
+        ledger, uid = self._ledger_with_one_disposition(tmp, author="claude")
+        with self.assertRaises(transport.Refusal):
+            transport.correct_actor(self._cfg(tmp), Ledger(tmp), [uid],
+                                    "claude", "user", "already correct")
+
+    def test_a_real_correction_records_and_names_the_events(self):
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix="correction-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            tmp, ignore_errors=True))
+        # The round-2 shape this fix was measured against: a disposition
+        # event recorded with NO author field at all (predating the field),
+        # answering a request whose author was "claude".
+        ledger, uid = self._ledger_with_one_disposition(tmp, author=None)
+        cfg = self._cfg(tmp)
+        rec = transport.correct_actor(cfg, Ledger(tmp), [uid], "claude",
+                                      "user", "round 2's disposition was "
+                                      "recorded under the reviewer's "
+                                      "identity; the request it answers "
+                                      "names claude as the round's author")
+        self.assertTrue(rec["recorded"])
+        self.assertEqual(rec["corrects"], [uid])
+        self.assertEqual(rec["true_actor"], "claude")
+        self.assertEqual(rec["corrected_by"], "user")
+        corrections = [e for e in Ledger(tmp).events()
+                      if e.get("event") == transport.CORRECTION]
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(corrections[0]["corrects"], [uid])
+        self.assertEqual(corrections[0]["true_actor"], "claude")
+        self.assertEqual(corrections[0]["corrected_by"], "user")
+        self.assertTrue(corrections[0]["reason"])
+        # Append-only: the original (wrongly-attributed) event is untouched.
+        original = next(e for e in Ledger(tmp).events()
+                        if e.get("event") == "disposition")
+        self.assertNotIn("author", original)
+
+    def test_the_cli_verb_requires_its_flags_and_records_through_it(self):
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix="correction-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            tmp, ignore_errors=True))
+        ledger, uid = self._ledger_with_one_disposition(tmp, author="codex")
+        cfg = self._cfg(tmp)
+        code, payload = _cli(cli.cmd_ledger_correct_actor, cfg, event=None,
+                             actor="claude", by="user", reason="r",
+                             ledger_dir=str(tmp))
+        self.assertNotEqual(code, 0, payload)
+        self.assertEqual(payload["next_kind"], "blocked")
+        self.assertEqual(len(Ledger(tmp).events()), 2)
+        code, payload = _cli(cli.cmd_ledger_correct_actor, cfg, event=[uid],
+                             actor="claude", by="user",
+                             reason="the request named claude",
+                             ledger_dir=str(tmp))
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload["recorded"])
+        corrections = [e for e in Ledger(tmp).events()
+                      if e.get("event") == transport.CORRECTION]
+        self.assertEqual(len(corrections), 1)
+
+
 class TestBlockedTakeRendersItsItemsToAHuman(unittest.TestCase):
     """Round 1 F3 (Medium): the remedy pointed at items a TTY never printed.
 
@@ -1586,28 +1710,9 @@ class TestToolIdentityIsInTheWarmKey(unittest.TestCase):
     unstamped rows both go warm.
     """
 
-    def setUp(self):
-        try:
-            self.tmp = Path(tempfile.mkdtemp(prefix="identity-key-"))
-        except OSError as exc:
-            self.skipTest(f"filesystem writes denied ({exc})")
-        self.addCleanup(lambda: __import__("shutil").rmtree(
-            self.tmp, ignore_errors=True))
-        self.cfg = dataclasses.replace(CFG, ledger_dir=self.tmp)
-        self.git = fake_git({("rev-parse", "HEAD"): SHA_B,
-                             ("status", "--porcelain"): "",
-                             **authority_calls()})
-
     def _warm(self, tool_attr):
-        text = request_text(tool_attr=tool_attr)
-        transport.keep_bytes(self.cfg, 1, "request", text)
-        ledger = Ledger.in_memory()
-        ledger.add({"event": "request", "round": 1, "sha": SHA_B,
-                    "source_digest": transport._digest_text(text),
-                    "bytes": len(text), "claim_digest": transport.NO_CLAIM})
-        return transport.cached_handoff(
-            self.cfg, ledger, 1, git=self.git,
-            claim_digest=transport.NO_CLAIM) is not None
+        return warm_cache_fixture(self, prefix="identity-key-",
+                                  tool_attr=tool_attr).cached() is not None
 
     def test_the_matching_identity_stays_warm(self):
         """The control: the rule must not simply kill the cache."""

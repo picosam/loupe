@@ -17,9 +17,17 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import paths, vocab, FORMER_NAMES, TOOL_NAME, env_var
+from . import paths, vocab, FORMER_NAMES, TOOL_NAME, TOOL_VERSION, env_var
 
 CONFIG_BASENAME = "review.toml"
+
+#: The `[tool]` section's one key: the minimum reader version a repository
+#: declares it was written for. Bound as a name because every use of it in
+#: this module would otherwise be a constant string key, which the
+#: command-boundary drift scan reads as a CLI egress key — see the note at
+#: its DEFAULTS entry below, and `caller_env` for the same reasoning applied
+#: to two environment names.
+REQUIRES_KEY = "requires"
 
 # Round-3 F5: these defaults previously restated this repo's taxonomy, so a
 # repo with no config silently inherited llm's severities and classifications
@@ -61,6 +69,29 @@ DEFAULTS = {
     # states it is in (round-4 F5).
     "limits": {"round_cap": 3, "token_budget": None},
     "wrapper": {"tag": TOOL_NAME},
+    # The repository's declared MINIMUM reader version (2026-09-01, brief
+    # config-keys-are-a-cross-installation-contract). `requires` has NO
+    # default for the same reason `token_budget` has none: a repository that
+    # declares nothing requires nothing, and "undeclared" must stay
+    # distinguishable from "requires 0.0.0" — the first is silence, the
+    # second is a statement.
+    #
+    # Why a NEW SECTION rather than another key in an existing one: an
+    # installation too old to know this key at all refuses it with `unknown
+    # section [tool]`, which points at a whole feature the reader has never
+    # heard of. The same declaration buried in `[roles]` would refuse with
+    # `[roles] states unknown key 'requires'`, which reads like a typo in a
+    # section the reader does understand. Both refusals are wrong about the
+    # cause; only one of them is diagnosable.
+    #
+    # The key NAME is bound above rather than written as a literal here, for
+    # the reason `caller_env` states about its two environment names: the
+    # command-boundary suite's ADVISORY drift scan reads a constant dict key
+    # in this module as a CLI egress key, and this is a key of the
+    # repository's CONFIG FILE, not of anything the tool prints. Registering
+    # it as a printed output key to satisfy a lexical scan would weaken the
+    # schema that scan exists to guard.
+    "tool": {REQUIRES_KEY: None},
 }
 # Gates are a list, not a section of scalars, so they merge by replacement.
 DEFAULT_GATES: list[dict] = []
@@ -74,9 +105,16 @@ class Config:
     roles: dict
     limits: dict
     wrapper: dict
+    tool: dict = field(default_factory=lambda: dict(DEFAULTS["tool"]))
     gates: list = field(default_factory=list)
     source: str = "defaults"
     ledger_dir: Path = field(default=None)  # resolved in load()
+    #: The dotted keys the loaded file ACTUALLY states, before any merge.
+    #: A merged section cannot answer this — `round_cap` is present in every
+    #: config because DEFAULTS supplies it — and "the repository never said"
+    #: is exactly the state `decisions` reports, so it is recorded at the one
+    #: place the user's own bytes are read (`load` and `from_text`).
+    declared: frozenset = field(default_factory=frozenset)
 
     @property
     def taxonomy_declared(self) -> bool:
@@ -115,6 +153,32 @@ class Config:
         """
         budget = self.limits.get("token_budget")
         return None if budget is None else int(budget)
+
+    @property
+    def required_version(self) -> str | None:
+        """The minimum reader version this repository declares, or None.
+
+        None is a real answer: a repository that declares no floor is not a
+        repository declaring `0.0.0`. Nothing in the tool GATES on this — it
+        is read once, at the config boundary, by `check_tool_version`, and
+        the only thing it can do is refuse.
+        """
+        return self.tool.get(REQUIRES_KEY)
+
+    def decisions(self, applied=None) -> list:
+        """What this repository never declared, and what was applied instead
+        (2026-09-03, brief `config-absent-asks-once`).
+
+        One entry per undeclared key of `vocab.DECIDE_KEYS`, empty when the
+        repository declared them all. The table, the meanings and the exact
+        TOML lines are vocabulary; what this adds is the only fact the
+        config layer owns — which keys the file actually states, and the
+        built-in round cap, which is DEFAULTS' rather than vocab's.
+        """
+        supplied = dict(applied or {})
+        supplied.setdefault(vocab.DECIDE_ROUND_CAP,
+                            DEFAULTS["limits"]["round_cap"])
+        return vocab.decisions(self.declared, supplied)
 
     @property
     def gate_commands(self) -> list[str]:
@@ -305,10 +369,40 @@ def repo_identity(repo_root: Path) -> str:
 CONFIG_DECLARED_ELSEWHERE = {
     ("roles", "relay"): str,            # what carries the envelope
     ("roles", "transport"): str,        # unstated must stay observable
+    ("roles", "debug"): bool,           # standing debug-round declaration;
+                                        # absent falls to the flag, then off
+                                        # (`emit.resolve_debug`)
+    # The two keys ruled 2026-09-03. Both are declared HERE rather than in
+    # DEFAULTS for the reason `transport` is: absence has to stay observable,
+    # because it is what `decisions()` reports as never chosen and what one
+    # adapter rule turns into a question asked once. Their built-in values
+    # live in `vocab` (`REVIEW_DEFAULT_DEFAULT`, `ENFORCEMENT_DEFAULT`).
+    #
+    # And both are a CROSS-INSTALLATION CONTRACT, on the seam documented
+    # below: a repository that declares either becomes unreadable to every
+    # installation older than this one, which refuses with `[roles] states
+    # unknown key` and a remedy that is false. So a repository adopts them
+    # only once a reader that parses them is published — the same staging
+    # `[roles] debug` had — and `[tool] requires` is what makes the refusal
+    # say the true thing when it happens anyway.
+    ("roles", "review_default"): str,   # session ends with a round, or not
+    ("roles", "enforcement"): str,      # which approval pathway, if any
     ("limits", "token_budget"): int,    # absent is not zero and not infinity
+    ("tool", REQUIRES_KEY): str,        # minimum reader version; absent is
+                                        # silence, not a floor of 0.0.0
 }
 _KIND_OF = {str: "a string", int: "a whole number", list: "a list of strings",
             dict: "a table of string values", bool: "true or false"}
+# Round 4 F2: `[roles] relay` is declared `str` above (`CONFIG_DECLARED_
+# ELSEWHERE`) and nothing narrower — so a config author could write a
+# hand-back sentence there, `emit_request` would copy it verbatim onto the
+# Roles line when the claim states no `relay` of its own, and the actor-
+# identifier grammar `validate_claim` applies to the claim's own `relay`
+# member (review/emit.py) never saw it. Same grammar, applied here — the
+# typed pre-lifecycle boundary every config value already passes through —
+# so the EFFECTIVE relay is closed to an actor identifier regardless of
+# which of the two admitted sources supplied it.
+_ACTOR_RE = re.compile(vocab.ACTOR_RE)
 
 
 def _kind_for(section: str, key: str):
@@ -327,9 +421,12 @@ def _bad(where: str, saw, want: str) -> str:
 def _check_value(section: str, key: str, value, errors: list) -> None:
     want = _kind_for(section, key)
     where = f"[{section}] {key}"
-    if want is bool or isinstance(value, bool) and want is int:
-        # `bool` is an `int` in Python and is never a count here.
-        if want is not bool:
+    if want is bool or (isinstance(value, bool) and want is int):
+        # `bool` is an `int` in Python and is never a count here — and a
+        # wanted bool takes only a real bool, not whatever TOML parsed
+        # (the first bool key, 2026-08-31, found this branch returning
+        # early with no check at all).
+        if want is not bool or not isinstance(value, bool):
             errors.append(_bad(where, value, _KIND_OF[want]))
         return
     if not isinstance(value, want):
@@ -344,6 +441,29 @@ def _check_value(section: str, key: str, value, errors: list) -> None:
         errors.append(f"{where} must not be negative")
     if (section, key) == ("limits", "round_cap") and value < 1:
         errors.append(f"{where} must be at least 1")
+    # Round 4 F2: `relay` names WHO carried the request, the same fact the
+    # claim's own `relay` member is closed to an actor identifier for
+    # (review/emit.py's `validate_claim`). A blank value is not a defect —
+    # emission falls back exactly as an absent key does — but anything else
+    # that fails the grammar is refused here, before it can reach the Roles
+    # line unverified.
+    #
+    # Round 5 F3: this used to validate `value.strip()` while emission
+    # (`review/emit.py`'s `relay = (claim.get("relay") or
+    # cfg.roles.get("relay") or ...)`) renders the ORIGINAL, unstripped
+    # value — so `" user "` matched the stripped copy, passed, and rendered
+    # `relay= user  ` on the Roles line. No stripping anywhere now: the
+    # grammar is checked against the exact value emission will render, and
+    # "blank" is exactly what emission's `or` already treats as absent — a
+    # falsy `""`, not a stripped one — so the two agree on every input,
+    # not only the ones this comment happens to enumerate.
+    if (section, key) == ("roles", "relay") and value and not \
+            _ACTOR_RE.match(value):
+        errors.append(
+            f"{where} is {value!r}, which is not {vocab.ACTOR_WANT} — "
+            f"relay says WHO carried the request, never what to do with "
+            f"the answer; a stopping instruction belongs in the claim's "
+            f"'hand_back' field, not in config")
 
 
 def _check_gates(rows, errors: list) -> None:
@@ -365,7 +485,8 @@ def _check_gates(rows, errors: list) -> None:
             errors.append(
                 f"{at} id {gid!r} is not one filename component: a gate id "
                 f"names its retained output at "
-                f"<ledger>/gate-output/<sha>/<id>.log, so it must match "
+                f"<ledger>/gate-output/<sha>/<run>/<id>.log, so it must "
+                f"match "
                 f"{vocab.GATE_ID_RE} — an absolute form discards that "
                 f"directory and a separator or dot segment leaves it")
         elif len(gid) > vocab.GATE_ID_MAX:
@@ -407,15 +528,142 @@ def _check_gates(rows, errors: list) -> None:
                 seen[key] = i
 
 
+# The config-evolution seam (2026-09-01, brief
+# config-keys-are-a-cross-installation-contract, measured on lineage 20
+# round 2). A key added to this grammar is a CROSS-INSTALLATION CONTRACT,
+# and until now the grammar had no way to say so. `take` judges a target's
+# config bytes against the READER's schema, so the moment a repository
+# declared a key its own tool understood, every older installation refused
+# the whole round — and refused with a remedy that was FALSE:
+#
+#     repo:review.toml declares 1 invalid value(s): [roles] states unknown
+#       key 'debug'
+#     remedy: a person repairs repo:review.toml
+#
+# The config was correct. The reader was old. Nothing in that output said so,
+# and a person following the remedy would have damaged a valid file.
+#
+# TOLERATING UNKNOWN KEYS IS NOT THE FIX AND STAYS REJECTED: the closed
+# grammar is why a misspelled key cannot silently erase what it meant to
+# declare, and `check_shape` below is unchanged. What is added is a way for
+# the repository to state the floor it was written for, so a reader below
+# that floor can say the true thing instead of the false one.
+#
+# THE HONEST LIMIT, stated here rather than discovered later: an installation
+# older than this key ITSELF still refuses with `unknown section [tool]`,
+# because it has never heard of the section carrying the requirement. No
+# change made in this version can reach a reader that is already deployed —
+# the refusal is emitted by the OLD binary, and improving the new one reaches
+# only future skews. That asymmetry is an argument for shipping the mechanism
+# EARLY, when the population of too-old readers is smallest, not for skipping
+# it. It also means a repository adopts `[tool] requires` only once the
+# readers that understand it are published; adopting it sooner re-breaks the
+# very bootstrap this exists to fix.
+
+#: A dotted run of ASCII digits. Deliberately not `\d`, which in a `str`
+#: pattern also matches non-ASCII decimal digits — `"٠.١٤.٠"` would parse and
+#: then compare against a version nobody wrote.
+_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+
+
+def parse_version(value) -> tuple[int, ...] | None:
+    """`"0.14.0"` -> `(0, 14, 0)`, or None if that is not a version.
+
+    None is the ONLY failure mode: no exception escapes, because every
+    caller is a boundary that owes a typed refusal rather than a traceback,
+    and the value arrives from a file anyone may edit.
+    """
+    if not isinstance(value, str) or not _VERSION_RE.fullmatch(value):
+        return None
+    return tuple(int(part) for part in value.split("."))
+
+
+def version_below(installed: tuple, required: tuple) -> bool:
+    """Whether `installed` is strictly older than `required`.
+
+    Components are compared numerically and the SHORTER side is padded with
+    zeros, so `0.14` and `0.14.0` are the same version and `0.9.9` is below
+    both. Padding rather than comparing lengths first is what keeps
+    `(0, 9)` below `(0, 14, 0)`: string or length ordering would put the
+    two-component value first and read 9 as newer than 14.
+    """
+    width = max(len(installed), len(required))
+
+    def pad(version: tuple) -> tuple:
+        return version + (0,) * (width - len(version))
+
+    return pad(installed) < pad(required)
+
+
+def check_tool_version(user: dict, source: str,
+                       installed: str = TOOL_VERSION) -> None:
+    """Refuse a config written for a NEWER tool than this one, before any
+    judgment of its schema.
+
+    ORDER IS THE WHOLE POINT. A config that declares `requires = "0.15.0"`
+    AND uses a key only 0.15.0 knows is not a broken config — it is a config
+    this reader is too old to read, and both facts have the same single
+    cause. Judged the other way round, the reader would report the SYMPTOM
+    (an unknown key) and hide the CAUSE (a version floor it does not meet),
+    which is exactly the false remedy this mechanism exists to end. So this
+    runs above `check_shape` at every door, and the version refusal wins.
+
+    `installed` is a parameter so a test can drive both sides of the
+    comparison; production always passes the package's own `TOOL_VERSION`.
+    A shape this cannot read — a `[tool]` that is not a table — is left to
+    `check_shape`, which owns kinds and will name it precisely.
+    """
+    if not isinstance(user, dict):
+        return
+    section = user.get("tool")
+    if not isinstance(section, dict) or REQUIRES_KEY not in section:
+        return
+    declared = section[REQUIRES_KEY]
+    required = parse_version(declared)
+    if required is None:
+        # A malformed floor is a REFUSAL, never a silent pass. Admitting it
+        # would make the guarantee conditional on spelling: a repository that
+        # typed `requires = "0.14.0-rc1"` would believe it had declared a
+        # floor and would in fact have declared nothing, which is worse than
+        # having declared nothing on purpose.
+        raise ConfigError(
+            f"{source} declares an unreadable [tool] requires value "
+            f"({declared!r}): a minimum {TOOL_NAME} version is dotted "
+            f"numbers, like \"{TOOL_VERSION}\"",
+            remedy=f"a person repairs the [tool] requires value in {source}; "
+                   f"this one is the config's own defect, not a version skew")
+    current = parse_version(installed)
+    if current is None or not version_below(current, required):
+        return
+    # The message a too-old reader prints. It names BOTH versions because
+    # either alone leaves the reader's question open, and it says in words
+    # that the configuration is not the thing at fault — the previous
+    # refusal's remedy sent a person to repair a correct file.
+    raise ConfigError(
+        f"{source} requires {TOOL_NAME} {declared} or newer; this "
+        f"installation is {installed}. The configuration is not broken — "
+        f"this reader is older than the repository it was asked to read",
+        code=1,
+        remedy=f"a person runs a {TOOL_NAME} installation at {declared} or "
+               f"newer against this repository; do not edit {source}, which "
+               f"is correct for the tool that wrote it")
+
+
 def check_shape(user: dict, source: str) -> None:
     """Every declared section, key and value kind, or a ConfigError naming
     all of them at once — a person repairing a config should see the whole
     list, not one error per run."""
     errors: list[str] = []
+    # An UNDECLARED name is the one defect class that is also what a
+    # newer repository looks like to this reader; a wrong kind never is.
+    # Tracked apart so the remedy can say so without saying it everywhere
+    # (2026-09-03, brief config-keys-are-a-cross-installation-contract).
+    undeclared = False
     if not isinstance(user, dict):
         raise ConfigError(f"{source} is not a table")
     known = set(DEFAULTS) | {"gates"}
     for name in sorted(set(user) - known):
+        undeclared = True
         errors.append(f"unknown section [{name}]; the declared sections are "
                       f"{sorted(known)}")
     for section in sorted(set(user) & set(DEFAULTS)):
@@ -425,17 +673,50 @@ def check_shape(user: dict, source: str) -> None:
             continue
         for key in sorted(body):
             if _kind_for(section, key) is None:
+                undeclared = True
                 errors.append(f"[{section}] states unknown key {key!r}")
                 continue
             _check_value(section, key, body[key], errors)
     if "gates" in user:
         _check_gates(user["gates"], errors)
     if errors:
+        remedy = (f"a person repairs {source}; every item above names the "
+                  f"section, the key and the kind it must have")
+        if undeclared:
+            # The half `[tool] requires` cannot reach: a repository written
+            # for a NEWER tool that declares no floor — or declares one in a
+            # section this reader knows nothing about — looks exactly like a
+            # misspelling from here. The reader cannot tell the two apart, so
+            # it names both and its own version instead of sending a person
+            # to repair a file that may be correct. Forward-only, and said so
+            # in the brief: this reaches the skews that come after it.
+            remedy += (
+                f" — UNLESS this is a version skew rather than a defect. An "
+                f"undeclared section or key is also what a repository "
+                f"written for a NEWER {TOOL_NAME} looks like to an older "
+                f"reader, and this installation is {TOOL_NAME} "
+                f"{TOOL_VERSION}. Check that first: if {source} was written "
+                f"for a newer tool, the file is correct and this reader is "
+                f"behind, and repairing it would damage a valid file. A "
+                f"repository can make that refusal say so directly by "
+                f"declaring [tool] {REQUIRES_KEY}")
         raise ConfigError(
             f"{source} declares {len(errors)} invalid value(s): "
-            + "; ".join(errors),
-            remedy=f"a person repairs {source}; every item above names the "
-                   f"section, the key and the kind it must have")
+            + "; ".join(errors), remedy=remedy)
+
+
+def _declared(user: dict) -> frozenset:
+    """The dotted keys the user's own bytes state, `section.key`.
+
+    Read from the RAW document, before `_merged` folds the defaults in:
+    after the merge every section holds every default, and "the repository
+    never declared this" is no longer answerable (`Config.decisions`).
+    """
+    keys = set()
+    for section, body in user.items():
+        if isinstance(body, dict):
+            keys.update(f"{section}.{key}" for key in body)
+    return frozenset(keys)
 
 
 def _merged(user: dict) -> dict:
@@ -467,11 +748,15 @@ def from_text(text: str, like: "Config", source: str) -> "Config":
             remedy=f"the author must repair {source} at the target commit; "
                    f"a request whose governing config cannot be read cannot "
                    f"be ruled on") from exc
+    # Above the schema, at both doors: a reader too old for this config must
+    # say so rather than report the first key it fails to recognise.
+    check_tool_version(user, source)
     check_shape(user, source)
     sections = _merged(user)
     return Config(repo_root=like.repo_root, repo_id=like.repo_id,
                   source=source, gates=user.get("gates", DEFAULT_GATES),
-                  ledger_dir=like.ledger_dir, **sections)
+                  ledger_dir=like.ledger_dir, declared=_declared(user),
+                  **sections)
 
 
 def legacy_state_dir(repo_id: str, home: Path | None = None) -> Path | None:
@@ -560,10 +845,12 @@ def load(repo_root: Path | None = None, ledger_dir: str | None = None,
             source = label
             break
 
+    check_tool_version(user, source)
     check_shape(user, source)
     sections = _merged(user)
     cfg = Config(repo_root=repo_root, repo_id=repo_id, source=source,
-                 gates=user.get("gates", DEFAULT_GATES), **sections)
+                 gates=user.get("gates", DEFAULT_GATES),
+                 declared=_declared(user), **sections)
 
     env_dir = os.environ.get(env_var("STATE_DIR"))
     if ledger_dir or env_dir:

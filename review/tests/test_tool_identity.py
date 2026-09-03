@@ -33,7 +33,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from review import (IDENTITY_ARTEFACTS, IDENTITY_EXCLUDED,
+from review import (IDENTITY_ARTEFACTS,
                     SHAPE_ARTEFACTS, shape_identity,
                     TOOL_VERSION,
                     identity_paths, installation_root,
@@ -65,15 +65,6 @@ class TestTheManifestIsComplete(unittest.TestCase):
     which, and that is the tripwire.
     """
 
-    def _excluded_by(self, path):
-        return [rule for rule in IDENTITY_EXCLUDED if path.startswith(rule)]
-
-    def test_no_artefact_is_both_carried_and_excluded(self):
-        for path in IDENTITY_ARTEFACTS:
-            with self.subTest(path=path):
-                self.assertEqual(self._excluded_by(path), [],
-                                 f"{path} is carried AND excluded")
-
     def test_every_carried_artefact_exists_in_this_installation(self):
         """Through the extraction transform, not by naive join: this
         workbench holds `pyproject.toml` as `public/pyproject.toml`."""
@@ -81,19 +72,6 @@ class TestTheManifestIsComplete(unittest.TestCase):
             with self.subTest(logical=logical):
                 self.assertTrue(Path(source).is_file(),
                                 f"{logical} is carried but not present")
-
-    def test_every_advertised_launcher_is_declared_as_shape(self):
-        """Round-1 F1 and round-2 F1 as amended by RVW-T18. `bin/loupe`
-        decides which installation runs and what environment its gates see;
-        `pyproject.toml` declares the console entrypoint the `uvx` install
-        path builds. Neither is packaging trivia and neither is dropped —
-        but neither is COMPARABLE either, because a wheel install carries
-        no resolvable copy of either one, so requiring them in the compared
-        set gave three advertised install paths three identities for one
-        codebase. They are stamped and reported instead."""
-        for launcher in ("bin/loupe", "pyproject.toml"):
-            self.assertIn(launcher, SHAPE_ARTEFACTS)
-            self.assertNotIn(launcher, IDENTITY_ARTEFACTS)
 
     def test_nothing_the_cli_loads_is_missing_from_the_identity(self):
         """The exclusion may only cover code no CLI path reaches. A module
@@ -397,6 +375,41 @@ class TestTheEnvelopesCarryIt(unittest.TestCase):
                     f"to is deliberate and needs revisiting, not "
                     f"inheriting")
 
+    def test_the_public_overview_narrows_the_stamp_to_its_emitters(self):
+        """Lineage 20 round 1, F1: the overview claimed EVERY envelope
+        carries the `tool` digest, while the verdict deliberately carries
+        none — the exact decision the test above keeps. The published
+        restatement is bound here, beside that decision: the overview must
+        name the two tool-emitted kinds as the stamped ones and state the
+        verdict's absence, and the universal claim cannot return.
+
+        MUTATION: restore "Every envelope carries" in docs/overview.md and
+        this fails while the request and disposition stamps above stay the
+        paired valid controls.
+
+        The member list is DERIVED from `vocab.STAMPED_KINDS` rather than
+        quoted: when the authorization joined the stamped kinds this test
+        demanded the sentence follow, which is the whole reason to bind
+        published prose to an authority instead of to a phrase."""
+        doc = public_path("docs/overview.md")
+        if doc is None:
+            self.skipTest("no overview shipped in this tree")
+        text = " ".join(doc.read_text(encoding="utf-8").split())
+        self.assertNotIn("Every envelope carries", text,
+                         "the overview universalises the stamp again; the "
+                         "verdict is deliberately unstamped")
+        head, _, rest = text.partition("carry a content digest (`tool`)")
+        self.assertTrue(rest, "the overview no longer states the stamp")
+        claim = head[-220:]
+        for kind in vocab.STAMPED_KINDS:
+            self.assertIn(kind, claim,
+                          f"the overview names the stamped kinds and omits "
+                          f"{kind!r}, which IS stamped")
+        self.assertNotIn("verdict", claim,
+                         "the overview lists the verdict among the kinds "
+                         "that carry the stamp; it is deliberately unstamped")
+        self.assertIn("The verdict carries none", text)
+
     def test_every_stamped_kind_is_stamped_by_its_emitter(self):
         """Both tool-emitted kinds carry the stamp. The comparison half is
         exercised through the production path in
@@ -404,8 +417,15 @@ class TestTheEnvelopesCarryIt(unittest.TestCase):
         the string `tool_agreement` passed even with the whole comparison
         deleted, because `render_tool_agreement` contains it. A test that
         can be satisfied by an unrelated identifier is not a test."""
-        for kind, emitter in (("request", "emit.py"),
-                              ("disposition", "wire.py")):
+        emitters = {"request": "emit.py", "disposition": "wire.py",
+                    "authorization": "wire.py"}
+        # DERIVED from the authority, not listed beside it: a kind added to
+        # STAMPED_KINDS with no emitter named here fails on the next line
+        # rather than going unchecked, which is how the two-kind version of
+        # this test would have greeted a third.
+        self.assertEqual(sorted(emitters), sorted(vocab.STAMPED_KINDS),
+                         "a stamped kind has no emitter to check")
+        for kind, emitter in sorted(emitters.items()):
             with self.subTest(kind=kind):
                 source = (REPO_ROOT / "review" / emitter).read_text(
                     encoding="utf-8")

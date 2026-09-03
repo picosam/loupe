@@ -22,20 +22,26 @@ import unittest
 from review import brief, config, emit, transport, vocab, wire
 from review.validate import validate_request
 from review.ledger import Ledger
-from review import tool_identity
-from review.tests._transport_fixtures import (SHA_A, SHA_B, fake_git,
-                                              ledgerless_cfg, request_text,
-                                              reviewer_clone_git)
+from review.tests._transport_fixtures import (CFG, SHA_A, SHA_B, fake_git,
+                                              git_out, ledgerless_cfg,
+                                              request_text,
+                                              reviewer_clone_git, run_cli,
+                                              scratch_loop_repo, sh,
+                                              verdict_text,
+                                              warm_cache_fixture)
 from review.tests.util import REPO_ROOT
-
-CFG = config.load(REPO_ROOT)
 
 
 class TestTheVocabularyIsClosed(unittest.TestCase):
 
-    def test_two_states_and_the_default_is_one_of_them(self):
+    def test_three_states_and_the_default_is_one_of_them(self):
+        """`git` joined the enum 2026-09-03 by the user's ruling. It is a
+        third TOPOLOGY, not a second carrier for the paste case: the two
+        ends share no filesystem AND both reach the remote the reviewed
+        branch is already pushed to."""
         self.assertEqual(vocab.TRANSPORTS,
-                         (vocab.TRANSPORT_PATH, vocab.TRANSPORT_PASTE))
+                         (vocab.TRANSPORT_PATH, vocab.TRANSPORT_PASTE,
+                          vocab.TRANSPORT_GIT))
         self.assertIn(vocab.TRANSPORT_DEFAULT, vocab.TRANSPORTS)
 
     def test_the_default_is_stated_once(self):
@@ -465,36 +471,14 @@ class TestTheCacheKeyIncludesIt(unittest.TestCase):
     # reason that has nothing to do with the transport under test.
     CLAIM = "claim-digest-fixture"
 
-    def _ledger_and_cfg(self, tmp, declared):
-        cfg = dataclasses.replace(CFG, ledger_dir=tmp)
-        # Round 1 F2 put the tool identity in the warm key, so a fixture
-        # that must REACH the check it is about stamps the current one;
-        # the identity's own cold cases live in test_transport.
-        envelope = request_text(transport_attr=declared,
-                                tool_attr=tool_identity())
-        (tmp / "exchange").mkdir(parents=True, exist_ok=True)
-        path = transport.exchange_path(cfg, 1, "request")
-        path.write_text(envelope, encoding="utf-8")
-        ledger = Ledger(tmp)
-        ledger.add(transport.request_event(
-            wire.parse_request(envelope), 1,
-            transport._digest_text(envelope), len(envelope),
-            claim_digest=self.CLAIM))
-        return cfg, ledger
-
-    def _git(self):
-        return fake_git({("rev-parse", "HEAD"): SHA_B,
-                         ("status", "--porcelain"): ""})
+    def _fixture(self, declared):
+        return warm_cache_fixture(self, prefix="topology-cache-",
+                                  transport_attr=declared,
+                                  claim_digest=self.CLAIM)
 
     def _warm(self, declared, wanted):
-        import tempfile
-        from pathlib import Path
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg, ledger = self._ledger_and_cfg(Path(tmp), declared)
-            return transport.cached_handoff(cfg, ledger, 1, git=self._git(),
-                                            claim_digest=self.CLAIM,
-                                            roles=("claude", "codex"),
-                                            transport=wanted) is not None
+        return self._fixture(declared).cached(
+            roles=("claude", "codex"), transport=wanted) is not None
 
     def test_the_same_declaration_is_warm(self):
         for declared in vocab.TRANSPORTS:
@@ -623,6 +607,441 @@ class TestBothRelaysAgreeWithTheRecord(unittest.TestCase):
                       brief.verdict_relay(self._verdict(), source="/tmp/v.md"))
 
 
+class TestTheRoundReference(unittest.TestCase):
+    """`git:<lineage>/<round>` — the one word a person carries."""
+
+    def test_the_ref_names_the_lineage_the_round_and_the_leg(self):
+        self.assertEqual(transport.carrier_ref(21, 3, "request"),
+                         "refs/loupe/21/3/request")
+        self.assertEqual(transport.carrier_ref(21, 3, "verdict"),
+                         "refs/loupe/21/3/verdict")
+
+    def test_the_reference_round_trips(self):
+        self.assertEqual(transport.round_reference(21, 3), "git:21/3")
+        self.assertEqual(transport.parse_round_reference("git:21/3"), (21, 3))
+
+    def test_everything_else_is_not_a_reference(self):
+        """A path, stdin and a malformed reference are all `None` — the
+        envelope readers are handed all three, and "not a round reference"
+        is the ordinary case rather than a fault."""
+        for value in ("-", "/tmp/round.md", "git:21", "git:a/b", "git:",
+                      "", None, "gitlab/21/3"):
+            with self.subTest(value=value):
+                self.assertIsNone(transport.parse_round_reference(value))
+
+
+class TestTheGitLegsRelayOneLine(unittest.TestCase):
+    """Both legs of a `git` round: one line, no bytes, nothing to choose."""
+
+    def _request(self):
+        return wire.parse_request(request_text(transport_attr="git"))
+
+    def _verdict(self):
+        return wire.parse_verdict(
+            f'<loupe-review-verdict sha="{SHA_B}">\n'
+            f"VERDICT: changes requested\n\n## findings\n\nNone\n"
+            f"\n## evidence checked\n\n- the tree\n")
+
+    def _fenced(self, relay):
+        lines = relay.splitlines()
+        body = lines[lines.index("```bash") + 1:]
+        return body[:body.index("```")]
+
+    def test_the_request_leg_is_the_take_command_by_reference(self):
+        relay = brief.relay("/kept/r.md", self._request(), "bytes\n",
+                            reference="git:2/1")
+        self.assertEqual(self._fenced(relay),
+                         ["loupe take git:2/1 --as codex"])
+        self.assertNotIn("bytes", relay)
+        self.assertNotIn("/kept/r.md", relay)
+
+    def test_the_verdict_leg_is_the_close_command_by_reference(self):
+        relay = brief.verdict_relay(self._verdict(), source="/tmp/v.md",
+                                    transport=vocab.TRANSPORT_GIT,
+                                    envelope="bytes\n", reference="git:2/1")
+        self.assertEqual(self._fenced(relay),
+                         ["loupe close --verdict git:2/1"])
+        self.assertNotIn("/tmp/v.md", relay)
+        self.assertNotIn("<<'", relay)
+
+    def test_without_a_reference_neither_leg_invents_one(self):
+        """The lineage is a fact of the ledger, so a caller that cannot
+        supply it gets the carrier it can prove — never a reference built
+        from a guess."""
+        relay = brief.relay("/kept/r.md", self._request(), "bytes\n")
+        self.assertEqual(self._fenced(relay),
+                         ["loupe take /kept/r.md --as codex"])
+
+
+class TestTheGitCarrierEndToEnd(unittest.TestCase):
+    """Two clones, one bare remote, both legs on refs.
+
+    The paste round's end-to-end test stops at one filesystem because a
+    person is its carrier. This one does not have to: the carrier is a
+    remote, so the reviewer here is a SECOND CLONE with its own ledger,
+    which is the arrangement the cross-machine round actually has.
+    """
+
+    def setUp(self):
+        scratch = scratch_loop_repo(self, "git-carrier-", objective="carrier")
+        self.tmp, self.repo = scratch.tmp, scratch.repo
+        self.base, self.claim, self.cwd = (scratch.base, scratch.claim,
+                                           scratch.cwd)
+        self.state = self.tmp / "state"
+        self.bare = self.tmp / "origin.git"
+        sh("git", "init", "-q", "--bare", str(self.bare))
+        sh("git", "-C", str(self.repo), "remote", "add", "origin",
+           str(self.bare))
+        sh("git", "-C", str(self.repo), "push", "-q", "-u", "origin", "main")
+
+    def _author(self, *argv):
+        return run_cli(self.repo, self.state, *argv, cwd=self.cwd)
+
+    def _reviewer_clone(self):
+        clone = self.tmp / "reviewer"
+        sh("git", "clone", "-q", str(self.bare), str(clone))
+        for k, v in (("user.name", "b"), ("user.email", "b@example.invalid"),
+                     ("commit.gpgsign", "false")):
+            sh("git", "-C", str(clone), "config", k, v)
+        self.reviewer_state = self.tmp / "reviewer-state"
+        return clone
+
+    def _reviewer(self, clone, *argv):
+        return run_cli(clone, self.reviewer_state, *argv, cwd=self.cwd)
+
+    def _remote_refs(self):
+        return git_out(self.repo, "ls-remote", "origin", "refs/loupe/*")
+
+    def _overwrite(self, ref, text):
+        """Put other bytes on a ref the tool pushed — the carrier is
+        untrusted, and this is what that has to mean in a test."""
+        import subprocess
+        blob = subprocess.run(
+            ["git", "-C", str(self.repo), "hash-object", "-w", "--stdin"],
+            input=text, capture_output=True, text=True,
+            check=True).stdout.strip()
+        sh("git", "-C", str(self.repo), "push", "-q", "origin",
+           f"+{blob}:{ref}")
+
+    def _handoff(self):
+        code, rec = self._author("handoff", "--claim-file", str(self.claim),
+                                 "--base", self.base, "--transport", "git")
+        self.assertEqual(code, 0, rec)
+        return rec
+
+    def test_the_request_leg_is_pushed_and_relayed_as_one_line(self):
+        rec = self._handoff()
+        self.assertIn("refs/loupe/1/1/request", self._remote_refs())
+        self.assertEqual(rec["carrier"]["ref"], "refs/loupe/1/1/request")
+        self.assertEqual(rec["carrier"]["remote"], "origin")
+        self.assertEqual(rec["reviewer_next"], "loupe take git:1/1 --as codex")
+        lines = rec["relay"].splitlines()
+        body = lines[lines.index("```bash") + 1:]
+        self.assertEqual(body[:body.index("```")],
+                         ["loupe take git:1/1 --as codex"])
+        # No bytes: the reviewer fetches them, so the relay carries none.
+        self.assertNotIn("<loupe-review-request", rec["relay"])
+
+    def test_the_reviewer_fetches_the_request_by_reference(self):
+        self._handoff()
+        clone = self._reviewer_clone()
+        code, rec = self._reviewer(clone, "take", "git:1/1", "--as", "codex")
+        self.assertEqual(code, 0, rec)
+        self.assertEqual(rec["transport"], "git")
+        self.assertIn("<loupe-review-request", rec["envelope"])
+        # The ref was mirrored into the reviewer's own clone, so the read
+        # names an exact ref rather than FETCH_HEAD.
+        self.assertEqual(git_out(clone, "cat-file", "-t",
+                                 "refs/loupe/1/1/request"), "blob")
+
+    def test_both_legs_round_trip(self):
+        """Request out on a ref, verdict back on a ref, neither pasted."""
+        self._handoff()
+        clone = self._reviewer_clone()
+        code, taken = self._reviewer(clone, "take", "git:1/1", "--as",
+                                     "codex")
+        self.assertEqual(code, 0, taken)
+        verdict = self.tmp / "verdict.md"
+        verdict.write_text(verdict_text(sha=taken["sha"]), encoding="utf-8")
+        code, ruled = self._reviewer(clone, "validate", str(verdict),
+                                     "--from-target")
+        self.assertEqual(code, 0, ruled)
+        self.assertIn("refs/loupe/1/1/verdict", self._remote_refs())
+        self.assertIn("loupe close --verdict git:1/1", ruled["relay"])
+        code, closed = self._author("close", "--verdict", "git:1/1")
+        self.assertEqual(code, 0, closed)
+        self.assertEqual(closed["sha"], taken["sha"])
+        self.assertEqual(closed["verdict"], "changes requested")
+
+    def test_the_disposition_leg_rides_a_ref_too(self):
+        """The author's answer to the ruling, on its own ref — and the
+        verdict it answers read back BY REFERENCE, which is the digest
+        binding passing rather than refusing: `respond --out` resolves the
+        fetched bytes to exactly one recorded verdict of this round."""
+        import json
+        self._handoff()
+        clone = self._reviewer_clone()
+        _, taken = self._reviewer(clone, "take", "git:1/1", "--as", "codex")
+        verdict = self.tmp / "verdict.md"
+        verdict.write_text(verdict_text(sha=taken["sha"]), encoding="utf-8")
+        self._reviewer(clone, "validate", str(verdict), "--from-target")
+        code, closed = self._author("close", "--verdict", "git:1/1")
+        self.assertEqual(code, 0, closed)
+        d_json = self.tmp / "d.json"
+        d_json.write_text(json.dumps({
+            "head": taken["sha"], "round": 1, "author": "claude",
+            "dispositions": [{"finding_id": "F1", "disposition": "accepted",
+                              "payload": {"change": "fixed",
+                                          "verification": "observed",
+                                          "falsification": {
+                                              "status": "pass",
+                                              "mutation": "fails_without_fix"}
+                                          }}]}), encoding="utf-8")
+        code, resp = self._author("respond", "--verdict", "git:1/1",
+                                  "--from-json", str(d_json), "--out",
+                                  str(self.tmp / "d.md"))
+        self.assertEqual(code, 0, resp)
+        self.assertIn("refs/loupe/1/1/disposition", self._remote_refs())
+
+    def test_a_fetched_request_whose_bytes_were_replaced_still_refuses(self):
+        """The ref is a carrier, never an authority: bytes that arrive on it
+        are judged by exactly the bindings pasted bytes are, and the SHA
+        binding is the first of them."""
+        rec = self._handoff()
+        kept = (self.state / "exchange" / "round-1-request.md").read_text(
+            encoding="utf-8")
+        self._overwrite("refs/loupe/1/1/request",
+                        kept.replace(rec["sha"], "9" * 40))
+        clone = self._reviewer_clone()
+        code, taken = self._reviewer(clone, "take", "git:1/1", "--as",
+                                     "codex")
+        self.assertNotEqual(code, 0, taken)
+        self.assertIn("9" * 12, str(taken))
+
+    def test_a_fetched_verdict_with_the_wrong_digest_still_refuses(self):
+        """The digest binding is unchanged by the carrier. A second close
+        of the same round from a ref carrying different bytes is refused by
+        the recorded digest, exactly as a second pasted verdict would be."""
+        self._handoff()
+        clone = self._reviewer_clone()
+        _, taken = self._reviewer(clone, "take", "git:1/1", "--as", "codex")
+        verdict = self.tmp / "verdict.md"
+        verdict.write_text(verdict_text(sha=taken["sha"]), encoding="utf-8")
+        self._reviewer(clone, "validate", str(verdict), "--from-target")
+        code, closed = self._author("close", "--verdict", "git:1/1")
+        self.assertEqual(code, 0, closed)
+        self._overwrite("refs/loupe/1/1/verdict",
+                        verdict_text(sha=taken["sha"], findings=2))
+        # The bytes arrive — and bind to nothing. The digest of what the ref
+        # now carries is not the digest this round recorded, so the ruling
+        # the ledger holds is untouched by anything written to the ref.
+        cfg = config.load(self.repo)
+        fetched = transport.fetch_envelope(cfg, 1, 1, "verdict")
+        self.assertNotEqual(transport.sha256_text(fetched), closed["digest"])
+        self.assertIsNone(transport.recorded_verdict(
+            Ledger(self.state), digest=transport.sha256_text(fetched)))
+        # And the verb refuses them rather than recording a second ruling.
+        code, again = self._author("close", "--verdict", "git:1/1")
+        self.assertNotEqual(code, 0, again)
+
+    def test_a_reference_naming_a_round_nobody_pushed_refuses_with_a_remedy(
+            self):
+        self._handoff()
+        clone = self._reviewer_clone()
+        code, rec = self._reviewer(clone, "take", "git:1/7", "--as", "codex")
+        self.assertNotEqual(code, 0, rec)
+        self.assertIn("git:1/7", str(rec))
+        self.assertEqual(rec["next_kind"], "blocked")
+        self.assertTrue(rec["remedy"])
+
+    def test_local_only_and_git_cannot_both_hold(self):
+        code, rec = self._author("handoff", "--claim-file", str(self.claim),
+                                 "--base", self.base, "--local-only",
+                                 "--transport", "git")
+        self.assertNotEqual(code, 0)
+        self.assertIn("cannot both be true", str(rec))
+
+    def test_the_result_reports_what_the_repository_never_declared(self):
+        """`decide` rides the same results the relay does (brief
+        `config-absent-asks-once`): this repository's config declares
+        neither `debug` nor a budget, and the round says so instead of
+        applying them in silence."""
+        # Since 2026-09-03 this repository declares `debug`, `enforcement`
+        # and `review_default` itself; the scratch copy of its config is
+        # stripped of those lines so the property is tested on silence.
+        import re
+        path = self.repo / "review.toml"
+        text = re.sub(r"^(debug|enforcement|review_default)\s*=.*\n", "",
+                      path.read_text(encoding="utf-8"), flags=re.M)
+        path.write_text(text, encoding="utf-8")
+        sh("git", "-C", str(self.repo), "commit", "--allow-empty", "-qam",
+           "undeclare")
+        rec = self._handoff()
+        keys = [e["key"] for e in rec["decide"]]
+        self.assertIn(vocab.DECIDE_DEBUG, keys)
+        self.assertIn(vocab.DECIDE_ENFORCEMENT, keys)
+        # The control, live: this repository's own config declares a token
+        # budget and a round cap, so neither is asked about.
+        self.assertNotIn(vocab.DECIDE_TOKEN_BUDGET, keys)
+        self.assertNotIn(vocab.DECIDE_ROUND_CAP, keys)
+        # `--transport git` is a declaration, and `applied` reports what was
+        # used rather than the built-in default.
+        applied = {e["key"]: e["applied"] for e in rec["decide"]}
+        self.assertEqual(applied[vocab.DECIDE_TRANSPORT], "git")
+        clone = self._reviewer_clone()
+        _, taken = self._reviewer(clone, "take", "git:1/1", "--as", "codex")
+        self.assertIn(vocab.DECIDE_DEBUG,
+                      [e["key"] for e in taken["decide"]])
+
+    def test_a_fresh_reviewer_ledger_carries_the_authors_lineage_not_its_own(
+            self):
+        """F1: lineage 1 closes on the AUTHOR's ledger before round 1 of
+        lineage 2 is emitted as `git:2/1`. The reviewer's clone here starts
+        with a genuinely EMPTY ledger — its own `lineage_number()` reads 1,
+        which has no relationship to the 2 this round is carried on. Every
+        leg of the round (request, verdict, the close relay, and the
+        disposition) must ride `refs/loupe/2/1/*`, never `1/1`, and a
+        later, independent lineage-3 round must land on its own ref
+        without disturbing lineage 2's.
+
+        Restoring the outbound ref selection to `ledger.lineage_number()`
+        reproduces `git:1/1` for lineage 2's round (a fresh ledger's own
+        count) and fails every assertion below that names `2/1` or `3/1`.
+        """
+        import json
+        self._handoff()  # lineage 1, round 1
+        code, closed1 = self._author("close", "--lineage", "--reason",
+                                     "starting over", "--by", "claude")
+        self.assertEqual(code, 0, closed1)
+
+        (self.repo / "f.txt").write_text("three\n", encoding="utf-8")
+        sh("git", "-C", str(self.repo), "commit", "-qam", "change 2")
+        base2 = git_out(self.repo, "rev-parse", "HEAD~1")
+        code, rec2 = self._author("handoff", "--claim-file", str(self.claim),
+                                  "--base", base2, "--transport", "git")
+        self.assertEqual(code, 0, rec2)
+        self.assertIn("refs/loupe/2/1/request", self._remote_refs())
+        self.assertEqual(rec2["reviewer_next"],
+                         "loupe take git:2/1 --as codex")
+
+        clone = self._reviewer_clone()  # a genuinely empty ledger
+        code, taken = self._reviewer(clone, "take", "git:2/1", "--as",
+                                     "codex")
+        self.assertEqual(code, 0, taken)
+        verdict = self.tmp / "verdict2.md"
+        verdict.write_text(verdict_text(sha=taken["sha"]), encoding="utf-8")
+        code, ruled = self._reviewer(clone, "validate", str(verdict),
+                                     "--from-target")
+        self.assertEqual(code, 0, ruled)
+        remote_refs = self._remote_refs()
+        self.assertIn("refs/loupe/2/1/verdict", remote_refs)
+        self.assertNotIn("refs/loupe/1/1/verdict", remote_refs)
+        self.assertIn("loupe close --verdict git:2/1", ruled["relay"])
+
+        code, closed2 = self._author("close", "--verdict", "git:2/1")
+        self.assertEqual(code, 0, closed2)
+        self.assertEqual(closed2["sha"], taken["sha"])
+        self.assertIn("git:2/1", closed2["relay"])
+
+        d_json = self.tmp / "d2.json"
+        d_json.write_text(json.dumps({
+            "head": taken["sha"], "round": 1, "author": "claude",
+            "dispositions": [{"finding_id": "F1", "disposition": "accepted",
+                              "payload": {"change": "fixed",
+                                          "verification": "observed",
+                                          "falsification": {
+                                              "status": "pass",
+                                              "mutation": "fails_without_fix"}
+                                          }}]}), encoding="utf-8")
+        code, resp = self._author("respond", "--verdict", "git:2/1",
+                                  "--from-json", str(d_json), "--out",
+                                  str(self.tmp / "d2.md"))
+        self.assertEqual(code, 0, resp)
+        self.assertIn("refs/loupe/2/1/disposition", self._remote_refs())
+
+        # Control: a LATER, independent lineage-3 round, taken by its own
+        # fresh reviewer clone, must not collide with lineage 2's refs —
+        # the exact regression a fresh ledger's own `lineage_number()`
+        # produces, since every fresh clone reads 1 regardless of which
+        # lineage the reference names.
+        code, closed3 = self._author("close", "--lineage", "--reason",
+                                     "starting over again", "--by", "claude")
+        self.assertEqual(code, 0, closed3)
+        (self.repo / "f.txt").write_text("four\n", encoding="utf-8")
+        sh("git", "-C", str(self.repo), "commit", "-qam", "change 3")
+        base3 = git_out(self.repo, "rev-parse", "HEAD~1")
+        code, rec3 = self._author("handoff", "--claim-file", str(self.claim),
+                                  "--base", base3, "--transport", "git")
+        self.assertEqual(code, 0, rec3)
+        self.assertIn("refs/loupe/3/1/request", self._remote_refs())
+
+        clone3 = self.tmp / "reviewer3"
+        sh("git", "clone", "-q", str(self.bare), str(clone3))
+        for k, v in (("user.name", "c"), ("user.email", "c@example.invalid"),
+                     ("commit.gpgsign", "false")):
+            sh("git", "-C", str(clone3), "config", k, v)
+        state3 = self.tmp / "reviewer3-state"
+        code, taken3 = run_cli(clone3, state3, "take", "git:3/1", "--as",
+                               "codex", cwd=self.cwd)
+        self.assertEqual(code, 0, taken3)
+        verdict3 = self.tmp / "verdict3.md"
+        verdict3.write_text(verdict_text(sha=taken3["sha"]), encoding="utf-8")
+        code, ruled3 = run_cli(clone3, state3, "validate", str(verdict3),
+                               "--from-target", cwd=self.cwd)
+        self.assertEqual(code, 0, ruled3)
+        remote_refs = self._remote_refs()
+        # Both verdicts stand on their own refs, neither overwritten by
+        # the other's push.
+        self.assertIn("refs/loupe/2/1/verdict", remote_refs)
+        self.assertIn("refs/loupe/3/1/verdict", remote_refs)
+        self.assertNotIn("refs/loupe/1/1/verdict", remote_refs)
+
+    def test_a_retake_refuses_a_carried_lineage_that_disagrees_with_storage(
+            self):
+        """Round-2 F3: the stored/requested disagreement is executable.
+
+        The same request bytes and SHA first arrive as ``git:2/1`` and are
+        recorded under lineage 2. Making those bytes available at
+        ``git:3/1`` must not let a retake move the round's later outbound
+        references. The refusal precedes both a second take event and any
+        new outbound ref.
+        """
+        self._handoff()  # lineage 1, round 1
+        code, closed = self._author("close", "--lineage", "--reason",
+                                    "start lineage 2", "--by", "claude")
+        self.assertEqual(code, 0, closed)
+        (self.repo / "f.txt").write_text("lineage two\n", encoding="utf-8")
+        sh("git", "-C", str(self.repo), "commit", "-qam", "lineage two")
+        base = git_out(self.repo, "rev-parse", "HEAD~1")
+        code, emitted = self._author(
+            "handoff", "--claim-file", str(self.claim), "--base", base,
+            "--transport", "git")
+        self.assertEqual(code, 0, emitted)
+
+        clone = self._reviewer_clone()
+        code, first = self._reviewer(clone, "take", "git:2/1", "--as",
+                                     "codex")
+        self.assertEqual(code, 0, first)
+
+        request = (self.state / "exchange" / "round-1-request.md").read_text(
+            encoding="utf-8")
+        self._overwrite("refs/loupe/3/1/request", request)
+        reviewer_ledger = self.reviewer_state / "ledger.jsonl"
+        before_ledger = reviewer_ledger.read_bytes()
+        before_refs = self._remote_refs()
+
+        code, second = self._reviewer(clone, "take", "git:3/1", "--as",
+                                      "codex")
+
+        self.assertEqual(code, 1, second)
+        self.assertEqual(second["next_kind"], "blocked")
+        self.assertIn("already taken under lineage 2", second["error"])
+        self.assertIn("carries lineage 3", second["error"])
+        self.assertEqual(reviewer_ledger.read_bytes(), before_ledger)
+        self.assertEqual(self._remote_refs(), before_refs)
+        self.assertNotIn("refs/loupe/3/1/verdict", before_refs)
+
+
 class TestTheLoopEndToEnd(unittest.TestCase):
     """A real repository, the real CLI, both declarations.
 
@@ -637,79 +1056,21 @@ class TestTheLoopEndToEnd(unittest.TestCase):
     """
 
     def setUp(self):
-        import os
-        import shutil
-        import tempfile
-        from pathlib import Path
-        from review.tests.test_worktree_and_brief import _sh, _git
-        try:
-            self.tmp = Path(tempfile.mkdtemp(prefix="topology-"))
-        except OSError as exc:
-            self.skipTest(f"filesystem writes denied ({exc})")
-        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
-        self.repo = self.tmp / "repo"
-        _sh("git", "init", "-q", "-b", "main", str(self.repo))
-        for k, v in (("user.name", "a"), ("user.email", "a@example.invalid"),
-                     ("commit.gpgsign", "false")):
-            _sh("git", "-C", str(self.repo), "config", k, v)
-        toml = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
-        toml = toml[:toml.index("[[gates]]")] + toml[toml.index("[roles]"):]
-        (self.repo / "review.toml").write_text(toml, encoding="utf-8")
-        (self.repo / "f.txt").write_text("one\n", encoding="utf-8")
-        _sh("git", "-C", str(self.repo), "add", ".")
-        _sh("git", "-C", str(self.repo), "commit", "-q", "-m", "init")
-        self.base = _git(self.repo, "rev-parse", "HEAD")
-        (self.repo / "f.txt").write_text("two\n", encoding="utf-8")
-        _sh("git", "-C", str(self.repo), "commit", "-qam", "change")
+        scratch = scratch_loop_repo(self, "topology-", objective="topology")
+        self.tmp, self.repo = scratch.tmp, scratch.repo
+        self.base, self.claim, self.cwd = scratch.base, scratch.claim, scratch.cwd
         self.state = self.tmp / "state"
-        self.claim = self.tmp / "claim.json"
-        import json
-        self.claim.write_text(json.dumps({
-            "objective": "topology",
-            "references": [{"path": "review.toml", "required": True}]}),
-            encoding="utf-8")
-        self.cwd = os.getcwd()
-        self.addCleanup(os.chdir, self.cwd)
 
     def _remote(self):
         """A bare remote both `paste` and the push rule need: a declared
         cross-machine round may not bind a SHA no other clone can fetch."""
-        import os
-        from review.tests.test_worktree_and_brief import _sh
         bare = self.tmp / "origin.git"
-        _sh("git", "init", "-q", "--bare", str(bare))
-        _sh("git", "-C", str(self.repo), "remote", "add", "origin", str(bare))
-        _sh("git", "-C", str(self.repo), "push", "-q", "-u", "origin", "main")
+        sh("git", "init", "-q", "--bare", str(bare))
+        sh("git", "-C", str(self.repo), "remote", "add", "origin", str(bare))
+        sh("git", "-C", str(self.repo), "push", "-q", "-u", "origin", "main")
 
     def _run(self, *argv, env=None):
-        import contextlib
-        import json
-        import os
-        from io import StringIO
-        from unittest import mock
-        from review import cli
-        os.chdir(self.repo)
-        buf = StringIO()
-        # The host running this suite may itself be a cloud sandbox
-        # carrying a transport declaration; the tests here state their own
-        # environment, so the host's is scrubbed and `env` (if any) is the
-        # whole declaration set.
-        scrubbed = {k: v for k, v in os.environ.items()
-                    if k != vocab.TRANSPORT_ENV
-                    and k not in {var for var, _v, _t
-                                  in vocab.TRANSPORT_PROVIDER_SIGNALS}}
-        scrubbed.update(env or {})
-        try:
-            with mock.patch.dict(os.environ, scrubbed, clear=True):
-                with contextlib.redirect_stdout(buf):
-                    code = cli.main(["--ledger-dir", str(self.state), *argv])
-        finally:
-            os.chdir(self.cwd)
-        out = buf.getvalue()
-        try:
-            return code, json.loads(out)
-        except json.JSONDecodeError:
-            return code, out
+        return run_cli(self.repo, self.state, *argv, cwd=self.cwd, env=env)
 
     def test_the_contradiction_stops_the_verb(self):
         """`--local-only` and `--transport paste` reach the CLI together and
@@ -1036,23 +1397,21 @@ class TestTransportDeclarationClosedWorld(unittest.TestCase):
         # A WARM copy exists and the invocation's config declares the
         # transport emptily: the old `or` folded that to `path` and served
         # the envelope. The boundary refuses before the cache can answer.
-        import tempfile
-        from pathlib import Path
-        fixture = TestTheCacheKeyIncludesIt()
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg, ledger = fixture._ledger_and_cfg(Path(tmp), "path")
-            cfg = dataclasses.replace(
-                cfg, roles={**cfg.roles, "transport": ""})
-            # Control: with a valid declaration the same state is warm.
-            self.assertIsNotNone(transport.cached_handoff(
-                dataclasses.replace(
-                    cfg, roles={**cfg.roles, "transport": "path"}),
-                ledger, 1, git=fixture._git(),
-                claim_digest=fixture.CLAIM, roles=("claude", "codex")))
-            with self.assertRaises(vocab.TransportDeclarationError):
-                transport.cached_handoff(cfg, ledger, 1, git=fixture._git(),
-                                         claim_digest=fixture.CLAIM,
-                                         roles=("claude", "codex"))
+        w = warm_cache_fixture(self, prefix="topology-cache-",
+                               transport_attr="path",
+                               claim_digest=TestTheCacheKeyIncludesIt.CLAIM)
+        empty = dataclasses.replace(
+            w.cfg, roles={**w.cfg.roles, "transport": ""})
+        valid = dataclasses.replace(
+            w.cfg, roles={**w.cfg.roles, "transport": "path"})
+        # Control: with a valid declaration the same state is warm.
+        self.assertIsNotNone(transport.cached_handoff(
+            valid, w.ledger, 1, git=w.git, claim_digest=w.claim_digest,
+            roles=("claude", "codex")))
+        with self.assertRaises(vocab.TransportDeclarationError):
+            transport.cached_handoff(empty, w.ledger, 1, git=w.git,
+                                     claim_digest=w.claim_digest,
+                                     roles=("claude", "codex"))
 
     # ------------------------------------------------------- both relays
 

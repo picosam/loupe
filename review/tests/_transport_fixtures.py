@@ -9,16 +9,31 @@ another or shared a `setUp`, so the split needed no fixture surgery.
 
 `request_text` and `evidence_cell` are also imported by other test modules;
 see `test_worktree_and_brief.py` and `test_lineage_reference.py`.
+
+Consolidated 2026-09-02: the two scaffolds that had grown by copy across
+the transport modules now live here once — the warm-cache scaffold
+(`warm_cache_fixture`, five copies before) and the real-CLI scratch
+repository (`scratch_loop_repo` + `run_cli`, two copies before) — with the
+shell helpers `sh`/`git_out` the scratch repositories are built with.
 """
 
 import contextlib
 import dataclasses
 import io
 import json
+import re
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
-from review import config, transport
+from review import cli, config, tool_identity, transport, vocab
 from review.ledger import Ledger
+from review.tests import synth
 from review.tests.util import REPO_ROOT
 
 CFG = config.load(REPO_ROOT)
@@ -106,15 +121,17 @@ def request_text(sha=SHA_B, base=SHA_A, reviewer="codex", author="claude",
 
 
 def verdict_text(sha=SHA_B, verdict="changes requested", findings=1):
+    """The transport modules' verdict: `synth.verdict_text`'s shape with
+    its evidence anchored at `f.txt` — the one file the scratch
+    repositories these tests build actually carry — where synth's builder
+    pins `review/wire.py` with no parameter to change it. The finding
+    block itself is synth's."""
     body = f'<loupe-review-verdict sha="{sha}">\nVERDICT: {verdict}\n\n## findings\n\n'
     if verdict == "clean to advance":
         body += "None\n"
     else:
         for i in range(1, findings + 1):
-            body += (f"### F{i}\nSeverity: Low\nClassification: design_gap\n"
-                     f"Title: finding number {i}\nEvidence: f.txt:1\n"
-                     f"Why: because\nRequired outcome: fix it\n"
-                     f"FALSIFICATION: observation: it is fixed\n\n")
+            body += synth.finding(i, evidence="f.txt:1")
     body += "## evidence checked\n\nf.txt\n</loupe-review-verdict>\n"
     return body
 
@@ -183,7 +200,163 @@ def reviewer_clone_git():
     return run
 
 
+#: What `request_text`'s reachability stamp points at — the repository the
+#: fixture's reviewer clone is a clone OF. `probe_target` compares the two
+#: before it fetches (`take-binds-to-caller-checkout`), so a test that wants
+#: the ordinary reviewer path declares this rather than inheriting whatever
+#: remotes the checkout running the suite happens to have.
+REVIEWER_REMOTES = ["ssh://example.invalid/x.git"]
+
+
 def ledgerless_cfg():
     """The repo config with no ledger directory — the shape every unit-level
     transport test uses, so nothing it does can reach a real ledger on disk."""
     return dataclasses.replace(CFG, ledger_dir=None)
+
+
+def sh(*args):
+    """Run one command to completion, raising on failure; output discarded."""
+    subprocess.run(args, check=True, capture_output=True, text=True,
+                   timeout=60)
+
+
+def git_out(where, *args):
+    """`git -C where args...`, returning stripped stdout."""
+    out = subprocess.run(["git", "-C", str(where), *args], check=True,
+                         capture_output=True, text=True, timeout=60)
+    return out.stdout.strip()
+
+
+def scratch_tmp(case, prefix):
+    """A temporary directory the test case owns, or a skip where the
+    filesystem refuses writes (the read-only pass)."""
+    try:
+        tmp = Path(tempfile.mkdtemp(prefix=prefix))
+    except OSError as exc:
+        case.skipTest(f"filesystem writes denied ({exc})")
+    case.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+    return tmp
+
+
+#: `warm_cache_fixture(tool_attr=...)` default: stamp the running identity.
+CURRENT_IDENTITY = object()
+
+
+@dataclasses.dataclass
+class WarmCache:
+    """What `warm_cache_fixture` built: a config whose state directory holds
+    the kept request, the in-memory ledger that recorded it, the scripted
+    runner, and the envelope text plus the path it was kept at."""
+    cfg: object
+    ledger: Ledger
+    git: object
+    text: str
+    kept: str
+    claim_digest: str
+
+    def cached(self, **kw):
+        """`cached_handoff` for round 1 under this scaffold; `kw` is the
+        key dimension under test (roles, transport, debug, ...)."""
+        return transport.cached_handoff(self.cfg, self.ledger, 1,
+                                        git=self.git,
+                                        claim_digest=self.claim_digest, **kw)
+
+
+def warm_cache_fixture(case, text=None, *, prefix="warm-cache-",
+                       tool_attr=CURRENT_IDENTITY, transport_attr=None,
+                       claim_digest=transport.NO_CLAIM):
+    """The warm-cache scaffold every cache-key test starts from: one kept
+    round-1 request, the ledger event that recorded it, and a runner that
+    reports a clean tree at its SHA.
+
+    Three facts the scaffold has to get right, or the test never reaches
+    its own subject:
+      * a recorded claim state, because round 5 F1 made "neither side says
+        anything" cold — `claim_digest` is recorded on the event and is
+        what `cached()` presents back;
+      * the current tool identity on the envelope, because round 1 F2 put
+        it in the warm key — the identity's own cold cases live in
+        `test_transport_lifecycle`, and pass `tool_attr=None` to reach them;
+      * the target's authority answered (round 2 F1: the warm path
+        resolves the TARGET's `review.toml` to decide the role key).
+    `text` overrides the envelope outright for a caller that stamps its
+    own attributes.
+    """
+    tmp = scratch_tmp(case, prefix)
+    cfg = dataclasses.replace(CFG, ledger_dir=tmp)
+    if text is None:
+        stamp = tool_identity() if tool_attr is CURRENT_IDENTITY else tool_attr
+        text = request_text(tool_attr=stamp, transport_attr=transport_attr)
+    kept = transport.keep_bytes(cfg, 1, "request", text)
+    git = fake_git({("rev-parse", "HEAD"): SHA_B,
+                    ("status", "--porcelain"): "",
+                    **authority_calls()})
+    ledger = Ledger.in_memory()
+    ledger.add({"event": "request", "round": 1, "sha": SHA_B,
+                "source_digest": transport._digest_text(text),
+                "bytes": len(text), "claim_digest": claim_digest})
+    return WarmCache(cfg, ledger, git, text, kept, claim_digest)
+
+
+def scratch_loop_repo(case, prefix, name="repo", objective="loop test"):
+    """A real repository the real CLI can run a round against: this repo's
+    `review.toml` with its gates spliced out, `f.txt` committed twice so
+    there is a base and a head, and a claim file naming `review.toml` as
+    the required reference. The caller's cwd is restored at cleanup, since
+    `run_cli` changes it. Returns tmp, repo, base, claim and cwd."""
+    tmp = scratch_tmp(case, prefix)
+    repo = tmp / name
+    sh("git", "init", "-q", "-b", "main", str(repo))
+    for k, v in (("user.name", "a"), ("user.email", "a@example.invalid"),
+                 ("commit.gpgsign", "false")):
+        sh("git", "-C", str(repo), "config", k, v)
+    toml = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
+    toml = toml[:toml.index("[[gates]]")] + toml[toml.index("[roles]"):]
+    # This repository declares `transport = "path"` (asked once, 2026-09-03);
+    # the scratch loop declares its topology per test — by flag, config line
+    # or environment — so the copy carries no transport of its own.
+    toml = re.sub(r"^transport\s*=.*\n", "", toml, flags=re.M)
+    (repo / "review.toml").write_text(toml, encoding="utf-8")
+    (repo / "f.txt").write_text("one\n", encoding="utf-8")
+    sh("git", "-C", str(repo), "add", ".")
+    sh("git", "-C", str(repo), "commit", "-q", "-m", "init")
+    base = git_out(repo, "rev-parse", "HEAD")
+    (repo / "f.txt").write_text("two\n", encoding="utf-8")
+    sh("git", "-C", str(repo), "commit", "-qam", "change")
+    claim = tmp / "claim.json"
+    claim.write_text(json.dumps({
+        "objective": objective,
+        "references": [{"path": "review.toml", "required": True}]}),
+        encoding="utf-8")
+    cwd = os.getcwd()
+    case.addCleanup(os.chdir, cwd)
+    return SimpleNamespace(tmp=tmp, repo=repo, base=base, claim=claim,
+                           cwd=cwd)
+
+
+def run_cli(where, state, *argv, cwd, env=None):
+    """`loupe --ledger-dir state argv...` run from inside `where`, returning
+    (exit code, parsed JSON payload — or the raw text when it is not JSON).
+
+    The host running this suite may itself be a cloud sandbox carrying a
+    transport declaration; the tests here state their own environment, so
+    the host's is scrubbed and `env` (if any) is the whole declaration set.
+    """
+    os.chdir(where)
+    buf = io.StringIO()
+    scrubbed = {k: v for k, v in os.environ.items()
+                if k != vocab.TRANSPORT_ENV
+                and k not in {var for var, _v, _t
+                              in vocab.TRANSPORT_PROVIDER_SIGNALS}}
+    scrubbed.update(env or {})
+    try:
+        with mock.patch.dict(os.environ, scrubbed, clear=True):
+            with contextlib.redirect_stdout(buf):
+                code = cli.main(["--ledger-dir", str(state), *argv])
+    finally:
+        os.chdir(cwd)
+    out = buf.getvalue()
+    try:
+        return code, json.loads(out)
+    except json.JSONDecodeError:
+        return code, out

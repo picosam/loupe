@@ -77,7 +77,11 @@ GUARDED_TYPES = ("Lit", "Command", "paths.Lit", "paths.Command")
 
 # Constants of this package, fixed at import: not dynamic, so legal as a
 # literal word.
-CONSTANTS = ("TOOL_NAME", "TOOL_VERSION")
+# `TRANSPORT_GIT` joined 2026-09-03: its VALUE is the word `git`, so
+# its own definition reads as a command to the scan below for the same
+# reason `TOOL_NAME = "loupe"` does. It is a constant of this package,
+# fixed at import, and the definition of a name is not a use of it.
+CONSTANTS = ("TOOL_NAME", "TOOL_VERSION", "TRANSPORT_GIT")
 
 
 def dotted(node) -> str:

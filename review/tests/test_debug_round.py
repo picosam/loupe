@@ -13,12 +13,9 @@ invocation that asked the other.
 """
 import dataclasses
 import re
-import tempfile
 import unittest
-from pathlib import Path
 
 from review import emit, transport, validate, vocab, wire
-from review.ledger import Ledger
 from review.tests.synth import (CFG, CLAIM, NO_GATES, head_sha,
                                 reachability, shadow_ledger)
 
@@ -73,6 +70,41 @@ class TestStamp(unittest.TestCase):
         self.assertEqual([i.code for i in items if i.level == "error"], [])
 
 
+class TestResolution(unittest.TestCase):
+    """Flag > `[roles] debug` > off (decided 2026-08-31): a default that
+    depends on whoever runs `handoff` remembering a flag is not a
+    default. The transport precedence, cut to this value's three
+    states."""
+
+    def _cfg(self, declared):
+        # CFG mirrors this repository's own config, which DECLARES debug —
+        # start each case from the undeclared state.
+        roles = dict(CFG.roles)
+        roles.pop("debug", None)
+        if declared is not None:
+            roles["debug"] = declared
+        return dataclasses.replace(CFG, roles=roles)
+
+    def test_the_flag_wins_in_both_directions(self):
+        self.assertTrue(emit.resolve_debug(self._cfg(False), True))
+        self.assertFalse(emit.resolve_debug(self._cfg(True), False))
+
+    def test_the_declaration_reaches_a_flagless_invocation(self):
+        self.assertTrue(emit.resolve_debug(self._cfg(True), None))
+        # Paired control: an explicit false declaration is off, not silence.
+        self.assertFalse(emit.resolve_debug(self._cfg(False), None))
+
+    def test_undeclared_and_flagless_is_off(self):
+        self.assertFalse(emit.resolve_debug(self._cfg(None), None))
+
+    def test_a_non_boolean_declaration_is_refused_at_the_boundary(self):
+        from review import config
+        with self.assertRaises(config.ConfigError) as ctx:
+            config.from_text("[roles]\ndebug = \"yes\"\n",
+                             like=CFG, source="review.toml")
+        self.assertIn("debug", str(ctx.exception))
+
+
 class TestVerdictSection(unittest.TestCase):
 
     def _wrap(self, body, sha="0" * 40):
@@ -106,27 +138,9 @@ class TestCacheKey(unittest.TestCase):
     claim, the roles and the transport in the key."""
 
     def _warm(self, text, debug):
-        from review.tests._transport_fixtures import (SHA_B, authority_calls,
-                                                 fake_git)
-        try:
-            tmp = Path(tempfile.mkdtemp(prefix="debug-cache-"))
-        except OSError as exc:
-            self.skipTest(f"filesystem writes denied ({exc})")
-        self.addCleanup(lambda: __import__("shutil").rmtree(
-            tmp, ignore_errors=True))
-        cfg = dataclasses.replace(CFG, ledger_dir=tmp)
-        transport.keep_bytes(cfg, 1, "request", text)
-        git = fake_git({("rev-parse", "HEAD"): SHA_B,
-                        ("status", "--porcelain"): "",
-                        **authority_calls()})
-        ledger = Ledger.in_memory()
-        ledger.add({"event": "request", "round": 1, "sha": SHA_B,
-                    "source_digest": transport._digest_text(text),
-                    "bytes": len(text),
-                    "claim_digest": transport.NO_CLAIM})
-        return transport.cached_handoff(cfg, ledger, 1, git=git,
-                                        claim_digest=transport.NO_CLAIM,
-                                        debug=debug)
+        from review.tests._transport_fixtures import warm_cache_fixture
+        return warm_cache_fixture(self, text, prefix="debug-cache-").cached(
+            debug=debug)
 
     def _texts(self):
         from review.tests._transport_fixtures import request_text

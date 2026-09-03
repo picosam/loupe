@@ -18,8 +18,10 @@ from dataclasses import dataclass
 
 from . import FORMER_NAMES, TOOL_NAME, paths, vocab
 from .config import Config
-from .wire import (Disposition, DuplicateMember, Finding, Request, Verdict,
-                   attestation_fence, load_json, parse_push_line)
+from .wire import (Authorization, Disposition, DuplicateMember, Finding,
+                   Request, Verdict, attestation_fence, load_json,
+                   parse_push_line)
+from .wire import json_kind as wire_json_kind
 # ONE section splitter for the emitter, the parser and this validator. A
 # second copy here is exactly how §10.1 found the emitter and the validator
 # each holding the same literal and agreeing only by accident.
@@ -1040,6 +1042,250 @@ def _identity_items(fid: str, rec: dict,
     return items
 
 
+#: The wrapper attribute value grammars this validator owns. `sha` and
+#: `shape` are absent on purpose: they are judged by the shared envelope
+#: grammar (`E-SHA-SHAPE`, `E-SHAPE-GRAMMAR`), and a second copy here would
+#: be a grammar with two chances to drift.
+_A_ATTR_VALUE = {
+    "digits": (re.compile(r"\A[0-9]+\Z"),
+               "a decimal count"),
+    "identity": (re.compile(r"\A[0-9a-f]{16}\Z"),
+                 "a 16-character lowercase hex identity"),
+    # The one grammar the recording verbs refuse by, so every name the
+    # tool accepts is one the wrapper can carry (lineage 20 round 4 F4).
+    "name": (re.compile(vocab.AUTHORIZER_NAME_RE), vocab.AUTHORIZER_NAME_WANT),
+}
+
+#: What each silent member fails to say, so the refusal names the silence
+#: rather than the member. Keyed by `vocab.AUTHORIZATION_NONEMPTY`.
+_A_SILENCE = {"by": "who decided", "reason": "why",
+              "sha": "which commit it advances"}
+
+#: JSON kind -> the predicate that admits it. `bool` is an `int` in Python,
+#: so an integer member must reject `true` explicitly — `config._check_value`
+#: is the house precedent, found by the first bool-valued key.
+_A_JSON_KIND = {
+    "string": lambda v: isinstance(v, str),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+    "waived_records": lambda v: isinstance(v, list),
+}
+
+
+def _a_wrapper(a: Authorization) -> list[Item]:
+    """The wrapper half of `vocab.AUTHORIZATION_WRAPPER_FIELDS`: every
+    attribute the emitter stamps is present and carries a value of its kind.
+
+    Unknown attribute NAMES are accepted (design §3.1) — an older
+    installation must be able to read an envelope carrying an attribute it
+    has never heard of. Repeats are already refused one layer up, by the one
+    attribute parser every kind goes through.
+    """
+    items: list[Item] = []
+    absent = [k for k in vocab.AUTHORIZATION_WRAPPER_FIELDS
+              if k not in a.attrs]
+    if absent:
+        items.append(_err("A-WRAPPER-MEMBERS",
+                          f"the authorization wrapper stamps none of "
+                          f"{absent} — the face of the envelope is what a "
+                          f"reader binds to before it opens the body, and an "
+                          f"unstamped fact there is one the body can state "
+                          f"alone with nothing to check it against"))
+    for attr, kind in vocab.AUTHORIZATION_WRAPPER_FIELDS.items():
+        if attr not in a.attrs:
+            continue
+        value = a.attrs[attr]
+        if kind == "name" and not value.strip():
+            items.append(_err("A-WRAPPER-VALUE",
+                              f"the authorization wrapper stamps an "
+                              f"empty {attr!r}: an attribute stated as "
+                              f"nothing is the silence the stamp exists "
+                              f"to replace, not a value"))
+        elif kind in _A_ATTR_VALUE:
+            pattern, want = _A_ATTR_VALUE[kind]
+            if not pattern.match(value):
+                items.append(_err("A-WRAPPER-VALUE",
+                                  f"the authorization wrapper stamps "
+                                  f"{attr}={value!r}, which is not {want}"))
+    return items
+
+
+def _a_waived(waived: list) -> list[Item]:
+    """One record per overruled finding, closed against `vocab.WAIVED_FIELDS`
+    exactly as the top level is closed against `AUTHORIZATION_FIELDS`."""
+    items: list[Item] = []
+    if not waived:
+        items.append(_err("A-WAIVED-EMPTY",
+                          "an authorization overrules nothing: with no "
+                          "open finding to advance past there is nothing "
+                          "for a human to authorize, and a clean verdict "
+                          "is the artifact that says so"))
+    seen: dict[str, list[str]] = {}
+    for i, rec in enumerate(waived):
+        at = f"waived[{i}]"
+        if not isinstance(rec, dict):
+            items.append(_err("A-WAIVED",
+                              f"{at} is {type(rec).__name__}, not a "
+                              f"record of one overruled finding"))
+            continue
+        unknown = sorted(set(rec) - set(vocab.WAIVED_FIELDS))
+        if unknown:
+            items.append(_err("A-WAIVED-UNKNOWN",
+                              f"{at} states unknown member(s) {unknown}; an "
+                              f"overruled finding carries "
+                              f"{', '.join(sorted(vocab.WAIVED_FIELDS))} and "
+                              f"nothing else. An unknown member ignored in "
+                              f"silence is a misspelled `reason` that "
+                              f"records no reason"))
+        for member, value in rec.items():
+            kind = vocab.WAIVED_FIELDS.get(member)
+            if kind is None or _A_JSON_KIND[kind](value):
+                continue
+            items.append(_err("A-WAIVED-TYPE",
+                              f"{at}.{member} is {wire_json_kind(value)}, "
+                              f"and this grammar states it as a "
+                              f"{'string' if kind == 'string' else kind}; a "
+                              f"record whose members are not what they are "
+                              f"declared to be is not one this tool wrote"))
+        absent = [k for k in vocab.WAIVED_REQUIRED
+                  if k not in rec
+                  or (isinstance(rec[k], str) and not rec[k].strip())]
+        if absent:
+            items.append(_err("A-WAIVED-MEMBERS",
+                              f"{at} missing {absent} — each overruled "
+                              f"finding names itself, its identity, the "
+                              f"reason it was overruled and who decided"))
+        # Uniqueness is by the STABLE identity, never the round-scoped
+        # label (lineage 20 round 4 F3): two standing findings from
+        # different rounds may both be labelled F1 and are two findings,
+        # while F1 and F2 sharing one fingerprint are one finding stated
+        # twice. A record with no readable identity was refused above and
+        # is not counted here — it identifies nothing to repeat.
+        fp = rec.get("fp")
+        if isinstance(fp, str) and fp.strip():
+            seen.setdefault(fp.strip(), []).append(
+                str(rec.get("finding_id", "?")))
+    for fp, labels in seen.items():
+        if len(labels) > 1:
+            items.append(_err("A-WAIVED-REPEAT",
+                              f"finding {fp} is overruled {len(labels)} "
+                              f"times in one authorization (as "
+                              f"{', '.join(labels)}); two records for one "
+                              f"finding let one reason hide another"))
+    return items
+
+
+def _a_split(a: Authorization) -> list[Item]:
+    """`vocab.AUTHORIZATION_DUPLICATED`: every fact the wrapper and the body
+    both state must agree.
+
+    They are written together by one emitter, so disagreement means a hand
+    edit after emission — and an approval binds to whichever half its reader
+    happens to take. Only the SHA split was refused before; an artifact
+    could stamp one authorizer on its face and name another in its body.
+    """
+    items: list[Item] = []
+    for fact in vocab.AUTHORIZATION_DUPLICATED:
+        stamped = a.attrs.get(fact)
+        if stamped is None or fact not in a.data:
+            continue
+        stated = a.data[fact]
+        if not _A_JSON_KIND[vocab.AUTHORIZATION_FIELDS[fact]](stated):
+            continue  # the type defect is reported; there is no fact to compare
+        if stamped == str(stated):
+            continue
+        items.append(_err(
+            "A-SHA-SPLIT" if fact == "sha" else "A-WRAPPER-SPLIT",
+            f"wrapper stamps {fact}={stamped!r} while the body states "
+            f"{stated!r}; one artifact cannot advance two commits, belong to "
+            f"two rounds or lineages, or be authorized by two people"))
+    return items
+
+
+def validate_authorization(a: Authorization, cfg: Config) -> list[Item]:
+    """A human's decision to advance a lineage over open findings.
+
+    What this judges is the RECORD, not the judgment: whether the artifact
+    says who decided, why, and which findings they decided about. It cannot
+    judge whether the decision was right, and — the limit worth stating at
+    the validator rather than leaving to a caller — it cannot establish that
+    a human rather than an agent produced it. `by` is asserted. Everything
+    here therefore aims at one property: an authorization that reaches a
+    reader must be unable to hide WHAT was overruled or WHO said so, because
+    silence on either is the state this whole mechanism exists to replace.
+
+    Empty `waived` is refused rather than treated as a trivially valid
+    authorization: an authorization overruling nothing is either a clean
+    verdict misfiled — in which case the clean path is the one to use — or a
+    record whose subject was lost, and neither should post an approval.
+
+    The GRAMMAR it enforces is `vocab.AUTHORIZATION_WRAPPER_FIELDS`,
+    `AUTHORIZATION_FIELDS`, `AUTHORIZATION_NONEMPTY`, `WAIVED_FIELDS` and
+    `AUTHORIZATION_DUPLICATED` — one authority, read here and derived from
+    by the tests, so a member added there without a rule to judge it fails
+    rather than being admitted in silence. Before that authority existed
+    this function checked presence and a handful of truthy values: every
+    wrapper stamp but the tag could be absent, every member could hold any
+    JSON type, unknown members at either depth were ignored, and only the
+    SHA of the four duplicated facts had to agree.
+    """
+    items: list[Item] = []
+    if not a.wrapped:
+        items.append(_err("A-WRAPPER", "no wrapper tag"))
+        return items
+    items.extend(envelope_identity(a.tag, a.attrs.get("sha"), a.exact, cfg,
+                                   "authorization", a.attr_defects))
+    items.extend(_a_wrapper(a))
+    for code, message in a.body_defects:
+        items.append(_err(code, message))
+    if a.body_defects:
+        return items
+
+    unknown = sorted(set(a.data) - set(vocab.AUTHORIZATION_FIELDS))
+    if unknown:
+        items.append(_err("A-UNKNOWN",
+                          f"authorization body states unknown member(s) "
+                          f"{unknown}; its members are "
+                          f"{', '.join(sorted(vocab.AUTHORIZATION_FIELDS))} "
+                          f"and nothing else. An unknown member dropped in "
+                          f"silence is a misspelled `waived` that overrules "
+                          f"nothing while the artifact reads as though it "
+                          f"overruled something"))
+    missing = [m for m in vocab.AUTHORIZATION_REQUIRED if m not in a.data]
+    if missing:
+        items.append(_err("A-MEMBERS",
+                          f"authorization body missing {missing} — an "
+                          f"authorization states the commit it advances, the "
+                          f"round and lineage it belongs to, who decided, "
+                          f"why, and every finding overruled"))
+    for member, value in a.data.items():
+        kind = vocab.AUTHORIZATION_FIELDS.get(member)
+        if kind is None:
+            continue  # reported as unknown above; there is no rule to apply
+        if not _A_JSON_KIND[kind](value):
+            if kind == "waived_records":
+                items.append(_err("A-WAIVED",
+                                  f"`waived` must be a list of overruled "
+                                  f"findings, got {type(value).__name__}"))
+            else:
+                items.append(_err("A-TYPE",
+                                  f"authorization member {member!r} is "
+                                  f"{wire_json_kind(value)}, and this "
+                                  f"grammar states it as a {kind}"))
+            continue
+        if member in vocab.AUTHORIZATION_NONEMPTY and not value.strip():
+            items.append(_err("A-SILENT",
+                              f"authorization states an empty {member!r}: a "
+                              f"record that does not say "
+                              f"{_A_SILENCE.get(member, 'what it binds to')} "
+                              f"is the silence this artifact exists to "
+                              f"replace"))
+        if kind == "waived_records":
+            items.extend(_a_waived(value))
+    items.extend(_a_split(a))
+    return items
+
+
 def validate_disposition(d: Disposition, cfg: Config,
                          against: Verdict | None = None) -> list[Item]:
     items: list[Item] = []
@@ -1117,3 +1363,101 @@ def validate_disposition(d: Disposition, cfg: Config,
                                   f"{f.id}: {rec['disposition']!r} is illegal "
                                   f"for blocking findings (§5.2)"))
     return items
+
+
+# ------------------------------------------- the claim against the diff span
+
+#: The characters a repository path is made of. Containment is tested with
+#: these as the boundary on both sides, for the reason `bin/scope-excluded`
+#: learned in its round 3: a path tested as a bare substring counts
+#: `a.txt` as named whenever `data.txt` is mentioned, and a claim that
+#: omitted the first then reconciled clean.
+_PATH_BOUNDARY = "0-9A-Za-z._/-"
+
+#: How many unnamed paths the notice spells out before it counts the rest.
+#: The notice exists to be READ; a hundred-path wall is a wall.
+SCOPE_NAMES_SHOWN = 10
+
+
+def claim_text(claim: dict) -> str:
+    """Every authored string of a claim, as one searchable document.
+
+    The claim's own grammar decides what is in it (`vocab.CLAIM_FIELDS`), so
+    a member added there joins this text without a second list to maintain.
+    """
+    parts: list[str] = []
+    for member, kind in vocab.CLAIM_FIELDS.items():
+        value = claim.get(member)
+        if kind == "string" and isinstance(value, str):
+            parts.append(value)
+        # A captured claim freezes its members (tuples under a mapping
+        # proxy), so sequences are matched by shape, not by `list` —
+        # measured 2026-09-03: every reference was invisible to the scope
+        # report and a 24-path span read as 24 unnamed.
+        elif kind == "list_of_string" and isinstance(value, (list, tuple)):
+            parts.extend(v for v in value if isinstance(v, str))
+        elif kind == "references" and isinstance(value, (list, tuple)):
+            for ref in value:
+                if hasattr(ref, "get"):
+                    parts.extend(str(ref.get(k, ""))
+                                 for k in ("path", "note"))
+    return "\n".join(parts)
+
+
+def names_path(text: str, path: str) -> bool:
+    """Whether `text` names `path` as a whole path, not as a fragment."""
+    return re.search(f"(?<![{_PATH_BOUNDARY}]){re.escape(path)}"
+                     f"(?![{_PATH_BOUNDARY}])", text) is not None
+
+
+def scope_gaps(claim: dict, changed_paths) -> list[str]:
+    """Changed paths the claim accounts for NOWHERE — neither as a
+    reference, nor named anywhere in its authored prose.
+
+    A claim that states nothing (the recorded no-claim state) asserts no
+    scope, so it contradicts no diff and there is nothing to report.
+    """
+    if not claim:
+        return []
+    text = claim_text(claim)
+    return [p for p in changed_paths if not names_path(text, p)]
+
+
+def scope_items(claim: dict, changed_paths) -> list[Item]:
+    """Round-9 F4 (non-blocking), landed 2026-09-03.
+
+    The round-9 claim said "no other file touched" while the round's own
+    machine-computed span — base to head, and the span is what the reviewer
+    reads — carried an unrelated commit's paths with no reference and no
+    rationale. The diff was fully reviewable and was reviewed; what was
+    missing was any comparison between the authored scope and the computed
+    one, so the two could disagree indefinitely and only a reader noticing
+    would catch it.
+
+    NON-BLOCKING, deliberately, and this is the `ci-evidence` precedent
+    rather than a softening: a path in the span with no account is a claim
+    an author must fix or a rationale they must add, and neither is
+    something the tool can decide. It reports what it measured — the paths,
+    by name — to the one person who can say which.
+
+    "Accounted for" is the claim naming the path anywhere it authors:
+    a reference entry, the review scope, a stop condition, deliberately-not.
+    Generated artefacts a commit regenerates are named there like anything
+    else — the tool carries no list of which files a repository generates,
+    because that list is identity rather than mechanism and does not travel
+    (design §11).
+    """
+    gaps = scope_gaps(claim, changed_paths)
+    if not gaps:
+        return []
+    shown = ", ".join(gaps[:SCOPE_NAMES_SHOWN])
+    rest = len(gaps) - SCOPE_NAMES_SHOWN
+    return [_notice(
+        "R-SCOPE-UNNAMED",
+        f"{len(gaps)} of {len(list(changed_paths))} changed path(s) are "
+        f"named nowhere in the claim: {shown}"
+        + (f", and {rest} more" if rest > 0 else "")
+        + " — the span the reviewer reads is base to head, so a path in it "
+          "with no reference and no stated exclusion is scope the claim "
+          "does not describe (round-9 F4). Name it, or say why it is out "
+          "of scope; the tool reports and does not refuse")]

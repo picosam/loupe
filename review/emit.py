@@ -138,6 +138,65 @@ def next_round(ledger: Ledger) -> int:
     return max((e["round"] for e in verdicts), default=0) + 1
 
 
+def _resolve_push_destination(repo: Path, branch: str, remotes: list[str],
+                              run) -> tuple[str, str] | None:
+    """The exact remote and remote ref a push of `branch` resolves to —
+    the ONE derivation both `ensure_pushed` and `check_enforcement` read
+    (F2).
+
+    Before the fix, `check_enforcement` picked a remote named `origin`
+    on its own, never consulting the branch's upstream; `ensure_pushed`
+    already did. With several remotes and no upstream, the two could
+    name different destinations — enforcement tested one remote's
+    default branch while the push landed on another's, so a branch that
+    was the default branch of its actual push target could pass
+    preflight whenever a differently-defaulted remote happened to be
+    named `origin`.
+
+    `branch`'s own upstream wins when declared. Absent that, the sole
+    remote is the only derivable destination; more than one remote with
+    no upstream is not derivable and raises, exactly as `ensure_pushed`
+    has always refused it (§9bis.3: the tool never invents a decision).
+    `remotes` empty returns None — the caller decides what "no remote"
+    means for its own refusal.
+    """
+    if not remotes:
+        return None
+    upstream = run("for-each-ref",
+                   "--format=%(upstream:remotename)\t%(upstream:remoteref)",
+                   f"refs/heads/{branch}")
+    remote, _, merge_ref = upstream.partition("\t")
+    if remote:
+        _destination_branch(remote, merge_ref)
+        return remote, merge_ref
+    if len(remotes) > 1:
+        raise RuntimeError(
+            f"{branch} has no upstream and {len(remotes)} remotes exist "
+            f"({', '.join(remotes)}): the destination is not derivable, "
+            f"and the tool never invents a decision (§9bis.3). Set one "
+            f"with `{paths.command(*paths.lits('git', 'push', '-u'), paths.Ph('<remote>'), branch)}`, "
+            f"then re-run")
+    return remotes[0], f"refs/heads/{branch}"
+
+
+def _destination_branch(remote: str, remote_ref: str) -> str:
+    """Return the branch identity carried by an exact push destination.
+
+    Enforcement is about the REMOTE ref that ``ensure_pushed`` will update,
+    not the name of the local branch on the left side of that refspec.  Only
+    ``refs/heads/<branch>`` has a branch identity that can be compared with a
+    remote's default branch.  Anything else is refused instead of being
+    silently classified as a safe working-branch destination.
+    """
+    prefix = "refs/heads/"
+    if not remote_ref.startswith(prefix) or not remote_ref[len(prefix):]:
+        raise RuntimeError(
+            f"push destination {remote}:{remote_ref or '(empty)'} does not "
+            f"name refs/heads/<branch>, so its branch identity cannot be "
+            f"derived and the approval pathway cannot be checked")
+    return remote_ref[len(prefix):]
+
+
 def ensure_pushed(cfg: Config, head: str | None = None,
                   local_only: bool = False,
                   commit_subject: str | None = None,
@@ -169,11 +228,15 @@ def ensure_pushed(cfg: Config, head: str | None = None,
     # human has already carried the envelope. Refused here, before the
     # commit, because it needs no git state to be false — this is the leg
     # RVW-T11 called unsolved-but-visible, now enforced rather than stamped.
-    if local_only and transport == vocab.TRANSPORT_PASTE:
+    # Both cross-machine topologies, and one reason: `paste` puts the bytes
+    # in a person's hands and `git` puts them on a remote, and neither
+    # reviewer can open this filesystem.
+    if local_only and transport in (vocab.TRANSPORT_PASTE,
+                                    vocab.TRANSPORT_GIT):
         raise RuntimeError(
             f"--local-only declares the target fetchable from no remote, "
-            f"while transport={vocab.TRANSPORT_PASTE!r} declares a reviewer "
-            f"with no access to this filesystem: the two cannot both be true, "
+            f"while transport={transport!r} declares a reviewer with no "
+            f"access to this filesystem: the two cannot both be true, "
             f"and the envelope would bind a SHA that reviewer can never reach "
             f"(§9bis.4, RVW-T11). Push the branch to a remote both sides can "
             f"fetch, or declare transport={vocab.TRANSPORT_PATH!r}")
@@ -301,19 +364,7 @@ def ensure_pushed(cfg: Config, head: str | None = None,
             "genuinely same-clone, re-run with --local-only, which stamps "
             "that state on the envelope's face")
 
-    upstream = run("for-each-ref",
-                   "--format=%(upstream:remotename)\t%(upstream:remoteref)",
-                   f"refs/heads/{branch}")
-    remote, _, merge_ref = upstream.partition("\t")
-    if not remote:
-        if len(remotes) > 1:
-            raise RuntimeError(
-                f"{branch} has no upstream and {len(remotes)} remotes exist "
-                f"({', '.join(remotes)}): the destination is not derivable, "
-                f"and the tool never invents a decision (§9bis.3). Set one "
-                f"with `{paths.command(*paths.lits('git', 'push', '-u'), paths.Ph('<remote>'), branch)}`, "
-                f"then re-run")
-        remote, merge_ref = remotes[0], f"refs/heads/{branch}"
+    remote, merge_ref = _resolve_push_destination(repo, branch, remotes, run)
 
     url = _scrub_url(run("remote", "get-url", remote))
     try:
@@ -400,26 +451,76 @@ def _tool_identity(repo_root: Path, argv0: str) -> str:
     return f"{argv0} -> {resolved} sha256:{digest}"
 
 
+#: The name of the symlink each per-SHA directory keeps pointing at its
+#: most recent run. Retained output is now per RUN, so "the log for this
+#: gate at this commit" is no longer a single path; this is where a person
+#: following that instinct lands.
+NEWEST_RUN = "newest"
+
+
+def run_token(when: float | None = None) -> str:
+    """A directory name for ONE gate run: UTC to the second, then six hex
+    characters so two runs in the same second cannot collide. Time-ordered,
+    so `ls` in a per-SHA directory reads oldest to newest."""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ",
+                          time.gmtime(time.time() if when is None else when))
+    return f"{stamp}-{os.urandom(3).hex()}"
+
+
+def _point_at_newest(sha_dir: Path, run: str) -> None:
+    """Repoint `<sha>/newest` at this run, atomically and best-effort.
+
+    Best-effort because the pointer is a convenience and the attestation
+    already carries the exact path: a filesystem that cannot make a symlink
+    loses the shortcut, never the evidence.
+    """
+    link = sha_dir / NEWEST_RUN
+    tmp = sha_dir / f".{NEWEST_RUN}.{os.getpid()}"
+    try:
+        if tmp.is_symlink() or tmp.exists():
+            tmp.unlink()
+        os.symlink(run, tmp, target_is_directory=True)
+        os.replace(tmp, link)
+    except (OSError, NotImplementedError, AttributeError):
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _retain_output(cfg: Config, executed_sha: str, gate_id: str,
-                   blob: str) -> dict:
+                   blob: str, run: str) -> dict:
     """Digest the gate's full output and point at the retained copy (§5.1).
 
     Output is retained OUTSIDE the repo, under the ledger directory, because
     that is where this process's state lives (§4) and a review must not add
     bytes to a tree it is reviewing. The digest is computed either way, so a
     failure to retain degrades the pointer without losing the identity.
+
+    RETAINED PER RUN, not per commit (`concurrent-gates-single-flake`,
+    2026-09-03). The path was `<sha>/<id>.log`, so a second run at the same
+    commit overwrote the first in place, last writer winning. That destroyed
+    the only copy of the thing worth keeping twice — measured 2026-09-02: a
+    handoff refused on a failing gate, the natural next act was to re-run
+    it, the re-run passed, and the retained log a person then opened was the
+    PASSING run's. Each run now writes under its own `<sha>/<run>/`
+    directory, so an attestation's pointer names bytes nothing later
+    rewrites, and `<sha>/newest` is repointed for whoever wants the last
+    one. Prune semantics are untouched: the pruneable unit is still the
+    per-SHA directory, and a run directory goes when its SHA does.
     """
     record = {"sha256": hashlib.sha256(blob.encode("utf-8")).hexdigest(),
               "bytes": len(blob.encode("utf-8"))}
     if cfg.ledger_dir is None:
         record["pointer"] = "not retained (no state directory configured)"
         return record
-    target = Path(cfg.ledger_dir) / "gate-output" / executed_sha
+    target = Path(cfg.ledger_dir) / "gate-output" / executed_sha / run
     try:
         target.mkdir(parents=True, exist_ok=True)
         path = target / f"{gate_id}.log"
         path.write_text(blob, encoding="utf-8")
         record["pointer"] = str(path)
+        _point_at_newest(target.parent, run)
     except OSError as exc:
         record["pointer"] = f"not retained ({exc.strerror})"
     return record
@@ -481,6 +582,10 @@ def run_gates(cfg: Config, target_sha: str) -> list[dict]:
         binding = "bound"
 
     env = {**_caller_env(), env_var("IN_GATE_RUN"): "1"}
+    # One token for the whole manifest: the run is the unit of evidence, so
+    # every gate of one run retains beside its siblings and a later run at
+    # the same commit lands somewhere else entirely.
+    run = run_token()
 
     def run_one(gate: dict) -> dict:
         started = time.monotonic()
@@ -505,7 +610,7 @@ def run_gates(cfg: Config, target_sha: str) -> list[dict]:
             "binding": binding,
             "duration_s": round(duration, 2),
             "output": _retain_output(cfg, executed_sha, gate["id"],
-                                     proc.stdout + proc.stderr),
+                                     proc.stdout + proc.stderr, run),
             "blocking": gate.get("blocking", False),
         }
 
@@ -810,6 +915,161 @@ def resolve_transport(cfg: Config, transport: str | None = None,
             return entailed
     return (vocab.TRANSPORT_PATH if local_only
             else vocab.TRANSPORT_EMISSION_DEFAULT)
+
+
+def resolve_debug(cfg: Config, debug: bool | None = None) -> bool:
+    """Whether this emission stamps a debug round (decided 2026-08-31).
+
+    The same precedence shape as `resolve_transport`, cut to the three
+    states this value has, and for the same reason: a default that depends
+    on whoever runs `handoff` remembering a flag is not a default.
+    Strongest declaration first:
+
+      1. `--debug` / `--no-debug` — this invocation's explicit human word,
+         in either direction; the CLI passes None when neither was given
+      2. `[roles] debug`          — the repository's standing declaration,
+                                    for a repository whose every round
+                                    should ask the reviewer to critique
+                                    the tool (the tool's own workbench is
+                                    the motivating case)
+      3. off — the built-in default. The stamp spends reviewer attention
+         on tool critique, so it is asked for by declaration, never
+         assumed; a repository that declares nothing gets none.
+
+    No environment or provider step: unlike transport, nothing about an
+    execution environment entails a debug round.
+    """
+    if debug is not None:
+        return bool(debug)
+    declared = cfg.roles.get("debug")
+    if declared is not None:
+        return bool(declared)
+    return False
+
+
+def resolve_review_default(cfg: Config) -> str:
+    """Whether review is the default end of an implementation session
+    (ruled 2026-09-03, brief `review-by-default`).
+
+    The precedence shape of `resolve_debug`, cut to two states, because
+    there is no flag to add: the value describes what an AGENT does at the
+    end of a session, and no invocation of this tool is that moment. So:
+    `[roles] review_default` when the repository declares it, else
+    `vocab.REVIEW_DEFAULT_DEFAULT` (`on`) — and an undeclared repository is
+    reported in `decide`, which is how the silence gets answered once.
+
+    Nothing in the tool gates on this. It is resolved here so that one
+    reader owns the value, refuses a declaration outside the vocabulary,
+    and the adapters read a resolved answer rather than parsing config.
+    """
+    return vocab.review_default_or_default(
+        cfg.roles.get("review_default"),
+        f"[roles] review_default in the governing config ({cfg.source})")
+
+
+def resolve_enforcement(cfg: Config) -> str:
+    """Which approval pathway the repository declares (ruled 2026-09-03,
+    brief `approval-pathway-lock-in`).
+
+    Same shape and same reason as `resolve_review_default`. The one thing
+    the tool does with it is `check_enforcement` below; posting the
+    approval and opening the pull request are the agents' steps with `gh`,
+    outside a tool that touches no forge.
+    """
+    return vocab.enforcement_or_default(
+        cfg.roles.get("enforcement"),
+        f"[roles] enforcement in the governing config ({cfg.source})")
+
+
+class EnforcementUnsatisfiable(RuntimeError):
+    """`pr-approval` declared, and the branch under review is the remote's
+    DEFAULT branch (brief `approval-pathway-lock-in`, item 2).
+
+    The matrix that brief locks in has one row that could not be assigned
+    while the state was reachable: a project committing straight to its
+    default branch has no pull request, so there is nothing for the
+    approval to bind to and the declared pathway silently does not apply.
+    Declaring `pr-approval` is the statement that it does apply, so the
+    state is refused at the author's door rather than discovered at merge
+    time, when the round is already spent.
+
+    Raised BEFORE anything is committed, pushed, run or emitted. Its
+    remedy is a person's — branch the work, or declare the pathway this
+    project actually uses — so the CLI maps it to `blocked`.
+    """
+
+    def __init__(self, message: str, remedy: str):
+        super().__init__(message)
+        self.remedy = remedy
+
+
+def check_enforcement(cfg: Config, git=None) -> None:
+    """Refuse `handoff` on the remote's default branch under `pr-approval`.
+
+    `git` is the injectable runner every other refusal in this module uses,
+    so the state is testable without a network. Two reads answer "is this
+    the default branch", in the order that costs nothing first: the
+    remote-tracking symbolic ref this clone already holds, then
+    `ls-remote --symref`, which asks the remote itself. A remote that
+    answers neither is not evidence that the branch is safe, so silence
+    passes: the refusal states a fact it established, never one it guessed.
+
+    F2: the remote tested is `_resolve_push_destination`'s answer — the
+    same one `ensure_pushed` will push to — never a remote picked because
+    it happens to be named `origin`. Several remotes with no derivable
+    destination is not evidence either way, so it is left for
+    `ensure_pushed`'s own refusal of that state, later in the same verb
+    and still before any push, gate or ledger write.
+    """
+    if resolve_enforcement(cfg) != vocab.ENFORCEMENT_PR_APPROVAL:
+        return
+    repo = cfg.repo_root
+    run = git or (lambda *a: _git(repo, *a))
+    try:
+        branch = run("rev-parse", "--abbrev-ref", "HEAD")
+    except RuntimeError:
+        return
+    if branch == "HEAD":
+        return                       # detached: `ensure_pushed` refuses it
+    remotes = [r for r in run("remote").splitlines() if r.strip()]
+    if not remotes:
+        return                       # no remote has a default branch
+    destination = _resolve_push_destination(repo, branch, remotes, run)
+    remote, merge_ref = destination
+    destination_branch = _destination_branch(remote, merge_ref)
+    default = ""
+    remote_prefix = f"refs/remotes/{remote}/"
+    try:
+        ref = run("symbolic-ref", f"refs/remotes/{remote}/HEAD")
+        default = ref[len(remote_prefix):] if ref.startswith(remote_prefix) else ""
+    except RuntimeError:
+        default = ""
+    if not default:
+        try:
+            for line in run("ls-remote", "--symref", remote, "HEAD").splitlines():
+                if line.startswith("ref:"):
+                    symref = line.split()[1]
+                    heads_prefix = "refs/heads/"
+                    default = (symref[len(heads_prefix):]
+                               if symref.startswith(heads_prefix) else "")
+                    break
+        except RuntimeError:
+            return
+    if not default or default != destination_branch:
+        return
+    raise EnforcementUnsatisfiable(
+        f"[roles] enforcement = {vocab.ENFORCEMENT_PR_APPROVAL!r} declares "
+        f"that the approval rides a pull request, and destination "
+        f"{remote}:{merge_ref} is {remote}'s default branch "
+        f"({destination_branch}): there is no pull request for a commit "
+        f"that is already on it, so nothing would carry the approval and "
+        f"the declared pathway would silently not apply",
+        remedy=f"the author moves the work onto a branch and opens a pull "
+               f"request for it (outside this tool, which touches no "
+               f"forge), then re-runs; or the repository declares "
+               f"`{vocab.toml_line('roles.enforcement', vocab.ENFORCEMENT_NONE)}`"
+               f" under [roles], which is the honest declaration for a "
+               f"project that commits to its default branch")
 
 
 class AuthorityAbsent(RuntimeError):
@@ -1194,7 +1454,8 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
     report_md = render_report_md(ledger.report(
         effective_cap, gate_manifest=cfg.gate_ids,
         token_budget=cfg.token_budget,
-        blocking_severities=cfg.blocking_severities))
+        blocking_severities=cfg.blocking_severities),
+        pending_round=round_no)
 
     tree_state = ("DIRTY — attestations from a dirty tree are not attestations"
                   if dirty else "clean at emission")
@@ -1397,6 +1658,8 @@ _WHY_NONEMPTY = {
                  "claim at all, and those are different states",
 }
 
+_ACTOR_RE = re.compile(vocab.ACTOR_RE)
+
 
 def _check_string(path: Path, member: str, value, *, nonempty: bool) -> None:
     if not isinstance(value, str):
@@ -1490,6 +1753,32 @@ def validate_claim(value, path: Path) -> dict:
         if kind == "string":
             _check_string(path, member, item,
                           nonempty=member in vocab.CLAIM_NONEMPTY)
+            # Round 3 F3: `relay` is provenance — who carried the request —
+            # closed to the same one-token identifier grammar an author or
+            # reviewer name is written in. A blank value is not a defect
+            # here (emission falls back to the configured relay exactly as
+            # an absent member does); anything ELSE that fails the grammar
+            # is refused before it can be rendered as if it named an actor.
+            #
+            # Round 5 F3: this used to validate `item.strip()` while
+            # emission below (`relay = claim.get("relay") or
+            # cfg.roles.get("relay") or ...`) renders the ORIGINAL,
+            # unstripped member — so `" user "` matched the stripped copy,
+            # passed, and rendered `relay= user  ` on the Roles line. No
+            # stripping here either: the grammar is checked against the
+            # exact value emission will render, and "blank" is exactly what
+            # emission's `or` already treats as absent — a falsy `""`, not
+            # a stripped one.
+            if member == "relay" and item and not \
+                    _ACTOR_RE.match(item):
+                raise ClaimDefective(
+                    path,
+                    f"member 'relay' is {item!r}, which is not "
+                    f"{vocab.ACTOR_WANT} — relay says WHO carried the "
+                    f"request, never what to do with the answer; a "
+                    f"stopping instruction belongs under 'hand_back', the "
+                    f"claim's dedicated field for exactly that",
+                    defect="shape", member=member)
         elif kind == "list_of_string":
             if not isinstance(item, list):
                 raise ClaimDefective(

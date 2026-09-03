@@ -6,8 +6,9 @@ paraphrase equivalence is explicitly NOT claimed and NOT tested for.
 """
 import unittest
 
-from review.fingerprint import (FP_VERSION, compute, normalize_claim,
-                                resolve_identity)
+from review import wire
+from review.fingerprint import (FP_VERSION, LineageError, compute,
+                                normalize_claim, resolve_identity)
 
 
 def normalize_text(text, anchor=""):
@@ -143,6 +144,142 @@ class TestIdentity(unittest.TestCase):
         new = compute("design_gap", "design", "", "a claim")
         self.assertNotEqual(old, new)
         self.assertEqual(resolve_identity(old, [alias_event(old, new)]), new)
+
+
+class TestF8StructuredAnchor(unittest.TestCase):
+    """Round-3 F8 — FALSIFICATION: Corpus and mutation tests exercise stable
+    structured anchors, anchor changes with lineage, and distinct symbols in
+    one path without collisions.
+
+    Through the parsed `Anchor:` field, which is what TestIdentity's direct
+    `compute` calls never touch; the lineage half is
+    `TestIdentity.test_anchor_change_carried_by_lineage`."""
+
+    def _finding(self, anchor, title="a claim"):
+        block = (f"### F1\nSeverity: High\nClassification: design_gap\n"
+                 f"Title: {title}\nEvidence: auth/token.py:44\n"
+                 f"{f'Anchor: {anchor}' if anchor else ''}\n"
+                 f"Why: w\nRequired outcome: r\nFALSIFICATION: f\n")
+        return wire.parse_findings(block)[0]
+
+    def test_distinct_symbols_in_one_path_do_not_collide(self):
+        a = self._finding("validate_token", "expiry is skipped")
+        b = self._finding("refresh_token", "expiry is skipped")
+        self.assertNotEqual(a.fingerprint(), b.fingerprint())
+
+    def test_anchor_is_stable_across_moved_lines(self):
+        a = self._finding("validate_token")
+        b = self._finding("validate_token")
+        b.evidence = "auth/token.py:900"
+        self.assertEqual(a.fingerprint(), b.fingerprint())
+
+    def test_absent_anchor_is_a_recorded_state_not_a_failure(self):
+        self.assertEqual(self._finding("").anchor_source,
+                         "derived-from-evidence")
+        self.assertEqual(self._finding("validate_token").anchor_source,
+                         "declared")
+
+
+class TestF6LineageFailsClosed(unittest.TestCase):
+    """Round-4 F6 — FALSIFICATION: Every member of an accepted lineage
+    component resolves identically; cycles and multiple outgoing targets fail
+    closed with a typed error."""
+
+    def test_every_member_of_a_chain_resolves_identically(self):
+        chain = [{"kind": "alias", "from_fp": "fp1:a", "to_fp": "fp2:b"},
+                 {"kind": "rename", "from_fp": "fp2:b", "to_fp": "fp2:c"}]
+        ends = {resolve_identity(fp, chain) for fp in ("fp1:a", "fp2:b",
+                                                       "fp2:c")}
+        self.assertEqual(ends, {"fp2:c"})
+
+    def test_a_cycle_fails_closed(self):
+        cycle = [{"kind": "alias", "from_fp": "A", "to_fp": "B"},
+                 {"kind": "alias", "from_fp": "B", "to_fp": "A"}]
+        # The defect: A resolved to A and B resolved to B, so one malformed
+        # component silently became two identities.
+        for start in ("A", "B"):
+            with self.subTest(start=start):
+                with self.assertRaises(LineageError):
+                    resolve_identity(start, cycle)
+
+    def test_a_self_edge_fails_closed(self):
+        with self.assertRaises(LineageError):
+            resolve_identity("A", [{"kind": "alias", "from_fp": "A",
+                                    "to_fp": "A"}])
+
+    def test_two_outgoing_merge_targets_fail_closed(self):
+        with self.assertRaises(LineageError):
+            resolve_identity("A", [{"kind": "alias", "from_fp": "A",
+                                    "to_fp": "B"},
+                                   {"kind": "rename", "from_fp": "A",
+                                    "to_fp": "C"}])
+
+    def test_a_split_parent_with_many_children_is_well_formed(self):
+        # `split` forks a parent into distinct children and does NOT merge, so
+        # five outgoing split edges are correct, not a conflict. The live
+        # ledger has exactly this shape.
+        splits = [{"kind": "split", "from_fp": "A", "to_fp": f"C{i}"}
+                  for i in range(5)]
+        self.assertEqual(resolve_identity("A", splits), "A")
+
+    def test_the_error_is_typed_and_routes_through_the_next_command(self):
+        self.assertIsInstance(LineageError("x"), ValueError)
+
+
+class TestF7DeclaredCitationsDoNotSplit(unittest.TestCase):
+    """Round-4 F7 (and the round-3 F13 it sustained) — FALSIFICATION: Moved
+    line numbers for primary and secondary structured citations normalize
+    identically, while `timeout:30/60` and `port:8080/9090` remain
+    distinct."""
+
+    def _fp(self, claim, citations=""):
+        return compute("design_gap", "code.py", "", claim,
+                       citations=citations)
+
+    def test_secondary_extensionless_citations_survive_a_moved_line(self):
+        # The round-4 probe verbatim: primary path code.py, secondary
+        # citations README and design, which have no extension and no
+        # separator and so were invisible to inference.
+        for target in ("README", "design", "RFC"):
+            with self.subTest(citation=target):
+                a = self._fp(f"{target}:10 says the contract", target)
+                b = self._fp(f"{target}:20 says the contract", target)
+                self.assertEqual(a, b)
+
+    def test_primary_citations_still_survive_a_moved_line(self):
+        a = compute("design_gap", "preflight.py", "",
+                    "P2 rejects BEHIND at preflight.py:150")
+        b = compute("design_gap", "preflight.py", "",
+                    "P2 rejects BEHIND at preflight.py:9")
+        self.assertEqual(a, b)
+
+    def test_semantic_literals_remain_distinct(self):
+        self.assertNotEqual(self._fp("timeout:30 is unsafe"),
+                            self._fp("timeout:60 is unsafe"))
+        self.assertNotEqual(self._fp("port:8080 is wrong"),
+                            self._fp("port:9090 is wrong"))
+
+    def test_declaring_a_citation_does_not_capture_unrelated_literals(self):
+        # Declaring `design` must not make `timeout:30` a citation too.
+        self.assertNotEqual(self._fp("design:10 and timeout:30", "design"),
+                            self._fp("design:10 and timeout:60", "design"))
+
+    def test_declaring_citations_does_not_disable_derivation(self):
+        # Additive, not exclusive: a reviewer that declares `design` must not
+        # have to re-declare every path it also cites.
+        a = self._fp("design:10 and review/wire.py:212", "design")
+        b = self._fp("design:99 and review/wire.py:900", "design")
+        self.assertEqual(a, b)
+
+    def test_absent_declaration_is_a_recorded_state(self):
+        block = ("### F1\nSeverity: High\nClassification: design_gap\n"
+                 "Title: t\nEvidence: code.py:1\nCitations: design, README\n"
+                 "Why: w\nRequired outcome: r\nFALSIFICATION: f\n")
+        declared = wire.parse_findings(block)[0]
+        derived = wire.parse_findings(
+            block.replace("Citations: design, README\n", ""))[0]
+        self.assertEqual(declared.citation_source, "declared")
+        self.assertEqual(derived.citation_source, "derived-from-shape")
 
 
 if __name__ == "__main__":
