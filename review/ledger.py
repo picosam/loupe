@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import secrets
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,11 +26,94 @@ from .fingerprint import resolve_identity
 
 LEDGER_BASENAME = "ledger.jsonl"
 
+#: The event field that carries the lineage id (brief `keyed-lineage`).
+LINEAGE_FIELD = "lineage"
+
+#: A minted id opens with a letter so it can never be read as a legacy
+#: ordinal, which is decimal digits and nothing else.
+LINEAGE_ID_PREFIX = "L"
+
+
+def new_lineage_id() -> str:
+    """A fresh lineage id: `L` followed by `secrets.token_hex(5)`.
+
+    Opaque and letter-led BY CONSTRUCTION. A legacy lineage's key is the
+    ordinal its closure markers counted — `"1"`…`"27"`, decimal digits —
+    and the two key spaces must never intersect, or a migrated ordinal and
+    a minted id could name one lineage. Ten hex characters is 40 bits,
+    which is not a hash and is not meant to be: two ids only have to differ
+    across the repositories and machines one ledger can reach.
+    """
+    return LINEAGE_ID_PREFIX + secrets.token_hex(5)
+
+
+def declared_lineage(event: dict) -> str:
+    """The lineage id an event DECLARES, or "" when it declares none.
+
+    THE ONE READER of the field, and the reason it is a function rather
+    than a `.get`. Three states, not two:
+
+      * a non-empty STRING is the event's lineage id — a minted id, or a
+        legacy ordinal materialised by `migrate-state`;
+      * ABSENT is the legacy positional state, resolved by
+        `Ledger.lineage_keys` and nowhere else;
+      * an INTEGER is neither. It is the pre-keying `take` stamp, which
+        recorded the lineage a `git:<lineage>/<round>` reference CARRIED —
+        the author's number, on the reviewer's ledger, on one event of the
+        round while its request and verdict events carried nothing. Reading
+        it as this event's key would split one round across two windows and
+        change what an existing reviewer ledger says. It stays what it
+        always was, provenance for the carrier, read by
+        `Ledger.carrier_lineage_for_sha` and by no window.
+    """
+    value = event.get(LINEAGE_FIELD)
+    return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
+class AmbiguousLineage(Exception):
+    """One commit, several reviews, and nothing carried to say which (F1).
+
+    Raised only by the SHA resolvers, and only in the state round-2 F1
+    found: a SHA recorded by more than one lineage, reached by an
+    invocation that named none. Every caller turns it into a refusal that
+    records nothing — the alternative, picking the newest event, is what
+    moved a closure into another branch's review.
+    """
+
+    def __init__(self, sha: str, candidates: list[str]):
+        self.sha = sha
+        self.candidates = list(candidates)
+        super().__init__(
+            f"{sha[:12]} is bound by rounds in {len(self.candidates)} "
+            f"lineages ({', '.join(self.candidates)}), and this invocation "
+            f"carries nothing that says which review it belongs to — a "
+            f"commit identifies code, not the review that owns its findings")
+
 
 def _uid(event: dict) -> str:
     src = {k: v for k, v in event.items() if k not in ("uid", "ts")}
     blob = json.dumps(src, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+#: The value `git rev-parse --abbrev-ref HEAD` returns for a detached HEAD.
+#: It names no branch, so it is read as unknown rather than as a branch two
+#: detached worktrees would share.
+DETACHED = "HEAD"
+
+
+def known_branch(value) -> str:
+    """The branch a recorded value NAMES, or "" when it names none.
+
+    One reader for the whole refusal, because the append-only rule has
+    exactly one failure mode worth guarding: absence must never be read as
+    a branch. A request recorded before the field existed carries nothing;
+    a detached checkout carries `HEAD`, which is a state and not a name.
+    Both answer "", and "" never equals "" here — every caller checks for
+    a known value on BOTH sides before it compares them.
+    """
+    text = (value or "").strip() if isinstance(value, str) else ""
+    return "" if text == DETACHED else text
 
 
 def material_id(*facts) -> str:
@@ -162,9 +247,38 @@ class Ledger:
                         self._events.append(json.loads(line))
         return self._events
 
-    def add(self, event: dict) -> bool:
-        """Append one event; returns False if an identical event exists."""
+    def reload(self) -> "Ledger":
+        """Drop the cached read so the NEXT selector sees the file as it is
+        now. Returns self, so a caller can read and refresh in one line.
+
+        Round-2 F2: `events()` caches its first disk read, and a lifecycle
+        snapshot taken before a reservation was acquired stays that snapshot
+        for the rest of the process — so a close completing in the interval
+        was invisible, and the handoff that had waited for the lock appended
+        a round-1 request into an already-closed review. A lock excludes an
+        operation while it is held; it cannot make an older read current.
+        Every reservation-taking verb calls this immediately after
+        `acquire()`, and that call is what makes the snapshot authoritative.
+
+        An in-memory ledger has no file to re-read and keeps its events.
+        """
+        if self.path is not None:
+            self._events = None
+        return self
+
+    def add(self, event: dict, *, lineage: str | None = None) -> bool:
+        """Append one event; returns False if an identical event exists.
+
+        `lineage` is the id this event belongs to and is stamped on it when
+        the event does not already declare one — the ONE write seam for the
+        key (brief `keyed-lineage`). Callers that record a lineage-scoped
+        fact pass it; the two deliberately global kinds — identity aliases
+        and waivers — pass none and stay unkeyed, exactly as `lineage()`
+        and `waivers()` read them.
+        """
         event = dict(event)
+        if lineage and not declared_lineage(event):
+            event[LINEAGE_FIELD] = str(lineage)
         event["uid"] = _uid(event)
         if any(e.get("uid") == event["uid"] for e in self.events()):
             return False
@@ -178,59 +292,202 @@ class Ledger:
         self._events.append(event)
         return True
 
-    def add_all(self, events: list[dict]) -> int:
-        return sum(1 for e in events if self.add(e))
+    def add_all(self, events: list[dict], *,
+                lineage: str | None = None) -> int:
+        return sum(1 for e in events if self.add(e, lineage=lineage))
 
     # ------------------------------------------------------------- selectors
 
     LINEAGE_CLOSED = "lineage_closed"
 
-    def closures_of_lineage(self) -> list[dict]:
-        """Every `lineage_closed` marker in the file, oldest first."""
-        return [e for e in self.events() if e.get("event") == self.LINEAGE_CLOSED]
+    def lineage_keys(self) -> list[str]:
+        """The lineage key of every event, parallel to `events()`.
 
-    def current(self) -> list[dict]:
-        """Events of the CURRENT review lineage: everything after the last
-        `lineage_closed` marker (RVW-T9, `close`).
+        THE ONE PLACE a lineage is derived from file position, and it
+        derives only the LEGACY one (brief `keyed-lineage`). An event that
+        declares an id is keyed by it and nothing else. An event that
+        declares none belongs to the legacy positional lineage: the ordinal
+        counted by `lineage_closed` markers in the prefix BEFORE the first
+        keyed event, as a decimal string. So an unmigrated ledger reads
+        exactly as it did when `current()` meant "everything after the last
+        closure marker" — `"1"`…`"27"` on a ledger with 26 closures — and a
+        mixed ledger keeps its prefix's ordinals rather than renumbering
+        them under the keyed events that follow.
 
-        One ledger file serves one repository across many reviews, so a
-        lineage boundary has to be a recorded event, not a new file — the
-        record stays append-only and auditable. Everything round-scoped
-        (rounds, breakers, metrics, the round cap in force, dispositions
-        answered) reads this view, so a cap override authorized for one
-        lineage cannot silently become the next review's starting point,
-        which is the property the cap-override docstring promised and, until
-        this view existed, did not deliver: `effective_round_cap` read the
-        last override in the file regardless of which review it was granted
-        for. Fingerprint identity aliases stay global (see `lineage`).
+        The counter FREEZES at the first keyed event. After that boundary a
+        keyless event is a hand-added row, not a lineage the markers were
+        counting, and it stays with the last legacy ordinal rather than
+        inventing a new one from a closure that belongs to a keyed lineage.
         """
-        events = self.events()
-        start = 0
-        for i, e in enumerate(events):
-            if e.get("event") == self.LINEAGE_CLOSED:
-                start = i + 1
-        return events[start:]
+        keys: list[str] = []
+        ordinal = 1
+        legacy_prefix = True
+        for event in self.events():
+            declared = declared_lineage(event)
+            if declared:
+                legacy_prefix = False
+                keys.append(declared)
+                continue
+            keys.append(str(ordinal))
+            if legacy_prefix and event.get("event") == self.LINEAGE_CLOSED:
+                ordinal += 1
+        return keys
 
-    def lineage_number(self) -> int:
-        """1 for the first review in this ledger, +1 per recorded closure."""
-        return len(self.closures_of_lineage()) + 1
-
-    def lineage_of(self, event: dict) -> int:
-        """The lineage number an event belongs to: 1 plus the closures
-        recorded before it (sweep F10 — a waiver refusal names which
-        lineage reviewed the commit, closed or current)."""
-        n = 1
-        for e in self.events():
+    def lineage_of(self, event: dict) -> str:
+        """The lineage id an event belongs to (sweep F10 — a waiver refusal
+        names which lineage reviewed the commit, closed or open)."""
+        declared = declared_lineage(event)
+        if declared:
+            return declared
+        keys = self.lineage_keys()
+        for i, e in enumerate(self.events()):
             if e is event or e.get("uid") == event.get("uid"):
-                return n
-            if e.get("event") == self.LINEAGE_CLOSED:
-                n += 1
-        return n
+                return keys[i]
+        return keys[-1] if keys else "1"
 
-    def _by(self, kind: str) -> list[dict]:
-        return [e for e in self.current() if e.get("event") == kind]
+    def all_closures(self) -> list[dict]:
+        """Every `lineage_closed` marker in the file, oldest first — across
+        every lineage. The audit surface, not a lineage-scoped read."""
+        return [e for e in self.events()
+                if e.get("event") == self.LINEAGE_CLOSED]
 
-    def disposition_batches(self, round_no: int | None = None) -> list[dict]:
+    def closures_of_lineage(self, lineage: str) -> list[dict]:
+        """The `lineage_closed` marker(s) that closed `lineage`."""
+        return [e for e in self.current(lineage)
+                if e.get("event") == self.LINEAGE_CLOSED]
+
+    def current(self, lineage: str) -> list[dict]:
+        """Events of ONE review lineage: every event keyed to `lineage`.
+
+        One ledger file serves one repository across many reviews, and since
+        the key exists it serves several CONCURRENT ones. Everything
+        round-scoped (rounds, breakers, metrics, the round cap in force,
+        dispositions answered) reads this view, so a cap override authorized
+        for one lineage cannot leak into another — the property
+        `effective_round_cap` promised before any of this was keyed.
+
+        Until 2026-09-06 this was "everything after the last `lineage_closed`
+        marker", a POSITION in the file, which made one repository hold
+        exactly one review in flight: two worktrees emitting into one ledger
+        both computed the same lineage and the same round, and closing either
+        one discarded the other's request unruled (brief
+        `worktree-shared-ledger`). Position now derives the legacy key only
+        (`lineage_keys`). Fingerprint identity aliases stay global (see
+        `lineage`), and so do waivers.
+        """
+        key = str(lineage)
+        keys = self.lineage_keys()
+        return [e for e, k in zip(self.events(), keys) if k == key]
+
+    def lineages(self) -> list[str]:
+        """Every lineage this ledger holds, in the order they first appear."""
+        out: list[str] = []
+        for key in self.lineage_keys():
+            if key not in out:
+                out.append(key)
+        return out
+
+    def lineage_number(self, lineage: str) -> int:
+        """The 1-based ORDINAL of `lineage` among the lineages this ledger
+        holds — equal to a legacy lineage's own key, which is where the
+        number in `lineage 27` came from.
+
+        Kept for the one thing an ordinal still answers: how many reviews
+        this ledger has seen and where in that sequence one sits. Every
+        DISPLAY of a lineage names its id (brief `keyed-lineage`, item 2),
+        because an ordinal is not an identity once lineages can run beside
+        each other.
+        """
+        order = self.lineages()
+        key = str(lineage)
+        return order.index(key) + 1 if key in order else len(order) + 1
+
+    def is_closed(self, lineage: str) -> bool:
+        """Whether a recorded closure ended `lineage`."""
+        return bool(self.closures_of_lineage(lineage))
+
+    def open_lineages(self) -> list[str]:
+        """Every lineage no closure has ended, oldest first."""
+        return [l for l in self.lineages() if not self.is_closed(l)]
+
+    def lineage_branch(self, lineage: str) -> str:
+        """The branch `lineage`'s requests were recorded on, or "" when none
+        of them names one.
+
+        The newest naming request decides, so an amend-and-re-emit onto the
+        same lineage from the same worktree reads as it always did. Absence
+        is UNKNOWN and never a branch (`known_branch`): every request
+        emitted before the field existed carries none, and a detached
+        checkout carries `HEAD`, which is a state and not a name.
+        """
+        for e in reversed(self.current(lineage)):
+            if e.get("event") == "request":
+                branch = known_branch(e.get("branch"))
+                if branch:
+                    return branch
+        return ""
+
+    #: `choose_open_lineage` states, so a caller refuses on the one state
+    #: where a lineage genuinely cannot be chosen rather than on absence.
+    LINEAGE_BOUND = "bound"          # an open lineage recorded on this branch
+    LINEAGE_ADOPTED = "adopted"      # the one open lineage that names none
+    LINEAGE_NONE = "none"            # nothing to continue: open a new one
+    LINEAGE_AMBIGUOUS = "ambiguous"  # several open, and nothing to choose by
+
+    def choose_open_lineage(self, branch: str) -> tuple[str | None, str]:
+        """`(lineage, state)` — which open lineage this worktree acts on.
+
+        The deterministic rule the verbs share (brief `keyed-lineage`,
+        item 3), and the reason `handoff` no longer refuses a second
+        worktree: a handoff continues the OPEN lineage whose requests were
+        recorded on this branch, and opens a new one when there is none.
+
+          * branch KNOWN — the newest open lineage recorded on it
+            (`bound`); failing that, the single open lineage that names no
+            branch at all (`adopted`), which is every pre-field ledger and
+            is what keeps a round opened before this change continuable;
+            failing that, `none`.
+          * branch UNKNOWN (a detached HEAD, or a name git would not give)
+            — one open lineage is unambiguous and is adopted; none is
+            `none`; several is `ambiguous`, the one state where a lineage
+            cannot be chosen and the verb refuses saying so.
+        """
+        mine = known_branch(branch)
+        open_lineages = self.open_lineages()
+        if mine:
+            matched = [l for l in open_lineages
+                       if self.lineage_branch(l) == mine]
+            if matched:
+                return matched[-1], self.LINEAGE_BOUND
+            unbranched = [l for l in open_lineages if not self.lineage_branch(l)]
+            if len(unbranched) == 1:
+                return unbranched[0], self.LINEAGE_ADOPTED
+            return None, self.LINEAGE_NONE
+        if not open_lineages:
+            return None, self.LINEAGE_NONE
+        if len(open_lineages) == 1:
+            return open_lineages[0], self.LINEAGE_ADOPTED
+        return None, self.LINEAGE_AMBIGUOUS
+
+    def last_closed_lineage(self, branch: str = "") -> str | None:
+        """The most recently closed lineage this branch was on, else the
+        most recently closed one — the window `brief` reads to name a round
+        that was discarded rather than ruled."""
+        closed = [l for l in self.lineages() if self.is_closed(l)]
+        if not closed:
+            return None
+        mine = known_branch(branch)
+        if mine:
+            matched = [l for l in closed if self.lineage_branch(l) == mine]
+            if matched:
+                return matched[-1]
+        return closed[-1]
+
+    def _by(self, kind: str, lineage: str) -> list[dict]:
+        return [e for e in self.current(lineage) if e.get("event") == kind]
+
+    def disposition_batches(self, lineage: str,
+                            round_no: int | None = None) -> list[dict]:
         """Every disposition EMISSION in the current lineage as ONE unit:
         the disposition row plus the `evidence` and `falsification_run`
         events derived from the same emission (lineage 6 round 2 F1).
@@ -268,7 +525,7 @@ class Ledger:
         newest_by_key: dict[tuple, dict] = {}
         by_stamp: dict[tuple, dict] = {}
         orphan_unstamped: dict[tuple, dict] = {}
-        for e in self.current():
+        for e in self.current(lineage):
             kind = e.get("event")
             if kind not in ("disposition", "evidence", "falsification_run"):
                 continue
@@ -318,7 +575,8 @@ class Ledger:
                    else "evidence"].append(e)
         return batches
 
-    def standing_disposition_batches(self, round_no: int | None = None
+    def standing_disposition_batches(self, lineage: str,
+                                     round_no: int | None = None
                                      ) -> list[dict]:
         """The standing ANSWER per (round, resolved fingerprint) — the
         one projection every operational consumer reads: the preflight,
@@ -329,20 +587,22 @@ class Ledger:
         standing batches for one key let a foreign run certify an
         acceptance). Raw event multiplicity and orphans are audit history:
         the file, and `orphan_companion_batches`."""
-        return [b for b in self.disposition_batches(round_no)
+        return [b for b in self.disposition_batches(lineage, round_no)
                 if b["standing"]]
 
-    def orphan_companion_batches(self, round_no: int | None = None
+    def orphan_companion_batches(self, lineage: str,
+                                 round_no: int | None = None
                                  ) -> list[dict]:
         """The audit/anomaly surface (round 3 F1): every companion batch
         that binds no recorded disposition emission — a stamp matching no
         row, or a truly rowless companion. Kept and named, never standing:
         these certify nothing and attribute to nothing, and each one fires
         the `orphan` breaker so a human decides what it is."""
-        return [b for b in self.disposition_batches(round_no)
+        return [b for b in self.disposition_batches(lineage, round_no)
                 if b["orphan"]]
 
-    def standing_dispositions(self, round_no: int | None = None) -> list[dict]:
+    def standing_dispositions(self, lineage: str,
+                              round_no: int | None = None) -> list[dict]:
         """The STANDING answer per finding: the newest disposition event for
         each resolved fingerprint, optionally limited to one round.
 
@@ -361,7 +621,7 @@ class Ledger:
         two different emissions (round 2 F1).
         """
         return [b["disposition"]
-                for b in self.standing_disposition_batches(round_no)
+                for b in self.standing_disposition_batches(lineage, round_no)
                 if b["disposition"] is not None]
 
     def lineage(self) -> list[dict]:
@@ -369,7 +629,7 @@ class Ledger:
         # the whole repository history and are deliberately NOT scoped.
         return [e for e in self.events() if e.get("event") == "lineage"]
 
-    def effective_round_cap(self, default: int) -> int:
+    def effective_round_cap(self, default: int, lineage: str) -> int:
         """The cap in force for THIS review lineage.
 
         The configured cap is the default for every review in the repo; a
@@ -380,47 +640,164 @@ class Ledger:
         means it is auditable, scoped to the review it was granted for, and
         cannot silently become the next review's starting point.
         """
-        overrides = self._by("cap_override")
+        overrides = self._by("cap_override", lineage)
         return int(overrides[-1]["round_cap"]) if overrides else default
 
     def resolve(self, fp: str) -> str:
         return resolve_identity(fp, self.lineage())
 
-    def rounds(self) -> list[int]:
+    def rounds(self, lineage: str) -> list[int]:
         """Every round that has started (a request or a verdict exists) in
-        the current lineage."""
-        rs = {e["round"] for e in self.current()
+        `lineage`."""
+        rs = {e["round"] for e in self.current(lineage)
               if e.get("event") in ("request", "verdict") and "round" in e}
         return sorted(rs)
 
-    def rounds_for_sha(self, sha: str | None) -> list[int]:
-        """Every round in the current lineage whose request binds `sha`."""
+    def rounds_for_sha(self, sha: str | None, lineage: str) -> list[int]:
+        """Every round in `lineage` whose request binds `sha`."""
         seen: list[int] = []
-        for e in self._by("request"):
+        for e in self._by("request", lineage):
             if e.get("sha") == sha and e["round"] not in seen:
                 seen.append(e["round"])
         return seen
 
-    def recorded_lineage_for_sha(self, sha: str | None) -> int | None:
-        """The lineage a `take` (or a local `request`) recorded for `sha`,
-        or None when nothing recorded one (F1: the git carrier's lineage).
+    def lineages_for_sha(self, sha: str | None) -> list[str]:
+        """Every lineage that recorded a `request` or `take` binding `sha`,
+        newest first.
 
-        A `take` fetched over `git:<lineage>/<round>` stamps the CARRIED
-        lineage on its event, because a fresh reviewer ledger's own
-        `lineage_number()` has no relationship to the lineage the author's
-        machine is on. A locally emitted request stamps none — its round
-        was written under this same ledger's own progression, so
-        `lineage_number()` already answers correctly for it. Callers use
-        this as the first authority and fall back to `lineage_number()`
-        only when it returns None.
+        A COMMIT IDENTIFIES CODE, NOT A REVIEW (round-2 F1). Two branches may
+        review the same commit under two independently scoped reviews, so this
+        answers with the whole set and the callers below decide — never with
+        "the newest", which is a file position wearing a lineage's name.
         """
-        for e in reversed(self.current()):
-            if (e.get("sha") == sha and e.get("event") in ("request", "take")
-                    and e.get("lineage") is not None):
-                return int(e["lineage"])
+        if not sha:
+            return []
+        seen: list[str] = []
+        for e in reversed(self.events()):
+            if e.get("sha") == sha and e.get("event") in ("request", "take"):
+                key = self.lineage_of(e)
+                if key not in seen:
+                    seen.append(key)
+        return seen
+
+    def _round_event_for_sha(self, sha: str | None,
+                             prefer: str | None = None) -> dict | None:
+        """The newest `request` or `take` binding `sha` IN THE LINEAGE THIS
+        INVOCATION CARRIES, or in the only lineage that binds it.
+
+        Whole-ledger deliberately: a verb is handed an envelope and has to
+        learn which lineage it belongs to before it can read one, so this
+        read cannot itself be lineage-scoped. What round-2 F1 established is
+        that "whole-ledger" may not mean "newest wins" — with two reviews of
+        one commit that picked whichever branch handed off last, and a close
+        from one branch appended its closure to the other's lineage while the
+        first review's kept bytes became unfindable.
+
+        Three answers, and only three:
+
+          * NOTHING binds the SHA — None, exactly as before.
+          * ONE lineage binds it — that one, whatever `prefer` says. This is
+            every ordinary round, every legacy ledger and every single-match
+            read, unchanged.
+          * SEVERAL bind it — `prefer` decides, and `prefer` is the review
+            identity the invocation carries: the branch's open lineage, the
+            id a `git:<lineage>/<round>` reference named, or the lineage the
+            verb already resolved. A `prefer` that binds nothing here answers
+            None (this SHA is not this review's, and the caller's own lineage
+            stands); no `prefer` at all raises `AmbiguousLineage`, because
+            there is nothing to choose by and event order is not a choice.
+        """
+        candidates = self.lineages_for_sha(sha)
+        if not candidates:
+            return None
+        chosen: str | None = None
+        if len(candidates) == 1:
+            chosen = candidates[0]
+        elif prefer is not None and str(prefer) in candidates:
+            chosen = str(prefer)
+        elif prefer is not None:
+            return None
+        else:
+            raise AmbiguousLineage(str(sha), candidates)
+        for e in reversed(self.events()):
+            if (e.get("sha") == sha
+                    and e.get("event") in ("request", "take")
+                    and self.lineage_of(e) == chosen):
+                return e
         return None
 
-    def round_for_sha(self, sha: str | None):
+    def lineages_for_source_digest(self, digest: str | None) -> list[str]:
+        """Every lineage that recorded a `request` or `take` over THESE
+        EXACT envelope bytes, newest first.
+
+        A REQUEST IS ITS BYTES, and a commit is not (round-3 F3). The SHA
+        answers "which code", which two independently emitted reviews share
+        by construction; the source digest answers "which request", which
+        they never do. That is the difference between a RETAKE of one round
+        under a second lineage, which redirects a verdict's destination and
+        is refused, and a second review of the same commit, which is a new
+        request with its own bytes and coexists.
+        """
+        if not digest:
+            return []
+        seen: list[str] = []
+        for e in reversed(self.events()):
+            if (e.get("source_digest") == digest
+                    and e.get("event") in ("request", "take")):
+                key = self.lineage_of(e)
+                if key not in seen:
+                    seen.append(key)
+        return seen
+
+    def recorded_lineage_for_sha(self, sha: str | None,
+                                 prefer: str | None = None) -> str | None:
+        """The LINEAGE `sha`'s round was recorded in, or None.
+
+        THE RESOLVER every envelope-bearing verb uses (brief
+        `keyed-lineage`, item 3): `close`, `respond`, `brief <envelope>`,
+        `ledger add` and `validate --from-target` are each handed a document
+        that names a commit, and the request or take that recorded that
+        commit is what says which lineage the document belongs to.
+
+        `prefer` is the review identity the invocation itself carries, and
+        it is what keeps that binding through lookup, validation, retention
+        and verdict publication when a commit is under review twice
+        (round-2 F1). Raises `AmbiguousLineage` when nothing is carried and
+        the SHA names more than one review.
+        """
+        event = self._round_event_for_sha(sha, prefer)
+        return self.lineage_of(event) if event is not None else None
+
+    def carrier_lineage_for_sha(self, sha: str | None,
+                                prefer: str | None = None) -> str | None:
+        """The lineage `sha`'s ENVELOPES are stored and pushed under —
+        `exchange/lineage-<id>/…` and `refs/<tool>/<id>/<round>/<leg>`.
+
+        The same id as `recorded_lineage_for_sha` for everything this tool
+        writes now, because the id is stamped on the events themselves. It
+        differs for exactly one historical shape, which is why the two are
+        separate readers: before the lineage was keyed, a `take` over a
+        `git:<lineage>/<round>` reference stamped the CARRIED lineage — the
+        author's number — on the take event alone, while the request and
+        verdict events of the same round carried nothing and belonged to
+        the reviewer's own positional lineage. That stamp is what names the
+        ref the verdict must be pushed to, so it still decides the carrier;
+        it never decides a window (`declared_lineage`).
+
+        `prefer` carries the same meaning it has on
+        `recorded_lineage_for_sha`: with one commit under review twice, the
+        review the invocation is acting on decides which round's ref and
+        which round's kept bytes are meant (round-2 F1).
+        """
+        event = self._round_event_for_sha(sha, prefer)
+        if event is None:
+            return None
+        stamped = event.get(LINEAGE_FIELD)
+        if stamped is not None and str(stamped).strip():
+            return str(stamped).strip()
+        return self.lineage_of(event)
+
+    def round_for_sha(self, sha: str | None, lineage: str):
         """The OPEN round whose request binds `sha`, or None — never a guess.
 
         Round 2 F1: this returned the first historical match, so a SHA that
@@ -435,23 +812,25 @@ class Ledger:
         and `ambiguous_rounds_for_sha` reports it so the caller can refuse
         rather than pick.
         """
-        open_rounds = self._open_rounds_for_sha(sha)
+        open_rounds = self._open_rounds_for_sha(sha, lineage)
         return open_rounds[-1] if len(open_rounds) == 1 else None
 
-    def _open_rounds_for_sha(self, sha: str | None) -> list[int]:
-        ruled = set(self.completed_rounds())
-        return [r for r in self.rounds_for_sha(sha) if r not in ruled]
+    def _open_rounds_for_sha(self, sha: str | None,
+                             lineage: str) -> list[int]:
+        ruled = set(self.completed_rounds(lineage))
+        return [r for r in self.rounds_for_sha(sha, lineage) if r not in ruled]
 
-    def ambiguous_rounds_for_sha(self, sha: str | None) -> list[int]:
+    def ambiguous_rounds_for_sha(self, sha: str | None,
+                                 lineage: str) -> list[int]:
         """The open rounds binding `sha` when there is more than one.
 
         Empty when the SHA resolves cleanly or not at all — those are the two
         states the caller already handles; this names only the third.
         """
-        open_rounds = self._open_rounds_for_sha(sha)
+        open_rounds = self._open_rounds_for_sha(sha, lineage)
         return open_rounds if len(open_rounds) > 1 else []
 
-    def completed_rounds(self) -> list[int]:
+    def completed_rounds(self, lineage: str) -> list[int]:
         """Rounds whose verdict exists.
 
         Round-3 F2: progress breakers may only be evaluated over these. A
@@ -459,11 +838,11 @@ class Ledger:
         judging it as a loop failure made the breaker report untrustworthy
         during exactly the window an agent consults it.
         """
-        return sorted({e["round"] for e in self._by("verdict")
+        return sorted({e["round"] for e in self._by("verdict", lineage)
                        if "round" in e})
 
-    def _all_rulings(self) -> list[dict]:
-        """Every ruling of the current lineage, in recorded order — THE
+    def _all_rulings(self, lineage: str) -> list[dict]:
+        """Every ruling of `lineage`, in recorded order — THE
         ruling authority (`is_ruling`, round-9 F3).
 
         Every lifecycle reader goes through this: `findings_in_round`,
@@ -473,15 +852,16 @@ class Ledger:
         the breakers identify a firing's material by `_uid` of the event
         itself, so what they hash has to be what the file holds.
         """
-        return [e for e in self.current() if is_ruling(e)]
+        return [e for e in self.current(lineage) if is_ruling(e)]
 
-    def findings_in_round(self, r: int) -> list[dict]:
+    def findings_in_round(self, r: int, lineage: str) -> list[dict]:
         """Findings ruled in round r: verdict findings plus atomic imports."""
-        return [e for e in self._all_rulings() if e.get("round") == r]
+        return [e for e in self._all_rulings(lineage) if e.get("round") == r]
 
     # -------------------------------------------------------------- breakers
 
-    def breakers(self, round_cap: int, token_budget: int | None = None,
+    def breakers(self, lineage: str, round_cap: int,
+                 token_budget: int | None = None,
                  blocking_severities: list[str] | None = None
                  ) -> list[dict]:
         """Evaluate every breaker over every completed round (§5.3d).
@@ -505,16 +885,16 @@ class Ledger:
         # Progress breakers read completed rounds only (F2); the budget
         # breaker reads every started round, because a fourth round that has
         # begun has already spent its budget.
-        rounds = self.completed_rounds()
+        rounds = self.completed_rounds(lineage)
         # Standing emissions only (lineage 6 round 2 F1): a superseded
         # emission's run or refutation evidence is history, not a live
         # claim — an obsolete `cannot_execute` must not stop a lineage
         # whose standing answer is `pass`. Evidence from verdicts and
         # request references is no emission companion and stays raw.
-        batches = self.standing_disposition_batches()
+        batches = self.standing_disposition_batches(lineage)
         dispositions = [b["disposition"] for b in batches
                         if b["disposition"] is not None]
-        evidence = ([e for e in self._by("evidence")
+        evidence = ([e for e in self._by("evidence", lineage)
                      if e.get("source") != "disposition"]
                     + [e for b in batches for e in b["evidence"]])
         runs = [x for b in batches for x in b["runs"]]
@@ -522,17 +902,17 @@ class Ledger:
         # recorded against a legacy atomic ruling has a severity to be
         # judged by, and reading only `finding` events made it unjudgeable
         # and so silently non-blocking.
-        all_findings = self._all_rulings()
+        all_findings = self._all_rulings(lineage)
 
         first_seen: dict[str, int] = {}
         for r in rounds:
-            for f in self.findings_in_round(r):
+            for f in self.findings_in_round(r, lineage):
                 ident = self.resolve(f["fp"])
                 first_seen.setdefault(ident, r)
 
         digests_before: set[str] = set()
         for r in rounds:
-            round_findings = self.findings_in_round(r)
+            round_findings = self.findings_in_round(r, lineage)
             round_evidence = [e for e in evidence if e.get("round") == r]
             new_digests = {e["digest"] for e in round_evidence
                            if e["digest"] not in digests_before}
@@ -607,7 +987,8 @@ class Ledger:
             # excluded either way and so still cannot suppress this
             # breaker.
             round_settles = [event for pairs in
-                             self.current_answers(as_of_round=r).values()
+                             self.current_answers(lineage,
+                                                  as_of_round=r).values()
                              for effect, event in pairs
                              if effect == vocab.ANSWER_SETTLES
                              and event.get("round") == r]
@@ -648,7 +1029,7 @@ class Ledger:
         # it is. Completed-rounds scoping deliberately does not apply: the
         # product emitter writes the row before its companions, so an
         # orphan is never a normal in-flight state.
-        for b in self.orphan_companion_batches():
+        for b in self.orphan_companion_batches(lineage):
             r_o, ident = b["key"]
             events = b["runs"] + b["evidence"]
             kinds = ", ".join(sorted({e["event"] for e in events}))
@@ -674,7 +1055,7 @@ class Ledger:
                                      "and decide its standing",
             })
 
-        started = self.rounds()
+        started = self.rounds(lineage)
         # Cumulative-token half of the budget rule (§5.3d, round-3 F6,
         # round-4 F5). The budget comes from `[limits] token_budget` and is
         # passed through by every product report path; the counts come from
@@ -682,7 +1063,7 @@ class Ledger:
         # because nothing in a no-LLM code path can measure them. Three
         # distinct states, and the report names which one it is in: no budget
         # declared, budget with no counts, budget with counts.
-        tokens = self.token_state(token_budget)
+        tokens = self.token_state(token_budget, lineage)
         if tokens["state"] in ("live", "partial") and \
                 tokens["spent"] > token_budget:
             # A partial sum is a lower bound, and a lower bound over the
@@ -731,7 +1112,225 @@ class Ledger:
     #: domain being hunted rather than a defect being fixed.
     HUNTED_ANCHOR = 2
 
-    def convergence(self) -> dict:
+    @staticmethod
+    def _note_names(note: str, ruling_id: str) -> bool:
+        """Does `note` name this round-local ruling id as a whole token?
+
+        `-` and `/` are excluded from both boundaries deliberately, and for
+        one reason: a token that merely CONTAINS an id is not a reference to
+        it. A legacy id is spelled `R1-F5` and a path is spelled
+        `docs/F1.md`, and `\\b` would let `F5` match inside the first and
+        `F1` inside the second — so the reading would bind a residue to the
+        wrong ruling on the strength of a suffix, or to no ruling at all on
+        the strength of a file name.
+
+        What this admits and what it misses, stated because a reading of
+        prose has no other way to be checked. A verdict's ids are `F1..Fn`,
+        uppercase and unpadded — `validate`'s V-IDS mints nothing else —
+        and only the EXACT spelling names a ruling here. Nothing is
+        case-folded and no padding is stripped to make a match:
+
+          named        `F1`, against any ordinary punctuation: `F1.`,
+                       `(F1)`, `F1,`, `F1;`.
+          not named    `F10` against the id `F1` — a longer id is a
+                       different ruling; `R2-F1` and any
+                       fingerprint-shaped token, which carry `-`;
+                       `docs/F1.md` and `F1/F2`, which carry `/`.
+
+        A near-miss of an id — `f1`, `F01` — therefore names nothing here,
+        and that USED to be the whole of it: `narrowed to f1, unlike F2`
+        read as naming F2 alone and hid F2 behind an edge its own note
+        denied. Naming is not where that is answered, because case-folding
+        to match would read `f1()` in a note about code as a reference.
+        `ID_SHAPED` answers it instead, by REFUSING the note rather than
+        resolving the token.
+        """
+        return re.search(rf"(?<![\w/-]){re.escape(ruling_id)}(?![\w/-])",
+                         note) is not None
+
+    #: Loosely id-shaped, and loose on purpose: `F1` and every near-miss of
+    #: it — `f1`, `F01`, `f01`, `F10`. Used ONLY to refuse, never to
+    #: resolve. A token of this shape that is not exactly an id of the
+    #: closure's own round is a reference this reading cannot place, and one
+    #: of those makes the whole note unreadable for inference. The
+    #: boundaries are `_note_names`'s, so a legacy `R1-F5`, a
+    #: fingerprint-shaped token and a path component are not of this shape
+    #: at all: they are not references, and they refuse nothing.
+    ID_SHAPED = re.compile(r"(?<![\w/-])[Ff]\d+(?![\w/-])")
+
+    #: How an edge was read. Carried on every followed edge and printed
+    #: beside it: the two are not the same evidence, and a reader weighing
+    #: a count that shrank is owed which one it rests on.
+    EDGE_DECLARED = "declared"
+    EDGE_INFERRED = "inferred from the closure's note"
+
+    def _reclassification_edges(self, findings: list[dict],
+                                closures: list[dict],
+                                first_seen: dict[str, int]
+                                ) -> dict[str, dict[str, str]]:
+        """Descendant identity -> {identity it was reclassified FROM: how}.
+
+        Brief `convergence-blind-to-reclassification`, raised by the reviewer
+        on the lineage-26 round-3 verdict. A reviewer doing exactly the right
+        thing — confirming most of a High finding fixed and re-issuing the
+        surviving residue at Medium under an accurate new title — mints a
+        second fingerprint on the same anchor, and `hunted` read that as a
+        fresh, unrelated finding: the signature of hunting, reported at the
+        moment the loop was in fact converging. The continuity was already in
+        the record. A `reclassified` closure names the PRIOR fingerprint, and
+        the residue is named by the closure's own `Residue:` declaration.
+
+        Bounded deliberately, per the brief: this READS an edge the closure
+        vocabulary already writes. Fingerprints stay unstable across
+        re-titling — the fingerprint should change when the claim changes,
+        and the reclassification record is what carries the history — so no
+        identity is merged here and `resolve` is untouched.
+
+        TWO SOURCES, RANKED, and the ranking is the point. A closure that
+        DECLARES its residue is authoritative for that closure: the edge is
+        read from the record's own field, and the note is not consulted at
+        all — not as a supplement, not as a tie-break. Reading both would
+        make the weaker source able to add edges the stronger one declined,
+        so a reviewer who declares one residue would silently get two.
+        Only a closure that declares NOTHING falls back to the note, which
+        is what every record written before the field existed carries
+        (lineage 26: "Current F1 records that bounded residue"). Prose is a
+        fallback for legacy records, never the grammar.
+
+        Every clause below is fail-CLOSED, because the two errors are not
+        symmetric: refusing an edge restores yesterday's over-report, which a
+        reader already corrects by hand, while following a wrong one HIDES a
+        genuinely new finding from the signal this report exists to raise.
+        So an edge is followed only when
+
+          * the closure is `reclassified` (no other term claims descent);
+          * its fingerprint resolves to an identity this lineage actually
+            ruled, and ruled in an EARLIER round than the closure — a
+            fingerprint from another lineage, or from no lineage, or first
+            seen in the closure's own round, supports no claim of descent.
+            That ordering is also why the edge graph cannot cycle: every
+            edge strictly increases the round a thread was first seen in;
+          * the residue — declared or inferred — is an identity this
+            lineage ruled in the closure's OWN round and that is NEW in it,
+            and is not the parent itself. A declaration naming anything
+            else is refused edge by edge rather than in whole: the reviewer
+            declaring two residues, one of which the record does not bear
+            out, still said something true about the other.
+
+        The note path carries two further clauses the declaration does not
+        need, because prose is not a field: the id must carry a digit — an
+        id with no digit is indistinguishable from the words around it —
+        and exactly one ruling may be named, since a note naming two is
+        prose this reading cannot disambiguate ("narrowed to F1, unlike
+        F3"). Both are limits of reading prose, and both are why the
+        declared form exists.
+
+        THE WHOLE NOTE IS READ BEFORE ANY OF IT IS USED, and that order is
+        the rule rather than an implementation detail (round-1 F2 of this
+        lineage). An inferred edge is followed only when EVERY id-shaped
+        token in the note (`ID_SHAPED`) resolves exactly to an id of the
+        closure's own round, all of them resolve to ONE identity, and that
+        identity then passes every bound above. Nothing is filtered before
+        that count: the parent, and the identities already seen in an
+        earlier round, are named as much as any other ruling is.
+
+        Both halves answer the same defect, which is that a wrongly
+        followed edge HIDES a finding. Filtering first — dropping the
+        parent and the identities already seen before testing how many
+        remained — let `narrowed to F1, unlike F2` read as uniquely naming
+        F2 whenever F1 was the parent or a returning finding: the note
+        expressly CONTRASTED the new finding with the residue, and the
+        reading gave it a parent, dropped it out of `new_per_round` and
+        took its anchor out of `hunted_anchors`. An id-shaped token this
+        reading cannot place does the same thing by the other door:
+        `narrowed to f1, unlike F2` names F2 and nothing else, because a
+        misspelling matches no id — the same hidden finding, reached
+        through a typo. So an ineligible name does not make another name
+        unique, and an unresolvable one does not either: it makes the note
+        unreadable, and nothing unreadable follows an edge. A reviewer
+        loses an over-report they already correct by hand; the alternative
+        loses a finding.
+
+        Two readings the ids themselves force, both settled by the same
+        asymmetry. Several ids resolving to ONE identity are one name, not
+        an ambiguity: identity resolves first here as everywhere — an alias
+        is the same thread — and what this clause guards is WHICH identity
+        the residue is, a question with one answer however many ids the
+        note spelt, and no second identity that following the edge could
+        hide. One id borne by TWO identities of the round is the inverse
+        and IS an ambiguity: the id names them equally and the note says
+        nothing about which was meant.
+
+        What that strictness costs, stated so it is a decision and not an
+        accident: a note naming one residue correctly AND mentioning an id
+        no ruling of this round carries — a typo, an id only an earlier
+        round carries, a forward reference — follows no edge at all, where
+        it used to follow the good one. That is the over-report coming
+        back for those notes, which is the cheap error. It costs nothing at
+        all for the tokens the boundaries already exclude: a legacy
+        `R1-F5`, a fingerprint, `docs/F1.md` and `F1/F2` are not id-shaped,
+        so they neither name nor refuse, and a note citing a path beside
+        its one real reference still reads. (`F1/F2` contains no id-shaped
+        token whatever: each half is bounded by the `/`. It follows no edge
+        because it names nothing, not because it is ambiguous.)
+
+        NOT COVERED, deliberately: ids here are round-local, and a verdict
+        numbers its findings from `F1` again every round, so a note naming
+        the parent's OWN earlier id — `F1` in a round-2 note, meaning the
+        round-1 ruling this closure is closing — is read as this round's
+        `F1`. The closure already names its parent by fingerprint, so the
+        round-local reading is the only one the note adds anything with,
+        and refusing every collision would refuse the commonest real shape
+        there is (a round-1 `F1` narrowed into a round-2 `F1`) and disable
+        the fallback for the legacy records it exists for. A reviewer who
+        means something else declares it.
+        """
+        by_round: dict[int, dict[str, set[str]]] = {}
+        for f in findings:
+            ruling_id = ruling_facts(f).get("id") or ""
+            if not any(ch.isdigit() for ch in ruling_id):
+                continue
+            by_round.setdefault(int(f.get("round") or 0), {}).setdefault(
+                ruling_id, set()).add(self.resolve(f.get("fp", "")))
+
+        edges: dict[str, dict[str, str]] = {}
+
+        def follow(child: str, parent: str, how: str) -> None:
+            if child != parent and first_seen.get(child) == closed_in:
+                edges.setdefault(child, {})[parent] = how
+
+        for c in closures:
+            if c.get("closure") != "reclassified":
+                continue
+            closed_in = int(c.get("round") or 0)
+            parent = self.resolve(c.get("fp", ""))
+            if first_seen.get(parent, closed_in) >= closed_in:
+                continue
+            declared = c.get("residue") or []
+            if declared:
+                for fp in declared:
+                    follow(self.resolve(fp), parent, self.EDGE_DECLARED)
+                continue
+            note = c.get("note") or ""
+            ids_of_round = by_round.get(closed_in, {})
+            # What the note NAMES, before any question of eligibility: an
+            # ineligible name must make the note ambiguous, never make
+            # another name unique. `follow` applies the bounds afterwards.
+            named = {ident for ruling_id, idents in ids_of_round.items()
+                     if self._note_names(note, ruling_id)
+                     for ident in idents}
+            # …and one id-shaped token this round cannot place makes the
+            # whole note unreadable, rather than leaving the ids that DID
+            # resolve looking unique. Shape refuses; it never resolves.
+            if any(token not in ids_of_round
+                   for token in self.ID_SHAPED.findall(note)):
+                continue
+            if len(named) != 1:
+                continue
+            follow(named.pop(), parent, self.EDGE_INFERRED)
+        return edges
+
+    def convergence(self, lineage: str) -> dict:
         """Is this lineage closing its findings, or hunting the same
         domains? A REPORT, not a verdict — read what it counts, not the
         word it ends with.
@@ -772,10 +1371,24 @@ class Ledger:
         anchor keeps producing new fingerprints, and a ruling that names no
         anchor is evidence about none. Grouping them under a shared absent
         key would invent exactly the anchor data the row does not carry.
+
+        Brief `convergence-blind-to-reclassification` (lineage 26 round 3,
+        the reviewer's own tool feedback): "new" means new CLAIM, not new
+        fingerprint. A residue the reviewer reclassified out of an earlier
+        finding carries a second fingerprint by design, and counting it as a
+        new identity reported scope expansion at the moment the loop was
+        narrowing. `_reclassification_edges` follows the edge the closure
+        already writes; `new_per_round` and `hunted` both drop what it finds,
+        `reclassified_per_round` and each thread's `descends_from` say so
+        rather than letting the count quietly shrink, and every other reading
+        here — `threads`, `stalled_threads`, `findings_per_round` — is
+        untouched, because a reclassified residue is a real ruling and a
+        reclassification is not a refusal to withdraw.
         """
-        rounds = sorted(self.rounds())
-        findings = self._all_rulings()
-        closures = [e for e in self.current() if e.get("event") == "closure"]
+        rounds = sorted(self.rounds(lineage))
+        findings = self._all_rulings(lineage)
+        closures = [e for e in self.current(lineage)
+                    if e.get("event") == "closure"]
 
         first_seen, last_seen, per_round, anchors = {}, {}, {}, {}
         finding_rounds: dict[str, list[int]] = {}
@@ -789,6 +1402,8 @@ class Ledger:
             if f.get("anchor_path"):
                 anchors.setdefault(f["anchor_path"], {}).setdefault(r, set()
                                                                     ).add(ident)
+
+        descends = self._reclassification_edges(findings, closures, first_seen)
 
         threads = {}
         for ident, opened in sorted(first_seen.items()):
@@ -832,6 +1447,18 @@ class Ledger:
                 "withdrawn": withdrawn,
                 "anchor": next((f.get("anchor_path") for f in findings
                                 if self.resolve(f.get("fp", "")) == ident), None),
+                # The followed edge, in both directions, on the thread it
+                # belongs to — so a reader can check the continuity the
+                # counts below now assume instead of taking it on trust.
+                # `descends_via` says which EVIDENCE each edge rests on: a
+                # field the reviewer wrote, or a sentence this reading
+                # parsed. Not the same claim, so not reported as one.
+                "descends_from": sorted(descends.get(ident, {})),
+                "descends_via": dict(sorted(
+                    descends.get(ident, {}).items())),
+                "reclassified_to": sorted(
+                    child for child, parents in descends.items()
+                    if ident in parents),
             }
 
         stuck = sorted(i for i, t in threads.items()
@@ -841,9 +1468,15 @@ class Ledger:
         # rendered every identity present in a round, so a finding returning
         # under the same fingerprint was displayed as new — the report
         # overstating exactly the evidence it exists to weigh.
+        # …and FRESH also means a new CLAIM: a residue whose descent from an
+        # earlier finding the reviewer recorded is the same thread under a
+        # new fingerprint, and reading it as a fresh finding on a recurring
+        # anchor is what made this report argue for stopping a lineage that
+        # was converging (brief `convergence-blind-to-reclassification`).
         hunted = {}
         for anchor, by_round in anchors.items():
-            fresh = {r: sorted(i for i in ids if first_seen[i] == r)
+            fresh = {r: sorted(i for i in ids
+                               if first_seen[i] == r and i not in descends)
                      for r, ids in sorted(by_round.items())}
             fresh = {r: ids for r, ids in fresh.items() if ids}
             distinct = set().union(*fresh.values()) if fresh else set()
@@ -881,16 +1514,48 @@ class Ledger:
             "findings_per_round": {r: len(per_round.get(r, []))
                                    for r in rounds},
             "new_per_round": {r: sum(1 for i in per_round.get(r, [])
-                                     if first_seen[i] == r) for r in rounds},
+                                     if first_seen[i] == r
+                                     and i not in descends) for r in rounds},
+            # What `new_per_round` no longer counts, counted: a number that
+            # falls with no column to fall into is a number that has gone
+            # missing.
+            "reclassified_per_round": {
+                r: sum(1 for i in per_round.get(r, [])
+                       if first_seen[i] == r and i in descends)
+                for r in rounds},
             "threads": threads,
             "stalled_threads": stuck,
             "hunted_anchors": hunted,
             "withdrawn_any": withdrew,
-            "reading": self._convergence_reading(state, stuck, hunted),
+            "reading": self._convergence_reading(state, stuck, hunted,
+                                                 descends),
         }
 
+    @classmethod
+    def _convergence_reading(cls, state, stuck, hunted, descends=None) -> str:
+        return cls._state_reading(state, stuck, hunted) \
+            + cls._edge_reading(descends or {})
+
+    @classmethod
+    def _edge_reading(cls, descends: dict) -> str:
+        """What the counts above no longer count, and on whose word.
+
+        A reading that silently rests on followed edges asks its reader to
+        trust an inference it never mentions; naming them WITH their source
+        is what lets a reader decide whether a `closing` that depends on a
+        sentence parsed out of a note is a `closing` they believe.
+        """
+        if not descends:
+            return ""
+        how = Counter(h for parents in descends.values()
+                      for h in parents.values())
+        sources = "; ".join(f"{n} {label}" for label, n in sorted(how.items()))
+        return (f". {len(descends)} narrowed residue(s) are counted as "
+                f"continuations of an earlier finding rather than as new "
+                f"identities ({sources})")
+
     @staticmethod
-    def _convergence_reading(state, stuck, hunted) -> str:
+    def _state_reading(state, stuck, hunted) -> str:
         if state == "stalled":
             return (f"{len(stuck)} finding(s) the reviewer has refused to "
                     f"withdraw twice or more: the loop is not closing them, "
@@ -915,7 +1580,7 @@ class Ledger:
 
     # ---------------------------------------------------------------- tokens
 
-    def token_state(self, token_budget: int | None) -> dict:
+    def token_state(self, token_budget: int | None, lineage: str) -> dict:
         """Which of the FOUR token states this ledger is in.
 
         A metric that reports a number is claiming the number was measured.
@@ -927,11 +1592,12 @@ class Ledger:
         but whose silence means nothing, and the report says which events
         are uncounted rather than letting the sum impersonate a total.
         """
-        counted = [e for e in self.current() if e.get("tokens") is not None]
+        counted = [e for e in self.current(lineage)
+                   if e.get("tokens") is not None]
         per_event = [int(e["tokens"]) for e in counted]
         uncounted = sorted(
             (e.get("round", 0), e["event"])
-            for e in self._by("request") + self._by("verdict")
+            for e in self._by("request", lineage) + self._by("verdict", lineage)
             if e.get("tokens") is None)
         if token_budget is None:
             return {"state": "no_budget", "spent": sum(per_event),
@@ -963,7 +1629,7 @@ class Ledger:
 
     # --------------------------------------------------------------- metrics
 
-    def latest_rulings(self) -> dict[str, dict]:
+    def latest_rulings(self, lineage: str) -> dict[str, dict]:
         """The NEWEST ruling of every finding identity in this lineage:
         resolved fingerprint -> the finding event of its latest round.
 
@@ -979,7 +1645,7 @@ class Ledger:
         exact rows this method had been dropping.
         """
         latest: dict[str, dict] = {}
-        for event in self._all_rulings():
+        for event in self._all_rulings(lineage):
             fp = self.resolve(event.get("fp", ""))
             if not fp:
                 continue
@@ -989,14 +1655,15 @@ class Ledger:
                 latest[fp] = ruling_facts(event)
         return latest
 
-    def _finding_rounds_by_identity(self, as_of_round: int | None = None
+    def _finding_rounds_by_identity(self, lineage: str,
+                                    as_of_round: int | None = None
                                     ) -> dict[str, list[int]]:
         """Resolved identity -> every round it was RULED in (`_all_rulings`,
         round-9 F3: a legacy atomic import is a ruling, and an answer bound
         by round arithmetic over a ruling set missing half its members
         binds to the wrong ruling or to none)."""
         result: dict[str, list[int]] = {}
-        for f in self._all_rulings():
+        for f in self._all_rulings(lineage):
             r = int(f.get("round") or 0)
             if as_of_round is not None and r > as_of_round:
                 continue
@@ -1034,7 +1701,7 @@ class Ledger:
         at_or_before = [fr for fr in finding_rounds if fr <= r]
         return max(at_or_before) if at_or_before else None
 
-    def current_answers(self, as_of_round: int | None = None
+    def current_answers(self, lineage: str, as_of_round: int | None = None
                         ) -> dict[str, list[tuple[str, dict]]]:
         """Every recorded answer that answers the NEWEST ruling of its
         identity, as (effect, event) pairs per resolved fingerprint, with
@@ -1061,7 +1728,8 @@ class Ledger:
         within a round supersedes as it does everywhere else; closures and
         waivers are the raw events, which the tool never re-emits.
         """
-        finding_rounds = self._finding_rounds_by_identity(as_of_round)
+        finding_rounds = self._finding_rounds_by_identity(lineage,
+                                                          as_of_round)
         latest = {fp: max(rounds) for fp, rounds in finding_rounds.items()}
         answers: dict[str, list[tuple[str, dict]]] = {}
 
@@ -1081,15 +1749,15 @@ class Ledger:
                 return
             answers.setdefault(fp, []).append((effect, event))
 
-        for event in self._by("closure"):
+        for event in self._by("closure", lineage):
             consider("closure", event.get("closure"), event)
-        for event in self.standing_dispositions():
+        for event in self.standing_dispositions(lineage):
             consider("disposition", event.get("disposition"), event)
-        for event in self._by(vocab.FINDING_WAIVER_EVENT):
+        for event in self._by(vocab.FINDING_WAIVER_EVENT, lineage):
             consider(vocab.FINDING_WAIVER_EVENT, None, event)
         return answers
 
-    def standing_findings(self) -> list[dict]:
+    def standing_findings(self, lineage: str) -> list[dict]:
         """Findings of this lineage that are still OPEN, newest ruling first.
 
         THE LIFECYCLE AUTHORITY for advancing over open findings (lineage 20
@@ -1116,25 +1784,26 @@ class Ledger:
         None of them is a finding resolved, so an advance over one is
         exactly what a human must be asked to authorize by name.
         """
-        answers = self.current_answers()
-        standing = [ruling for fp, ruling in self.latest_rulings().items()
+        answers = self.current_answers(lineage)
+        standing = [ruling
+                    for fp, ruling in self.latest_rulings(lineage).items()
                     if not any(effect == vocab.ANSWER_SETTLES
                                for effect, _ in answers.get(fp, []))]
         return sorted(standing,
                       key=lambda e: (-int(e.get("round") or 0),
                                      str(e.get("id") or "")))
 
-    def current_waivers(self) -> dict[str, dict]:
+    def current_waivers(self, lineage: str) -> dict[str, dict]:
         """Resolved fingerprint -> the human waiver answering its NEWEST
         ruling. A waiver recorded against an earlier ruling of the same
         identity is stale and is not here (lineage 20 round 4 F1): an answer
         to an older ruling is not an answer to a later one."""
         return {fp: event
-                for fp, pairs in self.current_answers().items()
+                for fp, pairs in self.current_answers(lineage).items()
                 for effect, event in pairs
                 if effect == vocab.ANSWER_OVERRULES}
 
-    def open_round(self) -> int | None:
+    def open_round(self, lineage: str) -> int | None:
         """A round whose request is recorded and whose verdict is not.
 
         An advance is about a ruling, so it may not be taken while a newer
@@ -1142,18 +1811,85 @@ class Ledger:
         an authorization to a commit that is no longer what the loop is
         working on (lineage 20 round 3 F2).
         """
-        requested = {e.get("round") for e in self.current()
+        requested = {e.get("round") for e in self.current(lineage)
                      if e.get("event") == "request"}
-        ruled = {e.get("round") for e in self.current()
+        ruled = {e.get("round") for e in self.current(lineage)
                  if e.get("event") == "verdict"}
         pending = [r for r in requested - ruled if r is not None]
         return max(pending) if pending else None
 
-    def _withdrawn_identities(self) -> set[str]:
-        return {self.resolve(e["fp"]) for e in self._by("closure")
+    def open_requests(self, lineage: str) -> list[dict]:
+        """Request events in `lineage` whose round carries no verdict,
+        oldest first.
+
+        The one definition; `brief.open_requests` delegates here so every
+        lifecycle read and the verb a human runs answer off one read.
+
+        A CLOSED lineage has none. Before the key this fell out of
+        `current()` meaning "everything after the last closure marker",
+        which emptied the moment a lineage closed; keyed, the window still
+        holds the closed review's events, so the rule is stated here rather
+        than inherited. A request the close swallowed is not open — it is
+        DISCARDED, which `discarded_requests` names as the distinct state
+        it is.
+        """
+        if self.is_closed(lineage):
+            return []
+        current = self.current(lineage)
+        ruled = {e.get("round") for e in current
+                 if e.get("event") == "verdict"}
+        return [e for e in current
+                if e.get("event") == "request" and e.get("round") not in ruled]
+
+    def discarded_requests(self, lineage: str) -> list[dict]:
+        """Requests in a CLOSED `lineage` that no verdict in it ever ruled —
+        the third state `brief` must be able to name.
+
+        A round that was emitted and then thrown away when the lineage was
+        closed at another SHA is neither "nothing has been emitted yet" nor
+        "every emitted round already carries a verdict", and saying either
+        to the worktree that emitted it is false. A keyed lineage makes the
+        state unreachable going forward — a handoff on another branch opens
+        its OWN lineage now, so there is no other worktree's request in this
+        one to swallow — but ledgers that already carry it must still read
+        truthfully, which is why this survives the stopgap that produced it
+        (brief `concurrent-round-refusal`, superseded 2026-09-06).
+
+        Answered means a verdict of that lineage binds the request's OWN
+        round and sha. Superseded is not discarded: a later request at the
+        same round, from the same branch — or from an unknown one, which is
+        every pre-field ledger — is the amend-and-re-emit flow replacing
+        its own emission, and only the survivor of that chain is judged.
+        """
+        events = self.current(lineage)
+        marks = [i for i, e in enumerate(events)
+                 if e.get("event") == self.LINEAGE_CLOSED]
+        if not marks:
+            return []
+        segment = events[:marks[-1]]
+        ruled = {(e.get("round"), e.get("sha")) for e in segment
+                 if e.get("event") == "verdict"}
+        requests = [e for e in segment if e.get("event") == "request"]
+        out = []
+        for i, e in enumerate(requests):
+            if (e.get("round"), e.get("sha")) in ruled:
+                continue
+            mine = known_branch(e.get("branch"))
+            superseded = any(
+                later.get("round") == e.get("round")
+                and (not mine or not known_branch(later.get("branch"))
+                     or known_branch(later.get("branch")) == mine)
+                for later in requests[i + 1:])
+            if not superseded:
+                out.append(e)
+        return out
+
+    def _withdrawn_identities(self, lineage: str) -> set[str]:
+        return {self.resolve(e["fp"]) for e in self._by("closure", lineage)
                 if e.get("closure") == "withdrawn"}
 
-    def _ruling_withdrawn(self, ident: str, ruling_round: int) -> bool:
+    def _ruling_withdrawn(self, ident: str, ruling_round: int,
+                          lineage: str) -> bool:
         """Whether a withdrawal answers the ruling `ident` carried at
         `ruling_round` SPECIFICALLY — the one it TARGETS
         (`_answer_target_round`), never merely one recorded somewhere in
@@ -1169,11 +1905,11 @@ class Ledger:
         re-raise answers whichever ruling its stamped `answers_round`
         names, never whichever one round arithmetic would guess.
         """
-        finding_rounds = self._finding_rounds_by_identity().get(ident, [])
+        finding_rounds = self._finding_rounds_by_identity(lineage).get(ident, [])
         return any(
             self._answer_target_round("closure", e, finding_rounds)
             == ruling_round
-            for e in self._by("closure")
+            for e in self._by("closure", lineage)
             if e.get("closure") == "withdrawn"
             and self.resolve(e.get("fp", "")) == ident)
 
@@ -1192,7 +1928,8 @@ class Ledger:
             return f"{total} partial ({detail}; {'/'.join(missing)} uncounted)"
         return f"{total} ({detail})"
 
-    def metrics(self, gate_manifest: list[str] | None = None) -> dict:
+    def metrics(self, lineage: str,
+                gate_manifest: list[str] | None = None) -> dict:
         """Every §5.4 metric derivable from this ledger; the underivable ones
         are reported as 'not captured', never silently zero (absent != none).
         """
@@ -1203,14 +1940,14 @@ class Ledger:
         # answers (round 2 F1): a fingerprint returning in a later round is
         # answered per round, and attributing every round's answer to every
         # round that saw the identity reported both under each.
-        verdicts = {e["round"]: e for e in self._by("verdict")}
-        requests = {e["round"]: e for e in self._by("request")}
+        verdicts = {e["round"]: e for e in self._by("verdict", lineage)}
+        requests = {e["round"]: e for e in self._by("request", lineage)}
 
-        for r in self.rounds():
-            findings = self.findings_in_round(r)
+        for r in self.rounds(lineage):
+            findings = self.findings_in_round(r, lineage)
             idents = {self.resolve(f["fp"]) for f in findings}
             r_batches = [b for b in self.standing_disposition_batches(
-                             round_no=r)
+                             lineage, round_no=r)
                          if b["disposition"] is not None
                          and b["key"][1] in idents]
             r_disp = [b["disposition"] for b in r_batches]
@@ -1284,7 +2021,7 @@ class Ledger:
             refuted_withdrawn = [
                 d for d in r_disp
                 if d["disposition"] == "refuted"
-                and self._ruling_withdrawn(self.resolve(d["fp"]), r)
+                and self._ruling_withdrawn(self.resolve(d["fp"]), r, lineage)
                 and str(d.get("payload", {}).get("evidence", "")).strip()]
             accepted = [b for b in r_batches
                         if b["disposition"]["disposition"] == "accepted"]
@@ -1312,7 +2049,8 @@ class Ledger:
                 named.get(b["key"][1], False)) for b in accepted)
             per_round[r] = {
                 "finding_ids": verdicts.get(r, {}).get(
-                    "finding_ids", len(self._by_round_parent(r)) or n),
+                    "finding_ids", len(self._by_round_parent(r, lineage))
+                    or n),
                 "atomic_claims": n,
                 "severity_spread": dict(Counter(
                     f.get("severity", "?") for f in findings)),
@@ -1340,8 +2078,8 @@ class Ledger:
                                      f"{len(verdicts)} rounds)"),
         }
 
-    def _by_round_parent(self, r: int) -> list[dict]:
-        return [e for e in self._by("import")
+    def _by_round_parent(self, r: int, lineage: str) -> list[dict]:
+        return [e for e in self._by("import", lineage)
                 if e.get("round") == r and e.get("kind") == "parent"]
 
     @staticmethod
@@ -1410,47 +2148,193 @@ class Ledger:
         # validator's rule is already evidenced by the run itself.
         return f.get("severity") in blocking_severities
 
-    def report(self, round_cap: int, gate_manifest: list[str] | None = None,
+    def _answer_term(self, lineage: str, ident: str) -> str:
+        """The word for how `ident` currently stands in `lineage`: the term
+        of its newest current answer, or `unanswered`."""
+        pairs = self.current_answers(lineage).get(ident) or []
+        if not pairs:
+            return "unanswered"
+        _, event = pairs[-1]
+        return (event.get("disposition") or event.get("closure")
+                or ("waived" if event.get("event") == vocab.FINDING_WAIVER_EVENT
+                    else "answered"))
+
+    def cross_lineage_notices(self, lineage: str) -> list[dict]:
+        """Every standing finding of `lineage` whose IDENTITY is also live in
+        another OPEN lineage, with that lineage's id, round and disposition.
+
+        Ruling 1 of 2026-09-06 (brief `keyed-lineage`). Aliases are global by
+        design, so one identity can be ruled in two lineages at once and
+        disposed differently — accepted in one, refuted in another — and
+        nothing said what two simultaneous dispositions mean. What was ruled:
+        answers stay derived over ONE lineage's rulings and bound to the
+        newest ruling of each identity, exactly as before; what is added is a
+        NOTICE on the envelope's face and in `brief`. Rejected: global
+        answers where the newest ruling wins across lineages — a reviewer's
+        ruling silently answered by a different review's author is the
+        "answer bound to the wrong ruling" the record guards against.
+
+        It has NO effect on either record. A human resolves a disagreement
+        with the verbs that already exist; this only stops them from having
+        to already know the other review was there.
+
+        Closed lineages are excluded: a settled review is history, and the
+        notice is about two reviews that are both live.
+        """
+        others = [l for l in self.open_lineages() if l != str(lineage)]
+        if not others:
+            return []
+        out: list[dict] = []
+        for ruling in self.standing_findings(lineage):
+            ident = self.resolve(ruling.get("fp", ""))
+            for other in others:
+                elsewhere = self.latest_rulings(other).get(ident)
+                if elsewhere is None:
+                    continue
+                out.append({
+                    "fp": ident,
+                    "id": ruling.get("id"),
+                    "title": ruling.get("title"),
+                    "lineage": other,
+                    "branch": self.lineage_branch(other) or None,
+                    "round": int(elsewhere.get("round") or 0),
+                    "disposition": self._answer_term(other, ident),
+                })
+        return out
+
+    def open_lineage_aggregate(self, token_budget: int | None = None
+                               ) -> list[dict]:
+        """Every OPEN lineage in this repository's ledger: its id, the branch
+        it was recorded on, its rounds and its summed counted tokens.
+
+        The repository aggregate ruled on 2026-09-06 (brief `keyed-lineage`).
+        The round cap counts the rounds of ONE review and is never
+        aggregated; the token budget stays per lineage. What a human gains
+        here is the fact a per-lineage report cannot show once lineages run
+        beside each other — how many are open, on which branches, and what
+        they have spent between them. A FACT, with no breaker and no new
+        config key: a declared repository-wide budget would be a threshold
+        nobody has asked for and would need reader-first staging.
+
+        `tokens` is the state name and the sum from `token_state`, so a
+        `partial` sum is labelled a lower bound here exactly as it is there
+        rather than impersonating a total.
+        """
+        out = []
+        for lineage in self.open_lineages():
+            tokens = self.token_state(token_budget, lineage)
+            out.append({
+                "lineage": lineage,
+                "branch": self.lineage_branch(lineage) or None,
+                "rounds": self.rounds(lineage),
+                "open_round": self.open_round(lineage),
+                "events": len(self.current(lineage)),
+                "tokens": {"state": tokens["state"], "spent": tokens["spent"]},
+            })
+        return out
+
+    def report(self, lineage: str, round_cap: int,
+               gate_manifest: list[str] | None = None,
                token_budget: int | None = None,
                blocking_severities: list[str] | None = None) -> dict:
         waived = self.waivers()
         return {
-            "breakers_fired": self.breakers(round_cap, token_budget,
+            "breakers_fired": self.breakers(lineage, round_cap, token_budget,
                                             blocking_severities),
             "round_cap": round_cap,
             "gate_manifest": list(gate_manifest) if gate_manifest else [],
-            "tokens": self.token_state(token_budget),
+            "tokens": self.token_state(token_budget, lineage),
             # The direction of the loop, beside its spend. A budget says how
             # much has been used; this says whether it is being used to
             # close anything (2026-08-25).
-            "convergence": self.convergence(),
-            "metrics": self.metrics(gate_manifest),
+            "convergence": self.convergence(lineage),
+            "metrics": self.metrics(lineage, gate_manifest),
             # The skipped half of the record. Reported even when empty, and
             # as a list rather than a count, because "which commits and why"
             # is the question a waiver exists to answer — a bare number would
             # be the same silence in a different shape.
             "waived": {"count": len(waived), "commits": waived},
             "events": len(self.events()),
-            "lineage": {"number": self.lineage_number(),
-                        "events": len(self.current()),
+            "lineage": {"id": str(lineage),
+                        "number": self.lineage_number(lineage),
+                        "branch": self.lineage_branch(lineage) or None,
+                        "events": len(self.current(lineage)),
                         "closed_before": [
                             {k: c.get(k) for k in ("at_round", "outcome",
                                                    "reason", "authorized_by")}
-                            for c in self.closures_of_lineage()]},
+                            for c in self.all_closures()
+                            if self.lineage_of(c) != str(lineage)]},
+            # The repository aggregate, beside the lineage this report is
+            # about: one review's numbers do not say how many are in flight.
+            "open_lineages": self.open_lineage_aggregate(token_budget),
             "ledger": str(self.path),
         }
+
+
+#: The heading the cross-lineage notice renders under, on the envelope's
+#: face and in `brief`. One string, so both readers name the same thing.
+CROSS_LINEAGE_HEADING = "## Also live in another lineage"
+
+
+def render_cross_lineage_md(notices: list[dict]) -> str:
+    """The cross-lineage notice, or "" when there is nothing to name.
+
+    Empty rather than a reassuring sentence: the notice exists because two
+    reviews are live at once, and a block that renders on every envelope
+    would teach a reader nothing about what its presence means.
+    """
+    if not notices:
+        return ""
+    lines = [CROSS_LINEAGE_HEADING, "",
+             "These findings' identities are also ruled in another OPEN "
+             "lineage of this repository. Nothing here answers anything and "
+             "no record is changed — a person decides what two live "
+             "dispositions of one identity mean.", ""]
+    for n in notices:
+        where = n["branch"] or "an unrecorded branch"
+        lines.append(f"- `{n['fp']}` ({n.get('id') or 'no id'}) — lineage "
+                     f"`{n['lineage']}` on {where}, round {n['round']}: "
+                     f"{n['disposition']}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def render_convergence_md(c: dict) -> str:
     """Markdown rendering of convergence(); every number comes from the
     dict, and the reading beneath them says only what they support."""
     lines = [f"## Convergence — **{c['state']}**", "", c["reading"], ""]
-    lines.append("| round | findings | new identities |")
-    lines.append("|---|---|---|")
+    # The `continued` column is what makes `new identities` readable at all
+    # (brief `convergence-blind-to-reclassification`): the two together say
+    # which of a round's fingerprints are new claims and which are residues
+    # of a finding the reviewer reclassified. It renders even when it is all
+    # zeroes, because a column that appears only when it is non-zero leaves
+    # the ordinary case saying `new` without saying new of what.
+    reclassified = c.get("reclassified_per_round") or {}
+    lines.append("| round | findings | new identities | continued |")
+    lines.append("|---|---|---|---|")
     for r in c["rounds"]:
         lines.append(f"| {r} | {c['findings_per_round'].get(r, 0)} | "
-                     f"{c['new_per_round'].get(r, 0)} |")
+                     f"{c['new_per_round'].get(r, 0)} | "
+                     f"{reclassified.get(r, 0)} |")
     lines.append("")
+    followed = [(ident, t) for ident, t in c["threads"].items()
+                if t.get("descends_from")]
+    if followed:
+        lines.append("**Reclassified threads, followed (a residue is not a "
+                     "new identity)**")
+        for ident, t in followed:
+            # Each parent WITH the evidence its edge was read from. A
+            # declaration the reviewer wrote and a sentence this report
+            # parsed are different warrants for the same subtraction, and
+            # printing them alike would hide which one a reader is trusting.
+            via = t.get("descends_via") or {}
+            parents = ", ".join(
+                f"`{p}` ({via.get(p, Ledger.EDGE_INFERRED)})"
+                for p in t["descends_from"])
+            lines.append(f"- `{ident}` opened round {t['opened_round']} "
+                         f"continuing {parents} "
+                         f"({t['anchor'] or 'no anchor'})")
+        lines.append("")
     if c["stalled_threads"]:
         lines.append("**Threads the reviewer will not withdraw**")
         for ident in c["stalled_threads"]:
@@ -1550,8 +2434,26 @@ def render_report_md(report: dict, pending_round: int | None = None) -> str:
     lines.append("")
     lin = report.get("lineage")
     if lin:
-        lines.append(f"Lineage: {lin['number']} ({lin['events']} events in "
-                     f"this lineage; {len(lin['closed_before'])} closed "
-                     f"before it)")
+        # The ID, not the ordinal: lineages run beside each other now, so a
+        # position in a sequence is not an identity (brief `keyed-lineage`).
+        lines.append(f"Lineage: {lin.get('id', lin.get('number'))} "
+                     f"({lin['events']} events in this lineage"
+                     + (f", on {lin['branch']}" if lin.get("branch") else "")
+                     + f"; {len(lin['closed_before'])} closed before it)")
+    open_lineages = report.get("open_lineages") or []
+    if open_lineages:
+        # The repository aggregate (ruled 2026-09-06): a fact, no breaker.
+        lines.append("")
+        lines.append(f"Open lineages in this repository: "
+                     f"**{len(open_lineages)}**")
+        for row in open_lineages:
+            rounds = ", ".join(str(r) for r in row["rounds"]) or "none"
+            spend = row["tokens"]
+            counted = (f"{spend['spent']} tokens counted"
+                       if spend["state"] in ("live", "partial")
+                       else spend["state"].replace("_", " "))
+            lines.append(f"- `{row['lineage']}` on "
+                         f"{row['branch'] or 'an unrecorded branch'} — "
+                         f"round(s) {rounds}, {counted}")
     lines.append(f"Events: {report['events']} · Ledger: `{report['ledger']}`")
     return "\n".join(lines)

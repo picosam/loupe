@@ -810,3 +810,117 @@ class TestF4GatesBindToTheExecutedTree(unittest.TestCase):
         [rec] = self.probe("0" * 40)
         self.assertEqual(len(rec["output"]["sha256"]), 64)
         self.assertIn("not retained", rec["output"]["pointer"])
+
+
+class TestTheReviewRangeReachesEveryGate(_GateHarness):
+    """Finding 4 of the 2026-09-05 audit. `handoff` commits outstanding
+    work BEFORE the manifest runs, so a gate reading the working tree
+    reads nothing; a gate that inspects the commits under review has to be
+    told the range. The runner exports it: the head always, the base
+    whenever the emission knows it. FALSIFICATION: drop either export and
+    the matching assertion below fails; `bin/loupe-diff-check` (this
+    repository's `whitespace` gate) reads exactly these two names."""
+
+    GATE_BASE = env_var("GATE_BASE")
+    GATE_HEAD = env_var("GATE_HEAD")
+    RANGE_PROBE = ("import json, os; print(json.dumps({k: os.environ.get(k) "
+                   f"for k in ('{GATE_BASE}', '{GATE_HEAD}')}}))")
+
+    def _run(self, base=None):
+        cfg = dataclasses.replace(
+            CFG, repo_root=self.repo, ledger_dir=self.state,
+            gates=[{"id": "probe",
+                    "command": [sys.executable, "-c", self.RANGE_PROBE],
+                    "blocking": True}])
+        ambient = {k: v for k, v in os.environ.items()
+                   if k not in (IN_GATE, self.GATE_BASE, self.GATE_HEAD)}
+        with unittest.mock.patch.dict(os.environ, ambient, clear=True):
+            [rec] = emit.run_gates(cfg, self.head, base=base)
+        return self.probe_env(rec)
+
+    def test_the_head_is_exported_and_no_base_means_no_base(self):
+        # The paired control for the export below: a run that knows no
+        # base exports none, so a range gate can name its fallback rather
+        # than read a stale value from the ambient environment.
+        env = self._run()
+        self.assertEqual(env[self.GATE_HEAD], self.head)
+        self.assertIsNone(env[self.GATE_BASE])
+
+    def test_the_base_is_exported_when_the_emission_knows_it(self):
+        base = "a" * 40
+        env = self._run(base=base)
+        self.assertEqual(env[self.GATE_BASE], base)
+        self.assertEqual(env[self.GATE_HEAD], self.head)
+
+    def _run_under(self, ambient: dict, base=None, command=None):
+        """run_gates with the two range names ALREADY in the environment —
+        the caller's stale state — and a declared base or none."""
+        cfg = dataclasses.replace(
+            CFG, repo_root=self.repo, ledger_dir=self.state,
+            gates=[{"id": "probe",
+                    "command": command or [sys.executable, "-c",
+                                           self.RANGE_PROBE],
+                    "blocking": True}])
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in (IN_GATE, self.GATE_BASE, self.GATE_HEAD)}
+        with unittest.mock.patch.dict(os.environ, {**clean, **ambient},
+                                      clear=True):
+            [rec] = emit.run_gates(cfg, self.head, base=base)
+        return rec
+
+    def test_the_runner_owns_both_names_whatever_the_caller_exported(self):
+        """Lineage 25 round 1 F3: with base=None an inherited
+        LOUPE_GATE_BASE reached the gate and a run that described itself
+        as base-less attested a stale range. The cross-product: ambient
+        HEAD and BASE absent or present, declared base absent or present —
+        the gate sees exactly what THIS run knows, never the ambient."""
+        stale = {self.GATE_BASE: "d" * 40, self.GATE_HEAD: "e" * 40}
+        for ambient in ({}, {self.GATE_HEAD: "e" * 40},
+                        {self.GATE_BASE: "d" * 40}, stale):
+            for declared in (None, "a" * 40):
+                with self.subTest(ambient=sorted(ambient), declared=declared):
+                    env = self.probe_env(self._run_under(ambient, declared))
+                    self.assertEqual(env[self.GATE_HEAD], self.head)
+                    self.assertEqual(env[self.GATE_BASE], declared)
+
+    def test_the_whitespace_gate_falls_back_rather_than_read_a_stale_base(self):
+        """The reviewer's reproducer with the real gate: a committed
+        trailing-whitespace defect, a clean tree, the ambient BASE equal to
+        HEAD (so the stale range is HEAD..HEAD and empty). Base-less, the
+        gate must fail and name its fallback; with the real base declared
+        over the same ambient value it must fail on the range; and a clean
+        range under the same ambient state is the passing control."""
+        git = lambda *a: subprocess.run(["git", "-C", str(self.repo), *a],
+                                        check=True, capture_output=True,
+                                        text=True).stdout.strip()
+        parent = git("rev-parse", "HEAD")
+        (self.repo / "probe.txt").write_text("probe \n", encoding="utf-8")
+        git("add", "probe.txt")
+        git("commit", "-q", "-m", "trailing whitespace")
+        self.head = git("rev-parse", "HEAD")
+        script = REPO_ROOT / "bin" / "loupe-diff-check"
+        if not script.is_file():
+            # Workbench tooling: the whitespace gate is this repository's,
+            # declared in its review.toml, and does not travel with the
+            # published candidate. The runner's own contract is the
+            # cross-product test above, which runs everywhere.
+            self.skipTest("bin/loupe-diff-check is not in this tree")
+        gate = [str(script), "--repo", str(self.repo)]
+        ambient = {self.GATE_BASE: self.head}
+        rec = self._run_under(ambient, None, command=gate)
+        log = Path(rec["output"]["pointer"]).read_text(encoding="utf-8")
+        self.assertEqual(rec["exit_code"], 1, log)
+        self.assertIn("FALLBACK", log)
+        rec = self._run_under(ambient, parent, command=gate)
+        log = Path(rec["output"]["pointer"]).read_text(encoding="utf-8")
+        self.assertEqual(rec["exit_code"], 1, log)
+        self.assertIn("the review range", log)
+        # Passing control: a clean commit on top, checked as its own range.
+        (self.repo / "probe.txt").write_text("probe\n", encoding="utf-8")
+        git("add", "probe.txt")
+        git("commit", "-q", "-m", "clean")
+        clean_head = git("rev-parse", "HEAD")
+        prior, self.head = self.head, clean_head
+        rec = self._run_under(ambient, prior, command=gate)
+        log = Path(rec["output"]["pointer"]).read_text(encoding="utf-8")
+        self.assertEqual(rec["exit_code"], 0, log)

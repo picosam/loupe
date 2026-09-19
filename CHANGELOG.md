@@ -5,6 +5,485 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.23.0
+
+Seven changes, all to what the tool SAYS or READS; none to what a round
+binds. Most came from reviewers' own tool feedback.
+
+**The `Round:` line reports the round, not a standing policy.** Its
+parenthetical switched on one axis — whether a ledger override had moved
+the cap — so `(budget breaker fires past the cap)` was printed
+byte-identically on round 1 of every lineage, pairing a state report with
+boilerplate nothing distinguished from it. Two readers, two rounds apart,
+on opposite sides of the exchange, read the standing half as the event:
+one spent a paragraph of a verdict ruling that no override was recorded,
+the other told the operator that a fourth round needed their
+authorization. It never did. Within the cap the line now says so; past it,
+that nothing is gated, no authorization is needed, the tool emits rather
+than refusing, and the convergence report the envelope already carries is
+what the count stood in for. "Fires" is gone: past the cap nothing trips.
+`loupe brief`'s past-cap banner carried the same sentence and is corrected
+with it.
+
+**`Base:` no longer invents a round 0, and neither does the disposition
+section.** Round 1 of a lineage printed "the SHA ruled on in round 0" and
+headed an empty section "Disposition ledger — round 0". There is no round
+0. Round 1 now says the base is the one the author declared, ruled on by
+no round of this lineage, and reports from the ledger whether any verdict
+in the record ever ruled on that SHA — the common shape when a lineage
+opens on the tip a closed one ended on. Later rounds are unchanged.
+
+**The disposition ledger names the ruling it answers.** The section opens
+with the previous round's verdict: its recorded digest and its kept copy's
+path, composed from the verdict event itself, never from a directory
+listing, so another lineage's round-N verdict cannot be served in its
+place. Where no copy was kept it says so in words, and on a `paste` or
+`git` round it says the digest is the half the reviewer can check.
+
+**A `reclassified` closure declares where the narrowed claim went, and
+convergence follows it.** A reviewer who confirms most of a finding fixed
+and re-issues the residue under an accurate new title mints a second
+identity on the same anchor; convergence read that as a new finding — the
+signature of hunting — at exactly the moment the loop was working. Add one
+continuation line under the closure, `Residue: F1` (several ids
+comma-separated), naming findings of the same verdict. Optional: a
+reclassification that leaves nothing behind omits it. Convergence counts a
+declared residue as a continuation (`reclassified_per_round`, and
+`descends_from` / `reclassified_to` / `descends_via` on each thread); a
+genuinely new finding beside a residue on the same anchor still reads
+`hunting`. For records written before this field, the residue is read from
+the round-local finding id in the closure's own note, fail-closed: the
+whole note must be readable before any of it is used. Every id-shaped
+token in it — `F1`, and near-misses of one such as `f1` or `F01` — must
+place exactly to an id of that round, all of them to one identity, before
+any question of whether that identity could be a residue. An ineligible
+name makes the note ambiguous rather than making another name unique, and
+a token this reading cannot place makes it unreadable rather than leaving
+the rest looking unique. A legacy `R1-F5`, a fingerprint and a path are
+not id-shaped, so they neither name nor refuse. Every followed edge is
+labelled `declared` or `inferred from the closure's note`. Declared on any other closure term it is refused
+(`C-RESIDUE-TERM`), as are an id no finding of the verdict carries
+(`C-RESIDUE-UNKNOWN`), a malformed or empty value (`C-RESIDUE-ID`) and a
+repeat (`C-RESIDUE-DUPLICATE`). *Reviewers:* the `rule` step and the
+request's verdict-shape block both ask for it. *Upgraders:* nothing to do.
+A verdict carrying the field validates on 0.22.0 and on 0.16.0, which read
+the line as part of the note, and a ledger carrying the `residue` member
+reads there as before; only `import-legacy`'s closed event grammar on an
+older installation refuses such a row.
+
+**Generated paths get their own heading in the request's span.** A changed
+path whose `linguist-generated` attribute is set IN THE TARGET TREE is
+listed under its own heading with its own counts, and the header states
+both totals — every changed path, and the part that is not generated — so
+a reviewer skips rendered inventories by rule instead of by inspection.
+*To benefit, mark your generated paths `linguist-generated` in
+`.gitattributes` and commit it* — the attribute forges already use to
+collapse those files in a diff. It is read from the commit under review,
+never from the emitting checkout, and from that commit's tracked
+declaration alone: the lookup is isolated from `info/attributes`, from a
+configured or default user attributes file and from the system one, so no
+machine-local override can promote a handwritten path or suppress a
+declared one, and where that isolation cannot be established the span says
+nothing about generated paths rather than something partly local. There is
+no configuration key for it and
+no inference from a file's name. A repository that marks nothing gets the
+span it always got, byte for byte; so does a git older than 2.40, which
+lacks `check-attr --source`.
+
+**The `respond` step is ordered.** It asked for a verified acceptance and
+THEN said to make the changes. It now reads: make the fix; run the
+finding's named test on the fixed head; run the mutation and restore; THEN
+write the record with `--out`; hand off. A fix proposed but not made is
+`deferred` or `escalated`, never `accepted`.
+
+**Tests: one grammar for the declared interpreter interval.** Two
+travelling tests parsed `project.requires-python` with looser regexes than
+each other — one by substring. `review/tests/util.declared_interval` is
+the single bounded, whole-value grammar, and a test fails if a second
+reader of the interval appears in the package.
+
+## 0.22.0
+
+**`handoff` names what its commit sweeps, before the commit exists, and
+refuses two states nobody could mean.** `handoff` commits outstanding
+tracked work and pushes it BEFORE any gate runs, so a gate protects the
+envelope and never the commit. That ordering is sound only while the dirty
+paths are the author's. It stopped being sound the first time a test suite
+was killed at a timeout: its corrupt-by-design fixture stayed tracked by
+intent-to-add beside a repointed record, and the next hand-off in that
+workspace would have published both under the author's envelope. The order
+stays — what an attestation binds to does not change — and a preflight now
+runs ahead of the commit.
+
+*`scope_paths`, a new optional claim member.* A list of strings: an exact
+path, a directory prefix ending in `/`, or an fnmatch glob. When the claim
+declares it, outstanding tracked paths outside it are REFUSED before the
+commit, with nothing committed, pushed or emitted. `[]` is a declaration
+("this round sweeps nothing"), not silence. `--allow-outside-scope` sweeps
+them anyway, and the request says so on its face. `review_scope` stays the
+prose a reviewer reads; this is the half a machine can hold a commit to.
+A claim that does not declare it behaves as before, and the request says
+the sweep was held to no path list.
+
+*The fixture marker.* A swept file carrying the marker line — the phrase
+`loupe-fixture:` followed by `corrupt-by-design`, alone on a line, comment
+leaders allowed — is refused, and no flag overrides it: the remedy is to
+restore the tree. A repository opts in by writing the marker into fixtures
+its suite places in the real tree. It is a whole line and never a
+substring, so a document that explains the marker does not trip it.
+
+*On the request's face.* Two header lines, printed in every state:
+`Swept:` lists the paths this hand-off committed (or says it committed
+nothing), whether they sat inside the declared scope, and any
+intent-to-add entries among them; `Env:` gives the interpreter and whether
+it is inside the declared range, whether the process ran as root, and
+whether the `loupe` on PATH is this installation. Older readers ignore
+both lines.
+
+*An interpreter below the floor gets a sentence.* The package's first
+statement now checks the interpreter, in syntax any Python 3 parses. Under
+3.9 the tool used to die with `TypeError: unsupported operand type(s) for
+|` from inside its own package; it now says which version it needs, which
+it found, and that nothing was read or written.
+
+*How the sweep is read.* Not from `status --porcelain` and the working
+tree: the first draft did that, and its own review found three faces of the
+mistake — git quotes a non-ASCII name in that output, `commit -a` records
+the index for a `skip-worktree` or `assume-unchanged` entry and the link
+text for a symlink, and a rename is two paths. The preflight now COPIES the
+index to a temporary file, runs `git add -u` against the copy (the exact
+staging `commit -a` performs), lists the candidate with `diff --cached --raw
+-z --no-renames` (lossless paths, a rename as its D and its A, the blob id
+each path will record) and reads each recorded blob's bytes. A submodule
+pointer has no bytes to judge and is refused by name, and both readers
+pass `--ignore-submodules=none` so no diff setting can hide one. After the
+real commit, the commit's own raw diff is compared with the candidate by
+status, path, mode and blob id: a hook, filter or attribute that changed
+what was recorded — the executable bit alone included — is refused with
+the commit named, nothing pushed. The real index is never written.
+
+## 0.21.0
+
+**`take` prints the request compactly, and says what the reviewer's
+checkout is.** Three debug rounds in a row (2026-09-17/18) the reviewer's
+tool feedback named the same cost first: `take` returned the whole request,
+and 64% of a measured 29,589-byte request was the attestation array — five
+of its twenty objects repeating one CI run and one receipt each.
+
+*The default rendering.* `take` now prints the request with its
+attestation objects as one table: gate, result (`exit N`, or `NOT RUN:` and
+the reason), binding, tree, where it ran, whether it blocks, who executed
+it, the command, the output's digest and the log's pointer, whole. `= target` in the ran-at column
+means `executed_sha` = `target_sha` = the request's own sha; any other row
+prints both shas. Every other section is byte-for-byte the envelope's. A
+block that does not parse, or holds a record that is not an object, is left
+exactly as it was: the rendering never summarises what it could not read.
+The measured request went from 29,589 to 13,727 bytes.
+
+*The full mode.* `take --full` prints the exact bytes, and the `kept` path
+— which `take` always wrote — holds them either way. Nothing else reads
+the rendering: validation, the digest, the kept copy and the ledger all
+work from the original bytes, so this is a view, not a second format.
+
+*For consumers of the JSON result.* The default payload carries
+`request_view` and NO `envelope` key; `--full` carries `envelope` and no
+`request_view`. `envelope` means the exact bytes and nothing else, so a
+caller that pipes it onward is never handed a rendering under that name. A
+script that read `envelope` from `take` passes `--full` or reads `kept`.
+
+*`head`.* The result gains `head` — `{state, sha, tree}` with `state` one
+of `at-target`, `elsewhere`, `unknown` — and the text prints it in all
+three states. It is reported, never refused: a reviewer rules from the
+diff command as legitimately as from a checkout, and an empty clone is a
+documented reviewer state. It exists because a reviewer whose working tree
+sat at an older commit read the right diff and ran its probes against the
+wrong files.
+
+*The gate banner.* A request précis said "1 of 20 did not pass" for a
+NON-blocking gate reporting the branch's earlier CI history, and a reviewer
+read a failure of the target. Blocking rows that did not pass are now
+named as failures AT THE TARGET; non-blocking ones get their own line,
+which says whether every blocking gate passed. A row with no `blocking`
+member is read as blocking.
+
+## 0.20.0
+
+**The lineage is keyed.** Every event now carries a lineage `id`, and every
+round-scoped read takes that id as an argument instead of deriving it from
+a position in the file. Until this version `current()` meant "everything
+after the last `lineage_closed` marker", so one repository held exactly one
+review in flight, structurally: two worktrees emitting into the shared
+ledger both computed lineage 1 round 1, and closing either discarded the
+other's request unruled. N reviews now coexist in one ledger.
+
+*The id.* A new lineage's id is `L` followed by ten hex characters
+(`secrets.token_hex(5)`) — opaque, and letter-led so it can never be read
+as a legacy ordinal, which is decimal digits. It is displayed everywhere
+the number used to be: `lineage L3f9a1c2b7e` rather than `lineage 27`. The
+exchange path is `exchange/lineage-<id>/…` and the envelope ref is
+`refs/loupe/<id>/<round>/<leg>`, carried as `git:<id>/<round>`. A legacy
+lineage keeps its ordinal as its id, so every retained path, every pushed
+ref and every historical citation of "lineage 25" stays true.
+
+*Which lineage a verb acts on.* `handoff` continues the OPEN lineage whose
+requests were recorded on this worktree's branch, and mints a new one when
+this branch holds none — so a second worktree opens its own review instead
+of being refused. `close`, `respond`, `brief <envelope>`, `ledger add` and
+`validate --from-target` resolve the lineage from the SHA their envelope
+names, through the request that recorded it. `close --lineage`,
+`authorize-advance`, `waive --finding` and the `ledger` verbs act on this
+branch's open lineage. A detached HEAD with several lineages open is the
+one state where a lineage cannot be chosen, and the verb refuses saying so
+rather than picking. `take` uses the id the `git:<id>/<round>` reference
+carried, else the lineage this ledger already recorded for the commit, else
+the single open lineage, else a new id.
+
+*Reading older ledgers.* The reader derives a key for every event: an
+explicit `lineage` id wins; an event without one belongs to the legacy
+positional lineage — the ordinal counted by `lineage_closed` markers in the
+prefix before the first keyed event, as a decimal string. Absence is a
+third state, never a collision and never a default of "the current
+lineage". A mixed ledger keeps its prefix's ordinals under the keyed events
+that follow.
+
+*The cross-lineage notice.* Fingerprint identity aliases are global by
+design, so one identity can be ruled in two lineages at once and disposed
+differently. Answers stay derived over ONE lineage's rulings, bound to the
+newest ruling of each identity, exactly as before. What is new is a notice:
+at emission and in `brief`, a standing finding whose identity is also ruled
+in another OPEN lineage is named with that lineage's id, round and
+disposition. It answers nothing and changes no record.
+
+*The report aggregate.* `ledger report` reports the lineage this branch is
+on and gains the repository aggregate: every open lineage with its id,
+branch, rounds and summed counted tokens. A fact, with no breaker and no
+new config key — the round cap counts the rounds of one review and is never
+aggregated, and the token budget stays per lineage.
+
+*Reservations.* `LineageReservation` now locks `lineage-<id>.lock`, so what
+it excludes is two commands acting on the SAME review; two worktrees
+running two different lineages share nothing to overwrite and are no longer
+refused. Opening a new lineage additionally takes a short repository-wide
+`lineages.lock` across the id assignment and the first record, so two
+openers cannot mint one review's worth of state twice.
+
+*Retired.* The 0.19.0 concurrency refusal is gone — `handoff` no longer
+refuses while another branch holds an open request, and `close` no longer
+refuses over another branch's round, because neither is in this lineage any
+more. `brief` still names a round that was emitted and then discarded,
+truthfully, for ledgers that already carry that state.
+
+*Which review a commit's envelope belongs to.* A SHA names a commit, and
+two branches may examine one commit under two independently scoped
+reviews. The SHA resolvers therefore keep the review identity the
+invocation carries — the branch it was run from, or the id a
+`git:<id>/<round>` reference names — through lookup, validation, retention
+and verdict publication. Where a commit is under review twice and the
+invocation names neither review, the verb refuses and records nothing; it
+never chooses by the order the two reviews happened to be recorded in. One
+review of a commit, and every legacy ledger, resolve exactly as they did.
+
+*The request envelope names its lineage.* The request wrapper now carries
+`lineage="<id>"`, the id the author's side records, keeps and pushes the
+round under. It matters on the reviewer's side, where `path` and `paste`
+supply no reference: `take` used to fold any previously unseen commit into
+whatever single review was open on its ledger, so a reviewer taking two
+independent branch reviews recorded both as one. `take` now binds to the
+carried id; failing that to the review this ledger already recorded for the
+commit; failing that to the open review whose recorded author branch is the
+envelope's, which keeps sequential continuation working for envelopes that
+carry no id; and it refuses rather than adopting when more than one
+association remains.
+
+*Lifecycle reads happen under the reservation.* `handoff`, `close` and
+`authorize-advance` re-read the ledger from disk immediately after
+acquiring their reservation and revalidate the lineage they selected before
+it. A lock excludes an operation while it is held but cannot make an
+earlier read current, so a close completing while a handoff waited for the
+lock was invisible and that handoff appended a round-1 request behind the
+review's own closure. A lineage open at selection and closed by the time
+the reservation is granted now refuses, having recorded nothing.
+
+*Envelopes are read once.* `close --verdict -` and `brief -` read their
+source a second time to resolve the lineage, which left the real read an
+empty document — the paste relay's own generated close command is a
+heredoc. Each verb now captures its source exactly once and uses those
+bytes for both resolution and processing, on every carrier.
+
+*`import-legacy` validates against the lineage it appends to.* Round
+sequence and answer-to-ruling binding are read from the destination lineage
+instead of the whole ledger, so a concurrent review can no longer supply the
+ruling an imported withdrawal claims to settle or the round a later verdict
+skips; identity aliases stay global, and their effect is checked against
+each affected lineage's own answers.
+
+**A gate can be attested by CI instead of executed locally.** A `[[gates]]`
+row may declare `attested_by = "ci"`. `handoff` then does not run that
+command: the branch is already pushed when gates run, so the runner polls
+the Actions API for a completed workflow run at the exact reviewed SHA and
+records that run's identity, URL and conclusion as the attestation. The row
+carries `attested_by: "ci"` and a `ci_run` object beside every field the
+attestation already required, and its retained output is the run JSON rather
+than a command transcript — verifiable by opening the URL, not believable by
+trusting the author's machine. Inside CI (`GITHUB_ACTIONS`) the gate runs
+normally, since there this process is the executor; `loupe-gates
+--execute-ci-gates` forces local execution. A conclusion other than
+`success` fails the gate with the run URL; no completed run at that SHA
+inside `[limits] ci_timeout` (new; default 900 seconds, polled every 20),
+`gh` missing or unauthenticated, or an unresolvable repository or branch is
+recorded in the not-run shape, so a blocking gate still refuses. A run on
+the same branch at a different commit is never admitted. A run's
+conclusion is not a gate's result: CI publishes a receipt — one row per
+declared gate with its command, exit code and not-run reason, uploaded as
+the artifact `loupe-gates-<sha>` — and the runner decides each gate by its
+own row; a green run with no receipt, no row for the gate, a row declaring
+not-run, a changed command or a receipt for another commit is a not-run
+record. The validator checks the receipt beside the run: required fields
+and types, the SHAs, the conclusion against the exit. The cost: wall
+time per handoff grows and CI minutes become a review dependency; the poll
+is run-level, so a red workflow at the reviewed commit refuses every
+CI-attested gate. *For upgraders:* `attested_by` and `[limits] ci_timeout`
+are new keys, unreadable to earlier installations, which refuse naming the
+version skew — unknown keys inside a gate row now get the same remedy
+unknown sections have had; adopt them once both sides of your loop parse
+them.
+
+*The review an envelope names travels with it.* `brief`, `ledger add`,
+`respond` and `close` carry the identity a supplied envelope names — the
+`lineage` the request wrapper stamps, or a `git:<id>/<round>` reference —
+ahead of the checkout's own branch; a stamp naming a review this ledger
+does not hold refuses without writes rather than recording under the
+branch's review. And a fresh reviewer can take two independently emitted
+reviews of one commit over the git carrier: the retake check compares
+request bytes, not commits, so the same bytes carried under a second
+lineage still refuse while a second review of the same commit enters.
+
+*For upgraders:* the `lineage` attribute on the request wrapper is the one
+wire change in this version and needs no coordination: an older reader
+tolerates it as it tolerates every unlisted wrapper attribute, and an
+envelope emitted before this version carries none, which `take` reads as
+the legacy path. And **nothing migrates, and nothing needs to.** An event
+written before this version carries no id, and the reader derives one for
+it: the ordinal counted by `lineage_closed` markers in the prefix before
+the first keyed event, as a decimal string — every number, path and ref an
+older ledger already had. New events carry ids from this version on, and a
+ledger that mixes the two reads correctly. There is no command that
+rewrites older rows with explicit ids: `migrate-state` still does only what
+it did before, move state written under a former tool name with its
+digests verified, and materialising legacy ordinals is deferred until
+something needs them on the rows themselves.
+
+## 0.19.0
+
+**A second worktree can no longer open or close a round over another's.**
+The state directory is keyed by repository, so two worktrees of one
+repository share one ledger — by design; a per-worktree ledger was the
+earlier defect. Both computed the same lineage and the same round, neither
+was told about the other, and closing either one discarded the other's
+open request: never ruled, never refused, gone from the record. Under the
+`git` carrier it was worse still — both force-pushed their envelope to the
+one `(lineage, round)` ref, and the second silently overwrote the first.
+The request event now records the emitting worktree's `branch`, read off
+the envelope's own stamp. `handoff` refuses while another branch holds an
+open request in the lineage, before anything is committed, pushed or run —
+including before a `git` round pushes its envelope ref. `close` refuses a
+verdict that leaves an open request unruled; the human's way through is
+the recorded decision that already existed, `close --lineage --reason …`,
+and there is no new flag. Branch, not SHA, is the axis, so
+amend-and-re-emit is untouched: it still supersedes its own emission at a
+new SHA and still reports the superseded count. `brief` also names a third
+state it used to deny — a round emitted and then discarded when the
+lineage was closed at another SHA — which ledgers written before this
+version can already carry. *For upgraders:* nothing migrates. Events
+recorded before the field carry no branch, absence is read as unknown, and
+a collision is never concluded from it. This refusal is a stopgap: a keyed
+lineage, which lets two rounds coexist, retires it.
+
+**And two worktrees can no longer be admitted to one lineage at once.**
+The branch refusal above is a single read of the ledger, and everything a
+handoff does after it destroys: it commits outstanding work, pushes the
+branch, runs the gate manifest — minutes, usually — emits, and only then
+records the round. Two worktrees whose handoffs merely overlapped
+therefore both passed that check, because neither had recorded anything
+for the other to see: both opened round 1, and under the `git` carrier
+the second force-pushed its envelope over the first at the shared
+`(lineage, round)` ref. `handoff` and `close` now take an exclusive
+reservation on the repository's state directory — the one directory every
+worktree of a repository shares — before the lifecycle is read, and hold
+it until the round is recorded or the command has failed. It is an OS
+lock, so a process that dies releases it: there is no stale lock to clear
+and no flag to override it with. A second worktree is refused, not
+queued, and told which branch holds the reservation, as what, and since
+when; it retries when that command finishes. A close is covered the same
+way, so it cannot slip between another worktree's admission and its
+record. Sequential flows are untouched — amend-and-re-emit takes the
+reservation, finds it free, and proceeds exactly as before. *For
+upgraders:* on a platform without `fcntl` the reservation cannot be taken
+and both verbs refuse, naming why, rather than running unguarded.
+
+The reservation covers every command that can end a lineage, not the two
+that were caught racing: `authorize-advance` appends the same
+`lineage_closed` marker as `close`, and now holds the same exclusive claim
+from before its pending-round read until after its record. An ordinary
+human advance can no longer close over a handoff being admitted beside
+it, and a handoff can no longer open a round inside an advance; the
+refusal names the holding branch, the verb it is running and its pid, as
+the other two do. Taking the reservation grants nothing — the advance is
+still a named human's recorded decision, refused as before while a round
+awaits a verdict or a standing finding is unanswered.
+
+## 0.18.0
+
+Three findings of an external audit of the tool (2026-09-05), each
+reproduced in a disposable repository before it was fixed.
+
+**Retained envelopes are kept by lineage, round, kind AND digest.** The
+kept copy was `exchange/round-<n>-<kind>.md`, named by round and kind
+alone — and every lineage starts at round 1, so the request that opened
+one lineage overwrote the request that opened the last, and the rule that
+restores a differing copy from the canonical text made the loss permanent.
+The ledger digest survived and could not recover the document. A kept copy
+now lives at `exchange/lineage-<l>/round-<n>-<kind>-<digest12>.md`: no two
+documents can share a path, and a copy whose bytes do not reproduce its
+own name is a rewrite every reader already refuses. *For upgraders:*
+nothing is moved. Copies retained under the flat name stay where they are
+and stay readable — every reader falls back to the flat name, still
+digest-checked against the ledger — and new emissions land only under the
+lineage directory.
+
+**`close` judges the verdict under the target commit's own review.toml.**
+It validated against whatever the checkout held, while `take` and
+`validate --from-target` judged under the target's; a checkout that had
+since renamed a severity refused, with `V-SEVERITY`, a verdict its target
+had already accepted, and the recovery it printed omitted `--from-target`.
+One authority for the three doors now, and the recovery names it.
+Unrelated checkout changes cannot alter the acceptance of an already
+reviewed artifact.
+
+**Every gate is told the review range.** `handoff` commits outstanding
+work before the manifest runs, so a gate that inspected the working tree —
+`git diff --check` was one — inspected nothing and was attested `bound`
+over commits that carried the defect. The runner now exports
+`LOUPE_GATE_HEAD` on every run and `LOUPE_GATE_BASE` whenever the emission
+knows the base (a handoff always does); a gate that checks a range reads
+these, and a run without a base exports none, so the gate can say what it
+fell back to rather than guess.
+
+## 0.17.0
+
+**A key with no off value can be left undeclared by decision, durably.**
+`[limits] token_budget` is uncounted when absent, and every integer a
+reader accepts is a budget the breaker fires on, so the `decide` entry for
+it printed no `unset` line and the adapter's ask-once could never end: an
+intentionally unbudgeted repository heard the question in every session.
+The entry now prints its `unset` as a comment line, `# decided:
+limits.token_budget undeclared`; written under `[limits]`, the current
+reader treats the key as decided — no entry — while the key stays absent
+and uncounted. A comment is the one form every reader parses without
+refusing: an older reader ignores it and keeps asking, which is this seam's
+usual forward-only reach. The marker counts only for keys whose off state
+is that line, so it cannot silence a key that has a real off value.
+
 ## 0.16.0
 
 **An unknown section or key now says that a version skew is possible.**

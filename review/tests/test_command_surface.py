@@ -52,7 +52,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from review import brief, cli, paths, transport, wire
-from review.tests.util import REPO_ROOT
+from review.tests.util import LINEAGE, REPO_ROOT
 
 # A command starts at one of these words, followed by ANY whitespace — a
 # tab is a shell separator exactly like a space (round 5 F1).
@@ -404,7 +404,7 @@ class TestSurfacesSplitToOneArgument(unittest.TestCase):
             with self.subTest(path=path):
                 with self.assertRaises(transport.Refusal) as ctx:
                     transport.close_round(CFG, Ledger.in_memory(),
-                                          self._verdict_text(), source=path)
+                                          self._verdict_text(), path, LINEAGE)
                 argv = shlex.split(ctx.exception.next_cmd)
                 self.assertEqual(argv[:2], ["loupe", "brief"])
                 self.assertEqual(argv[2], path)

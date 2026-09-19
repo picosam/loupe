@@ -171,13 +171,23 @@ class _Base(unittest.TestCase):
         # refuses: blank, a control character, an opening angle bracket.
         "name": (["", "   ", "\t", "a\tb", "a<b", "a\x7fb"], "A-WRAPPER-VALUE"),
         "identity": (["", "abc", "Z" * 16, "0" * 17], "A-WRAPPER-VALUE"),
+        # A lineage id (brief `keyed-lineage`): a minted `L<hex>` or a
+        # legacy ordinal, both letter-or-digit-led tokens. Refused: blank,
+        # a leading separator, and anything the ref and path names it keys
+        # cannot carry — a space, a slash, a control character.
+        "lineage_id": (["", " ", "-L1", ".1", "L 1", "L/1", "L\t1"],
+                       "A-WRAPPER-VALUE"),
     }
 
     #: A valid-but-different wrapper value per duplicated fact, for the
     #: disagreement cases, with the code that names the split.
     OTHER = {"sha": (OTHER_SHA, "A-SHA-SPLIT"),
              "round": ("7", "A-WRAPPER-SPLIT"),
-             "lineage": ("9", "A-WRAPPER-SPLIT"),
+             # A lineage id, not a count, since 0.20.0 (brief
+             # `keyed-lineage`): the wrapper and the body both carry the
+             # STRING, so the paired control below moves a token rather than
+             # an integer.
+             "lineage": ("L9f8e7d6c5b", "A-WRAPPER-SPLIT"),
              "by": ("someone else", "A-WRAPPER-SPLIT")}
 
     def codes(self, text: str) -> list[str]:
@@ -539,8 +549,7 @@ class TestTheWrapper(_Base):
                              f"wrapper {fact}={other!r}")
                 # Paired control: both halves moved, so they agree again.
                 body = {**_body(_emit()),
-                        fact: int(other) if fact in ("round", "lineage")
-                        else other}
+                        fact: int(other) if fact == "round" else other}
                 self.clean(_with_body(_set_attr(_emit(), fact, other), body),
                            f"{fact} agreed at {other!r}")
             seen.add(fact)

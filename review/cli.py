@@ -14,8 +14,11 @@ from pathlib import Path
 from . import (FORMER_NAMES, TOOL_NAME, TOOL_VERSION, adapters, brief, config,
                emit, paths, transport, vocab, wire)
 from .digest import sha256_file, sha256_text
-from .ledger import Ledger, render_convergence_md, render_report_md
-from .validate import (Item, errors_in, scope_items, validate_authorization,
+from .ledger import (AmbiguousLineage, Ledger, known_branch,
+                     render_convergence_md, render_cross_lineage_md,
+                     render_report_md)
+from .validate import (Item, accepted_tags, errors_in, scope_items,
+                       validate_authorization,
                        validate_disposition, validate_request,
                        validate_verdict)
 
@@ -68,7 +71,13 @@ PROSE_KEYS = (
     # Round 2 F1: the emission stamp binding a disposition row to its
     # companion events; an identity the agent reads, never a command.
     "batch",
-    "blocking", "breaker", "brief", "bytes",
+    "blocking", "breaker", "brief",
+    # The emitting worktree's branch, recorded on the request event
+    # (2026-09-05, brief `concurrent-round-refusal`): the axis the
+    # concurrency refusals compare on. Read, never run — a person checks it
+    # with git, and the decision it asks for is theirs.
+    "branch",
+    "bytes",
     "bytes_freed", "cached",
     # The git ref carrier (2026-09-03): where a `git` round's envelope was
     # put — the ref, the remote it was pushed to, and the leg it carries.
@@ -99,11 +108,39 @@ PROSE_KEYS = (
     "ignored_control_fields", "install", "installed", "items", "kept",
     "kept_unrecognised", "kind", "ledger", "ledgers", "limits", "lineage",
     "lineage_closed_at_round", "moved", "mutation", "next_kind",
-    "new_per_round", "next_lineage", "note", "of", "ok", "open_request",
+    "new_per_round",
+    # The counterpart `new_per_round` needs to be read at all (brief
+    # `convergence-blind-to-reclassification`): per round, how many
+    # identities were residues of a finding the reviewer reclassified rather
+    # than new claims. A count a person weighs; it runs nothing.
+    "reclassified_per_round",
+    "next_lineage", "note", "of", "ok", "open_request",
     "out", "outcome",
+    # Keyed lineage (2026-09-06). `open_lineages` names every OTHER review
+    # live in this repository — id, branch, round, state — and
+    # `cross_lineage` names each standing finding whose identity is also
+    # ruled in one of them. Both are FACTS a person weighs; neither answers
+    # anything, changes any record, or carries a command.
+    "open_lineages", "cross_lineage",
+    # The lineage reservation's holder record (2026-09-06, lineage 27 round
+    # 1 F1): the process that holds admission — its branch, its pid, the
+    # verb it is running and when it took the reservation. Written into a
+    # file beside the ledger and rendered into the refusal a second
+    # worktree is given, all four read and never run: nothing here is a
+    # command, and the recovery is to wait for that process to finish.
+    "pid", "verb", "ts",
     "path", "payload", "permitted_authors", "permitted_reviewers",
     "preventable_by", "pruned", "reason", "recorded", "referenced_shas",
     "reader", "reading", "references", "rejected_reviewers", "relay",
+    # `take`'s default rendering of the request (2026-09-18, brief
+    # `loupe-tool-feedback-pilot-2026-09`): the envelope with its
+    # attestation objects as a table. Read, never run, and never named
+    # `envelope` — that key means the exact bytes.
+    "request_view",
+    # A member of `take`'s `head` record (the reviewer's checkout: state,
+    # sha, tree). Nested, so the egress door never sees it; declared for
+    # the advisory scan, which reads dict literals and cannot tell depth.
+    "tree",
     "remedy", "repeated",
     "reviewer", "roles", "round", "round_cap", "severities", "severity",
     "rounds", "sha", "source",
@@ -126,6 +163,9 @@ PROSE_KEYS = (
     # tool the agent reads, never a command.
     "text",
     "token_budget", "tokens",
+    # brief ci-attested-gates (2026-09-07): the gate row's attester, the run
+    # it names, and the limit the poll runs under.
+    "attested_by", "ci_run", "ci_timeout",
     # Lineage 7 round 1: which INSTALLATION wrote the envelope and which is
     # reading it, with the verdict on whether they agree. Read, never run —
     # and deliberately not a command, because the tool takes no position on
@@ -351,15 +391,35 @@ def cmd_validate(args, cfg) -> int:
             return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
         authority = [Item("notice", "T-AUTHORITY",
                           f"judged against {governing.source}")]
+    _lineage_read = _ledger(cfg, args)
+    try:
+        # Round-3 F2: validate is itself a cross-installation reader of both
+        # stamped kinds (it says so, four lines up), and it was resolving by
+        # this checkout's branch while holding an envelope that names its
+        # own review. The same precedence helper every other envelope-bearing
+        # verb uses decides it here too. Its SOURCE leg is always empty in
+        # practice — `_read_envelope(args.envelope)` is called without `cfg`,
+        # so a `git:<lineage>/<round>` reference is refused before this line
+        # is reached, because a reference names a ROUND and the leg belongs
+        # to the verb, which this one does not have: it admits every kind.
+        # That is the admitted source domain, and the claim's contract is
+        # narrowed to it rather than left standing as a universal.
+        judged_lineage = _read_lineage(_lineage_read, cfg, "validate",
+                                       getattr(parsed, "sha", None),
+                                       carried=_carried_by(args.envelope,
+                                                           text))
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
     if kind == "request":
         items = validate_request(
             parsed, governing,
-            round_cap=_ledger(cfg, args).effective_round_cap(
-                governing.round_cap))
+            round_cap=_lineage_read.effective_round_cap(
+                governing.round_cap, judged_lineage))
     elif kind == "verdict":
         items = validate_verdict(
             parsed, governing,
-            answering=_dispositions_answered(_ledger(cfg, args), parsed))
+            answering=_dispositions_answered(_lineage_read, parsed,
+                                             judged_lineage))
     elif kind == vocab.AUTHORIZATION_KIND:
         items = validate_authorization(parsed, governing)
     else:
@@ -394,23 +454,24 @@ def cmd_validate(args, cfg) -> int:
     # RVW-T11: the topology comes from this machine's own record of the
     # round, never from the verdict document — see the note on the relay
     # below, which this now also decides.
-    ledger = _ledger(cfg, args)
-    carrier = (transport.recorded_transport(ledger, parsed.sha)
+    ledger = _lineage_read
+    carrier = (transport.recorded_transport(ledger, parsed.sha,
+                                            judged_lineage)
                if is_verdict else vocab.TRANSPORT_DEFAULT)
-    round_no = ledger.round_for_sha(parsed.sha) if is_verdict else None
+    round_no = (ledger.round_for_sha(parsed.sha, judged_lineage)
+                if is_verdict else None)
     # F1: the round's RECORDED provenance decides the lineage this verdict
-    # rides on, not this machine's own `lineage_number()` — a fresh
-    # reviewer ledger's own count has no relationship to a carried
-    # lineage the author's machine is on. `recorded_lineage_for_sha` reads
-    # back what `take` stamped for a git-carried round; None means this
-    # round was never taken over a reference (paste, or a request this
-    # same ledger wrote), where `lineage_number()` is already correct.
-    verdict_lineage = (ledger.recorded_lineage_for_sha(parsed.sha)
+    # rides on. `carrier_lineage_for_sha` reads back the id the round was
+    # carried under — the same id on both machines since the lineage was
+    # keyed, and the pre-keying `take` stamp for a round taken over a
+    # reference before it. None means this ledger never saw the round, and
+    # the lineage this verb resolved is the honest answer.
+    verdict_lineage = (ledger.carrier_lineage_for_sha(parsed.sha,
+                                                      prefer=judged_lineage)
                        if is_verdict else None)
     if verdict_lineage is None:
-        verdict_lineage = ledger.lineage_number()
-    reference = _round_reference(ledger, carrier, round_no,
-                                 lineage=verdict_lineage)
+        verdict_lineage = judged_lineage
+    reference = _round_reference(carrier, round_no, verdict_lineage)
     # The verdict leg of a `git` round is pushed HERE, by the reviewer, and
     # only here: `validate --from-target` is the reviewer's last step and
     # the moment the ruling is established, so it is the one place that can
@@ -486,6 +547,14 @@ def cmd_respond(args, cfg) -> int:
     verdict_text = _read_envelope(args.verdict, cfg, "verdict")
     verdict = wire.parse_verdict(verdict_text)
     ledger = _ledger(cfg, args)
+    # Which review this response belongs to: the lineage the round the
+    # verdict rules was recorded in, resolved through the request that
+    # carries its SHA (brief `keyed-lineage`, item 3).
+    try:
+        lineage = _read_lineage(ledger, cfg, "respond", verdict.sha,
+                                carried=_carried_by(args.verdict, None))
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
     # Sweep F2: a disposition is an answer to a VALID, RECORDED verdict, not
     # a free-standing assertion. This verb used to parse whatever file it
     # was handed and go straight to building the response — an unwrapped
@@ -493,7 +562,8 @@ def cmd_respond(args, cfg) -> int:
     # disposition events at a caller-supplied SHA with exit 0. The verdict
     # is validated first, in every mode.
     items = validate_verdict(
-        verdict, cfg, answering=_dispositions_answered(ledger, verdict))
+        verdict, cfg,
+        answering=_dispositions_answered(ledger, verdict, lineage))
     if errors_in(items):
         return _finish(items,
                        paths.command(*paths.lits(TOOL_NAME, "validate"),
@@ -513,7 +583,7 @@ def cmd_respond(args, cfg) -> int:
     # not (yet) resolve is not itself refused here — only a resolving one
     # whose author disagrees is, below.
     recorded = transport.recorded_verdict(
-        ledger, digest=sha256_text(verdict_text))
+        ledger, lineage, digest=sha256_text(verdict_text))
     if args.out:
         if recorded is None:
             close_cmd = paths.command(
@@ -583,10 +653,11 @@ def cmd_respond(args, cfg) -> int:
         # before this fix.
         try:
             transport.check_disposition_author(
-                ledger, recorded["round"], data.get("author"))
+                ledger, recorded["round"], data.get("author"), lineage)
         except transport.Refusal as exc:
             return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
-        expected_author = transport.request_author(ledger, recorded["round"])
+        expected_author = transport.request_author(ledger, recorded["round"],
+                                                   lineage)
         if expected_author is not None:
             data["author"] = expected_author
     by_id = {f.id: f for f in verdict.findings}
@@ -638,7 +709,7 @@ def cmd_respond(args, cfg) -> int:
         # RVW-T9: a written disposition is the author's half of the round;
         # record and keep it here so the loop needs no manual `ledger add`.
         rec = transport.record_response(cfg, ledger, envelope,
-                                        against=verdict)
+                                        against=verdict, lineage=lineage)
         _out({"ok": True, "out": args.out, "dispositions": len(records),
               "kept": rec["kept"], "events_added": rec["events_added"],
               "next": paths.command(*paths.lits(TOOL_NAME, "handoff"))},
@@ -654,7 +725,219 @@ def _ledger(cfg, args) -> Ledger:
     return Ledger(cfg.ledger_dir)
 
 
-def _dispositions_answered(ledger: Ledger, verdict) -> list[dict] | None:
+def _envelope_sha(text: str | None) -> str | None:
+    """The commit CAPTURED envelope bytes bind, or None.
+
+    Round-2 F3 took the read out of here. It used to open the source
+    itself, so a verb that resolved a lineage and then processed the
+    document read the source TWICE — which consumed `-` outright (the paste
+    relay's close command is a heredoc: the peek drained stdin and the real
+    read got an empty document) and, on a file or a fetched ref, let
+    selection and processing see different bytes. Its caller captures once
+    and hands the bytes here; any failure to parse still answers None and
+    the verb's own reader raises the refusal a person can act on.
+    """
+    if not text:
+        return None
+    for parse in (wire.parse_request, wire.parse_verdict):
+        try:
+            parsed = parse(text)
+        except Exception:
+            continue
+        if parsed.sha:
+            return parsed.sha
+    return None
+
+
+def _envelope_lineage(text: str | None) -> str | None:
+    """The lineage id CAPTURED request bytes STAMP, or None (round-3 F1).
+
+    Round-2 F5 put the author's lineage id on the request wrapper so the
+    reviewer's `take` could tell a continuation from a new review. Round-3
+    F1 found the other verbs still ignoring it: handed review B's request
+    from checkout A, `brief` reported A and relayed A's round, and
+    `ledger add` recorded B's bytes into A. A stamp is explicit provenance
+    and outranks the branch the verb happens to run from; a `git:<id>/<n>`
+    reference outranks both (the caller checks that first). A verdict
+    carries no stamp and answers None here; so does anything that does not
+    parse, whose own reader raises the refusal.
+    """
+    if not text:
+        return None
+    try:
+        parsed = wire.parse_request(text)
+    except Exception:
+        return None
+    try:
+        return transport.stamped_lineage(parsed)
+    except Exception:
+        return None
+
+
+def _carried_by(source: str | None, text: str | None) -> str | None:
+    """The review identity an invocation CARRIES: the id of a
+    `git:<lineage>/<round>` source, else the stamp on the captured bytes,
+    else None — in which case the caller falls back to its branch."""
+    reference = transport.parse_round_reference(source or "")
+    if reference:
+        return reference[0]
+    return _envelope_lineage(text)
+
+
+class LineageUnchoosable(Exception):
+    """No lineage can be chosen for this verb, and none may be guessed.
+
+    The one state brief `keyed-lineage` item 3 requires a refusal for: a
+    detached HEAD or a branch git will not name, with several lineages open
+    and no explicit reference to resolve one. Every other state is
+    deterministic — the open lineage recorded on this branch, the single
+    unbranched one, the id an envelope's SHA resolves to, or a new lineage.
+    """
+
+    def __init__(self, message: str, remedy: str):
+        super().__init__(message)
+        self.remedy = remedy
+
+
+def _unchoosable(ledger: Ledger, verb: str, branch: str
+                 ) -> LineageUnchoosable:
+    named = ", ".join(
+        f"`{l}` on {ledger.lineage_branch(l) or 'an unrecorded branch'} "
+        f"(round(s) {', '.join(str(r) for r in ledger.rounds(l)) or 'none'})"
+        for l in ledger.open_lineages())
+    where = (f"branch {branch}" if branch
+             else "a detached HEAD, which names no branch")
+    return LineageUnchoosable(
+        f"this worktree is on {where}, and "
+        f"{len(ledger.open_lineages())} lineages are open in this "
+        f"repository: {named}. `{verb}` acts on ONE lineage and there is "
+        f"nothing here to choose it by — a branch is what binds a worktree "
+        f"to its review",
+        remedy="a person checks out the branch whose review this is, or "
+               "names the round explicitly (`git:<lineage>/<round>`) where "
+               "the verb reads an envelope. The tool picks between open "
+               "reviews for nobody")
+
+
+def _branch_lineage(ledger: Ledger, cfg, verb: str,
+                    branch: str | None = None) -> str | None:
+    """The open lineage this worktree's branch is on, or None.
+
+    None is "this branch holds no open review", not a fault: `handoff` mints
+    one, a READ falls back to the legacy positional successor, and a verb
+    that RECORDS refuses. Each caller says what the absence means for it —
+    this answers only what the ledger holds.
+    """
+    mine = transport.current_branch(cfg) if branch is None else branch
+    lineage, state = ledger.choose_open_lineage(mine)
+    if state == Ledger.LINEAGE_AMBIGUOUS:
+        raise _unchoosable(ledger, verb, mine)
+    return lineage
+
+
+def _carried_lineage(ledger: Ledger, cfg, verb: str, branch=None):
+    """(the review identity this INVOCATION carries, the refusal to raise
+    if nothing else resolves one).
+
+    Round-2 F1 made this its own step. A SHA names a commit, and two
+    branches may review one commit under two reviews; what says which of
+    them a verb is acting on is the branch it was invoked from — so the
+    branch is resolved FIRST and handed to the SHA lookup as the binding to
+    preserve, instead of being consulted only after the SHA has already
+    picked by event order. An unchoosable branch is not fatal here: an
+    envelope may still resolve unambiguously, and the refusal is carried
+    forward to be raised only if it does not.
+    """
+    try:
+        return _branch_lineage(ledger, cfg, verb, branch), None
+    except LineageUnchoosable as exc:
+        return None, exc
+
+
+def _ambiguous(exc: AmbiguousLineage, verb: str) -> LineageUnchoosable:
+    """`AmbiguousLineage` as the refusal a person acts on (round-2 F1)."""
+    return LineageUnchoosable(
+        f"{exc} — so `{verb}` cannot say which review this envelope "
+        f"belongs to, and it records nothing rather than choosing by the "
+        f"order the two reviews happened to be recorded in",
+        remedy="a person runs this from the worktree whose review it is, "
+               "so the branch names it, or hands the round over as "
+               "`git:<lineage>/<round>` where the verb reads an envelope; "
+               "the tool picks between reviews of one commit for nobody")
+
+
+def _read_lineage(ledger: Ledger, cfg, verb: str, sha: str | None = None,
+                  carried: str | None = None) -> str:
+    """The lineage a READ acts on: the one an envelope's SHA resolves to
+    WITHIN the review this invocation carries, else this branch's open one,
+    else the LEGACY POSITIONAL SUCCESSOR — `str(closures + 1)`, the key the
+    window after the last closure marker has always had.
+
+    A read never mints. The fallback is what makes an unmigrated ledger
+    report the numbers it always reported: on an empty ledger it is `"1"`,
+    and on a ledger whose every lineage is closed it names the next one,
+    which holds no events and reports as the empty lineage the old
+    positional cursor did.
+
+    It DOES refuse in one state, added by round-2 F1: a SHA recorded by
+    more than one review, reached from a checkout that names none of them.
+    A read that guessed there returned another review's retained bytes and
+    another review's ref.
+    """
+    mine, unchoosable = ((carried, None) if carried
+                         else _carried_lineage(ledger, cfg, verb))
+    if sha:
+        try:
+            resolved = ledger.recorded_lineage_for_sha(sha, prefer=mine)
+        except AmbiguousLineage as exc:
+            raise _ambiguous(exc, verb) from exc
+        if resolved is not None:
+            return resolved
+    if mine is not None:
+        return mine
+    if unchoosable is not None:
+        raise unchoosable
+    return str(len(ledger.all_closures()) + 1)
+
+
+def _write_lineage(ledger: Ledger, cfg, verb: str, sha: str | None = None,
+                   carried: str | None = None) -> str:
+    """The lineage a verb that RECORDS acts on, resolved from the envelope
+    it was given (its SHA, through the request that carries it) WITHIN the
+    review this invocation carries, and otherwise from this worktree's
+    branch.
+
+    Refuses rather than guessing when neither answers, and — since round-2
+    F1 — when the SHA answers with more than one review and nothing carried
+    says which: recording into a lineage nobody chose is how a round dies
+    in the wrong review, and a close that chose by event order appended its
+    closure to another branch's lineage.
+    """
+    mine, unchoosable = ((carried, None) if carried
+                         else _carried_lineage(ledger, cfg, verb))
+    if sha:
+        try:
+            resolved = ledger.recorded_lineage_for_sha(sha, prefer=mine)
+        except AmbiguousLineage as exc:
+            raise _ambiguous(exc, verb) from exc
+        if resolved is not None:
+            return resolved
+    if mine is not None:
+        return mine
+    if unchoosable is not None:
+        raise unchoosable
+    raise LineageUnchoosable(
+        f"no open lineage in this repository holds "
+        + (f"{sha[:12]}, and none is recorded on this worktree's branch"
+           if sha else "this worktree's branch")
+        + f", so `{verb}` has no review to record into",
+        remedy=f"a person opens the round first — "
+               f"`{paths.command(*paths.lits(TOOL_NAME, 'handoff', '--claim-file'), paths.Ph('<claim>'))}` "
+               f"— or runs this from the worktree whose review it belongs to")
+
+
+def _dispositions_answered(ledger: Ledger, verdict,
+                           lineage: str) -> list[dict] | None:
     """The dispositions a verdict is answering, read back from the ledger.
 
     §5.2 requires a closure for every refutation and every
@@ -668,7 +951,7 @@ def _dispositions_answered(ledger: Ledger, verdict) -> list[dict] | None:
     # awaiting an answer. This asks "which round is this verdict FOR", which
     # stays true after the round closes — otherwise re-validating a recorded
     # verdict would report its closure requirements as unknowable.
-    bound = ledger.rounds_for_sha(verdict.sha)
+    bound = ledger.rounds_for_sha(verdict.sha, lineage)
     if not bound:
         return None
     round_no = bound[-1]
@@ -676,25 +959,40 @@ def _dispositions_answered(ledger: Ledger, verdict) -> list[dict] | None:
     # not raw event multiplicity: a disposition legitimately re-binds when
     # the head moves under it (lineage 6 round 2, with the ledger's
     # standing_dispositions as the one authority for what "answered" means).
-    return ledger.standing_dispositions(round_no=round_no - 1)
+    return ledger.standing_dispositions(lineage, round_no=round_no - 1)
 
 
 def cmd_ledger_add(args, cfg) -> int:
     text = _read_envelope(args.envelope)
     kind, parsed = _detect_and_parse(text)
     ledger = _ledger(cfg, args)
+    # The lineage this envelope belongs to: the one its SHA resolves to
+    # through the request that carries it, else this branch's open one,
+    # else the legacy positional successor. A READ resolution deliberately,
+    # so a hand-built ledger with no branch recorded anywhere — which is
+    # every fixture and every pre-0.20.0 ledger — lands where it always
+    # did instead of minting a review nobody asked for.
+    try:
+        lineage = _read_lineage(
+            ledger, cfg, "ledger add",
+            getattr(parsed, "sha", None)
+            or getattr(parsed, "attrs", {}).get("verdict_sha"),
+            carried=_carried_by(args.envelope, text))
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
     digest = sha256_file(Path(args.envelope))
     size = Path(args.envelope).stat().st_size
     added = 0
     agreement = None
     if kind == "verdict":
         items = validate_verdict(
-            parsed, cfg, answering=_dispositions_answered(ledger, parsed))
+            parsed, cfg,
+            answering=_dispositions_answered(ledger, parsed, lineage))
         if errors_in(items):
             return _finish(items,
                            paths.command(*paths.lits(TOOL_NAME, "validate"),
                                          args.envelope))
-        round_no = args.round or ledger.round_for_sha(parsed.sha)
+        round_no = args.round or ledger.round_for_sha(parsed.sha, lineage)
         if round_no is None:
             return _blocked(
                 "",
@@ -708,7 +1006,8 @@ def cmd_ledger_add(args, cfg) -> int:
         # an already-ruled round (`--round N` skips the open-round lookup),
         # and `respond` then answered whichever file the author chose. The
         # same guard `close` applies: a round is ruled once.
-        conflict = transport.verdict_conflict(ledger, round_no, digest)
+        conflict = transport.verdict_conflict(ledger, round_no, digest,
+                                              lineage)
         if conflict is not None:
             return _blocked(
                 "",
@@ -728,10 +1027,11 @@ def cmd_ledger_add(args, cfg) -> int:
         try:
             new_events = transport.verdict_events(
                 parsed, round_no, digest, size, args.tokens,
-                answering=ledger.standing_dispositions(round_no=round_no - 1))
+                answering=ledger.standing_dispositions(lineage,
+                                                       round_no=round_no - 1))
         except transport.Refusal as exc:
             return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
-        added += ledger.add_all(new_events)
+        added += ledger.add_all(new_events, lineage=lineage)
     elif kind == "request":
         # Sweep F3: this door validated nothing. A wrapped envelope carrying
         # the single word `malformed` was recorded as a round's request with
@@ -743,7 +1043,7 @@ def cmd_ledger_add(args, cfg) -> int:
         agreement = transport.tool_agreement(parsed)
         items = validate_request(
             parsed, cfg,
-            round_cap=ledger.effective_round_cap(cfg.round_cap))
+            round_cap=ledger.effective_round_cap(cfg.round_cap, lineage))
         if errors_in(items):
             return _finish(items,
                            paths.command(*paths.lits(TOOL_NAME, "validate"),
@@ -760,13 +1060,13 @@ def cmd_ledger_add(args, cfg) -> int:
         # The request event AND its evidence events — the shape the other
         # two doors record, through the one function they use.
         added += ledger.add_all(transport.request_events(
-            parsed, round_no, digest, size, args.tokens))
+            parsed, round_no, digest, size, args.tokens), lineage=lineage)
         ledger.add({"event": "ingest", "kind": "request",
                     "round": round_no, "digest": digest,
                     "tool": agreement["reader"],
                     "tool_agreement": agreement["agreement"],
                     **({"tool_writer": agreement["writer"]}
-                       if agreement["writer"] else {})})
+                       if agreement["writer"] else {})}, lineage=lineage)
     elif kind == "disposition":
         # Round 2 F2: this path recorded whatever identity it was handed.
         # A disposition binds by fingerprint, so it cannot be recorded
@@ -774,7 +1074,7 @@ def cmd_ledger_add(args, cfg) -> int:
         # cannot be retrieved, refusing is the only honest outcome.
         # Round 3 F2: resolved through the LEDGER, which is the record, not
         # through the kept file, which is a best-effort copy of it.
-        against = transport.answered_verdict(cfg, parsed, ledger)
+        against = transport.answered_verdict(cfg, parsed, ledger, lineage)
         if against is None:
             return _blocked(
                 "",
@@ -804,7 +1104,7 @@ def cmd_ledger_add(args, cfg) -> int:
         try:
             supplied = transport.disposition_supplied_author(parsed)
             resolved = transport.check_disposition_author(
-                ledger, int(parsed.data.get("round", 0)), supplied)
+                ledger, int(parsed.data.get("round", 0)), supplied, lineage)
         except transport.Refusal as exc:
             return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
         parsed.attrs["author"] = resolved
@@ -815,7 +1115,8 @@ def cmd_ledger_add(args, cfg) -> int:
                            paths.command(*paths.lits(TOOL_NAME, "validate"),
                                          args.envelope))
         added += ledger.add_all(
-            transport.disposition_events(parsed, against, cfg))
+            transport.disposition_events(parsed, against, cfg),
+            lineage=lineage)
         # Round-1 F3. This is the ONE door a disposition can arrive at from
         # another installation — `respond --out` writes and records in one
         # process, so its stamp is this end's by construction and comparing
@@ -827,13 +1128,17 @@ def cmd_ledger_add(args, cfg) -> int:
                     "digest": digest, "tool": agreement["reader"],
                     "tool_agreement": agreement["agreement"],
                     **({"tool_writer": agreement["writer"]}
-                       if agreement["writer"] else {})})
+                       if agreement["writer"] else {})}, lineage=lineage)
     else:
         return _blocked(
             paths.command(*paths.lits(TOOL_NAME, "validate"), args.envelope),
             f"{args.envelope} is not a recognizable request, verdict or "
             f"disposition envelope")
-    payload = {"ok": True, "events_added": added, "ledger": str(ledger.path)}
+    # The review the rows joined, by id: this door records into a lineage it
+    # RESOLVED rather than one the caller named, so the record has to say
+    # which (brief `keyed-lineage`, item 2).
+    payload = {"ok": True, "events_added": added, "lineage": lineage,
+               "ledger": str(ledger.path)}
     report = ""
     if agreement is not None:
         payload["tool"] = agreement
@@ -846,12 +1151,17 @@ def cmd_ledger_add(args, cfg) -> int:
 def cmd_authorize_cap(args, cfg) -> int:
     """Record a reason-bearing override of the round cap for this lineage."""
     ledger = _ledger(cfg, args)
+    try:
+        lineage = _write_lineage(ledger, cfg, "ledger authorize-cap")
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
     added = ledger.add({"event": "cap_override", "round_cap": args.to,
                         "reason": args.reason, "authorized_by": args.by,
-                        "default_cap": cfg.round_cap})
+                        "default_cap": cfg.round_cap}, lineage=lineage)
     _out({"ok": True, "recorded": bool(added), "round_cap": args.to,
+          "lineage": lineage,
           "default_cap": cfg.round_cap, "ledger": str(ledger.path)},
-         f"round cap for this lineage: {args.to} "
+         f"round cap for lineage {lineage}: {args.to} "
          f"(repo default stays {cfg.round_cap})")
     return EXIT_OK
 
@@ -861,8 +1171,13 @@ def cmd_authorize_breaker(args, cfg) -> int:
     sweep F8) — the counterpart of the handoff preflight's stop."""
     ledger = _ledger(cfg, args)
     try:
+        lineage = _write_lineage(ledger, cfg, "ledger authorize-breaker")
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
+    try:
         rec = transport.authorize_breaker(cfg, ledger, args.breaker,
-                                          args.reason or "", args.by or "")
+                                          args.reason or "", args.by or "",
+                                          lineage)
     except transport.Refusal as exc:
         return _blocked(exc.next_cmd, str(exc),
                         remedy="a person supplies the decision — a real "
@@ -887,7 +1202,9 @@ def cmd_ledger_correct_actor(args, cfg) -> int:
     try:
         rec = transport.correct_actor(cfg, ledger, args.event or [],
                                       args.actor or "", args.by or "",
-                                      args.reason or "")
+                                      args.reason or "",
+                                      _read_lineage(ledger, cfg,
+                                                    "ledger correct-actor"))
     except transport.Refusal as exc:
         report_cmd = paths.command(
             *paths.lits(TOOL_NAME, "ledger", "report"))
@@ -911,7 +1228,12 @@ def cmd_ledger_report(args, cfg) -> int:
     # with every product report, so the CLI and the emitter compute what the
     # ledger API computes. A metric that is only correct when a unit test
     # supplies its inputs is not wired.
-    report = ledger.report(ledger.effective_round_cap(cfg.round_cap),
+    try:
+        lineage = _read_lineage(ledger, cfg, "ledger report")
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
+    report = ledger.report(lineage,
+                           ledger.effective_round_cap(cfg.round_cap, lineage),
                            gate_manifest=cfg.gate_ids,
                            token_budget=cfg.token_budget,
                            blocking_severities=cfg.blocking_severities)
@@ -930,7 +1252,12 @@ def cmd_ledger_convergence(args, cfg) -> int:
     closures and anchors already in the record.
     """
     ledger = _ledger(cfg, args)
-    result = ledger.convergence()
+    try:
+        lineage = _read_lineage(ledger, cfg, "ledger convergence")
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
+    result = ledger.convergence(lineage)
+    result["lineage"] = lineage
     result["ok"] = True
     result["ledger"] = str(ledger.path)
     _out(result, render_convergence_md(result))
@@ -1037,7 +1364,17 @@ def cmd_import_legacy(args, cfg) -> int:
     # over PERSISTED answers as well as candidate ones. Checked as a whole
     # batch, before anything is appended — a partially bad import must
     # append zero events, not the rows that happened to come first.
-    problems = transport.legacy_import_problems(ledger, events, authority)
+    # The lineage the imported rows join: this branch's open one, else a
+    # fresh id — an import is a review's history arriving, and history that
+    # belongs to no open review is its own lineage. `migrate-state` and
+    # `import-legacy` are the migration agent's verbs; this is only the key
+    # they must write.
+    try:
+        import_lineage = _read_lineage(ledger, cfg, "import-legacy")
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
+    problems = transport.legacy_import_problems(ledger, events, authority,
+                                                import_lineage)
     if problems:
         return _blocked(
             "",
@@ -1052,8 +1389,9 @@ def cmd_import_legacy(args, cfg) -> int:
                    f"`{paths.command(*paths.lits(TOOL_NAME, 'import-legacy'), args.events)}`; "
                    f"the tool will not append part of a batch it cannot "
                    f"verify")
-    added = ledger.add_all(events)
+    added = ledger.add_all(events, lineage=import_lineage)
     _out({"ok": True, "events_added": added, "events_total": len(events),
+          "lineage": import_lineage,
           "source_commit": authority.commit,
           "source_refs": authority.refs,
           "source_witness": authority.witness,
@@ -1102,22 +1440,18 @@ def _claim_defect_exit(exc: "emit.ClaimDefective") -> int:
     return _blocked("", f"the claim file {exc.detail}", remedy=remedy)
 
 
-def _round_reference(ledger, carrier: str, round_no,
-                     lineage: int | None = None) -> str | None:
+def _round_reference(carrier: str, round_no, lineage: str) -> str | None:
     """`git:<lineage>/<round>` for a round carried on a ref, else None.
 
     The lineage is a fact of the ledger and the round is a fact of the
     envelope, so neither side of a relay can derive this on its own — which
     is why the reference is a word a person carries rather than something
-    the far end recomputes. `lineage` is a parameter for the one caller that
-    must read it BEFORE its own verb moves it: a clean verdict closes the
-    lineage, and the relay printed afterwards is about the round that just
-    ran, not the one that starts next.
+    the far end recomputes. `lineage` is now required rather than derived
+    here: a ledger holds several, and there is no "the" lineage to fall
+    back to (brief `keyed-lineage`).
     """
-    if carrier != vocab.TRANSPORT_GIT or not round_no:
+    if carrier != vocab.TRANSPORT_GIT or not round_no or not lineage:
         return None
-    if lineage is None:
-        lineage = ledger.lineage_number()
     return transport.round_reference(lineage, int(round_no))
 
 
@@ -1167,7 +1501,7 @@ def _debug_flag(args) -> bool | None:
 
 
 def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
-          selected_transport: str):
+          selected_transport: str, lineage: str):
     """emit-request's body, shared with handoff: push, emit, validate.
     Returns (envelope, parsed, scope) or an int exit code, where `scope` is
     the non-blocking claim-versus-span report (`validate.scope_items`).
@@ -1195,12 +1529,17 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
         record = emit.ensure_pushed(cfg, head=args.head,
                                     local_only=args.local_only,
                                     commit_subject=claim.get("commit_subject"),
-                                    round_no=emit.next_round(ledger),
+                                    round_no=emit.next_round(ledger,
+                                                             lineage),
                                     transport=selected_transport,
                                     author_flag=getattr(args, "author", None),
                                     reviewer_flag=getattr(args, "reviewer",
-                                                          None))
-    except (emit.AuthorityAbsent, emit.RoleSelectionError) as exc:
+                                                          None),
+                                    scope_paths=claim.get("scope_paths"),
+                                    allow_outside_scope=getattr(
+                                        args, "allow_outside_scope", False))
+    except (emit.AuthorityAbsent, emit.RoleSelectionError,
+            emit.SweepRefused) as exc:
         # RVW-T17: ONE catch, reached by both author doors, because both
         # reach `ensure_pushed` through this function. Round 7 F2's defect —
         # two author doors accepting different states — has no second place
@@ -1231,9 +1570,10 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
                                  author=roles[0], reviewer=roles[1],
                                  transport=selected_transport,
                                  debug=emit.resolve_debug(cfg,
-                                                          _debug_flag(args)))
+                                                          _debug_flag(args)),
+                                 lineage=lineage)
     parsed = wire.parse_request(envelope)
-    base = args.base or max((e for e in ledger.current()
+    base = args.base or max((e for e in ledger.current(lineage)
                              if e.get("event") == "verdict"),
                             key=lambda e: e["round"])["sha"]
     shape = emit.diff_shape(cfg.repo_root, base, parsed.sha)
@@ -1242,7 +1582,7 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
                                                shape["insertions"],
                                                shape["deletions"]),
                              round_cap=ledger.effective_round_cap(
-                                 governing.round_cap))
+                                 governing.round_cap, lineage))
     if errors_in(items):
         return _finish(items, "",
                        remedy=f"a person must correct review.toml or "
@@ -1307,7 +1647,14 @@ def cmd_emit_request(args, cfg) -> int:
     # lives there, so the defect class is now unrepresentable rather than
     # tested: there is no second place to put a different question.
     ledger = _ledger(cfg, args)
-    result = _emit(args, cfg, ledger, captured, selected_transport)
+    # `emit-request` writes an envelope to a file and opens nothing, so it
+    # READS the lineage rather than minting one: the round it renders
+    # belongs to whatever review this branch is on.
+    try:
+        lineage = _read_lineage(ledger, cfg, "emit-request")
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
+    result = _emit(args, cfg, ledger, captured, selected_transport, lineage)
     if isinstance(result, int):
         return result
     envelope, parsed, scope = result
@@ -1414,106 +1761,217 @@ def cmd_handoff(args, cfg) -> int:
         emit.check_enforcement(cfg)
     except emit.EnforcementUnsatisfiable as exc:
         return _blocked("", str(exc), remedy=exc.remedy)
+    # WHICH LINEAGE THIS HANDOFF IS (brief `keyed-lineage`, item 3): the
+    # OPEN lineage whose requests were recorded on this worktree's branch,
+    # and a NEW one when this branch holds none. A second worktree on a
+    # second branch therefore opens its own review instead of being
+    # refused, which is what retires the stopgap that stood here.
+    branch = transport.current_branch(cfg)
     try:
-        transport.handoff_preflight(cfg, ledger)
+        lineage = _branch_lineage(ledger, cfg, "handoff", branch=branch)
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
+    opening = lineage is None
+    #
+    # Lineage 27 round 1 F1: the RESERVATION, taken before the lifecycle is
+    # read and released only after the round is recorded.
+    #
+    # A ledger read is one moment, and everything after it destroys: the
+    # commit and push in `_emit`, the gate run that holds the interval open
+    # for minutes, and `record_handoff`, which under the `git` carrier
+    # force-pushes the envelope to a `(lineage, round)` ref. Two handoffs of
+    # ONE lineage that merely overlap therefore both pass any check —
+    # neither is refused, both record the same round, and the second
+    # overwrites the first. A check cannot protect a write it races; only
+    # something HELD across the interval can, which is what this is.
+    #
+    # Two locks, because there are two resources — and neither is the
+    # repository. CONTINUING a lineage holds `lineage-<id>.lock`, which
+    # excludes only the commands acting on the SAME review. OPENING one
+    # holds the branch's `lineage-new-<branch>.lock` instead, because an id
+    # that does not exist cannot be locked by id and two handoffs on ONE
+    # branch would otherwise mint two ids for the review the operator meant
+    # to open once. A lock over the whole repository would be held across
+    # the gates and would refuse the second worktree for the whole interval,
+    # which is the refusal keying exists to retire.
+    #
+    # The branch is resolved once above and handed to the preflight, so the
+    # reservation's record and the refusals below name the same worktree.
+    opening_lock = (transport.NewLineageReservation(ledger, branch=branch,
+                                                    verb="handoff")
+                    if opening else None)
+    reservation = None
+    if opening_lock is None:
+        reservation = transport.LineageReservation(ledger, branch=branch,
+                                                   verb="handoff",
+                                                   lineage=lineage)
+    else:
+        try:
+            opening_lock.acquire()
+        except transport.Refusal as exc:
+            return _blocked("", str(exc), remedy=exc.remedy)
+        try:
+            # Re-read under the lock: an opener that finished while this one
+            # waited may have recorded the very lineage this branch should
+            # continue, and continuing it is what the branch rule says. A
+            # minted id needs no lock of its own — nothing else can name it.
+            #
+            # Round-2 F2: the re-read has to reach the FILE. `Ledger.events`
+            # caches, so this "re-read" was reading the same snapshot the
+            # selection above took, and the opener it exists to observe was
+            # invisible to it.
+            ledger.reload()
+            lineage = _branch_lineage(ledger, cfg, "handoff", branch=branch)
+        except LineageUnchoosable as exc:
+            opening_lock.release()
+            return _blocked("", str(exc), remedy=exc.remedy)
+        if lineage is None:
+            lineage = transport.new_lineage_id()
+        else:
+            reservation = transport.LineageReservation(
+                ledger, branch=branch, verb="handoff", lineage=lineage)
+    try:
+        if reservation is not None:
+            reservation.acquire()
     except transport.Refusal as exc:
-        # Round 7 F3: this replaced every preflight refusal's remedy with one
-        # sentence about dispositions and decisions, so the configuration
-        # refusal reached agents with a recovery that could not repair it.
-        # A blocked exit has no runnable `next`; its remedy is the only
-        # recovery field there is, and it belongs to the refusal that raised.
-        return _blocked("", str(exc),
-                        remedy=exc.remedy or
-                        "a person supplies what is missing — the "
-                        "dispositions, or the recorded decision — then "
-                        "re-runs this command")
-    round_no = emit.next_round(ledger)
-    # User decision 2026-08-25: past the cap the tool emits and INVESTIGATES
-    # rather than refusing. The count alone taught nothing — it fires on a
-    # lineage doing exactly what it should — so the answer travels with the
-    # warning: which findings the loop is failing to close, and which
-    # domains keep producing new ones however many are fixed.
-    past_cap = round_no > ledger.effective_round_cap(cfg.round_cap)
-    cached = transport.cached_handoff(
-        cfg, ledger, round_no, claim_digest=claim_digest,
-        transport=selected_transport,
-        author_flag=getattr(args, "author", None),
-        reviewer_flag=getattr(args, "reviewer", None),
-        debug=emit.resolve_debug(cfg, _debug_flag(args)))
-    if cached is not None:
-        # RVW-T17, the call site the redesign had to rule on rather than
-        # inherit: this branch returns BEFORE `_emit`, so it never reaches
-        # `ensure_pushed` and never re-reads the committed authority. That
-        # is correct, and it is worth saying why rather than leaving it to
-        # look like an oversight. `cached_handoff` serves only when the
-        # tree is clean AND HEAD equals the SHA of the request it kept. A
-        # SHA names a tree; the same SHA is the same `review.toml` bytes,
-        # necessarily. The authority was verified against that SHA when the
-        # kept request was first emitted, so re-reading it here could not
-        # return a different answer — and an amend, which is the one way
-        # the content under a served request could move, changes HEAD and
-        # busts the cache before this branch is reached.
-        #
-        # Round-3 F1: this branch reads a request RETAINED by an earlier
-        # run — across processes, so possibly across installations — and
-        # then re-records it and renders its relay. It is a
-        # cross-installation reader like any other, and it compares BEFORE
-        # either of those, because both are what a stale installation gets
-        # wrong.
-        agreement = transport.tool_agreement(
-            wire.parse_request(cached["envelope"]))
-        rec = transport.record_handoff(cfg, ledger, cached["envelope"],
-                                       round_no, claim_digest=claim_digest)
-        rec["cached"] = True
+        # Blocked, like every other refusal here: the recovery is to wait
+        # for the holder, which is a person's move and no command of ours.
+        if opening_lock is not None:
+            opening_lock.release()
+        return _blocked("", str(exc), remedy=exc.remedy)
+    # Held through `record_handoff` on every path — a refused emission, a
+    # red gate, an exception — which is what `finally` is for.
+    try:
+        try:
+            # Round-2 F2: THE AUTHORITATIVE LIFECYCLE SNAPSHOT, taken here
+            # and not before. The lineage was selected, and `Ledger.events`
+            # cached, before the reservation existed; a close completing in
+            # that interval was therefore invisible, the acquisition
+            # succeeded normally, and this handoff appended a round-1
+            # request AFTER that lineage's clean closure — into a review
+            # that had ended, where a fresh `brief` reports no open request.
+            # A lock excludes an operation while it is held; only a read
+            # taken under it is current.
+            ledger.reload()
+            if reservation is not None and ledger.is_closed(lineage):
+                return _blocked(
+                    "",
+                    f"lineage {lineage} was closed while this handoff was "
+                    f"waiting for its reservation, so the round it was "
+                    f"opening has no review to open into; nothing was "
+                    f"committed, emitted or recorded",
+                    remedy=f"a person re-runs "
+                           f"`{paths.command(*paths.lits(TOOL_NAME, 'handoff', '--claim-file'), paths.Ph('<claim>'))}` "
+                           f"— this branch now holds no open review, so that "
+                           f"run opens a new one rather than appending "
+                           f"behind a terminal marker")
+            transport.handoff_preflight(cfg, ledger, lineage, branch=branch)
+        except transport.Refusal as exc:
+            # Round 7 F3: this replaced every preflight refusal's remedy with one
+            # sentence about dispositions and decisions, so the configuration
+            # refusal reached agents with a recovery that could not repair it.
+            # A blocked exit has no runnable `next`; its remedy is the only
+            # recovery field there is, and it belongs to the refusal that raised.
+            return _blocked("", str(exc),
+                            remedy=exc.remedy or
+                            "a person supplies what is missing — the "
+                            "dispositions, or the recorded decision — then "
+                            "re-runs this command")
+        round_no = emit.next_round(ledger, lineage)
+        # User decision 2026-08-25: past the cap the tool emits and INVESTIGATES
+        # rather than refusing. The count alone taught nothing — it fires on a
+        # lineage doing exactly what it should — so the answer travels with the
+        # warning: which findings the loop is failing to close, and which
+        # domains keep producing new ones however many are fixed.
+        past_cap = round_no > ledger.effective_round_cap(cfg.round_cap,
+                                                         lineage)
+        cached = transport.cached_handoff(
+            cfg, ledger, round_no, lineage, claim_digest=claim_digest,
+            transport=selected_transport,
+            author_flag=getattr(args, "author", None),
+            reviewer_flag=getattr(args, "reviewer", None),
+            debug=emit.resolve_debug(cfg, _debug_flag(args)))
+        if cached is not None:
+            # RVW-T17, the call site the redesign had to rule on rather than
+            # inherit: this branch returns BEFORE `_emit`, so it never reaches
+            # `ensure_pushed` and never re-reads the committed authority. That
+            # is correct, and it is worth saying why rather than leaving it to
+            # look like an oversight. `cached_handoff` serves only when the
+            # tree is clean AND HEAD equals the SHA of the request it kept. A
+            # SHA names a tree; the same SHA is the same `review.toml` bytes,
+            # necessarily. The authority was verified against that SHA when the
+            # kept request was first emitted, so re-reading it here could not
+            # return a different answer — and an amend, which is the one way
+            # the content under a served request could move, changes HEAD and
+            # busts the cache before this branch is reached.
+            #
+            # Round-3 F1: this branch reads a request RETAINED by an earlier
+            # run — across processes, so possibly across installations — and
+            # then re-records it and renders its relay. It is a
+            # cross-installation reader like any other, and it compares BEFORE
+            # either of those, because both are what a stale installation gets
+            # wrong.
+            agreement = transport.tool_agreement(
+                wire.parse_request(cached["envelope"]))
+            rec = transport.record_handoff(cfg, ledger, cached["envelope"],
+                                           round_no, lineage,
+                                           claim_digest=claim_digest)
+            rec["cached"] = True
+            rec["ok"] = True
+            rec["decide"] = _decide(cfg, {vocab.DECIDE_TRANSPORT:
+                                          selected_transport})
+            rec["tool"] = agreement
+            ledger.add({"event": "ingest", "kind": "request",
+                        "round": round_no, "digest": rec.get("digest"),
+                        "source": "handoff cache",
+                        "tool": agreement["reader"],
+                        "tool_agreement": agreement["agreement"],
+                        **({"tool_writer": agreement["writer"]}
+                           if agreement["writer"] else {})}, lineage=lineage)
+            if args.out:
+                Path(args.out).write_text(cached["envelope"], encoding="utf-8")
+                rec["out"] = args.out
+            _brief_into(rec, cached["envelope"], ledger, lineage)
+            _out(rec, f"round {round_no} request for {rec['sha']} is already "
+                      f"recorded and kept at {paths.display_path(rec['kept'])} — gates not re-run "
+                      f"(§9bis.3 rule 5)\n\n{rec['brief']}\n\n"
+                      f"{render_tool_agreement(agreement)}\n{rec['relay']}\n\n"
+                      f"author: {rec['author_next']}")
+            return EXIT_OK
+        result = _emit(args, cfg, ledger, captured, selected_transport,
+                       lineage)
+        if isinstance(result, int):
+            return result
+        envelope, parsed, scope = result
+        rec = transport.record_handoff(cfg, ledger, envelope, round_no,
+                                       lineage, claim_digest=claim_digest)
+        rec.update(_scope_report(scope))
+        rec["cached"] = False
         rec["ok"] = True
-        rec["decide"] = _decide(cfg, {vocab.DECIDE_TRANSPORT:
-                                      selected_transport})
-        rec["tool"] = agreement
-        ledger.add({"event": "ingest", "kind": "request",
-                    "round": round_no, "digest": rec.get("digest"),
-                    "source": "handoff cache",
-                    "tool": agreement["reader"],
-                    "tool_agreement": agreement["agreement"],
-                    **({"tool_writer": agreement["writer"]}
-                       if agreement["writer"] else {})})
+        rec["decide"] = _decide(cfg, {vocab.DECIDE_TRANSPORT: selected_transport})
         if args.out:
-            Path(args.out).write_text(cached["envelope"], encoding="utf-8")
+            Path(args.out).write_text(envelope, encoding="utf-8")
             rec["out"] = args.out
-        _brief_into(rec, cached["envelope"], ledger)
-        _out(rec, f"round {round_no} request for {rec['sha']} is already "
-                  f"recorded and kept at {paths.display_path(rec['kept'])} — gates not re-run "
-                  f"(§9bis.3 rule 5)\n\n{rec['brief']}\n\n"
-                  f"{render_tool_agreement(agreement)}\n{rec['relay']}\n\n"
+        _brief_into(rec, envelope, ledger, lineage)
+        if past_cap:
+            rec["convergence"] = ledger.convergence(lineage)
+        _out(rec, f"round {round_no} request emitted for {rec['sha']}, "
+                  f"recorded ({rec['bytes']} bytes, sha256 {rec['digest'][:16]}…), "
+                  f"kept at {paths.display_path(rec['kept'])}"
+                  f"{_scope_text(scope)}\n\n"
+                  f"{rec['brief']}\n\n"
+                  f"{render_convergence_md(rec['convergence']) if past_cap else ''}"
+                  f"{rec['relay']}\n\n"
                   f"author: {rec['author_next']}")
         return EXIT_OK
-    result = _emit(args, cfg, ledger, captured, selected_transport)
-    if isinstance(result, int):
-        return result
-    envelope, parsed, scope = result
-    rec = transport.record_handoff(cfg, ledger, envelope, round_no,
-                                   claim_digest=claim_digest)
-    rec.update(_scope_report(scope))
-    rec["cached"] = False
-    rec["ok"] = True
-    rec["decide"] = _decide(cfg, {vocab.DECIDE_TRANSPORT: selected_transport})
-    if args.out:
-        Path(args.out).write_text(envelope, encoding="utf-8")
-        rec["out"] = args.out
-    _brief_into(rec, envelope, ledger)
-    if past_cap:
-        rec["convergence"] = ledger.convergence()
-    _out(rec, f"round {round_no} request emitted for {rec['sha']}, "
-              f"recorded ({rec['bytes']} bytes, sha256 {rec['digest'][:16]}…), "
-              f"kept at {paths.display_path(rec['kept'])}"
-              f"{_scope_text(scope)}\n\n"
-              f"{rec['brief']}\n\n"
-              f"{render_convergence_md(rec['convergence']) if past_cap else ''}"
-              f"{rec['relay']}\n\n"
-              f"author: {rec['author_next']}")
-    return EXIT_OK
+    finally:
+        if reservation is not None:
+            reservation.release()
+        if opening_lock is not None:
+            opening_lock.release()
 
 
-def _brief_into(rec: dict, envelope: str, ledger) -> None:
+def _brief_into(rec: dict, envelope: str, ledger, lineage: str) -> None:
     """Attach the plain-language précis and the relay to a result record.
 
     On both channels deliberately. A TTY reader sees the text; an agent reads
@@ -1525,9 +1983,8 @@ def _brief_into(rec: dict, envelope: str, ledger) -> None:
     rec["brief"] = brief.request_precis(parsed, ledger)
     rec["relay"] = brief.relay(
         rec.get("kept"), parsed, envelope,
-        reference=_round_reference(ledger,
-                                   transport.declared_transport(parsed),
-                                   rec.get("round")))
+        reference=_round_reference(transport.declared_transport(parsed),
+                                   rec.get("round"), lineage))
 
 
 def _read_envelope(arg: str, cfg=None, kind: str | None = None) -> str:
@@ -1578,6 +2035,19 @@ def cmd_take(args, cfg) -> int:
     carried_reference = transport.parse_round_reference(args.envelope)
     carried_lineage = carried_reference[0] if carried_reference else None
     envelope = _read_envelope(args.envelope, cfg, "request")
+    # The cap in force is a fact of the lineage this take records into, and
+    # `take_lineage` is the one rule that decides which that is. Round-2 F5:
+    # the same three inputs `transport.take` gives it, so the cap and the
+    # record cannot be computed against two different reviews — the carried
+    # reference, the id the envelope stamps, and the author branch it names.
+    parsed_request = wire.parse_request(envelope)
+    try:
+        take_lineage = transport.take_lineage(
+            ledger, parsed_request.sha or "", carried_lineage,
+            stamped=transport.stamped_lineage(parsed_request),
+            branch=known_branch(parsed_request.attrs.get("branch")))
+    except transport.Refusal as exc:
+        return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
     try:
         rec = transport.take(
             cfg, ledger, envelope, args.envelope, reviewer=args.as_,
@@ -1587,7 +2057,8 @@ def cmd_take(args, cfg) -> int:
             # resolved by `take` after the fetch — not this checkout's.
             validate_items=lambda parsed, governing: validate_request(
                 parsed, governing,
-                round_cap=ledger.effective_round_cap(governing.round_cap)))
+                round_cap=ledger.effective_round_cap(governing.round_cap,
+                                                     take_lineage)))
     except transport.Refusal as exc:
         # The items come from the refusal because `take` already computed
         # them under the authority that governs them — the envelope's own
@@ -1613,13 +2084,49 @@ def cmd_take(args, cfg) -> int:
     # human looks. A report-not-refuse decision rests on the human SEEING
     # the difference; a field only the non-TTY path carries cannot support
     # a decision the visible command never names.
-    _out(rec, f"{rec['envelope']}\n"
+    # Tool feedback, pilot rounds 1 to 3 (brief
+    # `loupe-tool-feedback-pilot-2026-09`): the default is the request with
+    # its attestation objects as a table, and the verbatim bytes are one
+    # flag or one path away — `--full`, or `kept`, which `take` always
+    # wrote. The payload never carries both: `envelope` means the exact
+    # bytes and nothing else, so a consumer that pipes it onward is never
+    # handed a rendering under that name.
+    verbatim = rec.pop("envelope")
+    if args.full:
+        rec["envelope"] = shown = verbatim
+    else:
+        rec["request_view"] = shown = brief.compact_request(
+            verbatim, kept=rec.get("kept"), tags=accepted_tags(cfg))
+    _out(rec, f"{shown}\n"
               f"--- taken: round {rec['round']} target {rec['sha']} as "
               f"reviewer {rec['reviewer']}\n\n{rec['brief']}\n\n"
-              f"target: {rec['target']}\nreferences:\n{refs}\n"
+              f"target: {rec['target']}\n"
+              f"{render_checkout(rec['head'], rec['sha'])}"
+              f"references:\n{refs}\n"
               f"{render_tool_agreement(rec['tool'])}"
               f"diff:   {rec['diff']}\nthen:   {rec['then']}")
     return EXIT_OK
+
+
+def render_checkout(checkout: dict, sha: str) -> str:
+    """The reviewer's HEAD beside the target, all three states printed.
+
+    `at-target` prints too, for the reason `render_tool_agreement` gives: a
+    line that appears only when something is off teaches nothing about what
+    its absence means.
+    """
+    state = checkout.get("state")
+    tree = checkout.get("tree") or "tree state unknown"
+    if state == transport.CHECKOUT_AT_TARGET:
+        return (f"head:   AT the target — this checkout is {sha[:12]} "
+                f"({tree})\n")
+    if state == transport.CHECKOUT_ELSEWHERE:
+        return (f"head:   NOT the target — this checkout is "
+                f"{str(checkout.get('sha'))[:12]} ({tree}), the target is "
+                f"{sha[:12]}\n        files read from this working tree are "
+                f"not the reviewed bytes; the diff command below is\n")
+    return ("head:   UNKNOWN — this checkout has no HEAD to compare (empty "
+            "or unborn clone); read the target through the diff command\n")
 
 
 def render_tool_agreement(agreement: dict) -> str:
@@ -1683,9 +2190,16 @@ def cmd_waive(args, cfg) -> int:
     """
     ledger = _ledger(cfg, args)
     if getattr(args, "finding", None):
+        # A finding waiver is an answer WITHIN a review, so it takes the
+        # lineage this branch is on. The commit waiver below stays global.
+        try:
+            waiver_lineage = _write_lineage(ledger, cfg, "waive --finding")
+        except LineageUnchoosable as exc:
+            return _blocked("", str(exc), remedy=exc.remedy)
         try:
             rec = transport.waive_finding(
                 cfg, ledger, args.finding, args.reason or "", args.by,
+                waiver_lineage,
                 destination=getattr(args, "destination", None) or "",
                 trigger=getattr(args, "trigger", None) or "")
         except transport.Refusal as exc:
@@ -1720,80 +2234,265 @@ def cmd_waive(args, cfg) -> int:
 def cmd_authorize_advance(args, cfg) -> int:
     """A named human advances the lineage over findings they overruled."""
     ledger = _ledger(cfg, args)
+    # The third writer of the terminal marker (lineage 27 round 2 F1). The
+    # round-1 fix reserved `handoff` and `close` and called the lifecycle
+    # covered; it is not. `authorize_advance` reads `open_round` and then
+    # appends `lineage_closed` — the same shared lifecycle and the same
+    # terminal marker `close` takes the reservation for — so an advance
+    # that merely OVERLAPS an author's next handoff ends the lineage over
+    # a round being opened beside it: the request lands after the read, is
+    # swallowed by the closure, and the closure records `open_request:
+    # False` about it. `Ledger.events` caches its first read, so the
+    # handoff whose gates span the advance then finishes from its cached
+    # previous-lineage state. No forged state and no weaker-access
+    # adversary — two legitimate operator actions and a scheduling error,
+    # which is exactly what a reservation is for.
+    #
+    # Taken before the FIRST lifecycle read (`transport.authorize_advance`
+    # opens with `ledger.open_round()`), released after the record, on
+    # every path — `finally`, like the other two.
+    #
+    # What it does NOT do: grant anything. Holding the reservation excludes
+    # a concurrent lifecycle writer and decides nothing else; every refusal
+    # below it stands untouched, and the advance remains a NAMED human's
+    # recorded decision — `--reason` and `--by` still required, the pending
+    # round still refused, the standing findings still each answered by a
+    # waiver. Exclusion is not authority.
     try:
-        rec = transport.authorize_advance(cfg, ledger, args.reason or "",
-                                          args.by)
+        lineage = _write_lineage(ledger, cfg, "authorize-advance")
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
+    reservation = transport.LineageReservation(
+        ledger, branch=transport.current_branch(cfg),
+        verb="authorize-advance", lineage=lineage)
+    try:
+        reservation.acquire()
     except transport.Refusal as exc:
-        return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
-    envelope = rec.pop("envelope")
-    if args.out:
-        Path(args.out).write_text(envelope, encoding="utf-8")
-        rec["out"] = args.out
-    rec["ok"] = True
-    _out(rec, f"lineage {rec['lineage']} advanced at {rec['sha'][:12]} by "
-              f"{rec['authorized_by']}: {rec['reason']}\n"
-              f"over {len(rec['waived'])} overruled finding(s): "
-              f"{', '.join(rec['waived'])}\n"
-              f"kept at {paths.display_path(rec['kept'])} — an authorization, "
-              f"NOT a clean verdict, and it says so wherever it is carried")
-    return EXIT_OK
+        return _blocked("", str(exc), remedy=exc.remedy)
+    try:
+        try:
+            # Round-2 F2, the third terminal-marker writer: the lifecycle
+            # this advance ends is read UNDER the reservation. Selected
+            # before it and cached, the lineage could already have been
+            # closed by the time the lock was free, and the marker would be
+            # appended behind the one already there.
+            ledger.reload()
+            if ledger.is_closed(lineage):
+                return _blocked(
+                    "",
+                    f"lineage {lineage} was closed while this advance was "
+                    f"waiting for its reservation, so there is no open "
+                    f"review to advance; nothing was recorded",
+                    remedy=f"a person re-reads the record — "
+                           f"`{paths.command(*paths.lits(TOOL_NAME, 'brief'))}` "
+                           f"— and decides whether a new review is what this "
+                           f"decision belongs to; this tool appends nothing "
+                           f"behind a terminal marker")
+            rec = transport.authorize_advance(cfg, ledger, args.reason or "",
+                                              args.by, lineage)
+        except transport.Refusal as exc:
+            return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
+        envelope = rec.pop("envelope")
+        if args.out:
+            Path(args.out).write_text(envelope, encoding="utf-8")
+            rec["out"] = args.out
+        rec["ok"] = True
+        _out(rec, f"lineage {rec['lineage']} advanced at {rec['sha'][:12]} by "
+                  f"{rec['authorized_by']}: {rec['reason']}\n"
+                  f"over {len(rec['waived'])} overruled finding(s): "
+                  f"{', '.join(rec['waived'])}\n"
+                  f"kept at {paths.display_path(rec['kept'])} — an "
+                  f"authorization, NOT a clean verdict, and it says so "
+                  f"wherever it is carried")
+        return EXIT_OK
+    finally:
+        reservation.release()
 
 
 def cmd_close(args, cfg) -> int:
     """Author side: ingest the verdict and close the round; a clean verdict
     closes the lineage; --lineage closes one by recorded decision."""
     ledger = _ledger(cfg, args)
+    # WHICH LINEAGE THIS CLOSE ACTS ON (brief `keyed-lineage`, item 3).
+    # `--verdict` resolves it from the envelope's SHA, through the request
+    # that carries it — the envelope decides, not the checkout. `--lineage`
+    # is given no envelope and closes the review this branch is on. Neither
+    # may guess: a close appends the terminal marker, and appending it to
+    # the wrong review discards a round nobody ruled.
+    #
+    # Resolved BEFORE the reservation, because the reservation is keyed on
+    # it: `lineage-<id>.lock` excludes the commands acting on this same
+    # review and no longer excludes a second worktree running a different
+    # one.
+    # Round-2 F3: the verdict is read EXACTLY ONCE, here, and the same bytes
+    # resolve the lineage and are recorded. Two reads consumed the supported
+    # `--verdict -` outright — the paste relay's own generated close command
+    # is a heredoc, so the preliminary read drained stdin and the real read
+    # found an empty document — and on a file or a fetched ref they let
+    # selection and processing see different bytes. A failed capture is kept
+    # as the exception it was and re-raised at the point the second read
+    # used to raise, so a malformed envelope refuses exactly as it did.
+    verdict_text, verdict_error, verdict_sha = None, None, None
+    carried_lineage = None
+    if not args.lineage and args.verdict:
+        reference = transport.parse_round_reference(args.verdict)
+        carried_lineage = reference[0] if reference else None
+        try:
+            verdict_text = _read_envelope(args.verdict, cfg, "verdict")
+        except (transport.Refusal, OSError, ValueError) as exc:
+            verdict_error = exc     # re-raised for real below
+        if verdict_text is not None:
+            try:
+                verdict_sha = wire.parse_verdict(verdict_text).sha
+            except (ValueError, KeyError, TypeError):
+                verdict_sha = None
+    branch = transport.current_branch(cfg)
     try:
-        if args.lineage:
-            rec = transport.close_lineage(ledger, args.reason or "",
-                                          args.by or "")
-            rec["ok"] = True
-            _out(rec, f"lineage closed at round {rec['lineage_closed_at_round']}"
-                      + (" (with a request still open)"
-                         if rec["open_request"] else "")
-                      + f"\nnext: {rec['next']}")
-            return EXIT_OK
-        if not args.verdict:
-            return _usage_exit(
-                paths.command(*paths.lits(TOOL_NAME, "close", "--help")),
-                "close needs --verdict or --lineage",
-                remedy="a person chooses which close this is — a verdict to "
-                       "record, or a lineage to end by decision — and "
-                       "supplies its flag")
-        text = _read_envelope(args.verdict, cfg, "verdict")
-        parsed_verdict = wire.parse_verdict(text)
-        # Round 2 F2: the recorded transport is resolved and validated
-        # BEFORE close_round writes anything. Resolved after, a defective
-        # record refused the round only once the verdict — and for a clean
-        # ruling the lineage closure — was already appended, and the
-        # refusal escaped as generic usage help that cannot repair an
-        # append-only ledger; and a CLEAN close emptied `current()` first,
-        # so a recorded `paste` silently became the default carrier. The
-        # value is read once, here, and carried across the closure.
-        carrier = transport.recorded_transport(ledger, parsed_verdict.sha)
-        # Read BEFORE the close: a clean verdict closes the lineage, and the
-        # relay below is about the round that just ran.
-        lineage = ledger.lineage_number()
-        rec = transport.close_round(
-            cfg, ledger, text, args.verdict, round_no=args.round,
-            tokens=args.tokens,
-            validate_items=lambda parsed: validate_verdict(
-                parsed, cfg,
-                answering=_dispositions_answered(ledger, parsed)))
+        lineage = _branch_lineage(ledger, cfg, "close", branch=branch) \
+            if not verdict_sha else _write_lineage(ledger, cfg, "close",
+                                                   verdict_sha,
+                                                   carried=carried_lineage)
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
+    # The same reservation the handoff takes, around close's own
+    # read-check-write (lineage 27 round 1 F1). Both closes are inside it:
+    # `--verdict` refuses a verdict that would swallow an unruled request,
+    # and `--lineage` appends the marker that ends the lineage — each reads
+    # the ledger and then writes to it, so a close running beside an
+    # admission INTO THE SAME LINEAGE could slip between that admission and
+    # its record and rule on, or close over, a round the ledger does not
+    # yet show. Refused, not queued: the human retries once the holder
+    # finishes.
+    #
+    # When this branch names no lineage the reservation is the BRANCH's
+    # opening lock, not nothing: a close arriving while this branch's first
+    # handoff is mid-admission must be told the reservation is held, not
+    # told the branch has no review — the review is one `record_handoff`
+    # away from existing, and the marker this verb appends would land in
+    # front of it.
+    # Round-2 F2: what this close SELECTED, so the re-read under the
+    # reservation can tell the transition apart from the state. Closing a
+    # round into a lineage that was already closed when this command started
+    # is whatever it always was — the refusals inside `close_round` rule on
+    # it. What is new is a lineage that was OPEN here and is closed by the
+    # time the reservation is granted.
+    selected_open = lineage is not None and not ledger.is_closed(lineage)
+    reservation = (
+        transport.LineageReservation(ledger, branch=branch, verb="close",
+                                     lineage=lineage) if lineage
+        else transport.NewLineageReservation(ledger, branch=branch,
+                                             verb="close"))
+    try:
+        reservation.acquire()
     except transport.Refusal as exc:
-        return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
-    rec["ok"] = True
-    rec["brief"] = brief.verdict_precis(parsed_verdict, source=args.verdict)
-    rec["relay"] = brief.verdict_relay(
-        parsed_verdict, source=args.verdict, transport=carrier,
-        reference=_round_reference(ledger, carrier, rec.get("round"),
-                                   lineage))
-    _out(rec, f"round {rec['round']} closed: {rec['verdict']} on {rec['sha']} "
-              f"({rec['findings']} findings, {rec['closures']} closures), "
-              f"kept at {paths.display_path(rec['kept'])}\n"
-              f"lineage: {rec['lineage']}\n\n"
-              f"{rec['brief']}\n\n{rec['relay']}")
-    return EXIT_OK
+        return _blocked("", str(exc), remedy=exc.remedy)
+    try:
+        try:
+            # Round-2 F2: the AUTHORITATIVE lifecycle snapshot is the one
+            # taken under the reservation, on every path — not only the
+            # `lineage is None` one. `Ledger.events` caches its first disk
+            # read, so a close whose selection predates the lock was ruling
+            # on state that another process had already moved.
+            ledger.reload()
+            if lineage is None:
+                # Re-read under the reservation, then refuse for real: the
+                # admission that was in flight has finished by now, so this
+                # says what the record says rather than what it said before
+                # the lock was free.
+                lineage = _write_lineage(ledger, cfg, "close", verdict_sha,
+                                         carried=carried_lineage)
+            elif selected_open and ledger.is_closed(lineage):
+                # The terminal marker is already there. Whatever this close
+                # was going to append — a verdict, or a second closure —
+                # would land behind it, in a review that has ended.
+                return _blocked(
+                    "",
+                    f"lineage {lineage} was closed while this close was "
+                    f"waiting for its reservation, so there is no open "
+                    f"review here to close; nothing was recorded",
+                    remedy=f"a person re-reads the record — "
+                           f"`{paths.command(*paths.lits(TOOL_NAME, 'brief'))}` "
+                           f"— and decides whether this ruling belongs to a "
+                           f"review that is still open; this tool appends "
+                           f"nothing behind a terminal marker")
+            if args.lineage:
+                rec = transport.close_lineage(ledger, args.reason or "",
+                                              args.by or "", lineage)
+                rec["ok"] = True
+                _out(rec, f"lineage {rec['lineage']} closed at round "
+                          f"{rec['lineage_closed_at_round']}"
+                          + (" (with a request still open)"
+                             if rec["open_request"] else "")
+                          + f"\nnext: {rec['next']}")
+                return EXIT_OK
+            if not args.verdict:
+                return _usage_exit(
+                    paths.command(*paths.lits(TOOL_NAME, "close", "--help")),
+                    "close needs --verdict or --lineage",
+                    remedy="a person chooses which close this is — a verdict to "
+                           "record, or a lineage to end by decision — and "
+                           "supplies its flag")
+            # Round-2 F3: the ONE capture, not a second read. `raise` here
+            # is where the second read used to raise, so the refusal a
+            # malformed or unreachable envelope gets is byte-for-byte the
+            # one it got before — while a stdin envelope, which a second
+            # read could only find empty, is still in hand.
+            if verdict_error is not None:
+                raise verdict_error
+            text = verdict_text
+            parsed_verdict = wire.parse_verdict(text)
+            # Round 2 F2: the recorded transport is resolved and validated
+            # BEFORE close_round writes anything. Resolved after, a defective
+            # record refused the round only once the verdict — and for a clean
+            # ruling the lineage closure — was already appended, and the
+            # refusal escaped as generic usage help that cannot repair an
+            # append-only ledger; and a CLEAN close emptied `current()` first,
+            # so a recorded `paste` silently became the default carrier. The
+            # value is read once, here, and carried across the closure.
+            carrier = transport.recorded_transport(ledger,
+                                                   parsed_verdict.sha,
+                                                   lineage)
+            # Read BEFORE the close: the round's envelopes ride the lineage
+            # the round was CARRIED on, which is this lineage for everything
+            # written since the key existed and the pre-keying `take` stamp
+            # for a round taken over a reference before it.
+            carrier_lineage = (ledger.carrier_lineage_for_sha(
+                parsed_verdict.sha, prefer=lineage) or lineage)
+            # Audit of 2026-09-05, finding 3. The verdict is judged under the
+            # TARGET commit's own review.toml — the authority `take` read and
+            # `validate --from-target` judged it by — never under whatever this
+            # checkout holds now. A checkout that had since renamed a severity
+            # rejected a verdict its target had already accepted, with
+            # V-SEVERITY, and the recovery it printed omitted `--from-target`.
+            # An accepted artifact's acceptance cannot depend on unrelated
+            # checkout changes; the author's clone always holds the target,
+            # since it pushed it.
+            governing = transport.governing_for(cfg, parsed_verdict.sha)
+            rec = transport.close_round(
+                cfg, ledger, text, args.verdict, lineage,
+                round_no=args.round, tokens=args.tokens,
+                validate_items=lambda parsed: validate_verdict(
+                    parsed, governing,
+                    answering=_dispositions_answered(ledger, parsed,
+                                                     lineage)))
+        except LineageUnchoosable as exc:
+            return _blocked("", str(exc), remedy=exc.remedy)
+        except transport.Refusal as exc:
+            return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
+        rec["ok"] = True
+        rec["brief"] = brief.verdict_precis(parsed_verdict, source=args.verdict)
+        rec["relay"] = brief.verdict_relay(
+            parsed_verdict, source=args.verdict, transport=carrier,
+            reference=_round_reference(carrier, rec.get("round"),
+                                       carrier_lineage))
+        _out(rec, f"round {rec['round']} closed: {rec['verdict']} on {rec['sha']} "
+                  f"({rec['findings']} findings, {rec['closures']} closures), "
+                  f"kept at {paths.display_path(rec['kept'])}\n"
+                  f"lineage: {rec['lineage']}\n\n"
+                  f"{rec['brief']}\n\n{rec['relay']}")
+        return EXIT_OK
+    finally:
+        reservation.release()
 
 
 def cmd_prune(args, cfg) -> int:
@@ -1829,22 +2528,109 @@ def cmd_brief(args, cfg) -> int:
     verb that is safe to run when you are not sure what state the loop is in.
     """
     ledger = _ledger(cfg, args)
-    source, superseded = args.envelope, 0
+    source, superseded, text = args.envelope, 0, None
+    # Round-2 F3: ONE capture of the source, and the same bytes resolve the
+    # lineage and are summarised. `brief -` is how a request or a verdict
+    # arrives from a paste relay, and the preliminary read consumed it —
+    # `- is neither a review request nor a verdict`, about a document that
+    # was both. A failed capture is kept and re-raised where the second read
+    # used to raise it.
+    captured, capture_error, carried_lineage = None, None, None
+    if args.envelope:
+        reference = transport.parse_round_reference(args.envelope)
+        carried_lineage = reference[0] if reference else None
+        try:
+            captured = _read_envelope(args.envelope, cfg, "request")
+        except (transport.Refusal, OSError, ValueError) as exc:
+            capture_error = exc
+    # The lineage this brief is about. With an envelope in hand it is the
+    # one that envelope's SHA resolves to WITHIN the review this invocation
+    # carries; with none, it is the open lineage this worktree's branch is
+    # on (brief `keyed-lineage`, item 3).
+    try:
+        lineage = _read_lineage(ledger, cfg, "brief", _envelope_sha(captured),
+                                carried=carried_lineage
+                                or _envelope_lineage(captured))
+    except LineageUnchoosable as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
+    # Every OTHER open lineage, named on the face of this brief: with
+    # several reviews live in one repository, "the open request" is a claim
+    # about one of them and a reader is owed the rest.
+    elsewhere = [
+        {"lineage": l, "branch": ledger.lineage_branch(l) or None,
+         "round": ledger.open_round(l),
+         "state": ("awaiting a verdict" if ledger.open_round(l) is not None
+                   else "ruled, awaiting the author")}
+        for l in ledger.open_lineages() if l != lineage]
+    elsewhere_text = ("\n\nAlso open in this repository: "
+                      + "; ".join(
+                          f"lineage {o['lineage']} on "
+                          f"{o['branch'] or 'an unrecorded branch'}, round "
+                          f"{o['round'] if o['round'] is not None else '—'} "
+                          f"({o['state']})" for o in elsewhere)
+                      if elsewhere else "")
     if source is None:
-        event, superseded = brief.find_open_request(ledger)
+        event, superseded = brief.find_open_request(ledger, lineage)
         if event is None:
+            # The third state, named because it is real and the sentence
+            # that omitted it was false (brief `concurrent-round-refusal`,
+            # change 4). A round emitted from another worktree and thrown
+            # away when the lineage was closed at another SHA is neither
+            # "nothing emitted" nor "already ruled", and the worktree that
+            # emitted it was told both. A keyed lineage makes the state
+            # unreachable going forward — a handoff on another branch opens
+            # its own review — and ledgers already carrying it must still
+            # read truthfully.
+            closed = ledger.last_closed_lineage(
+                transport.current_branch(cfg))
+            discarded = (ledger.discarded_requests(closed) if closed
+                         else [])
+            emit_cmd = paths.command(
+                *paths.lits(TOOL_NAME, 'handoff', '--claim-file'),
+                paths.Ph('<their claim file>'))
+            if discarded:
+                named = "; ".join(
+                    f"round {e.get('round', '?')} for "
+                    f"{str(e.get('sha') or '?')[:12]}"
+                    + (f" on {b}"
+                       if (b := known_branch(e.get("branch")))
+                       else "")
+                    for e in discarded)
+                return _blocked(
+                    "",
+                    f"no open review request in this lineage — and the "
+                    f"previous one was closed with {len(discarded)} request "
+                    f"still unruled: {named}. That round was emitted and "
+                    f"then discarded by the close, so it carries no verdict "
+                    f"and never will{elsewhere_text}",
+                    remedy=f"a person decides whether that work is re-opened: "
+                           f"the discarded round is emitted again into this "
+                           f"lineage with "
+                           f"`{emit_cmd}`, or it is left as the record shows "
+                           f"it — abandoned. This tool re-opens nothing on "
+                           f"its own")
             return _blocked(
                 "",
                 "no open review request in this lineage: either nothing has "
                 "been emitted yet, or every emitted round already carries a "
-                "verdict",
+                "verdict" + elsewhere_text,
                 remedy=f"a person writes the claim and emits a round with "
-                       f"`{paths.command(*paths.lits(TOOL_NAME, 'handoff', '--claim-file'), paths.Ph('<their claim file>'))}`; "
+                       f"`{emit_cmd}`; "
                        f"there is nothing to summarise until one is "
                        f"open, and the claim is the author's judgment, which "
                        f"this tool carries and never invents")
-        path = transport.exchange_path(cfg, event["round"], "request")
-        if path is None or not path.is_file():
+        # Lineage 25 round 1 F4: the checked read. A copy that does not
+        # reproduce the open event's recorded digest — a pre-upgrade flat
+        # copy of an EARLIER lineage's round 1, say — is not the open
+        # request, and a brief derived from it would relay the wrong
+        # target with a live command under it.
+        digest = event.get("source_digest") or ""
+        path, text = transport.read_kept(
+            cfg, event["round"], "request",
+            lineage=ledger.carrier_lineage_for_sha(event.get("sha"),
+                                                  prefer=lineage) or lineage,
+            digest=digest)
+        if path is None:
             return _blocked(
                 "",
                 f"round {event['round']} is open but its bytes were not kept, "
@@ -1853,9 +2639,26 @@ def cmd_brief(args, cfg) -> int:
                        f"`{paths.command(*paths.lits(TOOL_NAME, 'brief'), paths.Ph('<the path they hold>'))}` — since the copy this "
                        f"tool kept is gone and only the person who has the "
                        f"bytes knows where they are")
+        if text is None:
+            return _blocked(
+                "",
+                f"round {event['round']} is open, but the retained copy at "
+                f"{paths.display_path(str(path))} does not reproduce the "
+                f"recorded digest {digest[:12]}… — it is another envelope "
+                f"(a rewritten copy, or a flat pre-0.18 copy of an earlier "
+                f"lineage's round {event['round']}), so it is not summarised",
+                remedy=f"a person passes the envelope itself — "
+                       f"`{paths.command(*paths.lits(TOOL_NAME, 'brief'), paths.Ph('<the path they hold>'))}` — or restores "
+                       f"the copy the ledger digested; the tool rewrites "
+                       f"and migrates no retained bytes")
         source = str(path)
 
-    text = _read_envelope(source)
+    if text is None:
+        # Round-2 F3: the captured bytes, never a second read of a source
+        # that may be standard input, a mutable file or a moving ref.
+        if capture_error is not None:
+            raise capture_error
+        text = captured
     as_request = wire.parse_request(text)
     if as_request.wrapped:
         # R1-F2: `brief` is an official relay reader, so a wrapped-looking
@@ -1882,23 +2685,35 @@ def cmd_brief(args, cfg) -> int:
             relay_text = brief.relay(
                 source, as_request, text, paste=args.paste,
                 reference=_round_reference(
-                    ledger, transport.declared_transport(as_request),
-                    as_request.attrs.get("round")))
+                    transport.declared_transport(as_request),
+                    as_request.attrs.get("round"),
+                    ledger.carrier_lineage_for_sha(as_request.sha,
+                                                   prefer=lineage)
+                    or lineage))
         except brief.UnrelayableEnvelope as exc:
             return _blocked("", f"{source}: {exc}",
                             remedy=f"a person appends the terminal newline "
                                    f"to {paths.display_path(source)} and "
                                    f"re-runs this command")
+        # Ruling 1 of 2026-09-06: the cross-lineage notice, in `brief` as
+        # well as on the envelope's face — and the other open lineages, so
+        # "the open request" is not read as "the only one".
+        notices = ledger.cross_lineage_notices(lineage)
         rec = {"kind": "request", "source": source, "ok": True,
                "decide": _decide(cfg),
                "round": as_request.attrs.get("round"),
                "sha": as_request.sha, "superseded": superseded,
+               "lineage": lineage, "open_lineages": elsewhere,
+               "cross_lineage": notices,
                "tool": agreement,
-               "brief": brief.request_precis(as_request, ledger),
+               "brief": brief.request_precis(as_request, ledger,
+                                             full=args.full),
                "relay": relay_text}
         note = (f"\nNOTE: {superseded} earlier emission(s) of this round are "
                 f"superseded; this is the live one.\n" if superseded else "")
-        _out(rec, f"{rec['brief']}\n{note}\n"
+        _out(rec, f"{rec['brief']}\n{note}"
+                  f"{render_cross_lineage_md(notices)}"
+                  f"{elsewhere_text}\n\n"
                   f"{render_tool_agreement(agreement)}\n{rec['relay']}")
         return EXIT_OK
 
@@ -1908,16 +2723,18 @@ def cmd_brief(args, cfg) -> int:
         # a human reads, and the commands a human copies (round 3 relay
         # split). Never one blob for a caller to divide by guesswork.
         try:
-            carrier = transport.recorded_transport(ledger, as_verdict.sha)
+            carrier = transport.recorded_transport(ledger, as_verdict.sha,
+                                                   lineage)
             # F1: same authority as the push in `cmd_validate` — the
-            # round's recorded lineage, not this ledger's own count, so a
-            # `brief` rendered on either machine names the same reference.
-            brief_lineage = ledger.recorded_lineage_for_sha(as_verdict.sha)
+            # round's carried lineage, so a `brief` rendered on either
+            # machine names the same reference.
+            brief_lineage = (ledger.carrier_lineage_for_sha(
+                as_verdict.sha, prefer=lineage) or lineage)
             relay_text = brief.verdict_relay(
                 as_verdict, source=source, transport=carrier,
                 reference=_round_reference(
-                    ledger, carrier, ledger.round_for_sha(as_verdict.sha),
-                    lineage=brief_lineage),
+                    carrier, ledger.round_for_sha(as_verdict.sha, lineage),
+                    brief_lineage),
                 envelope=text)
         except brief.UnrelayableEnvelope as exc:
             return _blocked("", f"{source}: {exc}",
@@ -1926,6 +2743,7 @@ def cmd_brief(args, cfg) -> int:
                                    f"re-runs this command")
         rec = {"kind": "verdict", "source": source, "ok": True,
                "decide": _decide(cfg), "sha": as_verdict.sha,
+               "lineage": lineage, "open_lineages": elsewhere,
                "brief": brief.verdict_precis(as_verdict, source=source,
                                              full=args.full),
                "relay": relay_text}
@@ -2268,6 +3086,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "is fetchable from no other machine; stamped on "
                              "the envelope, and an error when a remote is "
                              "configured (§9bis.4)")
+        sp.add_argument("--allow-outside-scope", action="store_true",
+                        help="sweep outstanding paths the claim's "
+                             "`scope_paths` does not cover, instead of "
+                             "refusing before the commit; the request names "
+                             "them on its face. Never overrides the "
+                             "fixture-marker refusal")
         sp.add_argument("--transport", choices=list(vocab.TRANSPORTS),
                         action=_OnceAction,
                         help="whether the reviewer shares this filesystem: "
@@ -2337,6 +3161,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "[roles] reviewer names the repository's default "
                          "direction, not who is at the keyboard. Must equal "
                          "the envelope's stamp")
+    tk.add_argument("--full", action="store_true",
+                    help="print the request verbatim, every attestation "
+                         "object included. The default prints the same "
+                         "request with those objects as one table; the kept "
+                         "file `take` names always holds the exact bytes")
     tk.add_argument("--no-fetch", action="store_true",
                     help="do not run the stamped fetch; still requires the "
                          "target to be present in this clone")

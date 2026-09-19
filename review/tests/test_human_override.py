@@ -45,6 +45,7 @@ from unittest import mock
 from review import transport, validate, vocab, wire
 from review.ledger import Ledger
 from review.tests.synth import CFG
+from review.tests.util import LINEAGE
 
 SHA = "a" * 40
 SHA2 = "b" * 40
@@ -86,13 +87,13 @@ class _Base(unittest.TestCase):
     def waive(self, ref="F1", reason="happy with this for now", by="sammy",
               **kw):
         return transport.waive_finding(self.cfg, self.ledger, ref, reason,
-                                       by, **kw)
+                                       by, LINEAGE, **kw)
 
     def advance(self, reason="ship", by="sammy"):
-        return transport.authorize_advance(self.cfg, self.ledger, reason, by)
+        return transport.authorize_advance(self.cfg, self.ledger, reason, by, LINEAGE)
 
     def standing_ids(self):
-        return [f["id"] for f in self.ledger.standing_findings()]
+        return [f["id"] for f in self.ledger.standing_findings(LINEAGE)]
 
     def errors(self, envelope):
         parsed = wire.parse_authorization(envelope)
@@ -126,7 +127,7 @@ class TestTheAuthoritysAnswer(_Base):
         self.assertEqual((rec["finding_id"], rec["fp"]), ("F1", FP1))
         self.assertEqual(rec["authorized_by"], "sammy")
         self.assertEqual(rec["destination"], "briefs/x.md")
-        events = [e for e in self.ledger.current()
+        events = [e for e in self.ledger.current(LINEAGE)
                   if e["event"] == vocab.FINDING_WAIVER_EVENT]
         self.assertEqual(len(events), 1, "the answer is not in the ledger")
         self.assertEqual(events[0]["severity"], "Medium",
@@ -144,7 +145,7 @@ class TestTheAuthoritysAnswer(_Base):
         difference between an override and a finding quietly going away."""
         self.rule()
         self.waive()
-        event = [e for e in self.ledger.current()
+        event = [e for e in self.ledger.current(LINEAGE)
                  if e["event"] == vocab.FINDING_WAIVER_EVENT][0]
         for key in ("fp", "reason", "authorized_by"):
             self.assertTrue(str(event.get(key, "")).strip(), key)
@@ -159,7 +160,7 @@ class TestTheAuthoritysAnswer(_Base):
             with self.subTest(reason=reason, by=by):
                 with self.assertRaises(transport.Refusal):
                     self.waive(reason=reason, by=by)
-        self.assertEqual([e for e in self.ledger.current()
+        self.assertEqual([e for e in self.ledger.current(LINEAGE)
                           if e["event"] == vocab.FINDING_WAIVER_EVENT], [],
                          "a refused waiver appended anyway")
 
@@ -198,7 +199,7 @@ class TestTheAuthoritysAnswer(_Base):
         self.rule(findings=[_finding()])
         self.rule(findings=[_finding(round_no=2)], round_no=2, sha=SHA2)
         self.waive(ref="F1")
-        event = self.ledger.current_waivers()[FP1]
+        event = self.ledger.current_waivers(LINEAGE)[FP1]
         self.assertEqual(event["round"], 2)
 
     def test_one_finding_takes_one_answer(self):
@@ -227,7 +228,8 @@ class TestTheAuthoritysAnswer(_Base):
             "payload": {"authority": "sammy", "criterion": "ship or not"}})
         self.assertTrue(
             transport.waive_finding(other.cfg, other.ledger, "F2", "r",
-                                    "sammy")["answers_escalation"])
+                                    "sammy",
+                                    LINEAGE)["answers_escalation"])
 
     def test_the_record_is_an_assertion_not_a_proof(self):
         """Stated in the suite so nobody has to infer it from the docstring
@@ -308,7 +310,7 @@ class TestAdvancingIsNeverClean(_Base):
         # Read the whole file: closing the lineage is what ENDS `current()`,
         # so the marker this asserts on is never inside it.
         self.assertEqual([e["outcome"]
-                          for e in self.ledger.closures_of_lineage()],
+                          for e in self.ledger.closures_of_lineage(LINEAGE)],
                          ["authorization"])
         self.assertEqual([e["event"] for e in self.ledger.events()
                           if e["event"] == vocab.ADVANCE_EVENT],
@@ -377,7 +379,7 @@ class TestEveryAnswerIsBoundToTheRulingItAnswers(_Base):
                 self.setUp()
                 self.rule(findings=[_finding()])
                 self.answer(kind, term, round_no=1)
-                waived = FP1 in self.ledger.current_waivers()
+                waived = FP1 in self.ledger.current_waivers(LINEAGE)
                 if effect == vocab.ANSWER_SETTLES:
                     self.assertEqual(self.standing_ids(), [])
                     self.assertFalse(waived)
@@ -409,7 +411,7 @@ class TestEveryAnswerIsBoundToTheRulingItAnswers(_Base):
                           round_no=2, sha=SHA2)
                 self.assertEqual(self.standing_ids(), ["F9"],
                                  "a re-raised finding is open again")
-                self.assertNotIn(FP1, self.ledger.current_waivers())
+                self.assertNotIn(FP1, self.ledger.current_waivers(LINEAGE))
                 with self.assertRaises(transport.Refusal) as ctx:
                     self.advance()
                 self.assertIn("F9", str(ctx.exception),
@@ -485,7 +487,7 @@ class TestTheAuthorizationEnumeratesTheStandingSet(_Base):
         self.waive()
         self.ledger.add({"event": "request", "round": 2, "sha": SHA2,
                          "bytes": 1, "author": "claude", "reviewer": "codex"})
-        self.assertEqual(self.ledger.open_round(), 2)
+        self.assertEqual(self.ledger.open_round(LINEAGE), 2)
         with self.assertRaises(transport.Refusal) as ctx:
             self.advance()
         self.assertIn("awaiting a verdict", str(ctx.exception))
@@ -639,7 +641,7 @@ class TestTheAuthorizerIsRepresentable(_Base):
                     self.advance(by=name)
                 self.assertEqual(self.snapshot(), before,
                                  "a refused advance wrote or recorded")
-                self.assertEqual(self.ledger.closures_of_lineage(), [])
+                self.assertEqual(self.ledger.closures_of_lineage(LINEAGE), [])
 
     def test_emitter_drift_cannot_commit_an_invalid_terminal_state(self):
         """The validation runs on the bytes the emitter actually produced,
@@ -658,7 +660,7 @@ class TestTheAuthorizerIsRepresentable(_Base):
                 self.advance()
         self.assertIn("does not validate", str(ctx.exception))
         self.assertEqual(self.snapshot(), before)
-        self.assertEqual(self.ledger.closures_of_lineage(), [])
+        self.assertEqual(self.ledger.closures_of_lineage(LINEAGE), [])
         # Paired control: the undrifted emitter advances.
         self.assertEqual(self.advance()["waived"], ["F1"])
 
@@ -703,7 +705,7 @@ class TestALegacyAtomicRulingIsARuling(_Base):
 
     def test_an_unanswered_atomic_ruling_stands(self):
         self.rule_legacy()
-        standing = self.ledger.standing_findings()
+        standing = self.ledger.standing_findings(LINEAGE)
         self.assertEqual([f["fp"] for f in standing], [self.LEGACY_FP])
         self.assertEqual(standing[0]["id"], "R1-F1a",
                          "the legacy row's own display facts, not None")
@@ -717,9 +719,9 @@ class TestALegacyAtomicRulingIsARuling(_Base):
                          "finding_id": "R1-F1a", "fp": self.LEGACY_FP,
                          "disposition": "accepted",
                          "payload": {"change": "x", "verification": "y"}})
-        self.assertEqual(self.ledger.standing_findings(), [])
+        self.assertEqual(self.ledger.standing_findings(LINEAGE), [])
         self.assertEqual(
-            [e for e, _ in self.ledger.current_answers()[self.LEGACY_FP]],
+            [e for e, _ in self.ledger.current_answers(LINEAGE)[self.LEGACY_FP]],
             [vocab.ANSWER_SETTLES])
 
     def test_a_deferred_atomic_ruling_keeps_standing(self):
@@ -729,7 +731,7 @@ class TestALegacyAtomicRulingIsARuling(_Base):
                          "disposition": "deferred",
                          "payload": {"destination": "briefs/x.md",
                                      "trigger": "when it bites"}})
-        self.assertEqual([f["fp"] for f in self.ledger.standing_findings()],
+        self.assertEqual([f["fp"] for f in self.ledger.standing_findings(LINEAGE)],
                          [self.LEGACY_FP])
 
     def test_a_withdrawal_binds_to_the_atomic_ruling_it_targets(self):
@@ -737,8 +739,8 @@ class TestALegacyAtomicRulingIsARuling(_Base):
         self.rule(findings=[_finding(round_no=2)], round_no=2, sha=SHA2)
         self.ledger.add({"event": "closure", "round": 2, "fp": self.LEGACY_FP,
                          "closure": "withdrawn", "note": "n"})
-        self.assertTrue(self.ledger._ruling_withdrawn(self.LEGACY_FP, 1))
-        self.assertEqual([f["fp"] for f in self.ledger.standing_findings()],
+        self.assertTrue(self.ledger._ruling_withdrawn(self.LEGACY_FP, 1, LINEAGE))
+        self.assertEqual([f["fp"] for f in self.ledger.standing_findings(LINEAGE)],
                          [FP1], "the round-2 finding, and nothing else")
 
     def test_a_re_raised_atomic_ruling_reopens(self):
@@ -748,12 +750,12 @@ class TestALegacyAtomicRulingIsARuling(_Base):
         self.ledger.add({"event": "closure", "round": 1, "fp": self.LEGACY_FP,
                          "closure": "withdrawn", "note": "n",
                          "answers_round": 1})
-        self.assertEqual(self.ledger.standing_findings(), [])
+        self.assertEqual(self.ledger.standing_findings(LINEAGE), [])
         self.rule(findings=[self.atomic(round_no=2)], round_no=2, sha=SHA2)
-        self.assertEqual([f["round"] for f in self.ledger.standing_findings()],
+        self.assertEqual([f["round"] for f in self.ledger.standing_findings(LINEAGE)],
                          [2])
-        self.assertFalse(self.ledger._ruling_withdrawn(self.LEGACY_FP, 2))
-        self.assertTrue(self.ledger._ruling_withdrawn(self.LEGACY_FP, 1))
+        self.assertFalse(self.ledger._ruling_withdrawn(self.LEGACY_FP, 2, LINEAGE))
+        self.assertTrue(self.ledger._ruling_withdrawn(self.LEGACY_FP, 1, LINEAGE))
 
     def test_an_advance_must_enumerate_a_standing_atomic_ruling(self):
         self.rule_legacy()
@@ -766,7 +768,7 @@ class TestALegacyAtomicRulingIsARuling(_Base):
     def test_convergence_reads_an_anchor_less_ruling_without_grouping_it(self):
         self.rule_legacy()
         self.rule(findings=[_finding(round_no=2)], round_no=2, sha=SHA2)
-        c = self.ledger.convergence()
+        c = self.ledger.convergence(LINEAGE)
         self.assertEqual(c["findings_per_round"], {1: 1, 2: 1})
         self.assertIn(self.LEGACY_FP, c["threads"])
         self.assertIsNone(c["threads"][self.LEGACY_FP]["anchor"])
@@ -813,7 +815,7 @@ class TestTheHandoffPreflightReadsTheRulingAuthority(_Base):
 
     def test_an_unanswered_atomic_ruling_is_owed_exactly_as_a_finding_is(self):
         self.atomic_round()
-        owed = transport.missing_dispositions(self.ledger)
+        owed = transport.missing_dispositions(self.ledger,LINEAGE)
         self.assertIsNotNone(
             owed, "an unanswered atomic ruling owes a disposition; returning "
                   "None is a finding dying by omission")
@@ -830,7 +832,7 @@ class TestTheHandoffPreflightReadsTheRulingAuthority(_Base):
         # The equivalence the finding demands: an ordinary finding in the
         # same position produces the same payload shape and the same refusal.
         self.rule(findings=[_finding(round_no=1)], round_no=1)
-        owed = transport.missing_dispositions(self.ledger)
+        owed = transport.missing_dispositions(self.ledger,LINEAGE)
         self.assertEqual(owed["round"], 1)
         self.assertEqual(owed["findings"], 1)
         self.assertEqual([u["id"] for u in owed["unanswered"]], ["F1"])
@@ -838,7 +840,7 @@ class TestTheHandoffPreflightReadsTheRulingAuthority(_Base):
     def test_the_preflight_refuses_the_handoff_and_names_the_ruling(self):
         self.atomic_round()
         with self.assertRaises(transport.Refusal) as ctx:
-            transport.handoff_preflight(self.cfg, self.ledger)
+            transport.handoff_preflight(self.cfg, self.ledger, LINEAGE)
         self.assertIn("R1-F1a", str(ctx.exception))
         self.assertIn(self.LEGACY_FP, str(ctx.exception))
 
@@ -848,8 +850,8 @@ class TestTheHandoffPreflightReadsTheRulingAuthority(_Base):
                          "finding_id": "R1-F1a", "fp": self.LEGACY_FP,
                          "disposition": "accepted",
                          "payload": {"change": "x", "verification": "y"}})
-        self.assertIsNone(transport.missing_dispositions(self.ledger))
-        transport.handoff_preflight(self.cfg, self.ledger)
+        self.assertIsNone(transport.missing_dispositions(self.ledger,LINEAGE))
+        transport.handoff_preflight(self.cfg, self.ledger, LINEAGE)
 
     def test_a_deferred_atomic_ruling_is_answered_too(self):
         # `deferred` leaves the finding STANDING but it is an answer, and
@@ -860,7 +862,7 @@ class TestTheHandoffPreflightReadsTheRulingAuthority(_Base):
                          "disposition": "deferred",
                          "payload": {"destination": "briefs/x.md",
                                      "trigger": "when it bites"}})
-        self.assertIsNone(transport.missing_dispositions(self.ledger))
+        self.assertIsNone(transport.missing_dispositions(self.ledger,LINEAGE))
 
     def test_a_mixed_round_owes_only_the_unanswered_one(self):
         self.rule(findings=[_finding(round_no=1)], round_no=1)
@@ -873,7 +875,7 @@ class TestTheHandoffPreflightReadsTheRulingAuthority(_Base):
                          "finding_id": "F1", "fp": FP1,
                          "disposition": "accepted",
                          "payload": {"change": "x", "verification": "y"}})
-        owed = transport.missing_dispositions(self.ledger)
+        owed = transport.missing_dispositions(self.ledger,LINEAGE)
         self.assertEqual(owed["findings"], 2,
                          "both rulings are counted, whatever kind they are")
         self.assertEqual([u["id"] for u in owed["unanswered"]], ["R1-F1a"])
@@ -916,7 +918,7 @@ class TestOwedRulingsAreNotAnchoredToTheVerdictRound(_Base):
     def test_a_ruling_in_a_round_with_no_verdict_is_still_owed(self):
         self.closed_round_one()
         self.import_at(2)
-        owed = transport.missing_dispositions(self.ledger)
+        owed = transport.missing_dispositions(self.ledger,LINEAGE)
         self.assertIsNotNone(
             owed, "a ruling outside the latest VERDICT round is still a "
                   "ruling, and an unanswered one is owed")
@@ -929,7 +931,7 @@ class TestOwedRulingsAreNotAnchoredToTheVerdictRound(_Base):
         self.closed_round_one()
         self.import_at(2)
         with self.assertRaises(transport.Refusal) as ctx:
-            transport.handoff_preflight(self.cfg, self.ledger)
+            transport.handoff_preflight(self.cfg, self.ledger, LINEAGE)
         self.assertIn("R2-F1a", str(ctx.exception))
         self.assertIn(self.LEGACY_FP, str(ctx.exception))
 
@@ -938,8 +940,8 @@ class TestOwedRulingsAreNotAnchoredToTheVerdictRound(_Base):
         self.import_at(2)
         self.answer("disposition", "accepted", 2, fp=self.LEGACY_FP,
                     fid="R2-F1a")
-        self.assertIsNone(transport.missing_dispositions(self.ledger))
-        transport.handoff_preflight(self.cfg, self.ledger)
+        self.assertIsNone(transport.missing_dispositions(self.ledger,LINEAGE))
+        transport.handoff_preflight(self.cfg, self.ledger, LINEAGE)
 
     def test_an_unanswered_ruling_of_an_EARLIER_round_is_owed_too(self):
         # The same defect in the other direction: round 1 unanswered, round
@@ -949,7 +951,7 @@ class TestOwedRulingsAreNotAnchoredToTheVerdictRound(_Base):
         self.rule(findings=[_finding(fid="F2", fp=FP2, round_no=2)],
                   round_no=2, sha=SHA2)
         self.answer("disposition", "accepted", 2, fp=FP2, fid="F2")
-        owed = transport.missing_dispositions(self.ledger)
+        owed = transport.missing_dispositions(self.ledger,LINEAGE)
         self.assertIsNotNone(owed)
         self.assertEqual([u["id"] for u in owed["unanswered"]], ["F1"])
         self.assertEqual(owed["round"], 1,
@@ -961,12 +963,12 @@ class TestOwedRulingsAreNotAnchoredToTheVerdictRound(_Base):
         # the reviewer withdrew or a named human overruled was not omitted.
         self.rule(findings=[_finding(round_no=1)], round_no=1)
         self.answer("closure", "withdrawn", 1)
-        self.assertIsNone(transport.missing_dispositions(self.ledger))
+        self.assertIsNone(transport.missing_dispositions(self.ledger,LINEAGE))
 
     def test_a_human_waiver_answers_it_too(self):
         self.rule(findings=[_finding(round_no=1)], round_no=1)
         self.waive()
-        self.assertIsNone(transport.missing_dispositions(self.ledger))
+        self.assertIsNone(transport.missing_dispositions(self.ledger,LINEAGE))
 
 
 if __name__ == "__main__":

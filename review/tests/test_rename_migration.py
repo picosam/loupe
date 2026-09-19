@@ -20,7 +20,7 @@ from review import (FORMER_NAMES, TOOL_NAME, config, digest, env_var,
 from review.emit import _git, emit_request
 from review.ledger import Ledger
 from review.tests import synth
-from review.tests.util import REPO_ROOT
+from review.tests.util import LINEAGE, REPO_ROOT
 
 CFG = config.load(REPO_ROOT)
 NO_GATES = dataclasses.replace(CFG, gates=[])
@@ -108,7 +108,7 @@ class TestNewEmissionsSpeakTheNewDialect(unittest.TestCase):
         claim = {"objective": "dialect under test",
                  "references": [{"path": "review.toml", "required": True}]}
         envelope = emit_request(NO_GATES, ledger, claim, base="HEAD",
-                                head="HEAD", reachability=record)
+                                head="HEAD", reachability=record, lineage=LINEAGE)
         self.assertIn("<loupe-review-request ", envelope)
         self.assertIn("```loupe-attestations", envelope)
         self.assertNotIn("rvw", envelope,

@@ -18,13 +18,14 @@ import unittest
 from review import emit, transport, validate, vocab, wire
 from review.tests.synth import (CFG, CLAIM, NO_GATES, head_sha,
                                 reachability, shadow_ledger)
+from review.tests.util import LINEAGE
 
 
 def _stamped(debug: bool) -> str:
     head = head_sha()
     return emit.emit_request(NO_GATES, shadow_ledger(), CLAIM,
                              base="HEAD", head="HEAD",
-                             reachability=reachability(head), debug=debug)
+                             reachability=reachability(head), debug=debug, lineage=LINEAGE)
 
 
 VERDICT_WITH_FEEDBACK = """VERDICT: changes requested

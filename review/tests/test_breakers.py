@@ -18,7 +18,7 @@ from review.cli import cmd_ledger_add, cmd_ledger_report
 from review.fingerprint import compute
 from review.ledger import Ledger
 from review.tests import synth
-from review.tests.util import REPO_ROOT, CliArgs, cli_report
+from review.tests.util import CliArgs, LINEAGE, REPO_ROOT, cli_report
 
 FP = compute("design_gap", "design", "", "the ledger has no owner")
 OTHER = compute("design_gap", "design", "", "an unrelated second claim")
@@ -59,7 +59,7 @@ BLOCKING = ["Blocker", "High"]
 
 
 def fired(ledger, name):
-    return [b for b in ledger.breakers(round_cap=3,
+    return [b for b in ledger.breakers(LINEAGE, round_cap=3,
                                        blocking_severities=BLOCKING)
             if b["breaker"] == name]
 
@@ -115,7 +115,7 @@ class TestNoProgress(unittest.TestCase):
                  "verdict": "changes requested", "bytes": 1, "finding_ids": 0})
         led.add({"event": "closure", "round": 2, "fp": FP,
                  "closure": "withdrawn", "ref": "F1"})
-        self.assertEqual(led.standing_findings(), [])
+        self.assertEqual(led.standing_findings(LINEAGE), [])
         self.assertFalse(fired(led, "no-progress"))
 
         control = make_ledger()
@@ -163,7 +163,7 @@ class TestNoProgress(unittest.TestCase):
         led.add({"event": "finding", "round": 2, "id": "F1", "fp": OTHER,
                  "severity": "Medium", "classification": "design_gap",
                  "title": "new territory", "preventable_by": None})
-        self.assertFalse(led.breakers(round_cap=3))
+        self.assertFalse(led.breakers(LINEAGE, round_cap=3))
 
 
 class TestF2ProgressBreakersNeedCompletedRounds(unittest.TestCase):
@@ -177,7 +177,7 @@ class TestF2ProgressBreakersNeedCompletedRounds(unittest.TestCase):
         led = make_ledger()
         base_round1(led)
         led.add({"event": "request", "round": 2, "sha": "b" * 40, "bytes": 1})
-        progress = [b for b in led.breakers(round_cap=3)
+        progress = [b for b in led.breakers(LINEAGE, round_cap=3)
                     if b["breaker"] in ("no-progress", "repetition", "stale")]
         self.assertEqual(progress, [],
                          "an in-flight round is not a spinning loop")
@@ -188,7 +188,7 @@ class TestF2ProgressBreakersNeedCompletedRounds(unittest.TestCase):
         led = make_ledger()
         base_round1(led)
         led.add({"event": "request", "round": 4, "sha": "d" * 40, "bytes": 1})
-        fired = [b["breaker"] for b in led.breakers(round_cap=3)]
+        fired = [b["breaker"] for b in led.breakers(LINEAGE, round_cap=3)]
         self.assertIn("budget", fired)
 
 
@@ -268,12 +268,12 @@ class TestTokenBreakerIsLive(unittest.TestCase):
         ledger = Ledger.in_memory()
         self._ingest(ledger, 1, 40_000)
         self._ingest(ledger, 2, 40_000)
-        fired = [b for b in ledger.breakers(round_cap=9, token_budget=100_000)
+        fired = [b for b in ledger.breakers(LINEAGE, round_cap=9, token_budget=100_000)
                  if b.get("limit") == "tokens"]
         self.assertEqual(fired, [], "80k of a 100k budget is not over it")
 
         self._ingest(ledger, 3, 40_000)
-        fired = [b for b in ledger.breakers(round_cap=9, token_budget=100_000)
+        fired = [b for b in ledger.breakers(LINEAGE, round_cap=9, token_budget=100_000)
                  if b.get("limit") == "tokens"]
         self.assertEqual(len(fired), 1, fired)
         self.assertIn("120000", fired[0]["rule"])
@@ -282,20 +282,20 @@ class TestTokenBreakerIsLive(unittest.TestCase):
 
     def test_the_four_input_states_are_partitioned(self):
         # no_budget outranks everything, counted or not.
-        self.assertEqual(Ledger.in_memory().token_state(None)["state"],
+        self.assertEqual(Ledger.in_memory().token_state(None, LINEAGE)["state"],
                          "no_budget")
         partial = _envelope_events({(1, "request"): 100,
                                     (1, "verdict"): None})
-        self.assertEqual(partial.token_state(None)["state"], "no_budget")
+        self.assertEqual(partial.token_state(None, LINEAGE)["state"], "no_budget")
         # no_counts: a budget and nothing counted at all.
-        self.assertEqual(Ledger.in_memory().token_state(100)["state"],
+        self.assertEqual(Ledger.in_memory().token_state(100, LINEAGE)["state"],
                          "no_counts")
         uncounted = _envelope_events({(1, "request"): None,
                                       (1, "verdict"): None})
-        self.assertEqual(uncounted.token_state(1000)["state"], "no_counts")
+        self.assertEqual(uncounted.token_state(1000, LINEAGE)["state"], "no_counts")
         # partial: some counted, the gaps named, the spend a lower bound.
         state = _envelope_events({(1, "request"): 100, (1, "verdict"): None,
-                                  (2, "request"): None}).token_state(1000)
+                                  (2, "request"): None}).token_state(1000, LINEAGE)
         self.assertEqual(state["state"], "partial")
         self.assertEqual(state["spent"], 100)
         self.assertEqual(state["uncounted"],
@@ -303,7 +303,7 @@ class TestTokenBreakerIsLive(unittest.TestCase):
         self.assertIn("LOWER BOUND", state["why"])
         # live: every envelope event counted.
         state = _envelope_events({(1, "request"): 100,
-                                  (1, "verdict"): 200}).token_state(1000)
+                                  (1, "verdict"): 200}).token_state(1000, LINEAGE)
         self.assertEqual(state["state"], "live")
         self.assertEqual(state["spent"], 300)
 
@@ -311,16 +311,16 @@ class TestTokenBreakerIsLive(unittest.TestCase):
         # The half-state this finding named: arithmetic that looks live
         # because it reports a number. With no counts there is no number.
         ledger = Ledger.in_memory()
-        state = ledger.token_state(100)
+        state = ledger.token_state(100, LINEAGE)
         self.assertEqual(state["spent"], 0)
         self.assertIn("absent is not zero", state["why"])
         self.assertEqual(
-            [b for b in ledger.breakers(round_cap=9, token_budget=100)
+            [b for b in ledger.breakers(LINEAGE, round_cap=9, token_budget=100)
              if b.get("limit") == "tokens"], [])
 
     def test_breaker_fires_on_a_lower_bound_breach_and_says_so(self):
         ledger = _envelope_events({(1, "request"): 1500, (1, "verdict"): None})
-        fired = [b for b in ledger.breakers(round_cap=9, token_budget=1000)
+        fired = [b for b in ledger.breakers(LINEAGE, round_cap=9, token_budget=1000)
                  if b.get("limit") == "tokens"]
         self.assertEqual(len(fired), 1)
         self.assertIn("LOWER BOUND", fired[0]["rule"])
@@ -328,13 +328,13 @@ class TestTokenBreakerIsLive(unittest.TestCase):
     def test_breaker_stays_silent_under_budget_on_partial(self):
         ledger = _envelope_events({(1, "request"): 100, (1, "verdict"): None})
         self.assertEqual(
-            [b for b in ledger.breakers(round_cap=9, token_budget=1000)
+            [b for b in ledger.breakers(LINEAGE, round_cap=9, token_budget=1000)
              if b.get("limit") == "tokens"], [])
 
     def test_the_budget_source_is_config_and_reaches_every_report_path(self):
         self.assertIn("token_budget", synth.CFG.limits)
         ledger = Ledger.in_memory()
-        report = ledger.report(3, gate_manifest=synth.CFG.gate_ids,
+        report = ledger.report(LINEAGE, 3, gate_manifest=synth.CFG.gate_ids,
                                token_budget=synth.CFG.token_budget)
         self.assertIn("tokens", report)
         self.assertEqual(report["tokens"]["budget"], synth.CFG.token_budget)
@@ -362,7 +362,7 @@ class TestGateManifestReachesTheMetric(unittest.TestCase):
 
     def test_cli_report_matches_the_ledger_api(self):
         ledger = self._synthetic_ledger()
-        api = ledger.report(ledger.effective_round_cap(synth.CFG.round_cap),
+        api = ledger.report(LINEAGE, ledger.effective_round_cap(synth.CFG.round_cap, LINEAGE),
                             gate_manifest=synth.CFG.gate_ids,
                             token_budget=synth.CFG.token_budget)
         cli = cli_report(self, ledger, synth.CFG)
@@ -389,7 +389,7 @@ class TestGateManifestReachesTheMetric(unittest.TestCase):
     def test_absent_proposed_gates_remain_excluded(self):
         # A label naming a gate that does not exist in the manifest is a
         # candidate, never a count.
-        m = self._synthetic_ledger().metrics(
+        m = self._synthetic_ledger().metrics(LINEAGE,
             gate_manifest=synth.CFG.gate_ids)["rounds"][1]
         self.assertEqual(m["deterministic_preventable"]["count"], 1)
         self.assertEqual(m["deterministic_preventable"]["gates"],
@@ -414,7 +414,7 @@ class TestGateManifestReachesTheMetric(unittest.TestCase):
         ledger.add({"event": "finding", "round": 1, "id": "F2", "fp": "fp2:2",
                     "severity": "High",
                     "preventable_by": "a doc-consistency linter nobody built"})
-        m = ledger.metrics(gate_manifest=synth.CFG.gate_ids)["rounds"][1]
+        m = ledger.metrics(LINEAGE, gate_manifest=synth.CFG.gate_ids)["rounds"][1]
         self.assertEqual(m["deterministic_preventable"]["count"], 1)
         self.assertEqual(m["deterministic_preventable"]["gates"], ["tests"])
 
@@ -425,7 +425,7 @@ class TestGateManifestReachesTheMetric(unittest.TestCase):
                     "verdict": "changes requested", "finding_ids": 1})
         ledger.add({"event": "finding", "round": 1, "id": "F1", "fp": "fp2:1",
                     "severity": "High", "preventable_by": "some gate"})
-        m = ledger.metrics()["rounds"][1]["deterministic_preventable"]
+        m = ledger.metrics(LINEAGE)["rounds"][1]["deterministic_preventable"]
         self.assertIsNone(m["count"])
         self.assertIn("not computable", m["share"])
 

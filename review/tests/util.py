@@ -1,10 +1,25 @@
 import ast
 import dataclasses
+import re
 from pathlib import Path
 
 from review import vocab
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: The lineage key a fixture ledger's events fall under when none of them
+#: declares an id (brief `keyed-lineage`): the legacy positional ordinal,
+#: as a decimal string, counted by `lineage_closed` markers. A fixture that
+#: records no closure is lineage "1", which is what almost every test here
+#: builds — and reading it under this key is the same read those tests made
+#: before the lineage was keyed. `LINEAGE_AFTER(n)` names the key after `n`
+#: recorded closures, for the few that close and keep going.
+LINEAGE = "1"
+
+
+def LINEAGE_AFTER(closures: int) -> str:
+    """The legacy positional key after `closures` recorded closures."""
+    return str(closures + 1)
 
 
 @dataclasses.dataclass
@@ -347,6 +362,75 @@ def public_path(*names: str) -> Path | None:
             if candidate.is_file():
                 return candidate
     return None
+
+
+#: ONE version component of the declared interpreter interval, in the ONE
+#: spelling every reader of `project.requires-python` admits: `0`, or a
+#: non-zero ASCII digit followed by at most three more ASCII digits.
+#:
+#: Two rounds put the two halves of that sentence here. CANONICAL ASCII
+#: (lineage Lf45b38923c round 3 F1): Python's `\d` is the Unicode `Nd`
+#: category, so `\d+` admitted `٣` and `014`, each of which a reader
+#: interpolates into a Python integer literal and each of which is a
+#: SyntaxError. BOUNDED at four digits (lineage La146cf464d round 1 F4): a
+#: canonical decimal of unbounded length is still not a literal everywhere
+#: — CPython's default integer-string conversion limit is 4,300 digits, and
+#: a component of 4,301 `1`s was rendered, checked clean and published. A
+#: version component is a small integer; 9999 is four orders of magnitude
+#: past any released Python and three below that limit, so the bound closes
+#: the CLASS instead of chasing an instance of a limit that is configurable
+#: per process and per version.
+INTERVAL_COMPONENT = r"(0|[1-9][0-9]{0,3})"
+
+_DECLARED_INTERVAL = re.compile(
+    ">=" + INTERVAL_COMPONENT + r"\." + INTERVAL_COMPONENT
+    + ",<" + INTERVAL_COMPONENT + r"\." + INTERVAL_COMPONENT)
+
+#: The refusal, in the one wording every reader prints. It names the RULE,
+#: not just the value: an operator holding a valid-looking `>=X.Y,<X.Z`
+#: needs to be told which property of it was wrong.
+INTERVAL_SHAPE = ("the '>=X.Y,<X.Z' shape in canonical ASCII decimals of "
+                  "at most 4 digits that the interval gate admits")
+
+
+def declared_interval(spec):
+    """`project.requires-python` as `((floor_major, floor_minor),
+    (below_major, below_minor))`, or `ValueError` naming what was wrong.
+
+    THE single authority for that value's spelling, for every reader that
+    travels with this package. It exists because there were three, held to
+    one shape by prose alone: this package's interpreter-floor check and
+    its packaging-interval gate each parsed the value with a regex of its
+    own — one `re.fullmatch` over Unicode `\\d` with optional whitespace
+    and an optional third component, one `re.search` over a SUBSTRING — so
+    a spelling one admitted another refused, and neither was the bounded
+    canonical grammar the generator downstream requires.
+
+    The match is over the WHOLE value (round 2 F1: a multiline TOML string
+    carrying one admitted line beside another was accepted line by line and
+    rendered invalid shell), and each component is `INTERVAL_COMPONENT`.
+
+    A THIRD reader lives outside this package, in the workbench that
+    develops it: a generator that embeds this interval in a shell snippet.
+    It holds the same grammar as embedded Python rather than importing this
+    one — it resolves its own root and must render from any tree, including
+    the scratch roots its own suite builds, where this package is not
+    importable — and the workbench holds the two equal row by row over a
+    single partition table. Nothing in the published tree depends on that;
+    it is recorded here so a change to this grammar is known to have a
+    reader it cannot see.
+    """
+    if not isinstance(spec, str):
+        raise ValueError(
+            f"requires-python is {spec!r}, which is not a string, so it is "
+            f"not {INTERVAL_SHAPE}")
+    found = _DECLARED_INTERVAL.fullmatch(spec)
+    if found is None:
+        raise ValueError(
+            f"requires-python is {spec!r}, not {INTERVAL_SHAPE}")
+    floor_major, floor_minor, below_major, below_minor = found.groups()
+    return ((int(floor_major), int(floor_minor)),
+            (int(below_major), int(below_minor)))
 
 
 def cli_report(test, ledger, cfg):

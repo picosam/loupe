@@ -54,6 +54,28 @@ from review.tests._transport_fixtures import (
 #: share an implementation (`converts` and `redirects the read` are both
 #: "the marker appears"), and without it one could be stamped onto the
 #: other's row and stay green while saying something false about it.
+# The repository's own cap, READ and never restated (brief
+# `handoff-guards-generalized` class 4). These tests edit the live
+# `review.toml` text to make a target and a checkout disagree, and once did
+# it with `.replace("round_cap = 3", ...)` beside `assertEqual(..., 3)`: the
+# day the repository sets another cap, the replace is a silent no-op and six
+# assertions go red over a correct tool. The probe that found them is
+# `bin/config-perturbation`.
+LIVE_CAP = config.load(REPO_ROOT).round_cap
+OTHER_CAP = LIVE_CAP + 4      # the committed, divergent value
+CHECKOUT_CAP = LIVE_CAP + 6   # the checkout's, where a substitution shows
+
+_CAP_LINE = re.compile(r"^round_cap = \d+$", re.M)
+
+
+def with_cap(toml: str, cap: int) -> str:
+    """`toml` with its `round_cap` line set to `cap`; an edit that finds
+    nothing to edit is a broken fixture, never a quiet one."""
+    edited, count = _CAP_LINE.subn(f"round_cap = {cap}", toml)
+    assert count == 1, f"expected one round_cap line, found {count}"
+    return edited
+
+
 LIVENESS_EFFECTS = {
     "converts": (
         frozenset({"show --textconv", "log -p", "checkout"}),
@@ -938,7 +960,7 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         commit and this fails, because `cfg` is the worktree's.
         """
         from review import emit as _emit
-        committed = self.toml.replace("round_cap = 3", "round_cap = 7")
+        committed = with_cap(self.toml, OTHER_CAP)
         self.assertNotEqual(committed, self.toml,
                             "fixture no longer edits the value it means to")
         (self.repo / "review.toml").write_text(committed, encoding="utf-8")
@@ -946,10 +968,10 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         self._git("update-index", "--assume-unchanged", "review.toml")
         (self.repo / "review.toml").write_text(self.toml, encoding="utf-8")
         self.assertEqual(self._git("status", "--porcelain"), "")
-        self.assertEqual(self._cfg().round_cap, 3)
+        self.assertEqual(self._cfg().round_cap, LIVE_CAP)
         record = _emit.ensure_pushed(self._cfg(), local_only=True)
         self.assertEqual(
-            record["governing"].round_cap, 7,
+            record["governing"].round_cap, OTHER_CAP,
             "the emission must be governed by what the COMMIT records, "
             "not by what this worktree happens to hold")
 
@@ -1071,8 +1093,8 @@ class TestAuthorityOriginIsClassified(unittest.TestCase):
             # different valid TOML: the two ends must not be able to read
             # different bytes for one SHA (round 4 F1).
             (repo / symlink_to).write_text(
-                (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
-                .replace("round_cap = 3", "round_cap = 9"), encoding="utf-8")
+                with_cap((REPO_ROOT / self.VALID).read_text(encoding="utf-8"),
+                         CHECKOUT_CAP), encoding="utf-8")
             (repo / self.VALID).symlink_to(symlink_to)
         elif as_dir:
             (repo / self.VALID).mkdir()
@@ -1135,7 +1157,7 @@ class TestAuthorityOriginIsClassified(unittest.TestCase):
         if as_dir:
             __import__("shutil").rmtree(repo / self.VALID)
         (repo / self.VALID).write_text(
-            good.replace("round_cap = 3", "round_cap = 9"), encoding="utf-8")
+            with_cap(good, CHECKOUT_CAP), encoding="utf-8")
         cfg = dataclasses.replace(config.load(repo), ledger_dir=tmp / "l")
         return cfg, sha
 
@@ -1148,19 +1170,19 @@ class TestAuthorityOriginIsClassified(unittest.TestCase):
     def test_a_truly_absent_config_is_the_advertised_fallback(self):
         governing, origin = self._resolve(body=None)
         self.assertEqual(origin, transport.AUTHORITY_EXTERNAL)
-        self.assertEqual(governing.round_cap, 9)   # the checkout's, honestly
+        self.assertEqual(governing.round_cap, CHECKOUT_CAP)   # the checkout's, honestly
 
     def test_a_readable_config_is_the_targets_own(self):
         good = (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
         governing, origin = self._resolve(body=good)
         self.assertEqual(origin, transport.AUTHORITY_TARGET)
-        self.assertEqual(governing.round_cap, 3)   # the TARGET's
+        self.assertEqual(governing.round_cap, LIVE_CAP)   # the TARGET's
 
     def test_ordinary_non_ascii_utf8_is_read(self):
         good = (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
         governing, origin = self._resolve(body="# caf\u00e9 \u2014 \u00e9\n" + good)
         self.assertEqual(origin, transport.AUTHORITY_TARGET)
-        self.assertEqual(governing.round_cap, 3)
+        self.assertEqual(governing.round_cap, LIVE_CAP)
 
     # ------------------------------------------------------ the refusals
 
@@ -1184,7 +1206,7 @@ class TestAuthorityOriginIsClassified(unittest.TestCase):
         good = (REPO_ROOT / self.VALID).read_text(encoding="utf-8")
         governing, origin = self._resolve(body=good, executable=True)
         self.assertEqual(origin, transport.AUTHORITY_TARGET)
-        self.assertEqual(governing.round_cap, 3)
+        self.assertEqual(governing.round_cap, LIVE_CAP)
 
     def test_a_tree_entry_refuses(self):
         self.assertIn("a directory",
@@ -1202,7 +1224,7 @@ class TestAuthorityOriginIsClassified(unittest.TestCase):
         link and read the file. One SHA, two configurations."""
         cfg, sha = self._repo(symlink_to="linked.toml")
         # The author's end follows the link: this is the value it would use.
-        self.assertEqual(cfg.round_cap, 9)
+        self.assertEqual(cfg.round_cap, CHECKOUT_CAP)
         with self.assertRaises(transport.Refusal) as ctx:
             transport.resolve_authority(cfg, sha)
         self.assertIn("a symbolic link", str(ctx.exception))

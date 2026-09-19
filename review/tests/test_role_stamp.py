@@ -27,6 +27,7 @@ from review.ledger import Ledger
 from review.tests._transport_fixtures import (run_cli, scratch_loop_repo, sh)
 from review.tests.synth import (CFG, CLAIM, NO_GATES, emitted_request,
                                 head_sha, reachability, shadow_ledger)
+from review.tests.util import LINEAGE
 
 
 def cfg_with_roles(**over):
@@ -375,7 +376,7 @@ class TestEmittedStamp(unittest.TestCase):
         envelope = emit.emit_request(
             NO_GATES, shadow_ledger(), {"objective": "role-stamp control"},
             base="HEAD", head="HEAD", reachability=reachability(head),
-            author="codex", reviewer="claude")
+            author="codex", reviewer="claude", lineage=LINEAGE)
         parsed = wire.parse_request(envelope)
         self.assertEqual(parsed.attrs["author"], "codex")
         self.assertEqual(parsed.attrs["reviewer"], "claude")
@@ -398,7 +399,7 @@ class TestRelayRendersAsAnActorNeverAsAnInstruction(unittest.TestCase):
         head = head_sha()
         return emit.emit_request(NO_GATES, shadow_ledger(), claim,
                                  base="HEAD", head="HEAD",
-                                 reachability=reachability(head))
+                                 reachability=reachability(head), lineage=LINEAGE)
 
     def test_an_explicit_actor_and_an_omitted_relay_render_the_same_line(self):
         explicit = self._emit({**CLAIM, "relay": "user"})

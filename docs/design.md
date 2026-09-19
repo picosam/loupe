@@ -321,6 +321,24 @@ the author knows which. A repository's generated artefacts are named there
 like any other path: which files a repository generates is identity, not
 mechanism, and does not travel with the tool (§11).
 
+The SPAN does separate them, and the same §11 line is why it can. A changed
+path whose `linguist-generated` attribute is set in the target tree is
+listed under its own heading with its own two counts, and the header states
+both totals — every changed path, and the part that is not generated. The
+identity stays the repository's: the attribute is its own declaration,
+written in its own `.gitattributes`, read at the target commit rather than
+in whichever checkout is emitting — and read from that TRACKED declaration
+alone, the lookup being isolated from `info/attributes`, from a configured
+or default user attributes file and from the system one, so that nothing on
+the emitting machine can promote a handwritten path to "skip by rule" or
+suppress a declared one, and a span whose isolation cannot be established
+says nothing about generated paths rather than something partly local. What
+travels is only the reading. The
+tool takes no configuration key for this, because a key would be a
+cross-installation contract for a list every adopter already keeps, and it
+makes no inference from a file's name or shape. A repository that declares
+nothing gets the span it always got, unchanged.
+
 **Evidence** — a machine attestation block, never raw output inline. The
 repository declares a **gate manifest** (`id`, `command`, `blocking`); the
 emitter runs every gate itself and records, per gate: exact command, exit
@@ -409,6 +427,18 @@ grammar (`## closures`, one line per prior fingerprint) and are validated:
 a verdict that leaves a refutation or an `accepted(test_amended)` unanswered
 fails; a malformed closure line is a defective record, never a silently
 dropped one.
+
+A `reclassified` closure may declare WHERE the narrowed claim went, on its
+own continuation line under that closure — `Residue: F1` (several ids
+comma-separated), naming findings of the same verdict. Optional: a
+reclassification that leaves no residue simply omits it. Declared on any
+other closure term it fails, as does an id that names no finding of this
+verdict, a malformed id and a repeated one. The closure's ledger event
+records the declaration as the residue findings' fingerprints, so the edge
+from a narrowed claim to what remains of it is in the record rather than in
+the reviewer's prose — which is what lets convergence (§3.3f) count the
+thread once. A reader that does not know the field reads the line as part
+of the closure's note: ignored, never refused.
 
 Legacy findings that predate the ledger are bound by explicit **import
 events** (historical id, verbatim text, source path and digest, generated
@@ -579,7 +609,11 @@ emission — and stopping the loop on those is the point.
 **Convergence (§3.3f).** Two signals, read from the ledger. `stalled` — a
 finding identity the reviewer has refused to withdraw across rounds: the
 loop failing to close one claim. `hunting` — an anchor whose findings are
-NEW identities round after round; every one may be real and every fix may
+NEW identities round after round, where new means a new CLAIM and not
+merely a new fingerprint: a residue a `reclassified` closure declares
+(`Residue:`, §5.2) is the same thread narrowed, and is counted as a
+continuation of the finding it came from rather than as an identity of its
+own. Every one of the rest may be real and every fix may
 have landed, and the domain still never closes, because what is being
 asked for is completeness over a set nobody can enumerate from inside.
 That second shape is invisible from inside any single round — each finding
@@ -1242,8 +1276,10 @@ decided something the repository never declared. Every result of a verb that
 applied such a default carries a `decide` list — one entry per undeclared
 key, with the key, its meaning in one sentence, the value applied, and the
 exact TOML line that would set it and (where the key has an off state) unset
-it. A declared key produces no entry, which is what ends the reporting
-permanently; the entries are on `handoff`, `take`, `emit-request` and `brief`,
+it — or, for a key whose only off state is to stay undeclared, the comment
+line that records that decision, which the reader treats as declared for
+this purpose and nothing else. A declared key produces no entry, which is
+what ends the reporting permanently; the entries are on `handoff`, `take`, `emit-request` and `brief`,
 the results an agent reads at the moments a round is opened or picked up. The
 tool stops there by construction. Turning one report into one question asked
 once per session, and the answer into a committed line, is an adapter rule —

@@ -56,7 +56,7 @@ from review.ledger import Ledger
 from review.tests._transport_fixtures import (git_out, run_cli,
                                               scratch_loop_repo, sh)
 from review.tests.synth import CFG
-from review.tests.util import REPO_ROOT
+from review.tests.util import LINEAGE, REPO_ROOT
 
 #: Config names this grammar gained AFTER the last published reader that a
 #: relay's generic command actually reached (0.12.1). Removing exactly these
@@ -965,11 +965,139 @@ class TestF5UndeclaredTaxonomyRefusesToRule(unittest.TestCase):
     def test_emission_refuses(self):
         cfg = self._bare_config()
         with self.assertRaises(RuntimeError) as ctx:
-            emit_request(cfg, Ledger.in_memory(), {}, base="HEAD", head="HEAD")
+            emit_request(cfg, Ledger.in_memory(), {}, base="HEAD", head="HEAD", lineage=LINEAGE)
         self.assertIn("no taxonomy declared", str(ctx.exception))
 
     def test_declared_taxonomy_still_rules(self):
         self.assertTrue(CFG.taxonomy_declared)
+
+
+class TestADecidedUndeclaredKeyStopsBeingAsked(unittest.TestCase):
+    """0.17.0, lineage 24 round 2 F3: the durable unbudgeted decision.
+
+    `token_budget` has no off VALUE — absent is uncounted and every
+    integer is a budget — so its `decide` entry prints its `unset` as the
+    comment line `vocab.decided_line` gives. Written into the file, a
+    fresh read treats the key as decided (no entry) while the key itself
+    stays undeclared and the ledger's token state stays `no_budget`.
+    """
+
+    BUDGETLESS = "[roles]\nauthor = \"a\"\n[limits]\nround_cap = 3\n"
+    MARKER = vocab.decided_line(vocab.DECIDE_TOKEN_BUDGET)
+
+    def _keys(self, cfg):
+        return [e["key"] for e in cfg.decisions()]
+
+    def test_the_entry_prints_the_decided_line_as_its_unset(self):
+        entries = {e["key"]: e for e in _read(self.BUDGETLESS).decisions()}
+        self.assertEqual(entries[vocab.DECIDE_TOKEN_BUDGET]["unset"],
+                         "# decided: limits.token_budget undeclared")
+        self.assertEqual(entries[vocab.DECIDE_TOKEN_BUDGET]["set"],
+                         "token_budget = 200000")
+
+    def test_the_written_line_ends_the_entry_on_a_fresh_read(self):
+        text = self.BUDGETLESS + self.MARKER + "\n"
+        # Two independent reads of the same bytes: what a next session sees.
+        for _ in range(2):
+            cfg = _read(text)
+            self.assertNotIn(vocab.DECIDE_TOKEN_BUDGET, self._keys(cfg))
+            # The key is decided, not declared: still uncounted.
+            self.assertNotIn(vocab.DECIDE_TOKEN_BUDGET, cfg.declared)
+            self.assertIsNone(cfg.token_budget)
+
+    def test_without_the_line_the_entry_recurs(self):
+        self.assertIn(vocab.DECIDE_TOKEN_BUDGET,
+                      self._keys(_read(self.BUDGETLESS)))
+
+    def test_a_declared_number_is_the_budgeted_control(self):
+        cfg = _read(self.BUDGETLESS + "token_budget = 10\n")
+        self.assertNotIn(vocab.DECIDE_TOKEN_BUDGET, self._keys(cfg))
+        self.assertEqual(cfg.token_budget, 10)
+
+    def test_the_line_is_read_exactly_and_from_the_raw_bytes(self):
+        # Surrounding whitespace is tolerated; a different key or a
+        # paraphrase is not a decision.
+        self.assertNotIn(vocab.DECIDE_TOKEN_BUDGET,
+                         self._keys(_read(self.BUDGETLESS + "   " + self.MARKER + "  \n")))
+        for wrong in ("# decided: limits.token_budget unset",
+                      "# decided: roles.debug undeclared",
+                      "# token_budget undeclared by decision"):
+            with self.subTest(line=wrong):
+                self.assertIn(vocab.DECIDE_TOKEN_BUDGET,
+                              self._keys(_read(self.BUDGETLESS + wrong + "\n")))
+
+    def test_the_marker_cannot_silence_a_key_with_a_real_off_value(self):
+        text = self.BUDGETLESS + vocab.decided_line(vocab.DECIDE_DEBUG) + "\n"
+        self.assertIn(vocab.DECIDE_DEBUG, self._keys(_read(text)))
+
+    def test_the_prior_release_reader_parses_the_line_without_refusing(self):
+        # A comment is inert to every TOML reader: the older reader keeps
+        # asking, which is the forward-only reach, but never refuses.
+        _read_old(self.BUDGETLESS + self.MARKER + "\n")
+
+
+class TestTheMarkerIsAComment_NotStringData(unittest.TestCase):
+    """Lineage 24 round 3 F2: the same characters inside a TOML string are
+    data and record no decision. Every accepted lexical context, each with
+    the real-comment sibling as its control."""
+
+    BUDGETLESS = "[roles]\nauthor = \"a\"\n[limits]\nround_cap = 3\n"
+    MARKER = vocab.decided_line(vocab.DECIDE_TOKEN_BUDGET)
+    NOTES = "[taxonomy.classification_notes]\n"
+
+    def _entry_present(self, cfg):
+        return vocab.DECIDE_TOKEN_BUDGET in [e["key"] for e in cfg.decisions()]
+
+    def test_the_real_comment_is_the_control(self):
+        cfg = _read(self.BUDGETLESS + self.MARKER + "\n")
+        self.assertIn(vocab.DECIDE_TOKEN_BUDGET, cfg.decided_undeclared)
+        self.assertFalse(self._entry_present(cfg))
+
+    def test_inside_a_multiline_basic_string_it_is_data(self):
+        text = (self.BUDGETLESS + self.NOTES
+                + 'design_gap = """ordinary text\n' + self.MARKER
+                + '\nordinary text"""\n')
+        cfg = _read(text)
+        self.assertIn(self.MARKER,
+                      cfg.taxonomy["classification_notes"]["design_gap"])
+        self.assertNotIn(vocab.DECIDE_TOKEN_BUDGET, cfg.decided_undeclared)
+        self.assertTrue(self._entry_present(cfg))
+
+    def test_inside_a_multiline_literal_string_it_is_data(self):
+        text = (self.BUDGETLESS + self.NOTES
+                + "design_gap = '''ordinary text\n" + self.MARKER
+                + "\nordinary text'''\n")
+        cfg = _read(text)
+        self.assertIn(self.MARKER,
+                      cfg.taxonomy["classification_notes"]["design_gap"])
+        self.assertNotIn(vocab.DECIDE_TOKEN_BUDGET, cfg.decided_undeclared)
+        self.assertTrue(self._entry_present(cfg))
+
+    def test_inside_single_line_strings_it_is_data(self):
+        for quoted in ('"' + self.MARKER + '"', "'" + self.MARKER + "'",
+                       '"escaped \\" quote then ' + self.MARKER + '"'):
+            with self.subTest(value=quoted):
+                cfg = _read(self.BUDGETLESS + self.NOTES
+                            + "design_gap = " + quoted + "\n")
+                self.assertNotIn(vocab.DECIDE_TOKEN_BUDGET,
+                                 cfg.decided_undeclared)
+                self.assertTrue(self._entry_present(cfg))
+
+    def test_a_trailing_comment_on_a_value_line_is_not_a_decision(self):
+        # The decision is written on its own line; a comment riding a
+        # value line is annotation.
+        cfg = _read("[roles]\nauthor = \"a\"\n[limits]\nround_cap = 3 "
+                    + self.MARKER + "\n")
+        self.assertNotIn(vocab.DECIDE_TOKEN_BUDGET, cfg.decided_undeclared)
+        self.assertTrue(self._entry_present(cfg))
+
+    def test_a_comment_after_a_string_that_contains_a_hash_is_still_read(self):
+        # The scanner must leave the string before it can see the comment.
+        text = (self.BUDGETLESS + self.NOTES
+                + 'design_gap = "a # not a comment"\n' + self.MARKER + "\n")
+        cfg = _read(text)
+        self.assertIn(vocab.DECIDE_TOKEN_BUDGET, cfg.decided_undeclared)
+        self.assertFalse(self._entry_present(cfg))
 
 
 if __name__ == "__main__":

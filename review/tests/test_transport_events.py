@@ -20,7 +20,7 @@ from review import cli, config, fingerprint, transport, validate, vocab, wire
 from review import ledger as ledger_mod
 from review.emit import _git
 from review.ledger import Ledger
-from review.tests.util import REPO_ROOT
+from review.tests.util import LINEAGE, REPO_ROOT
 from review.tests._transport_fixtures import (
     CFG, SHA_A, SHA_B, SHA_C, request_text, verdict_text, _cli)
 
@@ -95,7 +95,8 @@ class TestLedgerAddRequest(unittest.TestCase):
                                                  "unstamped"))
         # And parity is idempotence: filing the same envelope through the
         # normal path afterwards is a no-op, never a duplicate.
-        self.assertEqual(ledger.add_all(expected), 0)
+        self.assertEqual(ledger.add_all(expected, lineage=payload["lineage"]),
+                         0)
 
     def test_the_cap_in_force_is_advisory_at_this_door_too(self):
         """The cap reads the same at every door — and since 2026-08-25 it
@@ -166,7 +167,7 @@ class TestResponseLifecycle(unittest.TestCase):
                     "bytes": 1, "author": "claude", "reviewer": "codex"})
         text = verdict_text(sha=sha)
         transport.close_round(
-            self.cfg, ledger, text, "v.md",
+            self.cfg, ledger, text, "v.md",LINEAGE,
             validate_items=lambda v: validate.validate_verdict(v, self.cfg))
         return text
 
@@ -226,7 +227,7 @@ class TestResponseLifecycle(unittest.TestCase):
 
     def test_a_closed_lineage_s_verdict_is_not_answerable(self):
         text = self._record(1, SHA_B)
-        transport.close_lineage(Ledger(self.tmp), "done", "user")
+        transport.close_lineage(Ledger(self.tmp), "done", "user", LINEAGE)
         (code, payload), out = self._respond(text)
         self.assertNotEqual(code, 0, payload)
         self.assertEqual(self._dispositions(), [])
@@ -274,7 +275,7 @@ class TestResponseLifecycle(unittest.TestCase):
         # `close` refuses it the same way (the round is no longer open,
         # and even with the round derived it is a second ruling).
         with self.assertRaises(transport.Refusal):
-            transport.close_round(self.cfg, Ledger(self.tmp), second, "v.md",
+            transport.close_round(self.cfg, Ledger(self.tmp), second, "v.md",LINEAGE,
                                   validate_items=lambda v:
                                   validate.validate_verdict(v, self.cfg))
         # And if two rulings DID sit in one round (seeded, since no door
@@ -293,7 +294,7 @@ class TestResponseLifecycle(unittest.TestCase):
             self.assertFalse(out.exists())
         self.assertEqual(self._dispositions(), [])
         self.assertIsNone(transport.recorded_verdict(
-            Ledger(self.tmp), digest=transport._digest_text(first)))
+            Ledger(self.tmp), LINEAGE, digest=transport._digest_text(first)))
         # Control: one recorded verdict, one response.
         clean = dataclasses.replace(self.cfg,
                                     ledger_dir=self.tmp / "control")
@@ -301,11 +302,11 @@ class TestResponseLifecycle(unittest.TestCase):
         led = Ledger(clean.ledger_dir)
         led.add({"event": "request", "round": 1, "sha": SHA_B, "bytes": 1,
                  "author": "claude", "reviewer": "codex"})
-        transport.close_round(clean, led, first, "v.md",
+        transport.close_round(clean, led, first, "v.md",LINEAGE,
                               validate_items=lambda v:
                               validate.validate_verdict(v, clean))
         self.assertIsNotNone(transport.recorded_verdict(
-            Ledger(clean.ledger_dir), digest=transport._digest_text(first)))
+            Ledger(clean.ledger_dir), LINEAGE, digest=transport._digest_text(first)))
 
     def test_ledger_add_shares_the_boundary(self):
         # The standalone door: a disposition for a superseded round is
@@ -380,7 +381,7 @@ class TestEvidenceIngestion(unittest.TestCase):
         self.assertEqual(v2.findings[0].fingerprint(), fp,
                          "the identity must survive, or nothing is returning")
         ledger.add_all(transport.verdict_events(v2, 2, "d2", 1))
-        return [b["breaker"] for b in ledger.breakers(round_cap=5)]
+        return [b["breaker"] for b in ledger.breakers(LINEAGE, round_cap=5)]
 
     def test_new_reference_digest_is_bound_to_returning_fingerprint(self):
         """Round 2 F6 (Medium), falsification.
@@ -525,7 +526,7 @@ class TestEvidenceIngestion(unittest.TestCase):
                          "exemption could never apply to anything")
         ledger.add_all(transport.verdict_events(v2, 2, "d2", 1))
 
-        fired = [b["breaker"] for b in ledger.breakers(round_cap=5)]
+        fired = [b["breaker"] for b in ledger.breakers(LINEAGE, round_cap=5)]
         self.assertNotIn("repetition", fired,
                          "new content-addressed evidence is the documented "
                          "exemption; it must be observable")
@@ -545,7 +546,7 @@ class TestEvidenceIngestion(unittest.TestCase):
         ledger.add({"event": "request", "round": 2, "sha": SHA_C, "bytes": 1})
         ledger.add_all(transport.verdict_events(
             self._verdict_with_evidence(same, sha=SHA_C), 2, "d2", 1))
-        fired = [b["breaker"] for b in ledger.breakers(round_cap=5)]
+        fired = [b["breaker"] for b in ledger.breakers(LINEAGE, round_cap=5)]
         self.assertIn("repetition", fired)
 
 
@@ -575,7 +576,7 @@ class TestVerdictEvents(unittest.TestCase):
         ledger = Ledger.in_memory()
         ledger.add({"event": "request", "round": 1, "sha": SHA_B, "bytes": 1})
         ledger.add_all(events)
-        metric = ledger.metrics(gate_manifest=["tests", "whitespace"])
+        metric = ledger.metrics(LINEAGE, gate_manifest=["tests", "whitespace"])
         preventable = metric["rounds"][1]["deterministic_preventable"]
         self.assertEqual(preventable["count"], 1)
         self.assertEqual(preventable["gates"], ["tests"])
@@ -585,7 +586,7 @@ class TestVerdictEvents(unittest.TestCase):
         ledger = Ledger.in_memory()
         ledger.add({"event": "request", "round": 1, "sha": SHA_B, "bytes": 1})
         ledger.add_all(transport.verdict_events(self._verdict(), 1, "d", 1))
-        metric = ledger.metrics(gate_manifest=["tests"])
+        metric = ledger.metrics(LINEAGE, gate_manifest=["tests"])
         preventable = metric["rounds"][1]["deterministic_preventable"]
         self.assertIsNone(preventable["count"])
         self.assertIn("not captured", preventable["share"])
@@ -609,7 +610,7 @@ class TestVerdictEvents(unittest.TestCase):
         ledger.add({"event": "finding", "round": 1, "id": "F2", "fp": "fp2:2",
                     "severity": "Low", "preventable_by": None})
 
-        metric = ledger.metrics(gate_manifest=["tests", "whitespace"])
+        metric = ledger.metrics(LINEAGE, gate_manifest=["tests", "whitespace"])
         preventable = metric["rounds"][1]["deterministic_preventable"]
         self.assertIsNone(preventable["count"],
                           "the round-2 probe read 1/2 (50%) here")
@@ -633,7 +634,7 @@ class TestVerdictEvents(unittest.TestCase):
         complete.add({"event": "finding", "round": 1, "id": "F2",
                       "fp": "fp2:2", "severity": "Low",
                       "preventable_by": "whitespace"})
-        full = (complete.metrics(gate_manifest=["tests", "whitespace"])
+        full = (complete.metrics(LINEAGE, gate_manifest=["tests", "whitespace"])
                 ["rounds"][1]["deterministic_preventable"])
         self.assertEqual(full["count"], 2)
         self.assertIn("100%", full["share"])
@@ -668,8 +669,8 @@ class TestRepeatedShaResolution(unittest.TestCase):
         led.add({"event": "request", "round": 2, "sha": SHA_B, "bytes": 1,
                  "author": "claude", "reviewer": "codex"})
         # The same commit reviewed twice — a re-review on an unchanged tip.
-        self.assertEqual(led.rounds_for_sha(SHA_B), [1, 2])
-        self.assertEqual(led.round_for_sha(SHA_B), 2,
+        self.assertEqual(led.rounds_for_sha(SHA_B, LINEAGE), [1, 2])
+        self.assertEqual(led.round_for_sha(SHA_B, LINEAGE), 2,
                          "the open round is the one awaiting an answer")
 
     def test_close_files_the_verdict_against_the_open_round(self):
@@ -677,17 +678,17 @@ class TestRepeatedShaResolution(unittest.TestCase):
         led.add({"event": "verdict", "round": 1, "sha": SHA_B})
         led.add({"event": "request", "round": 2, "sha": SHA_B, "bytes": 1,
                  "author": "claude", "reviewer": "codex"})
-        rec = transport.close_round(self._cfg(), led, verdict_text(), "v.md")
+        rec = transport.close_round(self._cfg(), led, verdict_text(), "v.md", LINEAGE)
         self.assertEqual(rec["round"], 2)
 
     def test_two_open_rounds_on_one_sha_refuse_rather_than_guess(self):
         led = self._ledger()
         led.add({"event": "request", "round": 2, "sha": SHA_B, "bytes": 1,
                  "author": "claude", "reviewer": "codex"})
-        self.assertEqual(led.ambiguous_rounds_for_sha(SHA_B), [1, 2])
+        self.assertEqual(led.ambiguous_rounds_for_sha(SHA_B, LINEAGE), [1, 2])
         before = len(led.events())
         with self.assertRaises(transport.Refusal) as ctx:
-            transport.close_round(self._cfg(), led, verdict_text(), "v.md")
+            transport.close_round(self._cfg(), led, verdict_text(), "v.md", LINEAGE)
         self.assertIn("more than one OPEN request", str(ctx.exception))
         self.assertEqual(len(led.events()), before)
 
@@ -697,8 +698,8 @@ class TestRepeatedShaResolution(unittest.TestCase):
         led = self._ledger()
         led.add({"event": "request", "round": 1, "sha": SHA_B, "bytes": 2,
                  "author": "claude", "reviewer": "codex"})
-        self.assertEqual(led.ambiguous_rounds_for_sha(SHA_B), [])
-        self.assertEqual(led.round_for_sha(SHA_B), 1)
+        self.assertEqual(led.ambiguous_rounds_for_sha(SHA_B, LINEAGE), [])
+        self.assertEqual(led.round_for_sha(SHA_B, LINEAGE), 1)
 
 
 class TestDispositionsSupersedeByRecency(unittest.TestCase):
@@ -738,14 +739,14 @@ class TestDispositionsSupersedeByRecency(unittest.TestCase):
     def test_an_unanswered_finding_still_refuses(self):
         # The control that keeps the preflight a door: omission is owed.
         ledger = self._round1(Ledger.in_memory())
-        owed = transport.missing_dispositions(ledger)
+        owed = transport.missing_dispositions(ledger,LINEAGE)
         self.assertIsNotNone(owed)
         self.assertEqual([u["fp"] for u in owed["unanswered"]], [self.FP])
 
     def test_one_answer_satisfies(self):
         ledger = self._round1(Ledger.in_memory())
         ledger.add(self._disposition("a" * 40))
-        self.assertIsNone(transport.missing_dispositions(ledger))
+        self.assertIsNone(transport.missing_dispositions(ledger,LINEAGE))
 
     def test_a_rebound_answer_supersedes_instead_of_dead_ending(self):
         # The incident, reproduced: two batches for the same fingerprint,
@@ -754,8 +755,8 @@ class TestDispositionsSupersedeByRecency(unittest.TestCase):
         ledger = self._round1(Ledger.in_memory())
         ledger.add(self._disposition("a" * 40))
         ledger.add(self._disposition("b" * 40))
-        self.assertIsNone(transport.missing_dispositions(ledger))
-        standing = ledger.standing_dispositions(round_no=1)
+        self.assertIsNone(transport.missing_dispositions(ledger,LINEAGE))
+        standing = ledger.standing_dispositions(LINEAGE, round_no=1)
         self.assertEqual(len(standing), 1)
         self.assertEqual(standing[0]["head"], "b" * 40)
         kept = [e for e in ledger.events()
@@ -772,10 +773,10 @@ class TestDispositionsSupersedeByRecency(unittest.TestCase):
         ledger.add({"event": "request", "round": 2, "sha": SHA_A, "bytes": 1,
                     "author": "claude", "reviewer": "codex"})
         ledger.add(two)
-        self.assertEqual(len(ledger.standing_dispositions()), 2)
-        self.assertEqual(len(ledger.standing_dispositions(round_no=1)), 1)
+        self.assertEqual(len(ledger.standing_dispositions(LINEAGE)), 2)
+        self.assertEqual(len(ledger.standing_dispositions(LINEAGE, round_no=1)), 1)
         self.assertEqual(
-            ledger.standing_dispositions(round_no=1)[0]["head"], "a" * 40)
+            ledger.standing_dispositions(LINEAGE, round_no=1)[0]["head"], "a" * 40)
 
 
 class TestDispositionSupersessionLifecycle(unittest.TestCase):
@@ -836,12 +837,12 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
     def test_one_answer_is_one_standing_batch(self):
         ledger = self._round1(Ledger.in_memory())
         ledger.add_all(self._emission("a" * 40, evidence="e1"))
-        batches = ledger.standing_disposition_batches(round_no=1)
+        batches = ledger.standing_disposition_batches(LINEAGE, round_no=1)
         self.assertEqual(len(batches), 1)
         self.assertEqual(batches[0]["disposition"]["head"], "a" * 40)
         self.assertEqual(len(batches[0]["evidence"]), 1)
         self.assertEqual(len(batches[0]["runs"]), 1)
-        self.assertIsNone(transport.missing_dispositions(ledger))
+        self.assertIsNone(transport.missing_dispositions(ledger,LINEAGE))
 
     def test_idempotent_replay_is_a_no_op(self):
         # The same envelope re-recorded: same batch stamp, same uids.
@@ -849,7 +850,7 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
         events = self._emission("a" * 40, evidence="e1")
         self.assertEqual(ledger.add_all(events), 3)
         self.assertEqual(ledger.add_all(events), 0)
-        self.assertEqual(len(ledger.standing_disposition_batches(1)), 1)
+        self.assertEqual(len(ledger.standing_disposition_batches(LINEAGE, 1)), 1)
 
     def test_a_rebind_with_changed_head_supersedes_the_whole_batch(self):
         # The falsification of the finding: an accepted `cannot_execute`
@@ -859,8 +860,8 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
         ledger.add_all(self._emission("b" * 40, status="cannot_execute",
                                       mutation="not_run"))
         ledger.add_all(self._emission("c" * 40, status="pass"))
-        self.assertEqual(ledger.standing_dispositions(1)[0]["head"], "c" * 40)
-        fired = ledger.breakers(3, blocking_severities=["High"])
+        self.assertEqual(ledger.standing_dispositions(LINEAGE, 1)[0]["head"], "c" * 40)
+        fired = ledger.breakers(LINEAGE, 3, blocking_severities=["High"])
         self.assertFalse(
             [b for b in fired if b["breaker"] == "unverifiable"],
             "a superseded emission's run fired a breaker: a consumer is "
@@ -878,7 +879,7 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
         ledger.add_all(self._emission("b" * 40, status="pass"))
         ledger.add_all(self._emission("c" * 40, status="cannot_execute",
                                       mutation="not_run"))
-        fired = ledger.breakers(3, blocking_severities=["High"])
+        fired = ledger.breakers(LINEAGE, 3, blocking_severities=["High"])
         self.assertTrue([b for b in fired
                          if b["breaker"] == "unverifiable"])
 
@@ -898,7 +899,7 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
                     "mutation": "not_run", "test_digest": "td",
                     "source": "disposition", "blocking": True, "batch": "A"})
         batches = {b["disposition"]["batch"]: b
-                   for b in ledger.disposition_batches(1)
+                   for b in ledger.disposition_batches(LINEAGE, 1)
                    if b["disposition"]}
         self.assertEqual([r["status"] for r in batches["A"]["runs"]],
                          ["cannot_execute"])
@@ -907,7 +908,7 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
         self.assertEqual(batches["B"]["standing"], True)
         # And the consumer proof: the run belongs to superseded A, so it
         # does not fire even though it is the newest run event in the file.
-        fired = ledger.breakers(3, blocking_severities=["High"])
+        fired = ledger.breakers(LINEAGE, 3, blocking_severities=["High"])
         self.assertFalse([b for b in fired
                          if b["breaker"] == "unverifiable"])
 
@@ -925,10 +926,10 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
                         "fp": self.FP, "of": "F1", "status": status,
                         "mutation": "not_run", "test_digest": "td",
                         "source": "disposition", "blocking": True})
-        standing = ledger.standing_disposition_batches(1)
+        standing = ledger.standing_disposition_batches(LINEAGE, 1)
         self.assertEqual(len(standing), 1)
         self.assertEqual([r["status"] for r in standing[0]["runs"]], ["pass"])
-        fired = ledger.breakers(3, blocking_severities=["High"])
+        fired = ledger.breakers(LINEAGE, 3, blocking_severities=["High"])
         self.assertFalse([b for b in fired
                           if b["breaker"] == "unverifiable"])
 
@@ -946,7 +947,7 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
                     "of": "F1", "status": "cannot_execute",
                     "mutation": "not_run", "test_digest": "td",
                     "source": "disposition", "blocking": True})
-        fired = ledger.breakers(3, blocking_severities=["High"])
+        fired = ledger.breakers(LINEAGE, 3, blocking_severities=["High"])
         self.assertTrue([b for b in fired
                          if b["breaker"] == "unverifiable"])
 
@@ -973,7 +974,7 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
                             "disposition": kind, "payload": {},
                             "verdict_sha": SHA_B, "head": head,
                             "batch": f"{kind}-{head[:4]}"})
-        counts = ledger.metrics()["rounds"][1]["dispositions"]
+        counts = ledger.metrics(LINEAGE)["rounds"][1]["dispositions"]
         self.assertEqual(counts, {k: 1 for k in kinds},
                          "a superseded disposition row was counted: metrics "
                          "are reading raw events instead of standing batches")
@@ -996,7 +997,7 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
                         "finding_id": "F1", "fp": self.FP,
                         "disposition": disp, "payload": {},
                         "verdict_sha": sha, "head": sha})
-        rounds = ledger.metrics()["rounds"]
+        rounds = ledger.metrics(LINEAGE)["rounds"]
         self.assertEqual(rounds[1]["dispositions"], {"accepted": 1})
         self.assertEqual(rounds[2]["dispositions"], {"refuted": 1})
 
@@ -1019,7 +1020,7 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
                                               mutation="not_run"))
                 ledger.add_all(self._emission("c" * 40, status=status,
                                               mutation=mutation))
-                states = ledger.metrics()["rounds"][1][
+                states = ledger.metrics(LINEAGE)["rounds"][1][
                     "unverified_acceptance"]
                 self.assertEqual(states, {expected: 1})
 
@@ -1029,7 +1030,7 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
         ledger = self._round1(Ledger.in_memory())
         ledger.add_all(self._emission("b" * 40, status="pass"))
         ledger.add_all(self._emission("c" * 40, status=None))
-        states = ledger.metrics()["rounds"][1]["unverified_acceptance"]
+        states = ledger.metrics(LINEAGE)["rounds"][1]["unverified_acceptance"]
         self.assertEqual(states, {"named test, no run recorded": 1})
 
     def test_superseded_refutation_evidence_is_history(self):
@@ -1040,10 +1041,10 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
                                       status=None, evidence="old"))
         ledger.add_all(self._emission("c" * 40, disposition="refuted",
                                       status=None, evidence="new"))
-        standing = ledger.standing_disposition_batches(1)
+        standing = ledger.standing_disposition_batches(LINEAGE, 1)
         self.assertEqual([e["digest"] for e in standing[0]["evidence"]],
                          ["d-new"])
-        all_batches = ledger.disposition_batches(1)
+        all_batches = ledger.disposition_batches(LINEAGE, 1)
         superseded = [b for b in all_batches if not b["standing"]]
         self.assertEqual([e["digest"] for b in superseded
                           for e in b["evidence"]], ["d-old"])
@@ -1056,10 +1057,10 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
                                       status="cannot_execute",
                                       mutation="not_run"))
         ledger.add_all(self._emission("c" * 40, fp=self.FP, status="pass"))
-        standing = ledger.standing_disposition_batches(1)
+        standing = ledger.standing_disposition_batches(LINEAGE, 1)
         self.assertEqual(len(standing), 1)
         self.assertEqual(standing[0]["disposition"]["head"], "c" * 40)
-        fired = ledger.breakers(3, blocking_severities=["High"])
+        fired = ledger.breakers(LINEAGE, 3, blocking_severities=["High"])
         self.assertFalse([b for b in fired
                           if b["breaker"] == "unverifiable"])
 
@@ -1079,7 +1080,7 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
                     "fp": self.FP, "severity": "High",
                     "classification": "design_gap", "title": "t",
                     "preventable_by": None})
-        owed = transport.missing_dispositions(ledger)
+        owed = transport.missing_dispositions(ledger,LINEAGE)
         self.assertIsNotNone(owed)
         self.assertEqual(owed["round"], 2)
 
@@ -1091,7 +1092,7 @@ class TestDispositionSupersessionLifecycle(unittest.TestCase):
         ledger = self._round1(Ledger.in_memory())
         for head in ("a" * 40, "b" * 40, "c" * 40):
             ledger.add_all(self._emission(head))
-        block = _dispositions_block(ledger, 1)
+        block = _dispositions_block(ledger, 1, LINEAGE)
         self.assertEqual(block.count("**accepted**"), 1,
                          "a superseded disposition rendered as co-standing")
         self.assertIn("supersedes 2 earlier emission(s)", block)
@@ -1143,9 +1144,9 @@ class TestOrphanCompanionsNeverStand(unittest.TestCase):
     _emission = TestDispositionSupersessionLifecycle._emission
 
     def _states(self, ledger):
-        return (ledger.standing_disposition_batches(1),
-                ledger.orphan_companion_batches(1),
-                [b["breaker"] for b in ledger.breakers(
+        return (ledger.standing_disposition_batches(LINEAGE, 1),
+                ledger.orphan_companion_batches(LINEAGE, 1),
+                [b["breaker"] for b in ledger.breakers(LINEAGE,
                     3, blocking_severities=["High"])])
 
     def test_an_unknown_stamp_after_the_row_cannot_certify_the_answer(self):
@@ -1172,7 +1173,7 @@ class TestOrphanCompanionsNeverStand(unittest.TestCase):
         self.assertEqual([r["batch"] for r in orphans[0]["runs"]],
                          ["orphan-X"])
         self.assertEqual(
-            ledger.metrics()["rounds"][1]["unverified_acceptance"],
+            ledger.metrics(LINEAGE)["rounds"][1]["unverified_acceptance"],
             {"named test, no run recorded": 1},
             "the (fingerprint, round) run collapse is back: an orphan's "
             "run certified an acceptance it never verified")
@@ -1189,7 +1190,7 @@ class TestOrphanCompanionsNeverStand(unittest.TestCase):
         self.assertEqual(len(standing[0]["runs"]), 1)
         self.assertEqual(orphans, [])
         self.assertEqual(
-            ledger.metrics()["rounds"][1]["unverified_acceptance"],
+            ledger.metrics(LINEAGE)["rounds"][1]["unverified_acceptance"],
             {"test passed, mutation proven": 1})
         self.assertNotIn("orphan", breakers)
 
@@ -1226,7 +1227,7 @@ class TestOrphanCompanionsNeverStand(unittest.TestCase):
         self.assertEqual(orphans, [])
         self.assertNotIn("orphan", breakers)
         self.assertEqual(
-            ledger.metrics()["rounds"][1]["unverified_acceptance"],
+            ledger.metrics(LINEAGE)["rounds"][1]["unverified_acceptance"],
             {"test passed, mutation proven": 1})
 
     def test_a_repair_supersedes_an_earlier_standing_row(self):
@@ -1260,7 +1261,7 @@ class TestOrphanCompanionsNeverStand(unittest.TestCase):
         self.assertEqual(standing, [])
         self.assertEqual(len(orphans), 1)
         self.assertIn("orphan", breakers)
-        owed = transport.missing_dispositions(ledger)
+        owed = transport.missing_dispositions(ledger,LINEAGE)
         self.assertIsNotNone(owed)
 
     def test_rowless_unstamped_companions_group_as_one_orphan(self):
@@ -1321,7 +1322,7 @@ class TestOrphanCompanionsNeverStand(unittest.TestCase):
                     "mutation": "fails_without_fix", "test_digest": "td",
                     "source": "disposition", "blocking": True,
                     "batch": "orphan-X"})
-        block = _dispositions_block(ledger, 1)
+        block = _dispositions_block(ledger, 1, LINEAGE)
         self.assertEqual(block.count("**accepted**"), 1)
         self.assertIn("ANOMALY", block)
         self.assertIn("orphan", block)
@@ -1340,15 +1341,15 @@ class TestOrphanCompanionsNeverStand(unittest.TestCase):
                     "mutation": "fails_without_fix", "test_digest": "td",
                     "source": "disposition", "blocking": True,
                     "batch": "orphan-X"})
-        fired = [f for f in transport.unauthorized_breakers(cfg, ledger)
+        fired = [f for f in transport.unauthorized_breakers(cfg, ledger, LINEAGE)
                  if f["breaker"] == "orphan"]
         self.assertEqual(len(fired), 1)
         rec = transport.authorize_breaker(cfg, ledger, "orphan",
                                           "audited: hand-seeded probe",
-                                          "user")
+                                          "user",LINEAGE)
         self.assertTrue(rec["recorded"])
         self.assertEqual(
-            [f for f in transport.unauthorized_breakers(cfg, ledger)
+            [f for f in transport.unauthorized_breakers(cfg, ledger, LINEAGE)
              if f["breaker"] == "orphan"], [])
 
     # ------------------------------------------ one decision, one orphan
@@ -1374,7 +1375,7 @@ class TestOrphanCompanionsNeverStand(unittest.TestCase):
                 "blocking": True, "batch": batch}
 
     def _unauthorized_orphans(self, cfg, ledger):
-        return [f for f in transport.unauthorized_breakers(cfg, ledger)
+        return [f for f in transport.unauthorized_breakers(cfg, ledger, LINEAGE)
                 if f["breaker"] == "orphan"]
 
     def test_a_decision_on_one_orphan_does_not_take_the_next_one(self):
@@ -1391,32 +1392,32 @@ class TestOrphanCompanionsNeverStand(unittest.TestCase):
         fired = self._unauthorized_orphans(cfg, ledger)
         self.assertEqual(len(fired), 1)
         with self.assertRaises(transport.Refusal):
-            transport.handoff_preflight(cfg, ledger)
+            transport.handoff_preflight(cfg, ledger, LINEAGE)
         rec = transport.authorize_breaker(cfg, ledger, "orphan",
-                                          "audited orphan-X", "user")
+                                          "audited orphan-X", "user", LINEAGE)
         self.assertEqual(rec["covers"], [fired[0]["firing"]])
         # The control, first: re-reading the UNCHANGED X firing stays
         # covered, and the lineage moves.
         self.assertEqual(self._unauthorized_orphans(cfg, ledger), [])
-        transport.handoff_preflight(cfg, ledger)  # no raise
+        transport.handoff_preflight(cfg, ledger, LINEAGE)  # no raise
         # A second, distinct stamped orphan for the same (round, fp) is
         # material the human never saw.
         ledger.add(self._orphan_run("orphan-Y", "td-y"))
-        self.assertEqual(len(ledger.orphan_companion_batches()), 2)
+        self.assertEqual(len(ledger.orphan_companion_batches(LINEAGE)), 2)
         still = self._unauthorized_orphans(cfg, ledger)
         self.assertEqual(len(still), 1, "orphan-Y was pre-authorized by the "
                                         "decision on orphan-X")
         self.assertEqual([r["batch"] for r in
-                          [b for b in ledger.orphan_companion_batches()
+                          [b for b in ledger.orphan_companion_batches(LINEAGE)
                            if b["runs"][0]["test_digest"] == "td-y"][0]["runs"]],
                          ["orphan-Y"])
         self.assertNotIn(still[0]["firing"], rec["covers"])
         with self.assertRaises(transport.Refusal) as ctx:
-            transport.handoff_preflight(cfg, ledger)
+            transport.handoff_preflight(cfg, ledger, LINEAGE)
         self.assertIn(still[0]["firing"], str(ctx.exception))
         # ...and X stays decided: the second decision covers only Y.
         rec2 = transport.authorize_breaker(cfg, ledger, "orphan",
-                                           "audited orphan-Y", "user")
+                                           "audited orphan-Y", "user", LINEAGE)
         self.assertEqual(rec2["covers"], [still[0]["firing"]])
         self.assertEqual(self._unauthorized_orphans(cfg, ledger), [])
 
@@ -1443,21 +1444,21 @@ class TestOrphanCompanionsNeverStand(unittest.TestCase):
         first = self._unauthorized_orphans(cfg, ledger)
         self.assertEqual(len(first), 1)
         transport.authorize_breaker(cfg, ledger, "orphan",
-                                    "audited the rowless batch", "user")
+                                    "audited the rowless batch", "user", LINEAGE)
         # Control: unchanged, still one batch, still covered.
-        self.assertEqual(len(ledger.orphan_companion_batches()), 1)
+        self.assertEqual(len(ledger.orphan_companion_batches(LINEAGE)), 1)
         self.assertEqual(self._unauthorized_orphans(cfg, ledger), [])
-        transport.handoff_preflight(cfg, ledger)  # no raise
+        transport.handoff_preflight(cfg, ledger, LINEAGE)  # no raise
         # A later companion joins that same batch — still ONE anomaly, but
         # not the one that was decided.
         ledger.add(companion("cannot_execute"))
-        self.assertEqual(len(ledger.orphan_companion_batches()), 1)
+        self.assertEqual(len(ledger.orphan_companion_batches(LINEAGE)), 1)
         grown = self._unauthorized_orphans(cfg, ledger)
         self.assertEqual(len(grown), 1, "new post-decision material was "
                                         "covered by the earlier decision")
         self.assertNotEqual(grown[0]["firing"], first[0]["firing"])
         with self.assertRaises(transport.Refusal):
-            transport.handoff_preflight(cfg, ledger)
+            transport.handoff_preflight(cfg, ledger, LINEAGE)
 
     def test_an_authorized_orphan_survives_unrelated_appends(self):
         """The other half of the control: the identity is the firing's own
@@ -1469,19 +1470,19 @@ class TestOrphanCompanionsNeverStand(unittest.TestCase):
         ledger = self._answered()
         ledger.add(self._orphan_run("orphan-X", "td-x"))
         rec = transport.authorize_breaker(cfg, ledger, "orphan",
-                                          "audited orphan-X", "user")
+                                          "audited orphan-X", "user", LINEAGE)
         ledger.add({"event": "evidence", "round": 1, "fp": self.FP,
                     "digest": "d-verdict", "source": "verdict", "of": "F1"})
         ledger.add({"event": "gate", "round": 1, "id": "tests",
                     "status": "pass"})
-        after = ledger.orphan_companion_batches()
+        after = ledger.orphan_companion_batches(LINEAGE)
         self.assertEqual(len(after), 1)
         self.assertEqual(self._unauthorized_orphans(cfg, ledger), [])
         self.assertEqual(rec["covers"],
-                         [f["firing"] for f in ledger.breakers(
+                         [f["firing"] for f in ledger.breakers(LINEAGE,
                              3, blocking_severities=["High"])
                           if f["breaker"] == "orphan"])
-        transport.handoff_preflight(cfg, ledger)  # no raise
+        transport.handoff_preflight(cfg, ledger, LINEAGE)  # no raise
 
 
 class TestBreakerFiringIdentity(unittest.TestCase):
@@ -1508,7 +1509,7 @@ class TestBreakerFiringIdentity(unittest.TestCase):
         return _config.load(_root)
 
     def _of(self, cfg, ledger, breaker):
-        return [f for f in transport.unauthorized_breakers(cfg, ledger)
+        return [f for f in transport.unauthorized_breakers(cfg, ledger, LINEAGE)
                 if f["breaker"] == breaker]
 
     def test_identity_carries_the_key_and_the_material(self):
@@ -1533,7 +1534,7 @@ class TestBreakerFiringIdentity(unittest.TestCase):
                     "of": "F1", "status": "cannot_execute",
                     "mutation": "not_run", "source": "disposition",
                     "blocking": True, "batch": "orphan-X"})
-        fired = ledger.breakers(3, blocking_severities=["High"])
+        fired = ledger.breakers(LINEAGE, 3, blocking_severities=["High"])
         self.assertTrue(fired)
         for f in fired:
             self.assertEqual(f["firing"], ledger_mod.firing_id(f))
@@ -1555,7 +1556,7 @@ class TestBreakerFiringIdentity(unittest.TestCase):
         first = self._of(cfg, ledger, "unverifiable")
         self.assertEqual(len(first), 1)
         transport.authorize_breaker(cfg, ledger, "unverifiable",
-                                    "runner unavailable, accepted", "user")
+                                    "runner unavailable, accepted", "user", LINEAGE)
         self.assertEqual(self._of(cfg, ledger, "unverifiable"), [])
         ledger.add(cannot_execute("td-2"))
         second = self._of(cfg, ledger, "unverifiable")
@@ -1564,14 +1565,14 @@ class TestBreakerFiringIdentity(unittest.TestCase):
                                          "the first")
         self.assertNotEqual(second[0]["firing"], first[0]["firing"])
         with self.assertRaises(transport.Refusal):
-            transport.handoff_preflight(cfg, ledger)
+            transport.handoff_preflight(cfg, ledger, LINEAGE)
 
     def test_a_grown_token_spend_is_not_the_decided_breach(self):
         from unittest import mock
         cfg = self._cfg()
         ledger = self._round1(Ledger.in_memory())
         ledger.add_all(self._emission("b" * 40, batch="A"))
-        envelopes = [e for e in ledger.current()
+        envelopes = [e for e in ledger.current(LINEAGE)
                      if e.get("event") in ("request", "verdict")]
         for e in envelopes:
             e["tokens"] = 200
@@ -1581,7 +1582,7 @@ class TestBreakerFiringIdentity(unittest.TestCase):
             self.assertEqual(len(first), 1)
             self.assertIn("400", first[0]["rule"])
             transport.authorize_breaker(cfg, ledger, "budget",
-                                        "audited: 400 against 100", "user")
+                                        "audited: 400 against 100", "user", LINEAGE)
             # Control: the same measured spend re-read is the same firing.
             self.assertEqual(self._of(cfg, ledger, "budget"), [])
             for e in envelopes:
@@ -1599,7 +1600,7 @@ class TestBreakerFiringIdentity(unittest.TestCase):
                     "mutation": "fails_without_fix", "test_digest": "td",
                     "source": "disposition", "blocking": True,
                     "batch": "orphan-X"})
-        report = ledger.report(3, blocking_severities=["High"])
+        report = ledger.report(LINEAGE, 3, blocking_severities=["High"])
         fired = [f for f in report["breakers_fired"]
                  if f["breaker"] == "orphan"]
         self.assertEqual(len(fired), 1)
@@ -2024,7 +2025,7 @@ class TestImportLegacySourceAuthority(_ImportLegacyCase):
         ledger = Ledger.in_memory()
         real = self.fp_of("a real claim")
         self.admits(ledger, [self.finding(1, "a real claim")])
-        self.assertEqual([f["fp"] for f in ledger.standing_findings()], [real])
+        self.assertEqual([f["fp"] for f in ledger.standing_findings(LINEAGE)], [real])
         fabricated = self.fp_of("fabricated")
         payload = self.refuses(ledger, [
             self.finding(1, "fabricated"),
@@ -2033,7 +2034,7 @@ class TestImportLegacySourceAuthority(_ImportLegacyCase):
                                                "verification": "y"}),
         ], "fabricated claim over real anchored bytes")
         self.assertIn("does not occur in", json.dumps(payload))
-        self.assertEqual([f["fp"] for f in ledger.standing_findings()], [real],
+        self.assertEqual([f["fp"] for f in ledger.standing_findings(LINEAGE)], [real],
                          "the real finding must still stand: a forged "
                          "acceptance may not answer it")
 
@@ -2132,7 +2133,7 @@ class TestImportLegacySourceAuthority(_ImportLegacyCase):
         payload = self.refuses(ledger, [self.verdict_row(round_no=99)],
                                "round 99")
         self.assertIn("skips", json.dumps(payload))
-        self.assertEqual(ledger.metrics()["rounds_to_clean"],
+        self.assertEqual(ledger.metrics(LINEAGE)["rounds_to_clean"],
                          "open (no clean verdict in 0 rounds)")
 
     def test_a_verdict_row_may_not_invent_a_target_commit(self):
@@ -2148,7 +2149,7 @@ class TestImportLegacySourceAuthority(_ImportLegacyCase):
     def test_a_verdict_row_matching_the_authority_imports(self):
         ledger = Ledger.in_memory()
         self.admits(ledger, [self.verdict_row()])
-        self.assertEqual(ledger.completed_rounds(), [1])
+        self.assertEqual(ledger.completed_rounds(LINEAGE), [1])
 
     def test_a_verdict_row_must_cite_bytes_stating_its_own_verdict(self):
         # The split table carries claims, not a verdict term. A `verdict`
@@ -2195,7 +2196,7 @@ class TestImportLegacySourceAuthority(_ImportLegacyCase):
             self.finding(1, "claim two", fid="F2"),
             self.alias(one, two),
         ])
-        self.assertEqual([f["fp"] for f in ledger.standing_findings()], [two])
+        self.assertEqual([f["fp"] for f in ledger.standing_findings(LINEAGE)], [two])
 
     def test_a_sourced_batch_still_imports_and_reads_back(self):
         # The positive control: everything above refuses because of what it
@@ -2213,7 +2214,7 @@ class TestImportLegacySourceAuthority(_ImportLegacyCase):
         self.assertEqual(payload["source_artifacts"], 2)
         self.assertEqual(payload["source_commit"], self.anchor)
         self.assertTrue(payload["source_refs"])
-        self.assertEqual([f["fp"] for f in ledger.standing_findings()], [fp])
+        self.assertEqual([f["fp"] for f in ledger.standing_findings(LINEAGE)], [fp])
 
 
 class TestImportLegacyDuplicateMembers(_ImportLegacyCase):
@@ -2520,7 +2521,7 @@ class TestImportLegacyAnswersRoundIntegrity(_ImportLegacyCase):
                               self.disposition(2, fp)], "wrong round")
         self.admits(ledger, [self.finding(1, "claim a"),
                              self.disposition(1, fp)])
-        self.assertEqual(ledger.standing_findings(), [])
+        self.assertEqual(ledger.standing_findings(LINEAGE), [])
 
     def test_an_open_effect_answer_needs_no_binding(self):
         # `sustained` settles nothing (`vocab.FINDING_ANSWERS`), so it has
@@ -2552,7 +2553,7 @@ class TestImportLegacyBatchLocalIdentity(_ImportLegacyCase):
                                                              answers_round=1)]
         ledger = Ledger.in_memory()
         self.admits(ledger, events)
-        standing = ledger.standing_findings()
+        standing = ledger.standing_findings(LINEAGE)
         self.assertEqual([f["round"] for f in standing], [2],
                          "the round-2 ruling is unanswered and must stand")
 
@@ -2650,7 +2651,7 @@ class TestImportLegacyCannotReinterpretPersistedAnswers(_ImportLegacyCase):
         ledger = Ledger.in_memory()
         old = self.persist_unstamped_withdrawal(ledger)
         new = self.fp_of("claim new")
-        self.assertEqual(ledger.standing_findings(), [],
+        self.assertEqual(ledger.standing_findings(LINEAGE), [],
                          "the withdrawal settles round 1 today")
         self.refuses(ledger,
                      [self.alias(old, new), self.finding(2, "claim new")],
@@ -2691,10 +2692,10 @@ class TestImportLegacyCannotReinterpretPersistedAnswers(_ImportLegacyCase):
         old, new = self.fp_of("claim old"), self.fp_of("claim new")
         self.admits(ledger, [self.finding(1, "claim old"),
                              self.closure(2, old, answers_round=1)])
-        self.assertEqual(ledger.standing_findings(), [])
+        self.assertEqual(ledger.standing_findings(LINEAGE), [])
         self.admits(ledger, [self.alias(old, new),
                              self.finding(2, "claim new")])
-        standing = ledger.standing_findings()
+        standing = ledger.standing_findings(LINEAGE)
         self.assertEqual([f["round"] for f in standing], [2],
                          "the round-2 ruling nobody answered must stand")
 
@@ -2705,7 +2706,7 @@ class TestImportLegacyCannotReinterpretPersistedAnswers(_ImportLegacyCase):
         ledger = Ledger.in_memory()
         self.persist_unstamped_withdrawal(ledger)
         self.admits(ledger, [self.finding(5, "an unrelated claim")])
-        self.assertEqual([f["round"] for f in ledger.standing_findings()], [5])
+        self.assertEqual([f["round"] for f in ledger.standing_findings(LINEAGE)], [5])
 
 
 class TestImportLegacyAnswersCannotAcquireASameRoundRuling(_ImportLegacyCase):
@@ -2734,7 +2735,7 @@ class TestImportLegacyAnswersCannotAcquireASameRoundRuling(_ImportLegacyCase):
         old = self.fp_of("claim old")
         self.admits(ledger, [self.finding(1, "claim old"),
                              self.disposition(1, old)])
-        self.assertEqual(ledger.standing_findings(), [],
+        self.assertEqual(ledger.standing_findings(LINEAGE), [],
                          "call 1 must leave nothing standing")
         return ledger, old
 
@@ -2746,7 +2747,7 @@ class TestImportLegacyAnswersCannotAcquireASameRoundRuling(_ImportLegacyCase):
             [self.alias(old, new), self.finding(1, "claim new", fid="F2")],
             "a distinct same-round ruling behind an alias")
         self.assertIn("WHICH ruling occupies it did", json.dumps(payload))
-        self.assertEqual([f["fp"] for f in ledger.standing_findings()], [],
+        self.assertEqual([f["fp"] for f in ledger.standing_findings(LINEAGE)], [],
                          "the refused batch changed nothing at all")
 
     def test_the_alias_only_control_is_unaffected(self):
@@ -2755,7 +2756,7 @@ class TestImportLegacyAnswersCannotAcquireASameRoundRuling(_ImportLegacyCase):
         ledger, old = self.settled_ledger()
         new = self.fp_of("claim new")
         self.admits(ledger, [self.alias(old, new)])
-        self.assertEqual(ledger.standing_findings(), [],
+        self.assertEqual(ledger.standing_findings(LINEAGE), [],
                          "an alias-only rename preserves the settlement")
 
     def test_the_new_ruling_is_unsettled_after_the_refusal(self):
@@ -2764,7 +2765,7 @@ class TestImportLegacyAnswersCannotAcquireASameRoundRuling(_ImportLegacyCase):
         # alias leaves it standing and unanswered, which is the true state.
         ledger, _old = self.settled_ledger()
         self.admits(ledger, [self.finding(1, "claim new", fid="F2")])
-        self.assertEqual([f["id"] for f in ledger.standing_findings()],
+        self.assertEqual([f["id"] for f in ledger.standing_findings(LINEAGE)],
                          ["F2"])
 
     def test_a_second_ruling_of_the_SAME_identity_at_that_round_refuses(self):
@@ -2796,7 +2797,7 @@ class TestImportLegacyAnswersCannotAcquireASameRoundRuling(_ImportLegacyCase):
         new = self.fp_of("claim new")
         self.admits(ledger, [self.alias(old, new),
                              self.finding(2, "claim new", fid="F2")])
-        self.assertEqual([f["round"] for f in ledger.standing_findings()], [2])
+        self.assertEqual([f["round"] for f in ledger.standing_findings(LINEAGE)], [2])
 
 
 class TestImportLegacyDispositionAuthor(_ImportLegacyCase):
@@ -2945,3 +2946,252 @@ class TestImportLegacyDispositionAuthor(_ImportLegacyCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestImportLegacyValidatesItsDestinationLineage(_ImportLegacyCase):
+    """Round-2 F4 — FALSIFICATION. An import is validated against the
+    lineage its rows are APPENDED to, not against the whole file.
+
+    The door already selected a destination (`import_lineage`) and appended
+    with it, but two of its passes still scanned `ledger.events()`. So
+    another review's history substantiated this batch: a withdrawal naming a
+    round-1 ruling that existed only in a concurrent lineage validated and
+    landed in a lineage where no such ruling is, and a round-3 verdict
+    imported over a round 2 that had never happened HERE. Both are ordinary
+    mistaken imports on a machine running two reviews at once.
+
+    The partition is one comparison, run for every settling answer kind and
+    for the envelope sequence: the SAME batch against no backing evidence,
+    against evidence in the destination, and against evidence held only by
+    another lineage — open, closed, and the unkeyed legacy positional one a
+    mixed ledger still carries. Only the destination-backed control may
+    validate; every refusal appends zero events.
+
+    Aliases are the deliberate exception and stay global, so they are
+    checked here from both sides: a global merge may not import another
+    lineage's ROUND HISTORY, and may not silently rebind an answer persisted
+    in a lineage this batch appends nothing to.
+    """
+
+    DEST = "Ldest000001"
+    OTHER = "Lother00001"
+
+    #: Where the evidence a batch needs is held.
+    ELSEWHERE = ("open", "closed", "legacy")
+
+    def _ledger_where(self, where, evidence, dest_rounds=(1,)):
+        """A ledger holding `evidence` in the place `where` names, whose
+        destination for `import-legacy` is always `DEST`.
+
+        `DEST` is bound by BRANCH: its request rows name this fixture
+        repository's branch, so `choose_open_lineage` returns it however
+        many other open lineages the ledger holds. "legacy" seeds the
+        unkeyed positional prefix, which is what an unmigrated ledger's
+        events read as (`Ledger.lineage_keys`).
+        """
+        ledger = Ledger.in_memory()
+        if where == "legacy":
+            for row in evidence:
+                ledger.add(dict(row))
+        for r in dest_rounds:
+            ledger.add({"event": "request", "round": r, "sha": self.TARGET,
+                        "bytes": 1, "branch": "main"}, lineage=self.DEST)
+        if where == "dest":
+            for row in evidence:
+                ledger.add(dict(row), lineage=self.DEST)
+        elif where in ("open", "closed"):
+            for row in evidence:
+                ledger.add(dict(row), lineage=self.OTHER)
+            if where == "closed":
+                ledger.add({"event": Ledger.LINEAGE_CLOSED, "at_round": 1,
+                            "outcome": "decision", "reason": "done there",
+                            "authorized_by": "user"}, lineage=self.OTHER)
+        return ledger
+
+    def refuses_and_appends_nothing(self, ledger, events, why):
+        """`refuses` plus the length assertion stated in its own right: a
+        refused batch leaves the ledger exactly as long as it was."""
+        before = len(ledger.events())
+        payload = self.refuses(ledger, events, why)
+        self.assertEqual(len(ledger.events()), before,
+                         f"{why}: a refused batch appends zero events")
+        return payload
+
+    def _compare(self, evidence, batch, why, dest_rounds=(1,)):
+        """The three-case comparison itself: no evidence, destination
+        evidence, evidence only elsewhere."""
+        self.refuses_and_appends_nothing(
+            self._ledger_where("none", evidence, dest_rounds), batch,
+            f"{why}: no backing evidence anywhere")
+        payload = self.admits(
+            self._ledger_where("dest", evidence, dest_rounds), batch)
+        self.assertEqual(payload["lineage"], self.DEST)
+        self.assertEqual(payload["events_added"], len(batch),
+                         f"{why}: the destination-backed control must import")
+        for where in self.ELSEWHERE:
+            with self.subTest(evidence_in=where):
+                self.refuses_and_appends_nothing(
+                    self._ledger_where(where, evidence, dest_rounds), batch,
+                    f"{why}: evidence only in a {where} lineage")
+
+    # ------------------------------------------------------------- the guard
+
+    def test_the_fixture_imports_into_the_branch_bound_destination(self):
+        # Without this the whole class could be comparing one lineage with
+        # itself: every case below depends on DEST being the destination
+        # even while another open lineage exists beside it.
+        ledger = self._ledger_where("open", [self.finding(1, "claim b")])
+        payload = self.admits(ledger, [self.finding(1, "claim a")])
+        self.assertEqual(payload["lineage"], self.DEST)
+        self.assertEqual(ledger.lineages(), [self.DEST, self.OTHER])
+        self.assertEqual([f["fp"] for f in
+                          ledger.standing_findings(self.DEST)],
+                         [self.fp_of("claim a")])
+
+    # ------------------------------------------- the settling answer kinds
+
+    def test_a_withdrawal_binds_only_to_its_own_lineages_ruling(self):
+        # ("closure", "withdrawn") — F4's own reproduction: the withdrawal
+        # targets round 1, and only the destination's own round-1 ruling
+        # may substantiate it.
+        fp = self.fp_of("claim a")
+        self._compare([self.finding(1, "claim a")],
+                      [self.closure(2, fp, answers_round=1)],
+                      "a withdrawal")
+
+    def test_an_accepted_disposition_binds_only_to_its_own_lineages_ruling(
+            self):
+        # ("disposition", "accepted") — the other settling kind this door
+        # can actually append. A disposition answers its OWN round, so the
+        # ruling it needs is a round-1 ruling of the destination.
+        fp = self.fp_of("claim a")
+        self._compare([self.finding(1, "claim a")],
+                      [self.disposition(1, fp, term="accepted")],
+                      "an accepted disposition")
+
+    def test_a_waiver_row_is_refused_whatever_lineage_holds_the_ruling(self):
+        # (FINDING_WAIVER_EVENT, None) — the third settling kind. Its
+        # candidate half is closed one pass earlier: the schema admits no
+        # minted human waiver at all, so no lineage's ruling can
+        # substantiate one and the comparison has no admitting control by
+        # construction. Stated as a test so the kind's coverage is not
+        # silently missing.
+        waiver = {"event": vocab.FINDING_WAIVER_EVENT, "round": 2,
+                  "fp": self.fp_of("claim a"), "answers_round": 1,
+                  "authorized_by": "user", "reason": "r",
+                  **self.source()}
+        for where in ("none", "dest", *self.ELSEWHERE):
+            with self.subTest(evidence_in=where):
+                ledger = self._ledger_where(where,
+                                            [self.finding(1, "claim a")])
+                self.refuses_and_appends_nothing(
+                    ledger, [waiver], f"an imported waiver ({where})")
+
+    def test_an_envelope_round_is_contiguous_only_within_its_own_lineage(self):
+        # The request/verdict sequence check. Round 2 exists as a real
+        # envelope row; a round-3 verdict may only be stated by the lineage
+        # that actually ran round 2.
+        self._compare([{"event": "request", "round": 2, "sha": self.TARGET,
+                        "bytes": 1}],
+                      [self.verdict_row(round_no=3)],
+                      "a round-3 verdict")
+
+    def test_the_skipped_round_refusal_names_the_destination(self):
+        ledger = self._ledger_where("open",
+                                    [{"event": "request", "round": 2,
+                                      "sha": self.TARGET, "bytes": 1}])
+        payload = self.refuses_and_appends_nothing(
+            ledger, [self.verdict_row(round_no=3)],
+            "round 2 belongs to the other lineage")
+        text = json.dumps(payload)
+        self.assertIn("skips", text)
+        self.assertIn(self.DEST, text)
+        self.assertEqual(ledger.completed_rounds(self.DEST), [])
+
+    # ------------------------------------------------ the global alias half
+
+    def test_a_global_alias_does_not_merge_two_lineages_round_histories(self):
+        # The alias is legitimate and global; what it may NOT do is lend the
+        # destination the round history of the lineage it reaches into.
+        # `claim b` is ruled at round 2 only in the other lineage, so a
+        # withdrawal stamped to round 2 binds to nothing here.
+        a, b = self.fp_of("claim a"), self.fp_of("claim b")
+        for where in self.ELSEWHERE:
+            with self.subTest(other_ruling_in=where):
+                ledger = self._ledger_where(
+                    where, [self.finding(2, "claim b")])
+                ledger.add(self.finding(1, "claim a"), lineage=self.DEST)
+                self.refuses_and_appends_nothing(
+                    ledger, [self.alias(a, b), self.closure(3, b,
+                                                            answers_round=2)],
+                    f"a round-2 ruling held only by a {where} lineage")
+
+    def test_the_same_alias_binds_through_the_destinations_own_ruling(self):
+        # The paired control, and the proof the alias itself still works:
+        # the identical merge, with the withdrawal stamped to the round the
+        # DESTINATION actually ruled, imports and settles the thread.
+        a, b = self.fp_of("claim a"), self.fp_of("claim b")
+        ledger = self._ledger_where("open", [self.finding(2, "claim b")])
+        ledger.add(self.finding(1, "claim a"), lineage=self.DEST)
+        self.admits(ledger, [self.alias(a, b),
+                             self.closure(3, b, answers_round=1)])
+        self.assertEqual(ledger.standing_findings(self.DEST), [],
+                         "the destination's own ruling is answered")
+        self.assertEqual([f["round"] for f in
+                          ledger.standing_findings(self.OTHER)], [2],
+                         "the other lineage's round-2 ruling still stands")
+
+    def test_a_persisted_answer_here_may_not_be_rebound_by_this_batch(self):
+        # The round-9/10 protection, re-proved inside one lineage: two
+        # round-1 rulings of the destination, an answer stamped to one of
+        # them, and an alias that would make it cover both.
+        a, c = self.fp_of("claim a"), self.fp_of("claim c")
+        ledger = self._ledger_where("none", [])
+        ledger.add(self.finding(1, "claim a"), lineage=self.DEST)
+        ledger.add(self.finding(1, "claim c"), lineage=self.DEST)
+        ledger.add({"event": vocab.FINDING_WAIVER_EVENT, "round": 2,
+                    "fp": a, "answers_round": 1, "authorized_by": "user",
+                    "reason": "overruled"}, lineage=self.DEST)
+        self.refuses_and_appends_nothing(
+            ledger, [self.alias(a, c)],
+            "an alias moving a waiver persisted in the destination")
+
+    def test_a_persisted_answer_in_another_lineage_is_protected_too(self):
+        # Aliases are GLOBAL, so a batch appended entirely to DEST can still
+        # move an answer that lives in another lineage. The persisted half
+        # therefore runs over every lineage's own ruling set — scoping it to
+        # the destination alone would be the opposite error to F4's.
+        b, c = self.fp_of("claim b"), self.fp_of("claim c")
+        for where in self.ELSEWHERE:
+            with self.subTest(answer_in=where):
+                ledger = self._ledger_where(
+                    where, [self.finding(1, "claim b"),
+                            self.finding(1, "claim c"),
+                            {"event": vocab.FINDING_WAIVER_EVENT, "round": 2,
+                             "fp": b, "answers_round": 1,
+                             "authorized_by": "user", "reason": "overruled"}])
+                self.refuses_and_appends_nothing(
+                    ledger, [self.alias(b, c)],
+                    f"an alias moving a waiver persisted in a {where} lineage")
+
+    def test_another_lineages_ruling_cannot_disturb_this_lineages_answer(self):
+        # The same shape, one difference: the second ruling of the merged
+        # identity is in the OTHER lineage, so within the destination the
+        # waiver still answers exactly the material it always did. A
+        # whole-ledger comparison refuses this — a false refusal, the same
+        # defect read from the other side.
+        a, b = self.fp_of("claim a"), self.fp_of("claim b")
+        ledger = self._ledger_where("open", [self.finding(1, "claim b")])
+        ledger.add(self.finding(1, "claim a"), lineage=self.DEST)
+        ledger.add({"event": vocab.FINDING_WAIVER_EVENT, "round": 2,
+                    "fp": a, "answers_round": 1, "authorized_by": "user",
+                    "reason": "overruled"}, lineage=self.DEST)
+        self.admits(ledger, [self.alias(a, b)])
+        answers = ledger.current_answers(self.DEST)
+        self.assertEqual(
+            [effect for pairs in answers.values() for effect, _ in pairs],
+            [vocab.ANSWER_OVERRULES],
+            "the destination's waiver still answers the ruling it always did")
+        self.assertEqual([f["round"] for f in
+                          ledger.standing_findings(self.OTHER)], [1],
+                         "the other lineage's ruling is untouched by all this")

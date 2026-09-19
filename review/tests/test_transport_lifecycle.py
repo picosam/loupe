@@ -22,7 +22,7 @@ from pathlib import Path
 from review import cli, config, tool_identity, transport, validate, wire
 from review.emit import _git
 from review.ledger import Ledger
-from review.tests.util import REPO_ROOT, spec_path
+from review.tests.util import LINEAGE, REPO_ROOT, spec_path
 from review.tests._transport_fixtures import (
     ledgerless_cfg, reviewer_clone_git, CFG, SHA_A, SHA_B, SHA_C, fake_git, authority_calls, request_text, verdict_text, lineage_ledger, _cli,
     warm_cache_fixture, REVIEWER_REMOTES)
@@ -30,27 +30,41 @@ from review.tests._transport_fixtures import (
 class TestLineageScoping(unittest.TestCase):
     """FALSIFICATION: a cap override authorized for one lineage must not be
     the next lineage's starting point (the cap-override docstring's promise,
-    which effective_round_cap did not keep before this)."""
+    which effective_round_cap did not keep before this).
+
+    Since the lineage is KEYED (brief `keyed-lineage`), "the next lineage"
+    is a DIFFERENT KEY rather than the same reads after a marker: the
+    fixture's rounds are the legacy positional lineage `LINEAGE`, and what
+    a closed lineage must not leak into is `NEXT`, the one the handoff
+    after it opens. The property is the same and it is now stated on the
+    axis it actually holds on."""
+
+    #: The lineage a round opened after `LINEAGE` closes belongs to. Any
+    #: id distinct from the fixture's does: the point is that the scope is
+    #: a key and not a file position.
+    NEXT = "Lnext000001"
 
     def test_cap_override_does_not_survive_a_lineage_close(self):
         ledger = lineage_ledger()
-        self.assertEqual(ledger.effective_round_cap(3), 5)
-        transport.close_lineage(ledger, "slice closed", "user")
-        self.assertEqual(ledger.effective_round_cap(3), 3)
+        self.assertEqual(ledger.effective_round_cap(3, LINEAGE), 5)
+        transport.close_lineage(ledger, "slice closed", "user", LINEAGE)
+        self.assertEqual(ledger.effective_round_cap(3, self.NEXT), 3)
 
     def test_rounds_and_next_round_restart(self):
         from review.emit import next_round
         ledger = lineage_ledger()
-        self.assertEqual(ledger.rounds(), [1])
-        self.assertEqual(next_round(ledger), 2)
-        transport.close_lineage(ledger, "done", "user")
-        self.assertEqual(ledger.rounds(), [])
-        self.assertEqual(next_round(ledger), 1)
-        self.assertEqual(ledger.lineage_number(), 2)
+        self.assertEqual(ledger.rounds(LINEAGE), [1])
+        self.assertEqual(next_round(ledger, LINEAGE), 2)
+        transport.close_lineage(ledger, "done", "user", LINEAGE)
+        self.assertEqual(ledger.rounds(self.NEXT), [])
+        self.assertEqual(next_round(ledger, self.NEXT), 1)
+        # The closed one is closed, and the next one is open and unrelated.
+        self.assertTrue(ledger.is_closed(LINEAGE))
+        self.assertEqual(ledger.open_lineages(), [])
 
     def test_identity_aliases_are_global_not_scoped(self):
         ledger = lineage_ledger()
-        transport.close_lineage(ledger, "done", "user")
+        transport.close_lineage(ledger, "done", "user", LINEAGE)
         self.assertEqual(ledger.resolve("fp1:x"), "fp2:1")
 
     def test_round_for_sha_is_scoped(self):
@@ -58,19 +72,21 @@ class TestLineageScoping(unittest.TestCase):
         # rounds_for_sha answers "which round is this SHA's", open or ruled;
         # round_for_sha answers "which OPEN round awaits an answer" and so
         # excludes round 1 here, which already carries a verdict (round 2 F1).
-        self.assertEqual(ledger.rounds_for_sha(SHA_A), [1])
-        self.assertIsNone(ledger.round_for_sha(SHA_A))
-        transport.close_lineage(ledger, "done", "user")
-        self.assertEqual(ledger.rounds_for_sha(SHA_A), [])
-        self.assertIsNone(ledger.round_for_sha(SHA_A))
+        self.assertEqual(ledger.rounds_for_sha(SHA_A, LINEAGE), [1])
+        self.assertIsNone(ledger.round_for_sha(SHA_A, LINEAGE))
+        transport.close_lineage(ledger, "done", "user", LINEAGE)
+        self.assertEqual(ledger.rounds_for_sha(SHA_A, self.NEXT), [])
+        self.assertIsNone(ledger.round_for_sha(SHA_A, self.NEXT))
 
     def test_report_names_the_lineage_and_is_otherwise_unchanged(self):
         ledger = lineage_ledger()
-        before = ledger.report(3)
+        before = ledger.report(LINEAGE, 3)
+        self.assertEqual(before["lineage"]["id"], LINEAGE)
         self.assertEqual(before["lineage"]["number"], 1)
-        transport.close_lineage(ledger, "done", "user")
-        after = ledger.report(3)
-        self.assertEqual(after["lineage"]["number"], 2)
+        self.assertEqual(before["lineage"]["closed_before"], [])
+        transport.close_lineage(ledger, "done", "user", LINEAGE)
+        after = ledger.report(self.NEXT, 3)
+        self.assertEqual(after["lineage"]["id"], self.NEXT)
         self.assertEqual(after["lineage"]["closed_before"][0]["at_round"], 1)
         self.assertEqual(after["metrics"]["rounds"], {})
         self.assertEqual(after["breakers_fired"], [])
@@ -78,7 +94,7 @@ class TestLineageScoping(unittest.TestCase):
     def test_a_ledger_without_markers_reads_as_before(self):
         # Adjacent state: no lineage_closed anywhere → current() is everything.
         ledger = lineage_ledger()
-        self.assertEqual(ledger.current(), ledger.events())
+        self.assertEqual(ledger.current(LINEAGE), ledger.events())
 
 
 class TestWaiver(unittest.TestCase):
@@ -143,27 +159,27 @@ class TestWaiver(unittest.TestCase):
         led = Ledger.in_memory()
         transport.waive(self._cfg(), led, SHA_C, "docs only", "user",
                         git=self._git())
-        self.assertEqual(led.rounds(), [])
-        self.assertEqual(led.breakers(round_cap=5), [])
-        self.assertIsNone(led.round_for_sha(SHA_C))
+        self.assertEqual(led.rounds(LINEAGE), [])
+        self.assertEqual(led.breakers(LINEAGE, round_cap=5), [])
+        self.assertIsNone(led.round_for_sha(SHA_C, LINEAGE))
 
     def test_the_report_answers_how_much_went_unreviewed(self):
         led = Ledger.in_memory()
-        empty = led.report(5)["waived"]
+        empty = led.report(LINEAGE, 5)["waived"]
         self.assertEqual(empty, {"count": 0, "commits": []},
                          "reported even when empty: a missing key would be "
                          "the same silence in a different shape")
         transport.waive(self._cfg(), led, SHA_C, "docs only", "user",
                         git=self._git())
-        waived = led.report(5)["waived"]
+        waived = led.report(LINEAGE, 5)["waived"]
         self.assertEqual(waived["count"], 1)
         self.assertEqual(waived["commits"][0]["reason"], "docs only")
         # And it survives a lineage close, because a waiver is a decision
         # about a commit rather than a move inside one review.
         led.add({"event": "request", "round": 1, "sha": SHA_B, "bytes": 1})
         led.add({"event": "verdict", "round": 1, "sha": SHA_B})
-        transport.close_lineage(led, "done", "user")
-        self.assertEqual(led.report(5)["waived"]["count"], 1)
+        transport.close_lineage(led, "done", "user", LINEAGE)
+        self.assertEqual(led.report(LINEAGE, 5)["waived"]["count"], 1)
 
     def test_cli_requires_an_explicit_authorizer(self):
         """FALSIFICATION for sweep F9 (High). Mutation: restore
@@ -205,15 +221,15 @@ class TestWaiver(unittest.TestCase):
         led.add({"event": "verdict", "round": 1, "sha": SHA_B})
         for silent in ("", None):
             with self.assertRaises(transport.Refusal):
-                transport.close_lineage(led, "done", silent)
-        self.assertFalse(led.closures_of_lineage())
-        transport.close_lineage(led, "done", "user")
-        self.assertEqual(led.closures_of_lineage()[-1]["authorized_by"],
+                transport.close_lineage(led, "done", silent, LINEAGE)
+        self.assertFalse(led.closures_of_lineage(LINEAGE))
+        transport.close_lineage(led, "done", "user", LINEAGE)
+        self.assertEqual(led.closures_of_lineage(LINEAGE)[-1]["authorized_by"],
                          "user")
 
     def test_a_commit_reviewed_in_a_closed_lineage_cannot_be_waived(self):
         """FALSIFICATION for sweep F10 (Medium). Mutation: change the
-        eligibility lookup back to `ledger.current()` and the commit
+        eligibility lookup back to `ledger.current(LINEAGE)` and the commit
         reviewed in the closed lineage is waived with `recorded: True`,
         the report lists it as deliberately unreviewed beside its own
         review, and the first assertRaises fails."""
@@ -221,10 +237,11 @@ class TestWaiver(unittest.TestCase):
         led.add({"event": "request", "round": 1, "sha": SHA_C, "bytes": 1})
         led.add({"event": "verdict", "round": 1, "sha": SHA_C,
                  "verdict": "clean to advance"})
-        transport.close_lineage(led, "clean", "user")
-        self.assertFalse([e for e in led.current()
+        transport.close_lineage(led, "clean", "user", LINEAGE)
+        self.assertTrue(led.is_closed(LINEAGE))
+        self.assertFalse([e for e in led.current("Lnext000001")
                           if e.get("event") == "request"],
-                         "the review is in the closed lineage, not this one")
+                         "the review is in the closed lineage, not another")
         with self.assertRaises(transport.Refusal) as ctx:
             transport.waive(self._cfg(), led, SHA_C, "skip it", "user",
                             git=self._git())
@@ -232,7 +249,7 @@ class TestWaiver(unittest.TestCase):
         self.assertIn("lineage 1", str(ctx.exception))
         self.assertFalse([e for e in led.events()
                           if e.get("event") == "waiver"])
-        self.assertEqual(led.report(5)["waived"]["count"], 0)
+        self.assertEqual(led.report(LINEAGE, 5)["waived"]["count"], 0)
         # Control: a commit no lineage ever reviewed still waives.
         never = "d" * 40
         git = fake_git({("rev-parse", "--verify", f"{never}^{{commit}}"):
@@ -240,32 +257,32 @@ class TestWaiver(unittest.TestCase):
         rec = transport.waive(self._cfg(), led, never, "docs only", "user",
                               git=git)
         self.assertTrue(rec["recorded"])
-        self.assertEqual(led.report(5)["waived"]["count"], 1)
+        self.assertEqual(led.report(LINEAGE, 5)["waived"]["count"], 1)
 
 
 class TestCloseLineage(unittest.TestCase):
 
     def test_no_rounds_refuses(self):
         with self.assertRaises(transport.Refusal) as ctx:
-            transport.close_lineage(Ledger.in_memory(), "why", "user")
+            transport.close_lineage(Ledger.in_memory(), "why", "user", LINEAGE)
         self.assertIn("nothing to close", str(ctx.exception))
 
     def test_empty_reason_refuses(self):
         with self.assertRaises(transport.Refusal):
-            transport.close_lineage(lineage_ledger(), "  ", "user")
+            transport.close_lineage(lineage_ledger(), "  ", "user", LINEAGE)
 
     def test_open_request_is_recorded_as_such(self):
         ledger = lineage_ledger()
         ledger.add({"event": "request", "round": 2, "sha": SHA_B, "bytes": 1})
-        rec = transport.close_lineage(ledger, "abandoned", "user")
+        rec = transport.close_lineage(ledger, "abandoned", "user", LINEAGE)
         self.assertTrue(rec["open_request"])
         self.assertEqual(rec["lineage_closed_at_round"], 2)
-        marker = ledger.closures_of_lineage()[-1]
+        marker = ledger.closures_of_lineage(LINEAGE)[-1]
         self.assertEqual(marker["outcome"], "decision")
         self.assertEqual(marker["reason"], "abandoned")
 
     def test_completed_lineage_records_no_open_request(self):
-        rec = transport.close_lineage(lineage_ledger(), "done", "user")
+        rec = transport.close_lineage(lineage_ledger(), "done", "user", LINEAGE)
         self.assertFalse(rec["open_request"])
 
 
@@ -283,7 +300,7 @@ class TestCloseRound(unittest.TestCase):
     def test_changes_requested_records_and_keeps_the_lineage_open(self):
         ledger = self._ledger()
         rec = transport.close_round(self._cfg(), ledger, verdict_text(),
-                                    "v.md")
+                                    "v.md",LINEAGE)
         self.assertEqual(rec["round"], 1)
         self.assertEqual(rec["lineage"], "open")
         # F1 (lineage 6 round 1): the next step needs files the author has
@@ -296,18 +313,22 @@ class TestCloseRound(unittest.TestCase):
         self.assertIn("verdict", kinds)
         self.assertIn("finding", kinds)
         self.assertNotIn(Ledger.LINEAGE_CLOSED, kinds)
-        self.assertEqual(ledger.completed_rounds(), [1])
+        self.assertEqual(ledger.completed_rounds(LINEAGE), [1])
 
     def test_clean_verdict_closes_the_lineage(self):
         ledger = self._ledger()
         rec = transport.close_round(self._cfg(), ledger,
                                     verdict_text(verdict="clean to advance"),
-                                    "v.md")
+                                    "v.md",LINEAGE)
         self.assertIsNone(rec["next"])
-        marker = ledger.closures_of_lineage()[-1]
+        marker = ledger.closures_of_lineage(LINEAGE)[-1]
         self.assertEqual(marker["outcome"], "clean")
         self.assertEqual(marker["sha"], SHA_B)
-        self.assertEqual(ledger.lineage_number(), 2)
+        # The closure names the lineage it closed, and that lineage is now
+        # closed rather than merely behind a marker.
+        self.assertEqual(ledger.lineage_of(marker), LINEAGE)
+        self.assertTrue(ledger.is_closed(LINEAGE))
+        self.assertEqual(ledger.open_lineages(), [])
 
     def test_same_sha_second_round_binds_latest_request_and_requires_closures(
             self):
@@ -337,14 +358,14 @@ class TestCloseRound(unittest.TestCase):
                     "author": "claude", "reviewer": "codex"})
 
         # Half one: the round is the OPEN one, not the first match.
-        self.assertEqual(ledger.rounds_for_sha(SHA_B), [1, 2])
-        self.assertEqual(ledger.round_for_sha(SHA_B), 2)
+        self.assertEqual(ledger.rounds_for_sha(SHA_B, LINEAGE), [1, 2])
+        self.assertEqual(ledger.round_for_sha(SHA_B, LINEAGE), 2)
 
         # Half two: the refutation in round 1 is what round 2 must answer,
         # so a closure-free verdict cannot validate — the paired control the
         # finding asked for. Omission is how a live finding dies quietly.
         clean = wire.parse_verdict(verdict_text(verdict="clean to advance"))
-        answering = cli._dispositions_answered(ledger, clean)
+        answering = cli._dispositions_answered(ledger, clean, LINEAGE)
         self.assertEqual([r["fp"] for r in answering], [fp],
                          "round 2 answers round 1's dispositions")
         codes = {i.code for i in validate.validate_verdict(
@@ -355,15 +376,15 @@ class TestCloseRound(unittest.TestCase):
         # cannot close the lineage at the round already ruled.
         rec = transport.close_round(self._cfg(), ledger,
                                     verdict_text(verdict="clean to advance"),
-                                    "v.md")
+                                    "v.md",LINEAGE)
         self.assertEqual(rec["round"], 2)
-        self.assertEqual(ledger.closures_of_lineage()[-1]["at_round"], 2,
+        self.assertEqual(ledger.closures_of_lineage(LINEAGE)[-1]["at_round"], 2,
                          "the lineage closes at the round actually ruled")
 
     def test_unknown_sha_refuses_round_underivable(self):
         with self.assertRaises(transport.Refusal) as ctx:
             transport.close_round(self._cfg(), self._ledger(),
-                                  verdict_text(sha=SHA_C), "v.md")
+                                  verdict_text(sha=SHA_C), "v.md", LINEAGE)
         # The next command no longer offers --round as the escape: round 1 F1
         # established that supplying it was the defect, not the remedy.
         self.assertNotIn("--round", ctx.exception.next_cmd)
@@ -382,7 +403,7 @@ class TestCloseRound(unittest.TestCase):
         before = len(ledger.events())
         with self.assertRaises(transport.Refusal) as ctx:
             transport.close_round(self._cfg(), ledger,
-                                  verdict_text(sha=SHA_C), "v.md", round_no=1)
+                                  verdict_text(sha=SHA_C), "v.md", LINEAGE, round_no=1)
         self.assertIn("binds sha", str(ctx.exception))
         self.assertEqual(len(ledger.events()), before,
                          "a rejected close must record nothing")
@@ -398,7 +419,7 @@ class TestCloseRound(unittest.TestCase):
                     "author": "claude", "reviewer": "codex"})
         with self.assertRaises(transport.Refusal) as ctx:
             transport.close_round(self._cfg(), ledger,
-                                  verdict_text(sha=SHA_C), "v.md", round_no=1)
+                                  verdict_text(sha=SHA_C), "v.md", LINEAGE, round_no=1)
         self.assertIn("round 2", str(ctx.exception))
 
     def test_a_clean_verdict_for_an_unrequested_sha_closes_nothing(self):
@@ -408,15 +429,15 @@ class TestCloseRound(unittest.TestCase):
         with self.assertRaises(transport.Refusal):
             transport.close_round(
                 self._cfg(), ledger,
-                verdict_text(sha=SHA_C, verdict="clean to advance"), "v.md",
+                verdict_text(sha=SHA_C, verdict="clean to advance"), "v.md",LINEAGE,
                 round_no=1)
-        self.assertEqual(ledger.closures_of_lineage(), [])
-        self.assertEqual(ledger.lineage_number(), 1)
+        self.assertEqual(ledger.closures_of_lineage(LINEAGE), [])
+        self.assertFalse(ledger.is_closed(LINEAGE))
 
     def test_an_explicit_round_that_agrees_is_accepted(self):
         # Agreement is not the defect; substitution is.
         rec = transport.close_round(self._cfg(), self._ledger(),
-                                    verdict_text(), "v.md", round_no=1)
+                                    verdict_text(), "v.md", LINEAGE, round_no=1)
         self.assertEqual(rec["round"], 1)
 
     def test_validation_failure_records_nothing(self):
@@ -426,7 +447,7 @@ class TestCloseRound(unittest.TestCase):
         before = len(ledger.events())
         with self.assertRaises(transport.Refusal):
             transport.close_round(
-                self._cfg(), ledger, verdict_text(), "v.md",
+                self._cfg(), ledger, verdict_text(), "v.md",LINEAGE,
                 validate_items=lambda v: [validate.Item(
                     "error", "V-X", "planted")])
         self.assertEqual(len(ledger.events()), before)
@@ -434,7 +455,7 @@ class TestCloseRound(unittest.TestCase):
     def test_not_a_verdict_refuses(self):
         with self.assertRaises(transport.Refusal):
             transport.close_round(self._cfg(), self._ledger(),
-                                  "just prose\n", "v.md")
+                                  "just prose\n", "v.md", LINEAGE)
 
     def test_event_shape_parity_with_ledger_add(self):
         # `close` and `ledger add` must record byte-identical events (uids),
@@ -444,11 +465,12 @@ class TestCloseRound(unittest.TestCase):
         digest = transport._digest_text(text)
         a = Ledger.in_memory()
         a.add_all(transport.verdict_events(parsed, 1, digest,
-                                           len(text.encode("utf-8"))))
+                                           len(text.encode("utf-8"))),
+                  lineage=LINEAGE)
         b = Ledger.in_memory()
         b.add({"event": "request", "round": 1, "sha": SHA_B, "bytes": 1,
                "author": "claude", "reviewer": "codex"})
-        transport.close_round(self._cfg(), b, text, "v.md")
+        transport.close_round(self._cfg(), b, text, "v.md", LINEAGE)
         uids_a = {e["uid"] for e in a.events()}
         uids_b = {e["uid"] for e in b.events()
                   if e["event"] not in ("request",)}
@@ -474,17 +496,27 @@ class TestTake(unittest.TestCase):
         self.assertEqual(rec["reviewer"], "codex")
         self.assertIn(f"diff {SHA_A}...{SHA_B}", rec["diff"])
         self.assertIn("stop", rec["then"])
-        self.assertEqual(ledger.round_for_sha(SHA_B), 1)
+        # An empty reviewer ledger has no open lineage to continue, so the
+        # take MINTS one and records the round under it (`take_lineage`).
+        self.assertTrue(rec["lineage"].startswith("L"), rec["lineage"])
+        self.assertEqual(ledger.round_for_sha(SHA_B, rec["lineage"]), 1)
+        self.assertEqual({ledger.lineage_of(e) for e in ledger.events()},
+                         {rec["lineage"]})
 
     def test_request_event_parity_with_ledger_add(self):
         text = request_text()
         parsed = wire.parse_request(text)
         digest = transport._digest_text(text)
+        ledger = Ledger.in_memory()
+        rec = transport.take(self._cfg(), ledger, text, "r.md",
+                             git=self._git(), reviewer="codex")
+        # Same shape, and the same lineage key: the key is part of the
+        # event, so parity is asserted under the lineage the take recorded
+        # into rather than against a row that declares none.
         expected = Ledger.in_memory()
         expected.add(transport.request_event(parsed, 1, digest,
-                                             len(text.encode("utf-8"))))
-        ledger = Ledger.in_memory()
-        transport.take(self._cfg(), ledger, text, "r.md", git=self._git(), reviewer="codex")
+                                             len(text.encode("utf-8"))),
+                     lineage=rec["lineage"])
         self.assertEqual(ledger.events()[0]["uid"],
                          expected.events()[0]["uid"])
 
@@ -881,7 +913,7 @@ class TestCachedHandoff(unittest.TestCase):
         cfg = dataclasses.replace(CFG, ledger_dir=None)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
                         ("status", "--porcelain"): " M x"})
-        self.assertIsNone(transport.cached_handoff(cfg, Ledger.in_memory(), 1,
+        self.assertIsNone(transport.cached_handoff(cfg, Ledger.in_memory(), 1,LINEAGE,
                                                    git=git))
 
     def test_cold_when_no_request_for_this_tip(self):
@@ -892,7 +924,7 @@ class TestCachedHandoff(unittest.TestCase):
         ledger = Ledger.in_memory()
         ledger.add({"event": "request", "round": 1, "sha": SHA_A,
                     "source_digest": "x", "bytes": 1})
-        self.assertIsNone(transport.cached_handoff(cfg, ledger, 1, git=git))
+        self.assertIsNone(transport.cached_handoff(cfg, ledger, 1, LINEAGE, git=git))
 
     def test_cold_when_no_kept_copy(self):
         cfg = dataclasses.replace(CFG, ledger_dir=None)  # no exchange dir
@@ -902,7 +934,7 @@ class TestCachedHandoff(unittest.TestCase):
         ledger = Ledger.in_memory()
         ledger.add({"event": "request", "round": 1, "sha": SHA_B,
                     "source_digest": "x", "bytes": 1})
-        self.assertIsNone(transport.cached_handoff(cfg, ledger, 1, git=git))
+        self.assertIsNone(transport.cached_handoff(cfg, ledger, 1, LINEAGE, git=git))
 
     def test_warm_and_altered_copy(self):
         # This test is about the KEPT COPY; the scaffold records the claim
@@ -930,7 +962,7 @@ class TestCachedHandoff(unittest.TestCase):
             tmp, ignore_errors=True))
         cfg = dataclasses.replace(CFG, ledger_dir=tmp)
         text = request_text(tool_attr=tool_identity())
-        kept = transport.keep_bytes(cfg, 1, "request", text)
+        kept = transport.keep_bytes(cfg, 1, "request", text, lineage=1)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
                         ("status", "--porcelain"): "",
                         **authority_calls()})
@@ -941,17 +973,17 @@ class TestCachedHandoff(unittest.TestCase):
                     "claim_digest": transport.NO_CLAIM})
         # Paired control: the canonical LF copy is warm.
         self.assertIsNotNone(transport.cached_handoff(
-            cfg, ledger, 1, git=git, claim_digest=transport.NO_CLAIM))
+            cfg, ledger, 1, LINEAGE, git=git, claim_digest=transport.NO_CLAIM))
         for name, mutant in (("crlf", text.replace("\n", "\r\n")),
                              ("cr", text.replace("\n", "\r"))):
             Path(kept).write_bytes(mutant.encode("utf-8"))
             self.assertIsNone(
-                transport.cached_handoff(cfg, ledger, 1, git=git,
+                transport.cached_handoff(cfg, ledger, 1, LINEAGE, git=git,
                                          claim_digest=transport.NO_CLAIM),
                 f"{name}: a byte-distinct kept copy served warm")
         Path(kept).write_bytes(b"\xff" + text.encode("utf-8"))
         self.assertIsNone(transport.cached_handoff(
-            cfg, ledger, 1, git=git, claim_digest=transport.NO_CLAIM))
+            cfg, ledger, 1, LINEAGE, git=git, claim_digest=transport.NO_CLAIM))
 
     def test_keep_bytes_restores_a_rewritten_copy_from_canonical_text(self):
         """keep_bytes OWNS the retained copy (ruled 2026-08-30): the
@@ -966,13 +998,13 @@ class TestCachedHandoff(unittest.TestCase):
             tmp, ignore_errors=True))
         cfg = dataclasses.replace(CFG, ledger_dir=tmp)
         text = request_text(tool_attr=tool_identity())
-        kept = transport.keep_bytes(cfg, 1, "request", text)
+        kept = transport.keep_bytes(cfg, 1, "request", text, lineage=1)
         # Paired control: an unmodified canonical copy is left as it is.
-        self.assertEqual(transport.keep_bytes(cfg, 1, "request", text), kept)
+        self.assertEqual(transport.keep_bytes(cfg, 1, "request", text, lineage=1), kept)
         self.assertEqual(Path(kept).read_bytes(), text.encode("utf-8"))
         # The rewrite a text comparison could not see is repaired.
         Path(kept).write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
-        self.assertEqual(transport.keep_bytes(cfg, 1, "request", text), kept)
+        self.assertEqual(transport.keep_bytes(cfg, 1, "request", text, lineage=1), kept)
         self.assertEqual(Path(kept).read_bytes(), text.encode("utf-8"),
                          "a byte-rewritten kept copy must be restored from "
                          "the canonical emitted text")
@@ -996,7 +1028,7 @@ class TestCachedHandoff(unittest.TestCase):
             tmp, ignore_errors=True))
         cfg = dataclasses.replace(CFG, ledger_dir=tmp)
         text = request_text(tool_attr=tool_identity())
-        transport.keep_bytes(cfg, 1, "request", text)
+        transport.keep_bytes(cfg, 1, "request", text, lineage=1)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
                         ("status", "--porcelain"): "",
                         **authority_calls()})
@@ -1007,16 +1039,16 @@ class TestCachedHandoff(unittest.TestCase):
 
         # Same claim, unchanged tip: warm, which is the rule's whole point.
         self.assertIsNotNone(transport.cached_handoff(
-            cfg, ledger, 1, git=git, claim_digest="claim-one"))
+            cfg, ledger, 1, LINEAGE, git=git, claim_digest="claim-one"))
         # Edited claim, unchanged tip: cold.
         self.assertIsNone(transport.cached_handoff(
-            cfg, ledger, 1, git=git, claim_digest="claim-two"))
+            cfg, ledger, 1, LINEAGE, git=git, claim_digest="claim-two"))
         # Round 4 F1: this assertion used to read the other way, with a
         # comment explaining why "not given" was not "given and different".
         # It was ratifying the bug. Dropping the claim IS a change to the
         # authored input, so it is cold like any other.
         self.assertIsNone(transport.cached_handoff(
-            cfg, ledger, 1, git=git, claim_digest=transport.NO_CLAIM))
+            cfg, ledger, 1, LINEAGE, git=git, claim_digest=transport.NO_CLAIM))
 
     def test_a_supplied_claim_against_an_unrecorded_one_is_cold(self):
         """Round 3 F3 (High), second half — and a reversal.
@@ -1037,7 +1069,7 @@ class TestCachedHandoff(unittest.TestCase):
             tmp, ignore_errors=True))
         cfg = dataclasses.replace(CFG, ledger_dir=tmp)
         text = request_text(tool_attr=tool_identity())
-        transport.keep_bytes(cfg, 1, "request", text)
+        transport.keep_bytes(cfg, 1, "request", text, lineage=1)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
                         ("status", "--porcelain"): "",
                         **authority_calls()})
@@ -1046,12 +1078,12 @@ class TestCachedHandoff(unittest.TestCase):
                     "source_digest": transport._digest_text(text),
                     "bytes": len(text)})           # no claim_digest recorded
         self.assertIsNone(transport.cached_handoff(
-            cfg, ledger, 1, git=git, claim_digest="claim-one"))
+            cfg, ledger, 1, LINEAGE, git=git, claim_digest="claim-one"))
         # Round 5 F1: this assertion used to read the other way, with a
         # comment saying the comparison "is not required". Two unknowns are
         # the one equality that can never be proved, and calling it warm was
         # the fourth transition of a rule I had just claimed had none.
-        self.assertIsNone(transport.cached_handoff(cfg, ledger, 1, git=git))
+        self.assertIsNone(transport.cached_handoff(cfg, ledger, 1, LINEAGE, git=git))
 
     def test_removing_claim_file_is_cold(self):
         """Round 4 F1 (High), falsification.
@@ -1092,7 +1124,7 @@ class TestCachedHandoff(unittest.TestCase):
         # Stamped, so every row of the table below tests the CLAIM rule it is
         # about rather than falling cold on round 1 F2's identity key.
         text = request_text(tool_attr=tool_identity())
-        transport.keep_bytes(cfg, 1, "request", text)
+        transport.keep_bytes(cfg, 1, "request", text, lineage=1)
         git = fake_git({("rev-parse", "HEAD"): SHA_B,
                         ("status", "--porcelain"): "",
                         **authority_calls()})
@@ -1113,9 +1145,9 @@ class TestCachedHandoff(unittest.TestCase):
             # exactly that difference. Both forms are exercised.
             if current is OMITTED:
                 return transport.cached_handoff(
-                    cfg, ledger, 1, git=git) is not None
+                    cfg, ledger, 1, LINEAGE, git=git) is not None
             return transport.cached_handoff(
-                cfg, ledger, 1, git=git, claim_digest=current) is not None
+                cfg, ledger, 1, LINEAGE, git=git, claim_digest=current) is not None
 
         for recorded, current, expected, why in (
                 ("claim-one", "claim-one", True, "same claim: the rule's point"),
@@ -1219,7 +1251,7 @@ class TestHandoffBreakers(unittest.TestCase):
             tmp, ignore_errors=True))
         cfg = self._cfg(tmp)
         ledger = self._stale_ledger(Ledger(tmp))
-        self.assertTrue([b for b in ledger.breakers(3)
+        self.assertTrue([b for b in ledger.breakers(LINEAGE, 3)
                          if b["breaker"] == "stale"], "fixture fires stale")
         before = list(ledger.events())
         # Through the verb: refused as blocked, before anything is recorded,
@@ -1256,14 +1288,14 @@ class TestHandoffBreakers(unittest.TestCase):
         # — bound by identity, not by name and round ceiling (round-2 F3).
         rec = transport.authorize_breaker(cfg, Ledger(tmp), "stale",
                                           "reviewer confirmed on old SHA",
-                                          "user")
+                                          "user",LINEAGE)
         self.assertTrue(rec["recorded"])
         # Identity is the key AND the material the human read (round-4 F1);
         # the key alone is a prefix of it, never the whole of it.
         self.assertEqual(len(rec["covers"]), 1)
         self.assertTrue(rec["covers"][0].startswith(f"stale@2:{FP}#"),
                         rec["covers"])
-        transport.handoff_preflight(cfg, Ledger(tmp))  # no raise
+        transport.handoff_preflight(cfg, Ledger(tmp), LINEAGE)  # no raise
         # ...and not for a later one: the same breaker firing again in
         # round 3 is a new fact.
         led = Ledger(tmp)
@@ -1277,24 +1309,24 @@ class TestHandoffBreakers(unittest.TestCase):
                  "digest": "sha256:newer", "pointer": "y"})
         led.add({"event": "disposition", "round": 3, "finding_id": "F1",
                  "fp": FP, "disposition": "refuted", "payload": {}})
-        self.assertTrue([b for b in Ledger(tmp).breakers(3)
+        self.assertTrue([b for b in Ledger(tmp).breakers(LINEAGE, 3)
                          if b["breaker"] == "stale" and b["round"] == 3])
         with self.assertRaises(transport.Refusal):
-            transport.handoff_preflight(cfg, Ledger(tmp))
+            transport.handoff_preflight(cfg, Ledger(tmp), LINEAGE)
 
     def test_no_breaker_valid_control(self):
         from review.tests.test_breakers import base_round1
         ledger = Ledger.in_memory()
         base_round1(ledger, disposition="accepted")
-        self.assertFalse(ledger.breakers(3))
-        transport.handoff_preflight(self._cfg(), ledger)  # no raise
-        self.assertEqual(transport.unauthorized_breakers(self._cfg(), ledger),
+        self.assertFalse(ledger.breakers(LINEAGE, 3))
+        transport.handoff_preflight(self._cfg(), ledger, LINEAGE)  # no raise
+        self.assertEqual(transport.unauthorized_breakers(self._cfg(), ledger, LINEAGE),
                          [])
 
     def test_only_a_named_breaker_can_be_authorized(self):
         with self.assertRaises(transport.Refusal):
             transport.authorize_breaker(self._cfg(), Ledger.in_memory(),
-                                        "vibes", "r", "user")
+                                        "vibes", "r", "user", LINEAGE)
 
     def test_breaker_override_requires_nonempty_reason_and_actor(self):
         """FALSIFICATION for round-2 F2 (High). A required argparse flag
@@ -1314,16 +1346,16 @@ class TestHandoffBreakers(unittest.TestCase):
         cfg = self._cfg(tmp)
         self._stale_ledger(Ledger(tmp))
         before = list(Ledger(tmp).events())
-        self.assertTrue(transport.unauthorized_breakers(cfg, Ledger(tmp)))
+        self.assertTrue(transport.unauthorized_breakers(cfg, Ledger(tmp), LINEAGE))
         # Transport: omitted, empty, whitespace — reason and actor each.
         for reason, by in (("", "user"), ("   ", "user"), (None, "user"),
                            ("r", ""), ("r", "  "), ("r", None),
                            ("", ""), (None, None)):
             with self.assertRaises(transport.Refusal, msg=(reason, by)):
                 transport.authorize_breaker(cfg, Ledger(tmp), "stale",
-                                            reason, by)
+                                            reason, by, LINEAGE)
             self.assertEqual(Ledger(tmp).events(), before)
-            self.assertTrue(transport.unauthorized_breakers(cfg, Ledger(tmp)),
+            self.assertTrue(transport.unauthorized_breakers(cfg, Ledger(tmp), LINEAGE),
                             "the firing stays unauthorized")
         # CLI: typed blocked, nothing appended.
         for argv in ({"reason": "", "by": "user"},
@@ -1347,7 +1379,7 @@ class TestHandoffBreakers(unittest.TestCase):
         self.assertEqual(len(overrides), 1)
         self.assertEqual(overrides[0]["authorized_by"], "user")
         self.assertEqual(overrides[0]["reason"], "reviewer confirmed on old SHA")
-        self.assertEqual(transport.unauthorized_breakers(cfg, Ledger(tmp)), [])
+        self.assertEqual(transport.unauthorized_breakers(cfg, Ledger(tmp), LINEAGE), [])
 
     def test_breaker_override_cannot_pre_authorize_a_future_firing(self):
         """FALSIFICATION for round-2 F3 (High). An override recorded before
@@ -1364,13 +1396,13 @@ class TestHandoffBreakers(unittest.TestCase):
         # Round 1 completed with a High finding, accepted, no run yet:
         # nothing fires.
         base_round1(led, disposition="accepted")
-        self.assertEqual(led.breakers(3, blocking_severities=cfg.blocking_severities), [])
+        self.assertEqual(led.breakers(LINEAGE, 3, blocking_severities=cfg.blocking_severities), [])
         # Pre-authorizing `unverifiable` is refused: there is no firing for
         # a decision to cover.
         with self.assertRaises(transport.Refusal) as ctx:
             transport.authorize_breaker(cfg, led, "unverifiable",
                                         "we know the runner is missing",
-                                        "user")
+                                        "user",LINEAGE)
         self.assertIn("not firing", str(ctx.exception))
         self.assertFalse([e for e in led.events()
                           if e.get("event") == transport.BREAKER_OVERRIDE])
@@ -1379,10 +1411,10 @@ class TestHandoffBreakers(unittest.TestCase):
         led.add({"event": "falsification_run", "round": 1, "fp": FP,
                  "status": "cannot_execute", "mutation": "not_run",
                  "note": "no runner", "blocking": True})
-        fired = transport.unauthorized_breakers(cfg, led)
+        fired = transport.unauthorized_breakers(cfg, led, LINEAGE)
         self.assertEqual([f["breaker"] for f in fired], ["unverifiable"])
         with self.assertRaises(transport.Refusal):
-            transport.handoff_preflight(cfg, led)
+            transport.handoff_preflight(cfg, led, LINEAGE)
         # Even an override that DID get recorded for this breaker at an
         # earlier moment (seeded, as no door records one now) covers only
         # the identities it lists — not a later firing with the same name
@@ -1390,15 +1422,15 @@ class TestHandoffBreakers(unittest.TestCase):
         led.add({"event": transport.BREAKER_OVERRIDE, "breaker": "unverifiable",
                  "covers": [], "reason": "seeded", "authorized_by": "user"})
         with self.assertRaises(transport.Refusal):
-            transport.handoff_preflight(cfg, led)
+            transport.handoff_preflight(cfg, led, LINEAGE)
         # Only an explicit decision on the now-visible firing lifts it.
         rec = transport.authorize_breaker(cfg, led, "unverifiable",
                                           "runner unavailable, accepted",
-                                          "user")
+                                          "user",LINEAGE)
         self.assertEqual(len(rec["covers"]), 1)
         self.assertTrue(rec["covers"][0].startswith(f"unverifiable@1:{FP}#"),
                         rec["covers"])
-        transport.handoff_preflight(cfg, led)  # no raise
+        transport.handoff_preflight(cfg, led, LINEAGE)  # no raise
 
     def test_the_decision_names_its_taker(self):
         # `--by` is required by the parser: silence is not the user.
@@ -1441,7 +1473,7 @@ class TestCorrectActorAppendsWithoutRewriting(unittest.TestCase):
     def test_an_unnamed_event_is_refused(self):
         with self.assertRaises(transport.Refusal):
             transport.correct_actor(self._cfg(), Ledger.in_memory(), [],
-                                    "claude", "user", "reason")
+                                    "claude", "user", "reason", LINEAGE)
 
     def test_an_unrecorded_uid_is_refused(self):
         try:
@@ -1453,7 +1485,7 @@ class TestCorrectActorAppendsWithoutRewriting(unittest.TestCase):
         ledger, uid = self._ledger_with_one_disposition(tmp, author="codex")
         with self.assertRaises(transport.Refusal) as ctx:
             transport.correct_actor(self._cfg(tmp), Ledger(tmp),
-                                    ["not-a-real-uid"], "claude", "user", "r")
+                                    ["not-a-real-uid"], "claude", "user", "r", LINEAGE)
         self.assertIn("not-a-real-uid", str(ctx.exception))
         self.assertEqual(len(Ledger(tmp).events()), 2, "nothing appended")
 
@@ -1479,7 +1511,7 @@ class TestCorrectActorAppendsWithoutRewriting(unittest.TestCase):
             with self.assertRaises(transport.Refusal,
                                    msg=(actor, by, reason)):
                 transport.correct_actor(self._cfg(tmp), Ledger(tmp), [uid],
-                                        actor, by, reason)
+                                        actor, by, reason, LINEAGE)
             self.assertEqual(Ledger(tmp).events(), before)
 
     def test_a_correction_matching_the_record_is_refused(self):
@@ -1494,7 +1526,7 @@ class TestCorrectActorAppendsWithoutRewriting(unittest.TestCase):
         ledger, uid = self._ledger_with_one_disposition(tmp, author="claude")
         with self.assertRaises(transport.Refusal):
             transport.correct_actor(self._cfg(tmp), Ledger(tmp), [uid],
-                                    "claude", "user", "already correct")
+                                    "claude", "user", "already correct", LINEAGE)
 
     def test_a_real_correction_records_and_names_the_events(self):
         try:
@@ -1512,7 +1544,7 @@ class TestCorrectActorAppendsWithoutRewriting(unittest.TestCase):
                                       "user", "round 2's disposition was "
                                       "recorded under the reviewer's "
                                       "identity; the request it answers "
-                                      "names claude as the round's author")
+                                      "names claude as the round's author", LINEAGE)
         self.assertTrue(rec["recorded"])
         self.assertEqual(rec["corrects"], [uid])
         self.assertEqual(rec["true_actor"], "claude")
@@ -1855,7 +1887,7 @@ class TestTheAuthorDoorStampsTheCommittedRoles(unittest.TestCase):
         from review import cli, emit as _emit
         ran = []
 
-        def spy(cfg, target_sha):
+        def spy(cfg, target_sha, base=None):
             ran.append(target_sha)
             return []
 

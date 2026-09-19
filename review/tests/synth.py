@@ -21,7 +21,7 @@ import json
 from review import config, wire
 from review.emit import _attestation_block, _git, emit_request
 from review.ledger import Ledger
-from review.tests.util import REPO_ROOT
+from review.tests.util import LINEAGE, REPO_ROOT
 
 CFG = config.load(REPO_ROOT)
 NO_GATES = dataclasses.replace(CFG, gates=[])
@@ -66,7 +66,8 @@ def emitted_request(cfg=NO_GATES, claim: dict | None = None,
     apart from what the caller breaks on purpose."""
     head = head_sha()
     return emit_request(cfg, ledger or shadow_ledger(), claim or CLAIM,
-                        base="HEAD", head="HEAD", reachability=reachability(head))
+                        base="HEAD", head="HEAD",
+                        reachability=reachability(head), lineage=LINEAGE)
 
 
 def attestation_records(target_sha: str, gate_id: str = "probe",

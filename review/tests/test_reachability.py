@@ -19,7 +19,7 @@ from pathlib import Path
 from review import config, validate, wire
 from review.emit import _git, emit_request, ensure_pushed, next_round
 from review.ledger import Ledger
-from review.tests.util import REPO_ROOT
+from review.tests.util import LINEAGE, REPO_ROOT
 
 CFG = config.load(REPO_ROOT)
 NO_GATES = dataclasses.replace(CFG, gates=[])
@@ -122,6 +122,13 @@ class TestEnsurePushedDecisions(unittest.TestCase):
         self.assertEqual(record.pop("roles"), ("claude", "codex"),
                          "the stamps are the roles resolved against the "
                          "COMMITTED authority (round 1 F2)")
+        # The preflight's two records (0.22.0), popped the same way: a clean
+        # tree swept nothing under no declared scope, and the environment
+        # is this process's — held in `test_handoff_preflight`.
+        self.assertEqual(record.pop("sweep"), {
+            "swept": [], "declared": False,
+            "outside": [], "allowed_outside": False})
+        self.assertIn("python", record.pop("environment"))
         self.assertEqual(record, {
             "state": "pushed", "branch": "main", "ref": "refs/heads/main",
             "remote": "origin", "url": "ssh://example.invalid/x.git",
@@ -272,20 +279,20 @@ class TestEmitRequestReachability(unittest.TestCase):
     def test_emission_without_a_record_refuses(self):
         with self.assertRaises(RuntimeError) as ctx:
             emit_request(NO_GATES, shadow_ledger(), {}, base="HEAD",
-                         head="HEAD")
+                         head="HEAD", lineage=LINEAGE)
         self.assertIn("reachability", str(ctx.exception))
 
     def test_stale_record_refuses(self):
         with self.assertRaises(RuntimeError) as ctx:
             emit_request(NO_GATES, shadow_ledger(), {}, base="HEAD",
-                         head="HEAD", reachability=synthetic_record("c" * 40))
+                         head="HEAD", reachability=synthetic_record("c" * 40), lineage=LINEAGE)
         self.assertIn("stale", str(ctx.exception))
 
     def test_envelope_carries_the_stamp_and_validates(self):
         head = _git(REPO_ROOT, "rev-parse", "HEAD")
         envelope = emit_request(
             NO_GATES, shadow_ledger(), CLAIM, base="HEAD", head="HEAD",
-            reachability=synthetic_record(head))
+            reachability=synthetic_record(head), lineage=LINEAGE)
         self.assertIn("Push:   refs/heads/main = ", envelope)
         self.assertIn("Verify: git fetch ssh://example.invalid/x.git "
                       "refs/heads/main && git cat-file -e", envelope)
@@ -308,7 +315,7 @@ class TestEmitRequestReachability(unittest.TestCase):
             self.skipTest(f"history depth 1, no HEAD~1 ({exc})")
         with self.assertRaises(RuntimeError) as ctx:
             emit_request(NO_GATES, shadow_ledger(), {}, base="HEAD",
-                         head=parent, reachability=synthetic_record(parent))
+                         head=parent, reachability=synthetic_record(parent), lineage=LINEAGE)
         self.assertIn("not an ancestor", str(ctx.exception))
 
     def test_local_only_envelope_validates_with_a_notice(self):
@@ -316,7 +323,7 @@ class TestEmitRequestReachability(unittest.TestCase):
         record = {"state": "local-only", "branch": "main", "sha": head,
                   "committed": False}
         envelope = emit_request(NO_GATES, shadow_ledger(), CLAIM, base="HEAD",
-                                head="HEAD", reachability=record)
+                                head="HEAD", reachability=record, lineage=LINEAGE)
         self.assertIn(wire.PUSH_LOCAL_MARKER, envelope)
         items = validate.validate_request(wire.parse_request(envelope),
                                           NO_GATES)
@@ -327,7 +334,7 @@ class TestEmitRequestReachability(unittest.TestCase):
         head = _git(REPO_ROOT, "rev-parse", "HEAD")
         envelope = emit_request(
             NO_GATES, shadow_ledger(), {}, base="HEAD", head="HEAD",
-            reachability=synthetic_record(head))
+            reachability=synthetic_record(head), lineage=LINEAGE)
         forged = envelope.replace(f"= {head} @", f"= {'b' * 40} @")
         items = validate.validate_request(wire.parse_request(forged),
                                           NO_GATES)
@@ -338,7 +345,7 @@ class TestEmitRequestReachability(unittest.TestCase):
         head = _git(REPO_ROOT, "rev-parse", "HEAD")
         envelope = emit_request(
             NO_GATES, shadow_ledger(), {}, base="HEAD", head="HEAD",
-            reachability=synthetic_record(head))
+            reachability=synthetic_record(head), lineage=LINEAGE)
         stripped = "\n".join(ln for ln in envelope.splitlines()
                              if not ln.startswith(("Push:", "Verify:")))
         items = validate.validate_request(wire.parse_request(stripped),
@@ -347,8 +354,8 @@ class TestEmitRequestReachability(unittest.TestCase):
                       {i.code for i in items if i.level == "error"})
 
     def test_next_round_derivation(self):
-        self.assertEqual(next_round(shadow_ledger()), 2)
-        self.assertEqual(next_round(Ledger.in_memory()), 1)
+        self.assertEqual(next_round(shadow_ledger(),LINEAGE), 2)
+        self.assertEqual(next_round(Ledger.in_memory(),LINEAGE), 1)
 
 
 class TestRealPushIntegration(unittest.TestCase):

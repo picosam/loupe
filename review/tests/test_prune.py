@@ -65,7 +65,7 @@ class TestPruneGateOutput(unittest.TestCase):
         stray = Path(cfg.ledger_dir) / transport.GATE_OUTPUT_DIR / "stray.txt"
         stray.write_text("not a directory", encoding="utf-8")
         # The layers that are never pruned, present so the test can prove it.
-        exchange = Path(transport.keep_bytes(cfg, 1, "request", "bytes\n"))
+        exchange = Path(transport.keep_bytes(cfg, 1, "request", "bytes\n", lineage=1))
         result = transport.prune_gate_output(cfg, self._ledger())
         self.assertEqual([e["sha"] for e in result["pruned"]], [SHA_B])
         self.assertEqual(result["pruned"][0]["bytes"], 10)

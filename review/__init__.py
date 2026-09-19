@@ -21,6 +21,32 @@ refuses loudly when it finds a legacy ledger and no current one, and
 record is exactly what this protects).
 """
 
+# THE INTERPRETER GUARD (2026-09-18, brief `handoff-guards-generalized`
+# class 2). It runs before every other statement of the package and is
+# written in syntax any Python 3 can parse, because the interpreter that
+# needs to read it is the one that cannot run the rest. Measured before it
+# existed: under 3.9 `python -m review --version` died inside this file with
+# `TypeError: unsupported operand type(s) for |`, and a cloud session on
+# 3.11 was handed a traceback where the sentence below belongs. The floor is
+# restated here and nowhere else in code; `test_handoff_preflight` holds it
+# equal to the package metadata's `requires-python`.
+import sys as _sys
+
+REQUIRES_PYTHON = (3, 14)
+REQUIRES_PYTHON_BELOW = (3, 15)
+
+if _sys.version_info[:2] < REQUIRES_PYTHON:
+    raise SystemExit(
+        "This tool (loupe) needs Python {}.{} or newer; this interpreter is "
+        "{}.{}.{} "
+        "({}). Nothing was read, committed, pushed or emitted. Run it under "
+        "a matching interpreter; uv provisions one from the range the "
+        "package declares. A round cannot be authored or taken from this "
+        "environment until then.".format(
+            REQUIRES_PYTHON[0], REQUIRES_PYTHON[1],
+            _sys.version_info[0], _sys.version_info[1], _sys.version_info[2],
+            _sys.executable))
+
 from pathlib import Path
 
 TOOL_NAME = "loupe"
@@ -137,7 +163,7 @@ TOOL_NAME = "loupe"
 #   - the reviewer procedure gains the falsification-anchoring rule (D3):
 #     anchor in the reviewed tree wherever the defect admits it, and name
 #     an external mutable dependency in the finding when it does not.
-TOOL_VERSION = "0.16.0"
+TOOL_VERSION = "0.23.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never
@@ -279,8 +305,11 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_authorization_grammar.py": TESTS,
     "review/tests/test_attestation_integrity.py": TESTS,
     "review/tests/test_breakers.py": TESTS,
+    "review/tests/test_ci_attested_gates.py": TESTS,
     "review/tests/test_command_boundary.py": TESTS,
     "review/tests/test_cli_exits.py": TESTS,
+    "review/tests/test_close_authority.py": TESTS,
+    "review/tests/test_concurrent_rounds.py": TESTS,
     "review/tests/test_config_compat.py": TESTS,
     "review/tests/test_convergence.py": TESTS,
     "review/tests/test_debug_round.py": TESTS,
@@ -293,11 +322,14 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_paths.py": TESTS,
     "review/tests/test_prune.py": TESTS,
     "review/tests/test_reachability.py": TESTS,
+    "review/tests/test_retention_by_lineage.py": TESTS,
     "review/tests/test_readme_walkthrough.py": TESTS,
     "review/tests/test_reference_domain.py": TESTS,
     "review/tests/test_rename_migration.py": TESTS,
     "review/tests/test_role_stamp.py": TESTS,
     "review/tests/test_shadow_round.py": TESTS,
+    "review/tests/test_handoff_preflight.py": TESTS,
+    "review/tests/test_take_compact.py": TESTS,
     "review/tests/test_tool_identity.py": TESTS,
     "review/tests/_transport_fixtures.py": TESTS,
     "review/tests/test_transport_authority.py": TESTS,

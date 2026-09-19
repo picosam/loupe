@@ -226,7 +226,11 @@ pair away; the standing lines are the default, not a cage.
 `round_cap = 3` unless the repository has a reason. Leave `token_budget`
 undeclared unless you have measured something: the tool reports "no budget
 declared, the breaker cannot fire", which is honest — a number with no
-measurement behind it is not.
+measurement behind it is not. Record that decision so it is not asked
+again: the `decide` entry for the key prints its `unset` as a comment line,
+`# decided: limits.token_budget undeclared` — write it under `[limits]` and
+the entry stops, while the key stays undeclared and uncounted (0.17.0; an
+older reader ignores the comment and keeps asking).
 
 ## 6. Verify it resolves
 

@@ -141,6 +141,13 @@ CLAIM_STRING_FIELDS = (
 
 # Rendered as bulleted lists; every element is a string.
 CLAIM_LIST_FIELDS = (
+    # The paths this round's outstanding work may touch (2026-09-18, brief
+    # `handoff-guards-generalized` class 1): an exact path, a directory
+    # prefix ending in `/`, or an fnmatch glob. `review_scope` stays the
+    # prose the reviewer reads; this is the half a machine can hold the
+    # commit to. Optional: a claim without it sweeps as before, and the
+    # request says so on its face.
+    "scope_paths",
     "deliberately_not",
     "evidence_not_captured",
     "stop_conditions",
@@ -472,9 +479,15 @@ LEGACY_EVENT_SCHEMA = {
         "required": {"event": "event_name", "round": "round", "fp": "fingerprint",
                      "closure": "closure_term", "source_path": "text",
                      "source_digest": "digest"},
+        # `residue` (brief `convergence-blind-to-reclassification`): the
+        # fingerprints of the findings a `reclassified` closure DECLARES as
+        # carrying what remains of the claim it narrowed. Optional, because
+        # a reclassification may leave no residue and because every record
+        # written before the field exists carries none.
         "optional": {"note": "text_or_blank", "ref": "text",
                      "outcome": "amendment_outcome",
-                     "answers_round": "round"},
+                     "answers_round": "round",
+                     "residue": "text_list"},
     },
     "lineage": {
         "required": {"event": "event_name", "kind": "lineage_kind",
@@ -603,7 +616,9 @@ WAIVED_REQUIRED = ("finding_id", "fp", "reason", "by")
 AUTHORIZATION_WRAPPER_FIELDS = {
     "sha": "sha",           # the commit advanced
     "round": "digits",      # decimal, stamped as text
-    "lineage": "digits",
+    # The lineage ID (brief `keyed-lineage`): a minted `L<hex>` or a legacy
+    # ordinal, both opaque tokens. Never arithmetic, so never `digits`.
+    "lineage": "lineage_id",
     "by": "name",           # asserted, never verified — AUTHORIZER_NAME_RE
     "tool": "identity",     # 16 lowercase hex
     "shape": "shape",
@@ -616,7 +631,12 @@ AUTHORIZATION_WRAPPER_FIELDS = {
 AUTHORIZATION_FIELDS = {
     "sha": "string",
     "round": "integer",
-    "lineage": "integer",
+    # A STRING since 0.20.0: the lineage is an id, not a count. Every
+    # artifact written before it stamped a decimal number, which no longer
+    # validates as this member — an authorization is judged when it is
+    # emitted and again when it is read, and a historical one is read from
+    # the record rather than re-validated.
+    "lineage": "string",
     "by": "string",
     "reason": "string",
     "waived": "waived_records",
@@ -709,6 +729,10 @@ SEAM_CLASSES = ("cross", "same_process", "archival")
 # comparison belongs to the branch, not to the helper.
 STAMPED_PARSE_SITES = {
     ("cli", "_detect_and_parse"): (),
+    # Lineage L22283494f8 round 2 F1: parses only to read the lineage the
+    # wrapper stamps, so a verb can carry the review an envelope names; its
+    # callers (brief, ledger add, respond, close) are the seams.
+    ("cli", "_envelope_lineage"): (),
     ("cli", "cmd_validate"): (("validate", "request"),
                               ("validate", "disposition")),
     ("cli", "cmd_respond"): (("respond", "disposition"),),
@@ -730,6 +754,64 @@ STAMPED_PARSE_SITES = {
 #: The parse calls that reach a stamped envelope, for the source walk.
 STAMPED_PARSE_CALLS = ("parse_request", "parse_disposition",
                        "_detect_and_parse")
+
+# --------------------------------------------------------- the CI receipt
+# THE RECEIPT ROW'S SHAPE, in one place. Round-3 F3: the emitter wrote nine
+# fields into every CI-attested record and the validator's own table named
+# three, so `duration_s`, `not_run`, `artifact`, `sha`, `tool_version` and
+# `schema` could be missing, mistyped, or about another commit and still
+# validate beside a green outer row. The completeness test could not see it
+# either — it derived its cases from the validator's table, so shrinking
+# that table silently shrank what "every field" meant. A test that reads
+# the thing it is meant to falsify proves only that the two agree.
+#
+# One authority, and both sides read it. `emit` BUILDS the row from these
+# keys, so a field cannot reach a record without being declared here;
+# `validate` derives presence and type from the same mapping, so a declared
+# field cannot go unchecked. The gate on the pair is an equality in both
+# directions against a row a real emission produced, which is neither
+# table.
+#
+# Per field: the item code its failure carries — explicit, so renaming a
+# field never silently renumbers a published code — the predicate kind the
+# validator applies, and what the field is for. The RELATIONS between the
+# row and what it explains (its gate, its command, its exit, its commit)
+# are checks of their own in `validate`, because "something about the
+# receipt is wrong" does not tell a reader which claim to disbelieve.
+CI_RECEIPT_SCHEMA = "loupe-gate-receipt/1"
+
+#: Named for the COMMIT, not the run: two runs at one commit answer the same
+#: question, and an artifact whose name carries the SHA cannot be mistaken
+#: for one from the previous push even if a listing is stale.
+CI_RECEIPT_ARTIFACT_PREFIX = "loupe-gates-"
+
+
+def ci_receipt_artifact(sha: str) -> str:
+    """The artifact name CI uploads and the runner asks for."""
+    return f"{CI_RECEIPT_ARTIFACT_PREFIX}{sha}"
+
+
+CI_RECEIPT_ROW = {
+    "id": ("A-CI-RECEIPT-ID", "nonempty",
+           "the gate id CI recorded this row for"),
+    "command": ("A-CI-RECEIPT-COMMAND", "nonempty",
+                "the exact command CI ran for this gate"),
+    "exit_code": ("A-CI-RECEIPT-EXIT", "int",
+                  "the exit code CI recorded — the receipt's whole point"),
+    "duration_s": ("A-CI-RECEIPT-DURATION", "number",
+                   "how long CI's own execution of this gate took"),
+    "not_run": ("A-CI-RECEIPT-NOT-RUN-SHAPE", "text_or_none",
+                "CI's reason for skipping the gate, and None in a row that "
+                "reports an execution"),
+    "artifact": ("A-CI-RECEIPT-ARTIFACT", "nonempty",
+                 "the artifact the receipt travelled in"),
+    "sha": ("A-CI-RECEIPT-SHA", "sha",
+            "the commit CI wrote this receipt about"),
+    "tool_version": ("A-CI-RECEIPT-TOOL", "nonempty",
+                     "the emitter that wrote the receipt, in CI"),
+    "schema": ("A-CI-RECEIPT-SCHEMA", "nonempty",
+               "the receipt grammar these bytes were written to"),
+}
 # What an UNSTAMPED envelope or a legacy ledger record READS as: every
 # envelope and record written before the attribute existed came from a
 # same-filesystem loop, and reading that silence as anything else would
@@ -994,8 +1076,31 @@ DECIDE_KEYS = (
      "the cumulative token budget one lineage may spend before the budget "
      "breaker fires; undeclared is uncounted, which is neither zero nor "
      "infinite",
-     None, 200000, None),
+     None, 200000, "# decided: limits.token_budget undeclared"),
 )
+
+
+def decided_line(key: str) -> str:
+    """The comment line that records "this key stays undeclared, by
+    decision" (0.17.0, brief `token-budget-off-state`).
+
+    Some keys have no value that means off: `token_budget` is uncounted
+    when absent, and every integer a reader accepts is a budget the breaker
+    fires on. Before this line the adapter's ask-once could never end for
+    such a key — nothing durable recorded the answer "leave it undeclared".
+    A comment is the one form every reader parses without refusing: an
+    older reader ignores it and keeps asking, which is the forward-only
+    reach every fix on this seam has; the current reader (`config.load`,
+    `config.from_text`) treats the key as decided and prints no entry,
+    while the key itself stays absent and therefore uncounted.
+    """
+    return f"# decided: {key} undeclared"
+
+
+def decided_undeclared_keys() -> frozenset:
+    """The keys whose off state is the decided-undeclared line."""
+    return frozenset(key for key, *_, unset in DECIDE_KEYS
+                     if unset == decided_line(key))
 
 
 def toml_line(key: str, value) -> str:
@@ -1032,7 +1137,13 @@ def decisions(declared, applied=None) -> list:
         proposed = set_value if set_value is not None else entry["applied"]
         entry["set"] = (toml_line(key, proposed)
                         if proposed is not None else None)
-        entry["unset"] = (toml_line(key, unset_value)
-                          if unset_value is not None else None)
+        if unset_value is None:
+            entry["unset"] = None
+        elif unset_value == decided_line(key):
+            # Not a TOML assignment: the line that records the decision to
+            # leave the key undeclared (`decided_line`).
+            entry["unset"] = unset_value
+        else:
+            entry["unset"] = toml_line(key, unset_value)
         out.append(entry)
     return out

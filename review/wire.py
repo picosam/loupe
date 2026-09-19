@@ -151,11 +151,28 @@ class Closure:
 
         - fp2:abc123 sustained: the refutation does not answer the evidence
         - fp2:def456 test_amendment ratified: syntactic identity is right
+
+    A `reclassified` closure may DECLARE where the narrowed claim went, on
+    its own continuation line, in the `Field: value` idiom a finding block
+    already uses (brief `convergence-blind-to-reclassification`):
+
+        - fp2:abc123 reclassified: High to Medium; most of it is fixed
+          Residue: F1
+
+    `residue` holds the round-local finding ids of that declaration, in the
+    order the reviewer wrote them. It is the DECLARED half of an edge whose
+    other half — the parent — the fingerprint already carries; without it
+    the descendant can only be guessed at from the note's prose, which is
+    not a grammar.
     """
     fp: str
     closure: str
     outcome: str | None
     note: str
+    #: Round-local finding ids declared by `Residue:`; empty when the
+    #: closure declares none, which is legal — a reclassification may leave
+    #: no residue at all, the rest having simply been fixed.
+    residue: tuple = ()
     # Round-4 F2: the raw line, and the shape defects found while parsing it.
     # A line that does not conform is carried as a defective record, never
     # dropped — absent and unparseable are different states, and only the
@@ -169,11 +186,20 @@ class Closure:
     def well_formed(self) -> bool:
         return not self.defects
 
-    def as_event(self, round_no: int, answers_round: int | None = None) -> dict:
+    def as_event(self, round_no: int, answers_round: int | None = None,
+                 residue_fps: list | None = None) -> dict:
         ev = {"event": "closure", "round": round_no, "fp": self.fp,
               "closure": self.closure, "note": self.note}
         if self.outcome:
             ev["outcome"] = self.outcome
+        if residue_fps:
+            # The declared edge, IN THE RECORD, by fingerprint — the same
+            # id every other event binds to. A round-local `F1` means
+            # nothing a round later, so recording the declaration verbatim
+            # would leave the reader doing the resolution the writer could
+            # do exactly once, here, against the verdict that carries both
+            # halves (brief `convergence-blind-to-reclassification`).
+            ev["residue"] = list(residue_fps)
         if answers_round is not None:
             # Round-6 F1: the round the closure actually answers, when the
             # recording path can derive it from the disposition record
@@ -528,7 +554,54 @@ _CLOSURE_BODY_RE = re.compile(
     r"^`?(?P<fp>\S+?)`?\s+(?P<terms>[A-Za-z_][\w ]*?)\s*:\s*(?P<note>.*)$")
 _CLOSURE_FP_RE = re.compile(r"^fp\d+:[0-9a-f]{8,}$")
 
+# The declared residue (brief `convergence-blind-to-reclassification`): a
+# continuation line of the closure above it, in the `Field: value` idiom a
+# finding block already uses. Case is admitted rather than required, and so
+# is whitespace around the colon, because the alternative to recognising
+# `residue: F1` is folding it into the note — a declaration the reviewer
+# wrote, silently demoted to prose, which is the vanishing act C-UNBULLETED
+# exists to prevent one line up.
+_CLOSURE_RESIDUE_RE = re.compile(r"^residue\s*:\s*(?P<ids>.*)$", re.IGNORECASE)
+#: A round-local finding id, in the grammar the finding heads themselves use.
+_RULING_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
+
 _CLOSURE_GRAMMAR = ("- <fingerprint> <closure>[ <outcome>]: <note>")
+_RESIDUE_GRAMMAR = "Residue: <finding id>[, <finding id>…]"
+
+
+def _residue_defects(ids_text: str, prior: tuple) -> tuple:
+    """`Residue:`'s value as a list of round-local ids, or why it is not.
+
+    Shape only: whether the ids NAME findings of this verdict, and whether
+    the closure is one that may carry them at all, are the validator's
+    (C-RESIDUE-UNKNOWN, C-RESIDUE-TERM) — the same division the fingerprint
+    already has, where the parser rules on `fp<n>:<hex>` and the validator
+    on whether the record it binds to exists.
+    """
+    ids = [t for t in re.split(r"[,\s]+", ids_text.strip()) if t]
+    if prior:
+        return (), (("C-RESIDUE-DUPLICATE",
+                     f"a second `Residue:` line on one closure: {ids_text!r} "
+                     f"after {list(prior)} — a closure declares its residue "
+                     f"once, and two declarations state no order between "
+                     f"them; write `{_RESIDUE_GRAMMAR}`"),)
+    if not ids:
+        return (), (("C-RESIDUE-ID",
+                     f"`Residue:` names nothing; omit the line or write "
+                     f"`{_RESIDUE_GRAMMAR}` — a declaration with no id "
+                     f"claims a residue exists and refuses to say which"),)
+    bad = [i for i in ids if not _RULING_ID_RE.match(i)]
+    if bad:
+        return (), (("C-RESIDUE-ID",
+                     f"{bad} is not a round-local finding id: `Residue:` "
+                     f"names the ids of findings IN THIS VERDICT "
+                     f"(`{_RESIDUE_GRAMMAR}`), never a fingerprint, a round "
+                     f"number or prose"),)
+    if len(set(ids)) != len(ids):
+        return (), (("C-RESIDUE-DUPLICATE",
+                     f"{ids} names the same finding twice: an id repeated "
+                     f"declares nothing the first statement of it did not"),)
+    return tuple(ids), ()
 
 
 def parse_closures(text: str) -> list[Closure]:
@@ -547,6 +620,30 @@ def parse_closures(text: str) -> list[Closure]:
             continue
         item = _CLOSURE_ITEM_RE.match(line)
         if not item:
+            # The declared residue comes FIRST, before the continuation
+            # rule: a `Residue:` line is a field of the record above it,
+            # never note prose, and never a bare line the note swallows.
+            residue = _CLOSURE_RESIDUE_RE.match(line.strip())
+            if residue:
+                if not (out and out[-1].well_formed):
+                    out.append(Closure(
+                        fp="", closure="", outcome=None, note="", raw=line,
+                        defects=(("C-SHAPE",
+                                  f"`Residue:` declares where a "
+                                  f"reclassified finding's remainder went, "
+                                  f"so it belongs under the closure that "
+                                  f"reclassified it; there is no well-formed "
+                                  f"closure record above "
+                                  f"{line.strip()!r}"),)))
+                    continue
+                ids, defects = _residue_defects(residue.group("ids"),
+                                                out[-1].residue)
+                out[-1].raw = f"{out[-1].raw}\n{line}"
+                if defects:
+                    out[-1].defects = out[-1].defects + defects
+                else:
+                    out[-1].residue = ids
+                continue
             # A wrapped note is a legal continuation of the record above it;
             # the same convention finding fields already use. But an
             # unbulleted line that is itself closure-SHAPED — a
@@ -819,7 +916,7 @@ def emit_disposition(tag: str, verdict_sha: str, head: str, author: str,
     return f"{open_tag}\n{body}\n</{tag}-review-disposition>\n"
 
 
-def emit_authorization(tag: str, sha: str, round_no: int, lineage: int,
+def emit_authorization(tag: str, sha: str, round_no: int, lineage: str,
                        by: str, reason: str, waived: list[dict]) -> str:
     """Authorization envelope: a named human advancing a lineage over
     findings that are still open, listing every one of them.
@@ -831,7 +928,7 @@ def emit_authorization(tag: str, sha: str, round_no: int, lineage: int,
     data = {
         "sha": sha,
         "round": round_no,
-        "lineage": lineage,
+        "lineage": str(lineage),
         "by": by,
         "reason": reason,
         "waived": waived,

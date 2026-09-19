@@ -20,9 +20,11 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from review import TOOL_NAME, brief, cli, config, wire
 from review.tests._transport_fixtures import git_out as _git, sh as _sh
+from review.tests.util import LINEAGE
 
 
 class TestWorktreeIdentity(unittest.TestCase):
@@ -109,19 +111,19 @@ class TestOpenRequestDiscovery(unittest.TestCase):
         return led
 
     def test_nothing_emitted_means_nothing_open(self):
-        event, superseded = brief.find_open_request(self._ledger([]))
+        event, superseded = brief.find_open_request(self._ledger([]),LINEAGE)
         self.assertIsNone(event)
         self.assertEqual(superseded, 0)
 
     def test_a_ruled_round_is_not_open(self):
         led = self._ledger([{"event": "request", "round": 1, "sha": "a"},
                             {"event": "verdict", "round": 1, "sha": "a"}])
-        self.assertIsNone(brief.find_open_request(led)[0])
+        self.assertIsNone(brief.find_open_request(led,LINEAGE)[0])
 
     def test_the_newest_emission_wins_and_the_rest_are_reported(self):
         led = self._ledger([{"event": "request", "round": 1, "sha": "old"},
                             {"event": "request", "round": 1, "sha": "new"}])
-        event, superseded = brief.find_open_request(led)
+        event, superseded = brief.find_open_request(led,LINEAGE)
         self.assertEqual(event["sha"], "new")
         self.assertEqual(superseded, 1)
 
@@ -129,14 +131,14 @@ class TestOpenRequestDiscovery(unittest.TestCase):
         led = self._ledger([{"event": "request", "round": 1, "sha": "a"},
                             {"event": "verdict", "round": 1, "sha": "a"},
                             {"event": "request", "round": 2, "sha": "b"}])
-        event, superseded = brief.find_open_request(led)
+        event, superseded = brief.find_open_request(led,LINEAGE)
         self.assertEqual(event["sha"], "b")
         self.assertEqual(superseded, 0)
 
     def test_a_closed_lineage_does_not_leak_into_the_next(self):
         led = self._ledger([{"event": "request", "round": 1, "sha": "a"},
                             {"event": "lineage_closed", "round": 1}])
-        self.assertIsNone(brief.find_open_request(led)[0])
+        self.assertIsNone(brief.find_open_request(led,LINEAGE)[0])
 
 
 class TestPrecisIsDerived(unittest.TestCase):
@@ -161,6 +163,93 @@ class TestPrecisIsDerived(unittest.TestCase):
         same = self._request(sha="f" * 40, base="f" * 40)
         self.assertIn("EMPTY", brief.request_precis(same))
 
+    # Brief request-precis-legibility (the user, 2026-09-05): the précis is
+    # short, abnormal states come first, normal ones are silent, tallies are
+    # one sentence, and the claim is a first sentence plus a pointer.
+
+    def _past_cap(self, text):
+        # The fixture carries no Round line; the emitter writes one after
+        # Target, and that is where the cap is read from.
+        return text.replace("Target:", "Round:  4 of 3 (budget breaker fires "
+                            "past the cap)\nTarget:", 1)
+
+    def test_a_normal_round_is_at_most_six_lines(self):
+        text = brief.request_precis(self._request(round_no=2))
+        lines = [l for l in text.splitlines() if l.strip()]
+        self.assertLessEqual(len(lines), 6, text)
+        for silent in ("Reachable", "Gates", "Direction", "Declared",
+                       "Unevidenced", "Refuse if"):
+            self.assertNotIn(silent, text, silent)
+
+    def test_the_heading_carries_round_lineage_and_direction(self):
+        text = brief.request_precis(self._request(round_no=2))
+        heading = text.splitlines()[0]
+        self.assertTrue(heading.startswith("## What this asks — Round 2"),
+                        heading)
+        self.assertIn("claude → codex", heading)
+
+    def test_a_round_past_the_cap_comes_first(self):
+        from review.tests._transport_fixtures import request_text
+        text = brief.request_precis(
+            wire.parse_request(self._past_cap(request_text(round_no=4))))
+        body = [l for l in text.splitlines()[2:] if l.strip()]
+        self.assertIn("past the cap of 3", body[0])
+        # Brief `round-cap-stamp-misreports`: the line reports the state and
+        # says what the tool does with it. It must not tell its reader the
+        # round is theirs to authorize — that claim escaped the loop once,
+        # as a false statement to the user about a decision they did not
+        # have to take.
+        self.assertIn("no authorization is needed to continue", body[0])
+        for word in ("breaker", "fired"):
+            self.assertNotIn(word, body[0], body[0])
+        control = brief.request_precis(self._request(round_no=2))
+        self.assertNotIn("past the cap", control)
+
+    def test_an_unreachable_target_comes_first_and_a_reachable_one_is_silent(self):
+        text = brief.request_precis(self._request(push=False))
+        body = [l for l in text.splitlines()[2:] if l.strip()]
+        self.assertTrue(body[0].startswith("- **Reachable —"), body[0])
+        self.assertNotIn("Reachable", brief.request_precis(self._request()))
+
+    def test_a_failed_gate_is_named_and_a_green_manifest_is_silent(self):
+        from unittest import mock
+        req = self._request()
+        green = brief.request_precis(req)
+        self.assertNotIn("Gates", green)
+        rows = [{"id": "tests", "exit_code": 1, "binding": "bound"},
+                {"id": "lint", "exit_code": 0, "binding": "bound"}]
+        with mock.patch.object(brief, "parse_attestations",
+                               return_value=(rows, None, None)):
+            red = brief.request_precis(req)
+        # Rows that carry no `blocking` member read as blocking: the split
+        # banner (2026-09-18, test_take_compact) never takes the quieter
+        # reading of a flag that is absent.
+        self.assertIn("Gates — 1 of 2 BLOCKING gate(s) did not pass AT THE "
+                      "TARGET: tests", red)
+
+    def test_tallies_are_one_sentence_with_the_full_pointer(self):
+        text = brief.request_precis(self._request())
+        tally = [l for l in text.splitlines() if l.startswith("- The reviewer reads")]
+        self.assertEqual(len(tally), 1, text)
+        self.assertIn("reference(s)", tally[0])
+        self.assertIn("brief <request> --full", tally[0])
+        self.assertNotIn("- **References**", text)
+
+    def test_the_objective_is_its_first_sentence_unless_full(self):
+        from review.tests._transport_fixtures import request_text
+        raw = request_text().replace(
+            "Objective / decision boundary:",
+            "Objective / decision boundary: First sentence here. Second "
+            "sentence that the précis must not reprint.", 1)
+        req = wire.parse_request(raw)
+        short = brief.request_precis(req)
+        self.assertIn("First sentence here.", short)
+        self.assertNotIn("Second sentence", short)
+        self.assertNotIn("Author risk", short)
+        full = brief.request_precis(req, full=True)
+        self.assertIn("Second sentence", full)
+        self.assertIn("Author risk", full)
+
     def test_pushed_target_does_not_claim_universal_access(self):
         """Round 1 F9 (Low), falsification.
 
@@ -171,7 +260,8 @@ class TestPrecisIsDerived(unittest.TestCase):
         """
         text = brief.request_precis(self._request(push=True))
         self.assertNotIn("any machine", text)
-        self.assertIn("access", text)
+        # And since 2026-09-07 the normal state says nothing at all.
+        self.assertNotIn("Reachable", text)
 
     def test_unavailable_reference_is_not_called_digested(self):
         """Round 1 F10 (Low), falsification.
@@ -205,7 +295,10 @@ class TestPrecisIsDerived(unittest.TestCase):
         # more than the envelope again, in a quieter way.
         refs = f"  a.md  sha256:{'0' * 64}  [required] x\n"
         text = brief.request_precis(self._request(refs=refs))
-        self.assertIn("1 with a digest to check", text)
+        # Since 2026-09-07 the normal state is silent: the tally counts the
+        # reference and no bucket is named unless it is abnormal.
+        self.assertIn("1 reference(s)", text)
+        self.assertNotIn("with a digest to check", text)
         self.assertNotIn("declared unavailable", text)
 
     def test_the_heading_is_the_verdict_itself(self):
@@ -1129,16 +1222,16 @@ class TestBrief(unittest.TestCase):
         self.assertTrue(section.startswith("- one"), repr(section[:20]))
         self.assertEqual(len(brief._BULLETS.findall(section)), 3)
         precis = brief.request_precis(parsed, None)
-        self.assertIn("3 stated stop condition(s)", precis)
+        self.assertIn("3 stop condition(s)", precis)
         # And a bulleted list that sits mid-section, keeping its indent,
         # still counts exactly: two declared, two counted.
         envelope = synth.emitted_request(claim={
             **synth.CLAIM, "stop_conditions": stops,
             "deliberately_not": ["a", "b"]})
         precis = brief.request_precis(wire.parse_request(envelope), None)
-        self.assertIn("2 thing(s) the author says are deliberately not done",
+        self.assertIn("2 declared not done",
                       precis)
-        self.assertIn("3 stated stop condition(s)", precis)
+        self.assertIn("3 stop condition(s)", precis)
 
     def test_simple_command_fence_control(self):
         # The command relay is unchanged: one runnable line in a bash fence
@@ -1323,6 +1416,102 @@ class TestHandoffAlwaysCarriesTheBrief(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("next", rec)
 
+    # ------------------------------------------------------- round-2 F3
+    #
+    # `brief` resolved its lineage by opening the source and reading the
+    # SHA, then opened the same source again to summarise it. Piping a valid
+    # emitted request to `brief -` therefore returned exit 1 and "- is
+    # neither a review request nor a verdict", about a document that was
+    # both: the first read had consumed standard input. These pipe real
+    # bytes into a real process, which is the only place the defect exists.
+
+    def _process_env(self):
+        from review import env_var, vocab
+        env = {k: v for k, v in os.environ.items()
+               if k != vocab.TRANSPORT_ENV
+               and k not in {var for var, _v, _t
+                             in vocab.TRANSPORT_PROVIDER_SIGNALS}}
+        env.pop(env_var("IN_GATE_RUN"), None)
+        env.pop(env_var("STATE_DIR"), None)
+        from review.tests.util import REPO_ROOT
+        env["PYTHONPATH"] = str(REPO_ROOT)
+        env["PYTHONSAFEPATH"] = "1"
+        return env
+
+    def _piped(self, payload, *argv):
+        import sys
+        result = subprocess.run(
+            [sys.executable, "-m", "review", "--ledger-dir", str(self.state),
+             *argv],
+            cwd=str(self.repo), env=self._process_env(), text=True,
+            input=payload, capture_output=True)
+        try:
+            return result.returncode, json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return result.returncode, {"stdout": result.stdout,
+                                       "stderr": result.stderr}
+
+    def _emitted_request(self):
+        code, rec = self._run("handoff", "--claim-file", str(self.claim),
+                              "--base", self.base, "--local-only")
+        self.assertEqual(code, 0, rec)
+        return rec, Path(rec["kept"]).read_text(encoding="utf-8")
+
+    def test_brief_reads_a_request_from_standard_input(self):
+        rec, envelope = self._emitted_request()
+        code, briefed = self._piped(envelope, "brief", "-")
+        self.assertEqual(code, 0, briefed)
+        self.assertEqual(briefed["kind"], "request")
+        self.assertEqual(briefed["sha"], rec["sha"])
+        self.assertEqual(briefed["lineage"], rec["lineage"])
+
+    def test_brief_reads_a_verdict_from_standard_input(self):
+        rec, _ = self._emitted_request()
+        verdict = (
+            '<loupe-review-verdict sha="%s">\n'
+            "VERDICT: clean to advance\n\n## findings\n\nNone\n"
+            "\n## evidence checked\n\n- the diff\n"
+            "</loupe-review-verdict>\n" % rec["sha"])
+        code, briefed = self._piped(verdict, "brief", "-")
+        self.assertEqual(code, 0, briefed)
+        self.assertEqual(briefed["kind"], "verdict")
+        self.assertEqual(briefed["sha"], rec["sha"])
+
+    def test_a_piped_request_briefs_exactly_as_the_same_file_does(self):
+        """The equivalence the carriers owe each other."""
+        rec, envelope = self._emitted_request()
+        code, piped = self._piped(envelope, "brief", "-")
+        self.assertEqual(code, 0, piped)
+        code, filed = self._run("brief", rec["kept"])
+        self.assertEqual(code, 0, filed)
+        for key in ("kind", "sha", "round", "lineage", "brief", "superseded"):
+            self.assertEqual(piped[key], filed[key], key)
+
+    def test_a_malformed_document_on_stdin_still_refuses(self):
+        code, refused = self._piped("nothing here is an envelope\n",
+                                    "brief", "-")
+        self.assertNotEqual(code, 0, refused)
+        self.assertIn("neither a review request nor a verdict",
+                      refused["error"])
+
+    def test_the_source_is_opened_exactly_once(self):
+        """Round-2 F3 stated directly: a mutable source cannot be reopened
+        between the lineage resolution and the processing, because there is
+        only one read. Counted at `_read_envelope`, the single door every
+        envelope reader goes through."""
+        rec, _ = self._emitted_request()
+        real = cli._read_envelope
+        seen = []
+
+        def counting(arg, cfg=None, kind=None):
+            seen.append(arg)
+            return real(arg, cfg, kind)
+
+        with mock.patch.object(cli, "_read_envelope", counting):
+            code, briefed = self._run("brief", rec["kept"])
+        self.assertEqual(code, 0, briefed)
+        self.assertEqual(seen, [rec["kept"]],
+                         "the source was opened more than once")
 
 class TestVerdictCarrier(unittest.TestCase):
     """Round 4 F2, the half the tool owns: the verdict leg's transport.

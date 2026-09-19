@@ -17,9 +17,17 @@ cache, both relays, the reviewer's correction — and, at each end, the thing
 the design refuses to do: infer it.
 """
 import dataclasses
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 
-from review import brief, config, emit, transport, vocab, wire
+from review import brief, config, emit, env_var, transport, vocab, wire
+from review.digest import sha256_text
 from review.validate import validate_request
 from review.ledger import Ledger
 from review.tests._transport_fixtures import (CFG, SHA_A, SHA_B, fake_git,
@@ -29,7 +37,27 @@ from review.tests._transport_fixtures import (CFG, SHA_A, SHA_B, fake_git,
                                               scratch_loop_repo, sh,
                                               verdict_text,
                                               warm_cache_fixture)
-from review.tests.util import REPO_ROOT
+from review.tests.util import LINEAGE, REPO_ROOT
+
+
+def _process_env() -> dict:
+    """The environment a SEPARATE CLI process runs in (round-2 F3).
+
+    The same three edits `test_concurrent_rounds.cli_process_env` makes, for
+    the same reasons: the host may itself declare a transport, `PYTHONPATH`
+    reproduces what `bin/loupe` sets so `python3 -m review` loads THIS
+    checkout, and the gate-run re-entrancy guard is cleared because the
+    suite may itself be running inside a gate.
+    """
+    env = {k: v for k, v in os.environ.items()
+           if k != vocab.TRANSPORT_ENV
+           and k not in {var for var, _v, _t
+                         in vocab.TRANSPORT_PROVIDER_SIGNALS}}
+    env.pop(env_var("IN_GATE_RUN"), None)
+    env.pop(env_var("STATE_DIR"), None)
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    env["PYTHONSAFEPATH"] = "1"
+    return env
 
 
 class TestTheVocabularyIsClosed(unittest.TestCase):
@@ -369,12 +397,12 @@ class TestTheRecord(unittest.TestCase):
             ledger = Ledger.in_memory()
             ledger.add({"event": event, "round": 1, "sha": SHA_B,
                         "transport": "paste"})
-            self.assertEqual(transport.recorded_transport(ledger, SHA_B),
+            self.assertEqual(transport.recorded_transport(ledger, SHA_B, LINEAGE),
                              "paste")
 
     def test_a_sha_this_ledger_never_saw_is_the_default(self):
         self.assertEqual(
-            transport.recorded_transport(Ledger.in_memory(), SHA_B),
+            transport.recorded_transport(Ledger.in_memory(), SHA_B, LINEAGE),
             vocab.TRANSPORT_DEFAULT)
 
     def test_a_record_outside_the_vocabulary_is_refused_not_skipped(self):
@@ -387,14 +415,14 @@ class TestTheRecord(unittest.TestCase):
         ledger.add({"event": "take", "round": 1, "sha": SHA_B,
                     "transport": "carrier"})
         with self.assertRaises(vocab.TransportDeclarationError):
-            transport.recorded_transport(ledger, SHA_B)
+            transport.recorded_transport(ledger, SHA_B, LINEAGE)
 
     def test_a_record_that_predates_the_attribute_is_the_default(self):
         # Legacy-absence compatibility: no transport key at all is a real
         # historical state, read as the default like an unstamped envelope.
         ledger = Ledger.in_memory()
         ledger.add({"event": "take", "round": 1, "sha": SHA_B})
-        self.assertEqual(transport.recorded_transport(ledger, SHA_B),
+        self.assertEqual(transport.recorded_transport(ledger, SHA_B, LINEAGE),
                          vocab.TRANSPORT_DEFAULT)
 
     def test_the_newest_record_for_the_sha_wins(self):
@@ -405,7 +433,7 @@ class TestTheRecord(unittest.TestCase):
                     "transport": "path"})
         ledger.add({"event": "take", "round": 1, "sha": SHA_B,
                     "transport": "paste"})
-        self.assertEqual(transport.recorded_transport(ledger, SHA_B), "paste")
+        self.assertEqual(transport.recorded_transport(ledger, SHA_B, LINEAGE), "paste")
 
 
 class TestTheReviewerMayCorrectIt(unittest.TestCase):
@@ -618,7 +646,13 @@ class TestTheRoundReference(unittest.TestCase):
 
     def test_the_reference_round_trips(self):
         self.assertEqual(transport.round_reference(21, 3), "git:21/3")
-        self.assertEqual(transport.parse_round_reference("git:21/3"), (21, 3))
+        self.assertEqual(transport.parse_round_reference("git:21/3"),
+                         ("21", 3))
+        # A minted id is a token, and the reference carries it whole.
+        self.assertEqual(transport.round_reference("L0a1b2c3d4e", 3),
+                         "git:L0a1b2c3d4e/3")
+        self.assertEqual(transport.parse_round_reference("git:L0a1b2c3d4e/3"),
+                         ("L0a1b2c3d4e", 3))
 
     def test_everything_else_is_not_a_reference(self):
         """A path, stdin and a malformed reference are all `None` — the
@@ -727,48 +761,66 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
         code, rec = self._author("handoff", "--claim-file", str(self.claim),
                                  "--base", self.base, "--transport", "git")
         self.assertEqual(code, 0, rec)
+        # The round's own reference. Since the lineage is KEYED the id is
+        # minted rather than the position `1`, so every reference below is
+        # read off the record instead of being spelled out (brief
+        # `keyed-lineage`).
+        self.lineage = rec["lineage"]
+        self.reference = f"git:{self.lineage}/1"
         return rec
 
     def test_the_request_leg_is_pushed_and_relayed_as_one_line(self):
         rec = self._handoff()
-        self.assertIn("refs/loupe/1/1/request", self._remote_refs())
-        self.assertEqual(rec["carrier"]["ref"], "refs/loupe/1/1/request")
+        ref = f"refs/loupe/{self.lineage}/1/request"
+        self.assertIn(ref, self._remote_refs())
+        self.assertEqual(rec["carrier"]["ref"], ref)
         self.assertEqual(rec["carrier"]["remote"], "origin")
-        self.assertEqual(rec["reviewer_next"], "loupe take git:1/1 --as codex")
+        self.assertEqual(rec["reviewer_next"],
+                         f"loupe take {self.reference} --as codex")
         lines = rec["relay"].splitlines()
         body = lines[lines.index("```bash") + 1:]
         self.assertEqual(body[:body.index("```")],
-                         ["loupe take git:1/1 --as codex"])
+                         [f"loupe take {self.reference} --as codex"])
         # No bytes: the reviewer fetches them, so the relay carries none.
         self.assertNotIn("<loupe-review-request", rec["relay"])
 
     def test_the_reviewer_fetches_the_request_by_reference(self):
         self._handoff()
         clone = self._reviewer_clone()
-        code, rec = self._reviewer(clone, "take", "git:1/1", "--as", "codex")
+        code, rec = self._reviewer(clone, "take", self.reference, "--as",
+                                   "codex")
         self.assertEqual(code, 0, rec)
         self.assertEqual(rec["transport"], "git")
-        self.assertIn("<loupe-review-request", rec["envelope"])
+        # The default payload carries the request as `request_view`; the
+        # exact bytes are `--full`'s and the kept file's (2026-09-18).
+        self.assertIn("<loupe-review-request", rec["request_view"])
+        self.assertNotIn("envelope", rec)
         # The ref was mirrored into the reviewer's own clone, so the read
         # names an exact ref rather than FETCH_HEAD.
-        self.assertEqual(git_out(clone, "cat-file", "-t",
-                                 "refs/loupe/1/1/request"), "blob")
+        self.assertEqual(
+            git_out(clone, "cat-file", "-t",
+                    f"refs/loupe/{self.lineage}/1/request"), "blob")
 
     def test_both_legs_round_trip(self):
         """Request out on a ref, verdict back on a ref, neither pasted."""
         self._handoff()
         clone = self._reviewer_clone()
-        code, taken = self._reviewer(clone, "take", "git:1/1", "--as",
+        code, taken = self._reviewer(clone, "take", self.reference, "--as",
                                      "codex")
         self.assertEqual(code, 0, taken)
+        # The reviewer's own ledger records the round under the CARRIED id,
+        # not a count of its own: one id names one review on both machines.
+        self.assertEqual(taken["lineage"], self.lineage)
         verdict = self.tmp / "verdict.md"
         verdict.write_text(verdict_text(sha=taken["sha"]), encoding="utf-8")
         code, ruled = self._reviewer(clone, "validate", str(verdict),
                                      "--from-target")
         self.assertEqual(code, 0, ruled)
-        self.assertIn("refs/loupe/1/1/verdict", self._remote_refs())
-        self.assertIn("loupe close --verdict git:1/1", ruled["relay"])
-        code, closed = self._author("close", "--verdict", "git:1/1")
+        self.assertIn(f"refs/loupe/{self.lineage}/1/verdict",
+                      self._remote_refs())
+        self.assertIn(f"loupe close --verdict {self.reference}",
+                      ruled["relay"])
+        code, closed = self._author("close", "--verdict", self.reference)
         self.assertEqual(code, 0, closed)
         self.assertEqual(closed["sha"], taken["sha"])
         self.assertEqual(closed["verdict"], "changes requested")
@@ -781,11 +833,12 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
         import json
         self._handoff()
         clone = self._reviewer_clone()
-        _, taken = self._reviewer(clone, "take", "git:1/1", "--as", "codex")
+        _, taken = self._reviewer(clone, "take", self.reference,
+                                  "--as", "codex")
         verdict = self.tmp / "verdict.md"
         verdict.write_text(verdict_text(sha=taken["sha"]), encoding="utf-8")
         self._reviewer(clone, "validate", str(verdict), "--from-target")
-        code, closed = self._author("close", "--verdict", "git:1/1")
+        code, closed = self._author("close", "--verdict", self.reference)
         self.assertEqual(code, 0, closed)
         d_json = self.tmp / "d.json"
         d_json.write_text(json.dumps({
@@ -797,23 +850,24 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
                                               "status": "pass",
                                               "mutation": "fails_without_fix"}
                                           }}]}), encoding="utf-8")
-        code, resp = self._author("respond", "--verdict", "git:1/1",
+        code, resp = self._author("respond", "--verdict", self.reference,
                                   "--from-json", str(d_json), "--out",
                                   str(self.tmp / "d.md"))
         self.assertEqual(code, 0, resp)
-        self.assertIn("refs/loupe/1/1/disposition", self._remote_refs())
+        self.assertIn(f"refs/loupe/{self.lineage}/1/disposition",
+                      self._remote_refs())
 
     def test_a_fetched_request_whose_bytes_were_replaced_still_refuses(self):
         """The ref is a carrier, never an authority: bytes that arrive on it
         are judged by exactly the bindings pasted bytes are, and the SHA
         binding is the first of them."""
         rec = self._handoff()
-        kept = (self.state / "exchange" / "round-1-request.md").read_text(
-            encoding="utf-8")
-        self._overwrite("refs/loupe/1/1/request",
+        from pathlib import Path
+        kept = Path(rec["kept"]).read_text(encoding="utf-8")
+        self._overwrite(f"refs/loupe/{self.lineage}/1/request",
                         kept.replace(rec["sha"], "9" * 40))
         clone = self._reviewer_clone()
-        code, taken = self._reviewer(clone, "take", "git:1/1", "--as",
+        code, taken = self._reviewer(clone, "take", self.reference, "--as",
                                      "codex")
         self.assertNotEqual(code, 0, taken)
         self.assertIn("9" * 12, str(taken))
@@ -824,33 +878,35 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
         the recorded digest, exactly as a second pasted verdict would be."""
         self._handoff()
         clone = self._reviewer_clone()
-        _, taken = self._reviewer(clone, "take", "git:1/1", "--as", "codex")
+        _, taken = self._reviewer(clone, "take", self.reference,
+                                  "--as", "codex")
         verdict = self.tmp / "verdict.md"
         verdict.write_text(verdict_text(sha=taken["sha"]), encoding="utf-8")
         self._reviewer(clone, "validate", str(verdict), "--from-target")
-        code, closed = self._author("close", "--verdict", "git:1/1")
+        code, closed = self._author("close", "--verdict", self.reference)
         self.assertEqual(code, 0, closed)
-        self._overwrite("refs/loupe/1/1/verdict",
+        self._overwrite(f"refs/loupe/{self.lineage}/1/verdict",
                         verdict_text(sha=taken["sha"], findings=2))
         # The bytes arrive — and bind to nothing. The digest of what the ref
         # now carries is not the digest this round recorded, so the ruling
         # the ledger holds is untouched by anything written to the ref.
         cfg = config.load(self.repo)
-        fetched = transport.fetch_envelope(cfg, 1, 1, "verdict")
+        fetched = transport.fetch_envelope(cfg, self.lineage, 1, "verdict")
         self.assertNotEqual(transport.sha256_text(fetched), closed["digest"])
         self.assertIsNone(transport.recorded_verdict(
-            Ledger(self.state), digest=transport.sha256_text(fetched)))
+            Ledger(self.state), LINEAGE, digest=transport.sha256_text(fetched)))
         # And the verb refuses them rather than recording a second ruling.
-        code, again = self._author("close", "--verdict", "git:1/1")
+        code, again = self._author("close", "--verdict", self.reference)
         self.assertNotEqual(code, 0, again)
 
     def test_a_reference_naming_a_round_nobody_pushed_refuses_with_a_remedy(
             self):
         self._handoff()
         clone = self._reviewer_clone()
-        code, rec = self._reviewer(clone, "take", "git:1/7", "--as", "codex")
+        missing = f"git:{self.lineage}/7"
+        code, rec = self._reviewer(clone, "take", missing, "--as", "codex")
         self.assertNotEqual(code, 0, rec)
-        self.assertIn("git:1/7", str(rec))
+        self.assertIn(missing, str(rec))
         self.assertEqual(rec["next_kind"], "blocked")
         self.assertTrue(rec["remedy"])
 
@@ -889,24 +945,25 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
         applied = {e["key"]: e["applied"] for e in rec["decide"]}
         self.assertEqual(applied[vocab.DECIDE_TRANSPORT], "git")
         clone = self._reviewer_clone()
-        _, taken = self._reviewer(clone, "take", "git:1/1", "--as", "codex")
+        _, taken = self._reviewer(clone, "take", self.reference,
+                                  "--as", "codex")
         self.assertIn(vocab.DECIDE_DEBUG,
                       [e["key"] for e in taken["decide"]])
 
     def test_a_fresh_reviewer_ledger_carries_the_authors_lineage_not_its_own(
             self):
-        """F1: lineage 1 closes on the AUTHOR's ledger before round 1 of
-        lineage 2 is emitted as `git:2/1`. The reviewer's clone here starts
-        with a genuinely EMPTY ledger — its own `lineage_number()` reads 1,
-        which has no relationship to the 2 this round is carried on. Every
-        leg of the round (request, verdict, the close relay, and the
-        disposition) must ride `refs/loupe/2/1/*`, never `1/1`, and a
-        later, independent lineage-3 round must land on its own ref
-        without disturbing lineage 2's.
+        """F1: one review closes on the AUTHOR's ledger before the next
+        one's round 1 is emitted. The reviewer's clone here starts with a
+        genuinely EMPTY ledger, which has no relationship to the id this
+        round is carried on. Every leg of the round (request, verdict, the
+        close relay, and the disposition) must ride that id's refs, and a
+        later, independent third review must land on its own without
+        disturbing the second's.
 
-        Restoring the outbound ref selection to `ledger.lineage_number()`
-        reproduces `git:1/1` for lineage 2's round (a fresh ledger's own
-        count) and fails every assertion below that names `2/1` or `3/1`.
+        Restoring the outbound ref selection to a count of this ledger's own
+        closures reproduces the collision the finding named — every fresh
+        clone reads the same number regardless of which review the reference
+        names — and fails every assertion below.
         """
         import json
         self._handoff()  # lineage 1, round 1
@@ -920,28 +977,32 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
         code, rec2 = self._author("handoff", "--claim-file", str(self.claim),
                                   "--base", base2, "--transport", "git")
         self.assertEqual(code, 0, rec2)
-        self.assertIn("refs/loupe/2/1/request", self._remote_refs())
+        two, one = rec2["lineage"], self.lineage
+        self.assertNotEqual(two, one)
+        reference2 = f"git:{two}/1"
+        self.assertIn(f"refs/loupe/{two}/1/request", self._remote_refs())
         self.assertEqual(rec2["reviewer_next"],
-                         "loupe take git:2/1 --as codex")
+                         f"loupe take {reference2} --as codex")
 
         clone = self._reviewer_clone()  # a genuinely empty ledger
-        code, taken = self._reviewer(clone, "take", "git:2/1", "--as",
+        code, taken = self._reviewer(clone, "take", reference2, "--as",
                                      "codex")
         self.assertEqual(code, 0, taken)
+        self.assertEqual(taken["lineage"], two)
         verdict = self.tmp / "verdict2.md"
         verdict.write_text(verdict_text(sha=taken["sha"]), encoding="utf-8")
         code, ruled = self._reviewer(clone, "validate", str(verdict),
                                      "--from-target")
         self.assertEqual(code, 0, ruled)
         remote_refs = self._remote_refs()
-        self.assertIn("refs/loupe/2/1/verdict", remote_refs)
-        self.assertNotIn("refs/loupe/1/1/verdict", remote_refs)
-        self.assertIn("loupe close --verdict git:2/1", ruled["relay"])
+        self.assertIn(f"refs/loupe/{two}/1/verdict", remote_refs)
+        self.assertNotIn(f"refs/loupe/{one}/1/verdict", remote_refs)
+        self.assertIn(f"loupe close --verdict {reference2}", ruled["relay"])
 
-        code, closed2 = self._author("close", "--verdict", "git:2/1")
+        code, closed2 = self._author("close", "--verdict", reference2)
         self.assertEqual(code, 0, closed2)
         self.assertEqual(closed2["sha"], taken["sha"])
-        self.assertIn("git:2/1", closed2["relay"])
+        self.assertIn(reference2, closed2["relay"])
 
         d_json = self.tmp / "d2.json"
         d_json.write_text(json.dumps({
@@ -953,11 +1014,11 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
                                               "status": "pass",
                                               "mutation": "fails_without_fix"}
                                           }}]}), encoding="utf-8")
-        code, resp = self._author("respond", "--verdict", "git:2/1",
+        code, resp = self._author("respond", "--verdict", reference2,
                                   "--from-json", str(d_json), "--out",
                                   str(self.tmp / "d2.md"))
         self.assertEqual(code, 0, resp)
-        self.assertIn("refs/loupe/2/1/disposition", self._remote_refs())
+        self.assertIn(f"refs/loupe/{two}/1/disposition", self._remote_refs())
 
         # Control: a LATER, independent lineage-3 round, taken by its own
         # fresh reviewer clone, must not collide with lineage 2's refs —
@@ -973,7 +1034,9 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
         code, rec3 = self._author("handoff", "--claim-file", str(self.claim),
                                   "--base", base3, "--transport", "git")
         self.assertEqual(code, 0, rec3)
-        self.assertIn("refs/loupe/3/1/request", self._remote_refs())
+        three = rec3["lineage"]
+        self.assertNotIn(three, (one, two))
+        self.assertIn(f"refs/loupe/{three}/1/request", self._remote_refs())
 
         clone3 = self.tmp / "reviewer3"
         sh("git", "clone", "-q", str(self.bare), str(clone3))
@@ -981,8 +1044,8 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
                      ("commit.gpgsign", "false")):
             sh("git", "-C", str(clone3), "config", k, v)
         state3 = self.tmp / "reviewer3-state"
-        code, taken3 = run_cli(clone3, state3, "take", "git:3/1", "--as",
-                               "codex", cwd=self.cwd)
+        code, taken3 = run_cli(clone3, state3, "take", f"git:{three}/1",
+                               "--as", "codex", cwd=self.cwd)
         self.assertEqual(code, 0, taken3)
         verdict3 = self.tmp / "verdict3.md"
         verdict3.write_text(verdict_text(sha=taken3["sha"]), encoding="utf-8")
@@ -992,17 +1055,17 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
         remote_refs = self._remote_refs()
         # Both verdicts stand on their own refs, neither overwritten by
         # the other's push.
-        self.assertIn("refs/loupe/2/1/verdict", remote_refs)
-        self.assertIn("refs/loupe/3/1/verdict", remote_refs)
-        self.assertNotIn("refs/loupe/1/1/verdict", remote_refs)
+        self.assertIn(f"refs/loupe/{two}/1/verdict", remote_refs)
+        self.assertIn(f"refs/loupe/{three}/1/verdict", remote_refs)
+        self.assertNotIn(f"refs/loupe/{one}/1/verdict", remote_refs)
 
     def test_a_retake_refuses_a_carried_lineage_that_disagrees_with_storage(
             self):
         """Round-2 F3: the stored/requested disagreement is executable.
 
-        The same request bytes and SHA first arrive as ``git:2/1`` and are
-        recorded under lineage 2. Making those bytes available at
-        ``git:3/1`` must not let a retake move the round's later outbound
+        The same request bytes and SHA first arrive under one lineage id
+        and are recorded under it. Making those bytes available under a
+        DIFFERENT id must not let a retake move the round's later outbound
         references. The refusal precedes both a second take event and any
         new outbound ref.
         """
@@ -1017,29 +1080,34 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
             "handoff", "--claim-file", str(self.claim), "--base", base,
             "--transport", "git")
         self.assertEqual(code, 0, emitted)
+        two = emitted["lineage"]
+        other = "Lnotthisone"
 
         clone = self._reviewer_clone()
-        code, first = self._reviewer(clone, "take", "git:2/1", "--as",
+        code, first = self._reviewer(clone, "take", f"git:{two}/1", "--as",
                                      "codex")
         self.assertEqual(code, 0, first)
 
-        request = (self.state / "exchange" / "round-1-request.md").read_text(
-            encoding="utf-8")
-        self._overwrite("refs/loupe/3/1/request", request)
+        # The CURRENT round's kept bytes — lineage 2's, which before finding
+        # 1 of the 2026-09-05 audit had overwritten lineage 1's at the flat
+        # `round-1-request.md`; each lineage keeps its own now.
+        from pathlib import Path
+        request = Path(emitted["kept"]).read_text(encoding="utf-8")
+        self._overwrite(f"refs/loupe/{other}/1/request", request)
         reviewer_ledger = self.reviewer_state / "ledger.jsonl"
         before_ledger = reviewer_ledger.read_bytes()
         before_refs = self._remote_refs()
 
-        code, second = self._reviewer(clone, "take", "git:3/1", "--as",
-                                      "codex")
+        code, second = self._reviewer(clone, "take", f"git:{other}/1",
+                                      "--as", "codex")
 
         self.assertEqual(code, 1, second)
         self.assertEqual(second["next_kind"], "blocked")
-        self.assertIn("already taken under lineage 2", second["error"])
-        self.assertIn("carries lineage 3", second["error"])
+        self.assertIn(f"already taken under lineage {two}", second["error"])
+        self.assertIn(f"carries lineage {other}", second["error"])
         self.assertEqual(reviewer_ledger.read_bytes(), before_ledger)
         self.assertEqual(self._remote_refs(), before_refs)
-        self.assertNotIn("refs/loupe/3/1/verdict", before_refs)
+        self.assertNotIn(f"refs/loupe/{other}/1/verdict", before_refs)
 
 
 class TestTheLoopEndToEnd(unittest.TestCase):
@@ -1101,7 +1169,18 @@ class TestTheLoopEndToEnd(unittest.TestCase):
         from review import config as c
         import dataclasses
         cfg = dataclasses.replace(c.load(self.repo, ledger_dir=str(self.state)))
-        return t.exchange_path(cfg, 1, "request").read_text(encoding="utf-8")
+        # The LATEST recorded request of the round: a re-declared topology
+        # re-emits different bytes at the same tip, and since finding 1 of
+        # the 2026-09-05 audit both emissions are retained.
+        from review.ledger import Ledger
+        led = Ledger(self.state)
+        requests = [e for e in led.events() if e.get("event") == "request"]
+        # The lineage is an ID now, read off the event rather than assumed
+        # to be the file's first position (brief `keyed-lineage`).
+        kept = t.exchange_path(cfg, 1, "request",
+                               lineage=led.lineage_of(requests[-1]),
+                               digest=requests[-1]["source_digest"])
+        return kept.read_text(encoding="utf-8")
 
     def test_a_declared_paste_round_carries_bytes_and_the_stdin_command(self):
         self._remote()
@@ -1213,6 +1292,137 @@ class TestTheLoopEndToEnd(unittest.TestCase):
         self.assertIn(verdict.read_text(encoding="utf-8").rstrip("\n"),
                       validated["relay"])
 
+    # ------------------------------------------------------- round-2 F3
+    #
+    # The paste relay's close command is a HEREDOC, and `cmd_close` read the
+    # verdict twice: once to resolve the lineage, once to record it. The
+    # preliminary read consumed standard input, so the generated block —
+    # the one the fence promises runs exactly as printed — exited 2 with
+    # "'NoneType' object is not subscriptable". These run the block itself,
+    # in a real process, because the defect is invisible to any caller that
+    # hands the bytes over twice.
+
+    def _paste_block(self, relay: str) -> list[str]:
+        lines = relay.splitlines()
+        start = lines.index("```bash") + 1
+        return lines[start:start + lines[start:].index("```")]
+
+    def _run_block(self, block: list[str], state, marker="close --verdict -"):
+        """The generated block, with only the tool's own launcher rewritten
+        to this checkout's — everything else, the heredoc included, runs
+        exactly as the fence printed it."""
+        block = list(block)
+        head = block[0]
+        self.assertIn(marker, head, block)
+        block[0] = (f"{shlex.quote(sys.executable)} -m review --ledger-dir "
+                    f"{shlex.quote(str(state))} {head[head.index(marker):]}")
+        return subprocess.run(["/bin/sh", "-c", "\n".join(block) + "\n"],
+                              cwd=str(self.repo), env=_process_env(),
+                              text=True, capture_output=True)
+
+    def _round_ready_to_close(self):
+        """A declared paste round, taken and validated: the verdict file and
+        the relay whose block the author is told to paste."""
+        self._remote()
+        code, rec = self._run("handoff", "--claim-file", str(self.claim),
+                              "--base", self.base, "--transport", "paste")
+        self.assertEqual(code, 0, rec)
+        code, taken = self._run("take", rec["kept"], "--as", "codex")
+        self.assertEqual(code, 0, taken)
+        verdict = self.tmp / "verdict.md"
+        verdict.write_text(
+            f'<loupe-review-verdict sha="{rec["sha"]}">\n'
+            f"VERDICT: clean to advance\n\n## findings\n\nNone\n\n"
+            f"## evidence checked\n\n- the diff\n"
+            f"</loupe-review-verdict>\n", encoding="utf-8")
+        code, validated = self._run("validate", str(verdict))
+        self.assertEqual(code, 0, validated)
+        return rec, verdict, validated["relay"]
+
+    def test_the_generated_paste_close_heredoc_runs_as_printed(self):
+        rec, verdict, relay = self._round_ready_to_close()
+        result = self._run_block(self._paste_block(relay), self.state)
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(payload["sha"], rec["sha"])
+        self.assertEqual(payload["round"], 1)
+        # The bytes recorded are EXACTLY the bytes supplied: the digest is
+        # the verdict file's, not an empty document's.
+        self.assertEqual(payload["digest"],
+                         sha256_text(verdict.read_text(encoding="utf-8")))
+
+    def test_stdin_and_a_file_close_the_round_identically(self):
+        """Two states, one round, two carriers of one document."""
+        rec, verdict, relay = self._round_ready_to_close()
+        twin = self.tmp / "state-twin"
+        shutil.copytree(self.state, twin)
+        result = self._run_block(self._paste_block(relay), twin)
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        piped = json.loads(result.stdout)
+        code, filed = self._run("close", "--verdict", str(verdict))
+        self.assertEqual(code, 0, filed)
+        for key in ("sha", "round", "verdict", "digest", "lineage",
+                    "findings", "closures"):
+            self.assertEqual(piped[key], filed[key], key)
+        self.assertEqual(Path(piped["kept"]).name,
+                         Path(filed["kept"]).name)
+
+    def test_a_verdict_piped_to_close_is_read_once_and_only_once(self):
+        """The direct statement: one capture, whatever the carrier. A
+        second read of `-` can only find an empty document, which is what
+        the refusal reported as a NoneType error."""
+        rec, verdict, _ = self._round_ready_to_close()
+        result = subprocess.run(
+            [sys.executable, "-m", "review", "--ledger-dir", str(self.state),
+             "close", "--verdict", "-"],
+            cwd=str(self.repo), env=_process_env(), text=True,
+            input=verdict.read_text(encoding="utf-8"), capture_output=True)
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        self.assertNotIn("NoneType", result.stdout + result.stderr)
+
+    def test_a_malformed_verdict_on_stdin_still_refuses(self):
+        """The refusal control: capturing once may not make a broken
+        document acceptable."""
+        self._round_ready_to_close()
+        for name, payload in (
+                ("not an envelope", "nothing here is an envelope\n"),
+                ("a request, not a verdict",
+                 self._envelope()),
+                ("an unknown commit",
+                 '<loupe-review-verdict sha="%s">\n'
+                 "VERDICT: clean to advance\n\n## findings\n\nNone\n\n"
+                 "## evidence checked\n\n- the diff\n"
+                 "</loupe-review-verdict>\n" % ("f" * 40))):
+            with self.subTest(payload=name):
+                result = subprocess.run(
+                    [sys.executable, "-m", "review", "--ledger-dir",
+                     str(self.state), "close", "--verdict", "-"],
+                    cwd=str(self.repo), env=_process_env(), text=True,
+                    input=payload, capture_output=True)
+                self.assertNotEqual(result.returncode, 0,
+                                    result.stdout + result.stderr)
+        # Nothing was recorded by any of them.
+        led = Ledger(self.state)
+        self.assertEqual([e for e in led.events()
+                          if e.get("event") == "verdict"], [])
+
+    def test_a_crlf_verdict_on_stdin_refuses_as_it_did_from_a_file(self):
+        """Round-4 F1's refusal, unchanged by the single capture: the
+        physical form is ruled on the captured bytes."""
+        rec, verdict, _ = self._round_ready_to_close()
+        crlf = verdict.read_text(encoding="utf-8").replace("\n", "\r\n")
+        result = subprocess.run(
+            [sys.executable, "-m", "review", "--ledger-dir", str(self.state),
+             "close", "--verdict", "-"],
+            cwd=str(self.repo), env=_process_env(), text=True,
+            input=crlf, capture_output=True)
+        self.assertNotEqual(result.returncode, 0,
+                            result.stdout + result.stderr)
+        self.assertIn("CRLF", result.stdout + result.stderr)
 
 class TestTransportDeclarationClosedWorld(unittest.TestCase):
     """R1-F2: ONE schema-derived lifecycle over every admitted source and
@@ -1360,7 +1570,7 @@ class TestTransportDeclarationClosedWorld(unittest.TestCase):
                 ledger.add({"event": event, "round": 1, "sha": SHA_B,
                             "transport": declared})
                 self.assertEqual(
-                    transport.recorded_transport(ledger, SHA_B), declared)
+                    transport.recorded_transport(ledger, SHA_B, LINEAGE), declared)
 
     def test_recorded_empty_or_invalid_is_refused_before_a_relay(self):
         for value in ("", "carrier"):
@@ -1369,12 +1579,12 @@ class TestTransportDeclarationClosedWorld(unittest.TestCase):
                 ledger.add({"event": "take", "round": 1, "sha": SHA_B,
                             "transport": value})
                 with self.assertRaises(vocab.TransportDeclarationError):
-                    transport.recorded_transport(ledger, SHA_B)
+                    transport.recorded_transport(ledger, SHA_B, LINEAGE)
 
     def test_recorded_legacy_absence_is_the_default(self):
         ledger = Ledger.in_memory()
         ledger.add({"event": "request", "round": 1, "sha": SHA_B})
-        self.assertEqual(transport.recorded_transport(ledger, SHA_B),
+        self.assertEqual(transport.recorded_transport(ledger, SHA_B, LINEAGE),
                          vocab.TRANSPORT_DEFAULT)
 
     # ------------------------------------------- sentinels at the lifecycle
@@ -1406,10 +1616,10 @@ class TestTransportDeclarationClosedWorld(unittest.TestCase):
             w.cfg, roles={**w.cfg.roles, "transport": "path"})
         # Control: with a valid declaration the same state is warm.
         self.assertIsNotNone(transport.cached_handoff(
-            valid, w.ledger, 1, git=w.git, claim_digest=w.claim_digest,
+            valid, w.ledger, 1, LINEAGE, git=w.git, claim_digest=w.claim_digest,
             roles=("claude", "codex")))
         with self.assertRaises(vocab.TransportDeclarationError):
-            transport.cached_handoff(empty, w.ledger, 1, git=w.git,
+            transport.cached_handoff(empty, w.ledger, 1, LINEAGE, git=w.git,
                                      claim_digest=w.claim_digest,
                                      roles=("claude", "codex"))
 
@@ -1524,10 +1734,17 @@ class TestRecordedTransportProductReaders(unittest.TestCase):
         import contextlib
         import io
         import json
-        from review import cli
+        from unittest import mock
+        from review import cli, transport
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            code = cli.main(["--ledger-dir", str(self.tmp), *argv])
+        # These rounds bind a synthetic SHA no clone holds; `close` judges
+        # under the target's own authority (finding 3, 2026-09-05), which
+        # is the checkout's here — the readers under test are the
+        # transport record's, not the authority's.
+        with mock.patch.object(transport, "governing_for",
+                               lambda cfg, sha, git=None: cfg):
+            with contextlib.redirect_stdout(buf):
+                code = cli.main(["--ledger-dir", str(self.tmp), *argv])
         return code, json.loads(buf.getvalue())
 
     def _verdict_file(self, verdict="changes requested", sha=SHA_B):

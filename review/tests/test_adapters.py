@@ -125,6 +125,59 @@ class TestOneSource(unittest.TestCase):
             self.assertIn("cannot_execute", rule, kind)
             self.assertIn("unverifiable", rule, kind)
 
+    def test_the_respond_step_orders_fix_before_falsification_before_mutation_before_record_before_handoff(self):
+        """Brief `respond-procedure-ordering`: read in order, the old text
+        let an agent record `accepted` (with a falsification run) before the
+        fix existed, or fix first and then wonder what "the mutation" meant.
+        The reworded step must put five things in this order, textually,
+        in every rendered adapter (the body is shared, per
+        `test_bodies_are_identical_across_kinds`): the instruction to make
+        the fix; the instruction to run the finding's falsification test on
+        the fixed head; the instruction to run the mutation (defect
+        reintroduced) and restore; the instruction to write the disposition
+        record with `--out`; the instruction to hand off again.
+
+        FALSIFICATION: restore the old ordering sentence ("...records the
+        run of THAT test... Do the mutation before you write the record,
+        not after. `--out` records and keeps it. Then make the changes and
+        hand off again...") in the `"respond"` entry of `procedure()` and
+        this fails in every kind, because "make the fix" no longer precedes
+        "falsification test" in the text.
+        """
+        markers = ("make the fix", "falsification test", "mutation",
+                   "`--out`", "hand off again")
+        for kind in adapters.OUTPUTS:
+            text = adapters.render(kind)
+            # From the descriptive paragraph, not the command line above it
+            # — that line names `--out` too, as a flag, and would satisfy
+            # the marker before the ordering it is meant to check.
+            respond = text[text.index("Exactly one disposition per finding"):
+                          text.index("**close a lineage")]
+            positions = [respond.index(m) for m in markers]
+            self.assertEqual(positions, sorted(positions),
+                             f"{kind}: {markers} out of order in {positions}")
+
+    def test_the_respond_step_never_calls_a_proposed_fix_accepted(self):
+        """A fix that is proposed but not yet made is `deferred` or
+        `escalated`, never `accepted` — and a blocking finding cannot take
+        `deferred`. The old text said nothing about the not-yet-made case
+        at all, which is what let an agent reach for `accepted` there.
+
+        FALSIFICATION: drop the "proposed but not made" sentence from the
+        `"respond"` entry of `procedure()` and this fails in every kind.
+        """
+        for kind in adapters.OUTPUTS:
+            text = adapters.render(kind)
+            respond = text[text.index("**respond**"):
+                          text.index("**close a lineage")]
+            self.assertIn("proposed but not made", respond, kind)
+            not_made = respond[respond.index("proposed but not made"):]
+            self.assertIn("`deferred` or `escalated`", not_made, kind)
+            self.assertIn("never `accepted`", not_made, kind)
+            self.assertNotIn("is `accepted`", not_made, kind)
+            self.assertIn("blocking finding cannot take `deferred`",
+                         not_made, kind)
+
 
 class TestTrackedCopiesAreCurrent(unittest.TestCase):
 
@@ -1812,6 +1865,11 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
                          "procedure",
         "LINEAGE_MERGING": "fingerprint-lineage grammar; not in the "
                            "procedure",
+        "CI_RECEIPT_ROW": "the CI receipt row's field authority — the "
+                          "emitter builds the row from it and the validator "
+                          "checks against it; a machine contract between two "
+                          "modules, and nothing an agent authors or reads in "
+                          "the procedure",
         "SEAM_CLASSES": "reader-authority internals; the procedure never "
                         "names seams",
         "STAMPED_PARSE_CALLS": "reader-authority internals; the procedure "

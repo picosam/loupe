@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass
 
 from . import FORMER_NAMES, TOOL_NAME, paths, vocab
-from .config import Config
+from .config import GATE_ATTESTERS, Config
 from .wire import (Authorization, Disposition, DuplicateMember, Finding,
                    Request, Verdict, attestation_fence, load_json,
                    parse_push_line)
@@ -148,9 +148,16 @@ def validate_closures(v: Verdict, answering: list[dict] | None = None
     vanishing; and where the dispositions being answered are known, the
     closures §5.2 makes mandatory are checked for PRESENCE, since a finding
     that dies by omission is precisely what the symmetry rule forbids.
+
+    A declared `Residue:` is ruled on here for the two things the parser
+    cannot see (brief `convergence-blind-to-reclassification`): whether the
+    closure is one that may claim descent at all, and whether the ids name
+    findings of THIS verdict. Both are refusals rather than shrugs, because
+    a declaration nobody checks is exactly the prose the field replaces.
     """
     items: list[Item] = []
     seen: set[str] = set()
+    finding_ids = {f.id for f in v.findings}
     for c in v.closures:
         for code, message in c.defects:
             items.append(_err(code, message))
@@ -171,6 +178,22 @@ def validate_closures(v: Verdict, answering: list[dict] | None = None
             items.append(_err("C-OUTCOME",
                               f"{c.fp}: {c.closure!r} takes no outcome "
                               f"qualifier"))
+        if c.residue and c.closure != "reclassified":
+            items.append(_err("C-RESIDUE-TERM",
+                              f"{c.fp}: `{c.closure}` declares no descent, "
+                              f"so it cannot name a residue — only "
+                              f"`reclassified` says a claim was narrowed and "
+                              f"where the remainder of it went"))
+        for rid in c.residue:
+            if rid not in finding_ids:
+                items.append(_err("C-RESIDUE-UNKNOWN",
+                                  f"{c.fp}: `Residue: {rid}` names no "
+                                  f"finding of this verdict "
+                                  f"({sorted(finding_ids) or 'none'}) — the "
+                                  f"residue is the finding HERE that carries "
+                                  f"what remains, and an id pointing "
+                                  f"anywhere else binds the record to "
+                                  f"nothing"))
         if not c.note.strip():
             items.append(_err("C-EVIDENCE",
                               f"{c.fp}: a closure must answer the author's "
@@ -491,6 +514,207 @@ _ATTESTATION_FIELDS = (
      "a pointer to the full output, with its digest and size"),
 )
 
+
+# ------------------------------------------------- the CI receipt (round-3 F4)
+#
+# `attested_by = "ci"` moves the EXECUTOR off this machine, and the row then
+# carries two nested objects that are the whole explanation of the move:
+# `ci_run`, the Actions run that ran the manifest at this commit, and
+# `receipt`, that run's OWN row for THIS gate. Round-3 F4 measured what
+# happened while nothing checked them: deleting `ci_run` entirely produced no
+# validation error, and replacing only `ci_run.head_sha` with a different
+# commit and `ci_run.conclusion` with `failure` produced none either, while
+# the outer row went on asserting `exit_code: 0` and `binding: bound`. A
+# receipt that explains a pass must AGREE with the pass; a receipt that
+# contradicts it is not a weaker explanation, it is a defect that entered the
+# envelope wearing the shape of one.
+#
+# Two tables, then the relations. Each nested field is required and typed on
+# its own, and each relation between the nesting and the outer row gets its
+# own code, because "something about the receipt is wrong" does not tell a
+# reader WHICH claim to disbelieve. The attester name itself is checked for
+# every record, not only these: an executor this validator does not know is
+# an executor it cannot judge (`config.GATE_ATTESTERS` is the grammar; this
+# is the same closed set met at the record rather than at the manifest).
+CI_ATTESTER = "ci"
+
+
+def _nonempty(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _an_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+_CI_RUN_FIELDS = (
+    ("id", "A-CI-RUN-ID", lambda v: _an_int(v) or _nonempty(v),
+     "the Actions run id, which is how the run is fetched again"),
+    ("url", "A-CI-RUN-URL", _nonempty,
+     "the run's URL, so the claim can be opened rather than believed"),
+    ("status", "A-CI-RUN-STATUS", _nonempty,
+     "the run's status — a run still in flight has concluded nothing"),
+    ("conclusion", "A-CI-RUN-CONCLUSION", _nonempty,
+     "GitHub's own word for how the run ended"),
+    ("head_sha", "A-CI-RUN-SHA",
+     lambda v: isinstance(v, str) and bool(_SHA_OK(v)),
+     "the 40-hex commit CI checked out"),
+    ("workflow", "A-CI-RUN-WORKFLOW", _nonempty,
+     "the workflow's name — an unrelated green workflow attests nothing"),
+    ("completed", "A-CI-RUN-COMPLETED", _nonempty,
+     "when the run finished"),
+)
+
+#: Round-3 F3. The receipt row's fields are NOT listed here: they are
+#: `vocab.CI_RECEIPT_ROW`, the same mapping `emit` builds the row from, so
+#: this validator cannot check a narrower set than the emitter writes. What
+#: lives here is only the predicate each declared KIND names — the grammar
+#: of the check, not the list of what is checked.
+_CI_RECEIPT_KINDS = {
+    "nonempty": (_nonempty, "a non-empty string"),
+    "int": (_an_int, "an integer"),
+    "number": (lambda v: isinstance(v, (int, float))
+               and not isinstance(v, bool), "a number"),
+    "text_or_none": (lambda v: v is None or _nonempty(v),
+                     "a non-empty string or None"),
+    "sha": (lambda v: isinstance(v, str) and bool(_SHA_OK(v)),
+            "a 40-hex commit"),
+}
+
+
+def _ci_items(gate_id: str, rec: dict, request_sha: str | None) -> list:
+    """Everything a CI-attested row can get wrong that the §5.1 field table
+    cannot see, one code per problem (round-3 F4)."""
+    items: list[Item] = []
+    run = rec.get("ci_run")
+    if not isinstance(run, dict):
+        items.append(_err(
+            "A-CI-RUN",
+            f"{gate_id}: attested_by={CI_ATTESTER!r} but the record carries "
+            f"no 'ci_run' object naming the run that attests it — the "
+            f"executor was elsewhere and nothing here says where"))
+        run = None
+    else:
+        for name, code, ok, expected in _CI_RUN_FIELDS:
+            if name not in run:
+                items.append(_err(code, f"{gate_id}: ci_run omits {name!r} "
+                                        f"({expected})"))
+            elif not ok(run[name]):
+                items.append(_err(code, f"{gate_id}: ci_run.{name}="
+                                        f"{run[name]!r} is not {expected}"))
+    receipt = rec.get("receipt")
+    if not isinstance(receipt, dict):
+        items.append(_err(
+            "A-CI-RECEIPT",
+            f"{gate_id}: attested_by={CI_ATTESTER!r} but the record carries "
+            f"no 'receipt' object — a run's conclusion says nothing about "
+            f"WHICH gates it executed, so a row without CI's own per-gate "
+            f"receipt claims more than the run establishes"))
+        receipt = None
+    else:
+        for name, (code, kind, why) in vocab.CI_RECEIPT_ROW.items():
+            ok, expected = _CI_RECEIPT_KINDS[kind]
+            if name not in receipt:
+                items.append(_err(code, f"{gate_id}: receipt omits {name!r} "
+                                        f"({why})"))
+            elif not ok(receipt[name]):
+                items.append(_err(code, f"{gate_id}: receipt.{name}="
+                                        f"{receipt[name]!r} is not "
+                                        f"{expected} — {why}"))
+
+    exit_code = rec.get("exit_code") if _an_int(rec.get("exit_code")) else None
+    if run is not None:
+        status = run.get("status")
+        if _nonempty(status) and status != "completed":
+            items.append(_err(
+                "A-CI-INCOMPLETE",
+                f"{gate_id}: ci_run.status={status!r}; a run that has not "
+                f"completed has concluded nothing, and an unfinished run is "
+                f"not an attestation"))
+        head = run.get("head_sha")
+        if head != rec.get("executed_sha"):
+            items.append(_err(
+                "A-CI-SHA",
+                f"{gate_id}: the record says the gate ran against "
+                f"{rec.get('executed_sha')!r} while its ci_run checked out "
+                f"{head!r} — the run IS the execution, so those cannot "
+                f"differ"))
+        if request_sha is not None and head != request_sha:
+            items.append(_err(
+                "A-CI-REQUEST-SHA",
+                f"{gate_id}: the attesting run checked out {head!r} and this "
+                f"request binds {request_sha} — a real, green, completed run "
+                f"about another commit is not this request's evidence"))
+        if exit_code is not None:
+            if (exit_code == 0) != (run.get("conclusion") == "success"):
+                items.append(_err(
+                    "A-CI-CONCLUSION",
+                    f"{gate_id}: the record claims exit_code {exit_code} "
+                    f"while its ci_run concluded "
+                    f"{run.get('conclusion')!r} ({run.get('url')}) — the "
+                    f"receipt and the run disagree, and a contradiction is "
+                    f"not evidence"))
+    if receipt is not None:
+        if receipt.get("not_run"):
+            items.append(_err(
+                "A-CI-NOT-RUN",
+                f"{gate_id}: CI's own receipt says this gate did not run "
+                f"({receipt['not_run']!r}) and the record reports it as a "
+                f"run — a declared skip is the state this receipt exists to "
+                f"make visible"))
+        if _nonempty(receipt.get("id")) and receipt["id"] != rec.get("id"):
+            items.append(_err(
+                "A-CI-GATE",
+                f"{gate_id}: the receipt row is about gate "
+                f"{receipt['id']!r} — another gate's execution is not this "
+                f"gate's evidence"))
+        if (_nonempty(receipt.get("command"))
+                and receipt["command"] != rec.get("command")):
+            items.append(_err(
+                "A-CI-COMMAND",
+                f"{gate_id}: the record attests {rec.get('command')!r} and "
+                f"CI's receipt records {receipt['command']!r} — a changed "
+                f"command is a different gate"))
+        if (_an_int(receipt.get("exit_code")) and exit_code is not None
+                and receipt["exit_code"] != exit_code):
+            items.append(_err(
+                "A-CI-EXIT",
+                f"{gate_id}: the record reports exit_code {exit_code} and "
+                f"CI's receipt records {receipt['exit_code']} for this "
+                f"gate — the row may not improve on what CI recorded"))
+        # Round-3 F3: three relations the per-field kinds cannot state. A
+        # well-formed string in each of these can still be the WRONG
+        # well-formed string, and each wrong one means something different.
+        if (_nonempty(receipt.get("schema"))
+                and receipt["schema"] != vocab.CI_RECEIPT_SCHEMA):
+            items.append(_err(
+                "A-CI-RECEIPT-GRAMMAR",
+                f"{gate_id}: the receipt declares schema "
+                f"{receipt['schema']!r} and this reader parses "
+                f"{vocab.CI_RECEIPT_SCHEMA!r} — a document in another "
+                f"grammar was read as though it were in this one"))
+        if (_nonempty(receipt.get("sha"))
+                and _nonempty(rec.get("executed_sha"))
+                and receipt["sha"] != rec["executed_sha"]):
+            items.append(_err(
+                "A-CI-RECEIPT-TARGET",
+                f"{gate_id}: the receipt is about {receipt['sha']!r} and "
+                f"this record attests execution at "
+                f"{rec['executed_sha']!r} — a receipt about another commit "
+                f"explains nothing about this one"))
+        if (_nonempty(receipt.get("artifact")) and _nonempty(receipt.get("sha"))
+                and receipt["artifact"]
+                != vocab.ci_receipt_artifact(receipt["sha"])):
+            items.append(_err(
+                "A-CI-RECEIPT-ARTIFACT-NAME",
+                f"{gate_id}: the receipt names artifact "
+                f"{receipt['artifact']!r}, and the artifact for "
+                f"{receipt['sha']!r} is "
+                f"{vocab.ci_receipt_artifact(receipt['sha'])!r} — the name "
+                f"carries the commit, so these cannot differ"))
+    return items
+
+
 def parse_attestations(evidence: str, tags: list[str] | None = None):
     """(records, error, tag) for the attestation block in an Evidence section.
 
@@ -590,6 +814,19 @@ def validate_attestations(evidence: str, cfg: Config,
                 f"{rec['blocking']!r} but the manifest says {blocking}; "
                 f"blocking is the manifest's to decide, never the "
                 f"record's (§5.1, RVW-T2)"))
+        # The attester, before anything branches on it: a record may name an
+        # executor, and one this validator does not know is one it cannot
+        # judge. Checked for not-run rows too — they claim an executor as
+        # well, and a typo there would silently become "not ci, so local".
+        attester = rec.get("attested_by")
+        if attester is not None and attester not in GATE_ATTESTERS:
+            items.append(_err(
+                "A-ATTESTER",
+                f"{gate_id}: attested_by={attester!r} names no admitted "
+                f"attester ({', '.join(repr(a) for a in GATE_ATTESTERS)}; "
+                f"absent means this tool executed the gate itself) — an "
+                f"unknown executor is an unjudged one, and unjudged is not "
+                f"clean"))
         if "error" in rec:
             # A gate that could not run is a recorded state, not a pass —
             # and RVW-T2(c): the one path that means "no evidence" meets its
@@ -620,6 +857,11 @@ def validate_attestations(evidence: str, cfg: Config,
             elif not ok(rec[name]):
                 items.append(_err(code, f"{gate_id}: {name}={rec[name]!r} is "
                                         f"not {expected}"))
+        # Round-3 F4: a row whose executor was CI carries the run and the
+        # receipt that explain it, and both are checked against the claim
+        # they explain rather than displayed beside it.
+        if rec.get("attested_by") == CI_ATTESTER:
+            items.extend(_ci_items(gate_id, rec, request_sha))
         if rec.get("binding") != "bound" and isinstance(rec.get("binding"), str):
             items.append(_err("A-UNBOUND",
                               f"{gate_id}: {rec['binding']}. An attestation "
@@ -1049,6 +1291,10 @@ def _identity_items(fid: str, rec: dict,
 _A_ATTR_VALUE = {
     "digits": (re.compile(r"\A[0-9]+\Z"),
                "a decimal count"),
+    # A lineage id: letter-led when minted, decimal when legacy, and in
+    # both cases a token this grammar carries rather than counts.
+    "lineage_id": (re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z"),
+                   "a lineage id"),
     "identity": (re.compile(r"\A[0-9a-f]{16}\Z"),
                  "a 16-character lowercase hex identity"),
     # The one grammar the recording verbs refuse by, so every name the

@@ -41,8 +41,10 @@ from review import (IDENTITY_ARTEFACTS,
 from review.digest import sha256_file_set
 from review.ledger import Ledger
 from review import cli, transport, wire
-from review.tests.util import (REPO_ROOT, SCOPE_RULES, TRANSPARENT_NODES,
-                               ast_grammar_nodes, grammar_fields,
+from review.tests.util import (LINEAGE, REPO_ROOT, SCOPE_RULES,
+                               TRANSPARENT_NODES,
+                               ast_grammar_nodes, declared_interval,
+                               grammar_fields,
                                grammar_problems, public_path, spec_path,
                                stamped_parse_sites)
 
@@ -527,7 +529,7 @@ class TestTheDispositionDoorCompares(unittest.TestCase):
         code, payload = _cli_add(self.cfg, self.tmp, path)
         self.assertEqual(code, 0, payload)
         transport.close_round(
-            self.cfg, Ledger(self.tmp), verdict_text(sha=SHA_B), "verdict.md",
+            self.cfg, Ledger(self.tmp), verdict_text(sha=SHA_B), "verdict.md",LINEAGE,
             validate_items=lambda v: validate.validate_verdict(v, self.cfg))
         return SHA_B
 
@@ -838,8 +840,22 @@ class TestEveryStampedReaderCompares(unittest.TestCase):
         granularity that erases its meaning. That is the same posture as
         refusing an undeclared taxonomy: a check that cannot judge a shape
         says so instead of guessing.
+
+        TWO authorities, each over its own question. The OPERATOR loop below
+        is this gate's own — it is what names `==` and `~=` as refused and
+        why, and the mutation set is derived from those tables. The
+        SPELLING of the value is `declared_interval`, the one grammar every
+        travelling reader of `project.requires-python` shares (2026-09-19).
+        Until then the loop was also the spelling authority, with a regex
+        that admitted optional whitespace, Unicode `\\d`, leading zeros,
+        components of any length and a third clause — so this gate accepted
+        values the generator downstream refused, which is the disagreement
+        a reviewer named across two lineages. The operator classification
+        runs FIRST, so a recognised-but-refused spelling still gets its
+        reason rather than a bare shape error; the bounds then come from
+        the shared authority, never from this regex's own `int()`.
         """
-        clauses = []
+        ops = []
         for raw in spec.split(","):
             alternation = "|".join(re.escape(op) for op in sorted(
                 cls.RECOGNISED_OPS, key=len, reverse=True))
@@ -867,10 +883,10 @@ class TestEveryStampedReaderCompares(unittest.TestCase):
                 raise ValueError(
                     f"requires-python clause {raw!r} uses an operator this "
                     f"gate does not judge")
-            clauses.append((cls.MINOR_EXACT_OPS[op],
-                            (int(found.group(2)), int(found.group(3)))))
-        if not clauses:
-            raise ValueError("requires-python declares no clause")
+            ops.append(op)
+        floor, below = declared_interval(spec)
+        bounds = {">=": floor, "<": below}
+        clauses = [(cls.MINOR_EXACT_OPS[op], bounds[op]) for op in ops]
         return lambda version: all(op(version, bound)
                                    for op, bound in clauses)
 
@@ -953,6 +969,79 @@ class TestEveryStampedReaderCompares(unittest.TestCase):
         for op, reason in self.PATCH_SENSITIVE_OPS.items():
             self.assertTrue(str(reason).strip(),
                             f"{op} is refused without a reason")
+
+    def test_no_spelling_the_shared_authority_refuses_passes_here(self):
+        """The other half of the same gate: the SPELLING, decided by
+        `declared_interval` rather than by a regex of this file's own.
+
+        Each row was admitted here and refused by the generator that reads
+        the same value — the disagreement two lineages named. FALSIFICATION.
+        Mutation: take the bounds from this file's own clause regex again
+        (`int(found.group(2))`, `int(found.group(3))`) and every row below
+        goes green while the generator keeps refusing it.
+        """
+        major, minor = sys.version_info[:2]
+        for label, spec in {
+                "padding after the operator": f">= {major}.{minor},"
+                                              f"<{major}.{minor + 1}",
+                "padding after the comma": f">={major}.{minor}, "
+                                           f"<{major}.{minor + 1}",
+                "a leading zero": f">={major}.0{minor},"
+                                  f"<{major}.{minor + 1}",
+                "a non-ASCII decimal digit": ">=٣.١٤,<٣.١٥",
+                "a component past the four-digit bound":
+                    f">={'1' * 5}.{minor},<{major}.{minor + 1}",
+                "a multiline value whose first line is admitted":
+                    f">={major}.{minor},<{major}.{minor + 1}\n"
+                    f">=3.11,<3.12",
+        }.items():
+            with self.subTest(spelling=label, spec=spec):
+                with self.assertRaises(ValueError):
+                    self._admitted_minors(spec)
+        # The paired control: one character back from each family.
+        admits = self._admitted_minors(
+            f">={major}.{minor},<{major}.{minor + 1}")
+        self.assertTrue(admits((major, minor)))
+
+    def test_this_package_has_ONE_grammar_for_the_declared_interval(self):
+        """The completeness half of the authority: no second reader.
+
+        The debt was three programs parsing one value, each with a regex of
+        its own, held to one shape by a comment. Making them agree is only
+        half a fix — the other half is that a FOURTH cannot appear
+        unnoticed. Every `re.*` call in this package whose pattern names
+        `>=` is a reader of an interpreter interval, and there must be
+        exactly one: the authority itself.
+
+        FALSIFICATION. Mutation: restore the
+        `re.search(r">=\\s*(\\d+)\\.(\\d+)", declared)` that
+        `test_handoff_preflight` used until 2026-09-19 and this names it.
+        """
+        sites = []
+        for path in sorted((REPO_ROOT / "review").rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                function = getattr(node, "func", None)
+                if not (isinstance(node, ast.Call)
+                        and isinstance(function, ast.Attribute)
+                        and isinstance(function.value, ast.Name)
+                        and function.value.id == "re"
+                        and function.attr in ("compile", "search", "match",
+                                              "fullmatch")
+                        and node.args):
+                    continue
+                pattern = "".join(
+                    piece.value for piece in ast.walk(node.args[0])
+                    if isinstance(piece, ast.Constant)
+                    and isinstance(piece.value, str))
+                if ">=" in pattern:
+                    sites.append(f"{path.relative_to(REPO_ROOT)}:"
+                                 f"{node.lineno}")
+        self.assertEqual(
+            [site.split(":")[0] for site in sites],
+            ["review/tests/util.py"],
+            f"more than one program in this package parses an interpreter "
+            f"interval: {sites}")
 
     def test_the_shipped_prose_names_the_pinned_minor(self):
         """The floor is a promise on every shipped surface, not only in

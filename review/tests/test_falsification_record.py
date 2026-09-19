@@ -16,6 +16,7 @@ from review.digest import sha256_text
 from review.ledger import Ledger
 from review.tests.test_validate import (CFG, FINDING, SHA, disposition_envelope,
                                         errs, record, verdict_text)
+from review.tests.util import LINEAGE
 
 RUN = {"status": "pass", "mutation": "fails_without_fix"}
 
@@ -215,7 +216,7 @@ class TestBreakersReadTheProductPath(unittest.TestCase):
     def test_unverifiable_fires_from_a_recorded_cannot_execute(self):
         led = Ledger.in_memory()
         self.round_one(led, self.CANNOT)
-        names = [b["breaker"] for b in led.breakers(round_cap=3)]
+        names = [b["breaker"] for b in led.breakers(LINEAGE, round_cap=3)]
         self.assertIn("unverifiable", names)
 
     def test_nonblocking_cannot_execute_does_not_fire_unverifiable(self):
@@ -233,12 +234,12 @@ class TestBreakersReadTheProductPath(unittest.TestCase):
                    if e["event"] == "falsification_run")
         self.assertIs(run["blocking"], False,
                       "the run is bound to its finding's blocking state")
-        names = [b["breaker"] for b in led.breakers(round_cap=3)]
+        names = [b["breaker"] for b in led.breakers(LINEAGE, round_cap=3)]
         self.assertNotIn("unverifiable", names)
         # High control: fires, and its rule text is now true.
         led2 = Ledger.in_memory()
         self.round_one(led2, self.CANNOT, sev="High")
-        fired = [b for b in led2.breakers(round_cap=3)
+        fired = [b for b in led2.breakers(LINEAGE, round_cap=3)
                  if b["breaker"] == "unverifiable"]
         self.assertEqual(len(fired), 1)
         self.assertIn("blocking finding", fired[0]["rule"])
@@ -246,7 +247,7 @@ class TestBreakersReadTheProductPath(unittest.TestCase):
         led3 = Ledger.in_memory()
         self.round_one(led3, self.CANNOT, sev="Blocker")
         self.assertIn("unverifiable",
-                      [b["breaker"] for b in led3.breakers(round_cap=3)])
+                      [b["breaker"] for b in led3.breakers(LINEAGE, round_cap=3)])
 
     def test_a_run_without_a_stamp_is_joined_through_its_finding(self):
         # Legacy or hand-seeded runs carry no `blocking`; the breaker joins
@@ -264,12 +265,12 @@ class TestBreakersReadTheProductPath(unittest.TestCase):
         led.add({"event": "falsification_run", "round": 1, "fp": fp,
                  "status": "cannot_execute"})
         self.assertIn("unverifiable", [
-            b["breaker"] for b in led.breakers(
+            b["breaker"] for b in led.breakers(LINEAGE,
                 round_cap=3, blocking_severities=CFG.blocking_severities)])
         # Without a set to judge by, it does not claim a severity it
         # cannot establish.
         self.assertNotIn("unverifiable",
-                         [b["breaker"] for b in led.breakers(round_cap=3)])
+                         [b["breaker"] for b in led.breakers(LINEAGE, round_cap=3)])
 
     def test_a_rowless_run_escalates_as_an_orphan_not_as_a_verdict(self):
         # Round 3 F1: a run that answers no recorded emission must neither
@@ -284,7 +285,7 @@ class TestBreakersReadTheProductPath(unittest.TestCase):
                  "fp": v.findings[0].fingerprint(),
                  "status": "cannot_execute"})
         for severities in (CFG.blocking_severities, None):
-            names = [b["breaker"] for b in led.breakers(
+            names = [b["breaker"] for b in led.breakers(LINEAGE,
                 round_cap=3, blocking_severities=severities)]
             self.assertIn("orphan", names)
             self.assertNotIn("unverifiable", names)
@@ -295,13 +296,13 @@ class TestBreakersReadTheProductPath(unittest.TestCase):
         # Round 2 re-raises the same finding, unchanged, on a new tip.
         led.add({"event": "request", "round": 2, "sha": "b" * 40, "bytes": 10})
         led.add_all(transport.verdict_events(v, 2, "sha256:v2", 10))
-        names = [b["breaker"] for b in led.breakers(round_cap=3)]
+        names = [b["breaker"] for b in led.breakers(LINEAGE, round_cap=3)]
         self.assertIn("stale", names)
 
     def test_a_proven_run_is_progress(self):
         led = Ledger.in_memory()
         self.round_one(led, RUN)
-        names = [b["breaker"] for b in led.breakers(round_cap=3)]
+        names = [b["breaker"] for b in led.breakers(LINEAGE, round_cap=3)]
         self.assertNotIn("unverifiable", names)
         self.assertNotIn("no-progress", names)
 
@@ -311,7 +312,7 @@ class TestAcceptanceMetric(unittest.TestCase):
     reads the run events and keeps the two absences apart."""
 
     def metric(self, led):
-        return led.metrics(gate_manifest=[])["rounds"][1]["unverified_acceptance"]
+        return led.metrics(LINEAGE, gate_manifest=[])["rounds"][1]["unverified_acceptance"]
 
     def seed(self, led, run, fals="run x"):
         v = verdict(fals=fals)

@@ -34,7 +34,7 @@ from unittest import mock
 from review import cli, config, tool_identity, transport, vocab
 from review.ledger import Ledger
 from review.tests import synth
-from review.tests.util import REPO_ROOT
+from review.tests.util import LINEAGE, REPO_ROOT
 
 CFG = config.load(REPO_ROOT)
 SHA_A, SHA_B, SHA_C = "a" * 40, "b" * 40, "c" * 40
@@ -103,7 +103,11 @@ def request_text(sha=SHA_B, base=SHA_A, reviewer="codex", author="claude",
             f'author="{author}" reviewer="{reviewer}" round="{round_no}"'
             f'{tr}{tl}>\n'
             f"Roles: author={author} · reviewer={reviewer} · relay=user.\n\n"
-            f"Target: {sha}\nBase:   {base}   (the SHA ruled on in round 0)\n"
+            # The emitter stopped writing "ruled on in round 0" (brief
+            # `round-cap-stamp-misreports`): there is no round 0, so the
+            # fixture no longer models a line the tool cannot produce.
+            f"Target: {sha}\nBase:   {base}   (round 1 opens this lineage: "
+            f"the base is the one the author declared)\n"
             f"Diff:   git diff {base}...{sha}\nTree:   clean at emission\n"
             f"{push_lines}"
             f"## Taxonomy\n\nSeverity, ordered:      Blocker > High > Medium "
@@ -188,6 +192,10 @@ def reviewer_clone_git():
         ("cat-file", "-t", f"{SHA_B}:review/wire.py"): "blob",
         ("show", f"{SHA_B}:review/wire.py"): "not the manifest's bytes",
         ("cat-file", "-t", f"{SHA_B}:review"): "tree",
+        # `reviewer_checkout` (2026-09-18): what this clone's working tree
+        # IS. The fixture clone sits at the target with a clean tree.
+        ("rev-parse", "HEAD"): SHA_B,
+        ("status", "--porcelain"): "",
     }
     inner = fake_git(known)
 
@@ -257,7 +265,7 @@ class WarmCache:
     def cached(self, **kw):
         """`cached_handoff` for round 1 under this scaffold; `kw` is the
         key dimension under test (roles, transport, debug, ...)."""
-        return transport.cached_handoff(self.cfg, self.ledger, 1,
+        return transport.cached_handoff(self.cfg, self.ledger, 1, LINEAGE,
                                         git=self.git,
                                         claim_digest=self.claim_digest, **kw)
 
@@ -287,7 +295,7 @@ def warm_cache_fixture(case, text=None, *, prefix="warm-cache-",
     if text is None:
         stamp = tool_identity() if tool_attr is CURRENT_IDENTITY else tool_attr
         text = request_text(tool_attr=stamp, transport_attr=transport_attr)
-    kept = transport.keep_bytes(cfg, 1, "request", text)
+    kept = transport.keep_bytes(cfg, 1, "request", text, lineage=LINEAGE)
     git = fake_git({("rev-parse", "HEAD"): SHA_B,
                     ("status", "--porcelain"): "",
                     **authority_calls()})

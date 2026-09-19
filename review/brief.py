@@ -46,7 +46,10 @@ _CHANGED = re.compile(r"^What changed \((.+?)\s*—", re.M)
 # the recurring trap category: a stated count whose enumeration disagrees
 # with it.
 _BULLETS = re.compile(r"^(?:  )?- (.+?)$", re.M)
-_LINEAGE = re.compile(r"^Lineage:\s+(\d+)", re.M)
+#: The `Lineage:` line of the embedded ledger report. The id is opaque
+#: since 2026-09-06 (brief `keyed-lineage`) — a minted `L…` or a legacy
+#: ordinal — so this matches a token, never a number.
+_LINEAGE = re.compile(r"^Lineage:\s+(\S+)", re.M)
 
 
 _LABEL = 15  # kept for callers that still pass an explicit indent
@@ -257,15 +260,17 @@ def _count_bullets(section: str, heading: str) -> int:
 
 # --------------------------------------------------------------- discovery
 
-def open_requests(ledger) -> list[dict]:
-    """Request events in the CURRENT lineage whose round carries no verdict."""
-    current = ledger.current()
-    ruled = {e.get("round") for e in current if e.get("event") == "verdict"}
-    return [e for e in current
-            if e.get("event") == "request" and e.get("round") not in ruled]
+def open_requests(ledger, lineage: str) -> list[dict]:
+    """Request events in `lineage` whose round carries no verdict.
+
+    Delegates to `Ledger.open_requests`, which every lifecycle refusal also
+    reads: the verb a human runs and the refusal that stops them must
+    answer off one read, or they can disagree about what is open.
+    """
+    return ledger.open_requests(lineage)
 
 
-def find_open_request(ledger):
+def find_open_request(ledger, lineage: str):
     """`(event, superseded)` for the live request, or `(None, 0)`.
 
     The ledger is append-only, so re-emitting a round does not remove its
@@ -274,7 +279,7 @@ def find_open_request(ledger):
     as a count rather than silently dropped, because a human who emitted twice
     should be told which of the two they are about to carry.
     """
-    candidates = open_requests(ledger)
+    candidates = open_requests(ledger, lineage)
     if not candidates:
         return None, 0
     top = max(e.get("round", 0) for e in candidates)
@@ -284,94 +289,270 @@ def find_open_request(ledger):
 
 # ------------------------------------------------------------------ précis
 
-def request_precis(parsed, ledger=None) -> str:
-    """What this request asks, in prose. Derived from the envelope only."""
+_ROUND_OF = re.compile(r"(\d+)\s+of\s+(\d+)")
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z(`])")
+
+
+def _first_sentence(text: str) -> str:
+    text = " ".join(text.split())
+    parts = _SENTENCE_END.split(text, maxsplit=1)
+    return parts[0] if parts else text
+
+
+def request_precis(parsed, ledger=None, full: bool = False) -> str:
+    """What this request asks, in prose. Derived from the envelope only.
+
+    Brief `request-precis-legibility` (the user, 2026-09-05: "way too
+    much"). This had one consumer — the person deciding whether to carry
+    the round or intervene — and printed fifteen labelled bullets at equal
+    weight, so the one line that needed them (round 4 against a cap of 3)
+    sat level with a reference count. The verdict précis already had the
+    shape asked for. Rules, mirrored from there: normal states go SILENT (a
+    reachable commit, a clean tree, gates all passed and bound, references
+    all matched say nothing); ABNORMAL states come first, bold, one line
+    each; tallies are one trailing sentence, never bullets; round and
+    direction live in the heading; and the author's claim is shown as its
+    objective's first sentence with a pointer to `--full`, because a
+    130-word objective is the author's to shorten, not this renderer's to
+    reprint. `full=True` prints the claim's objective, risk and scope whole.
+    """
     body, sections = parsed.body, parsed.sections
     attrs = parsed.attrs
     head = {k: (m.group(1) if (m := rx.search(body)) else None)
             for k, rx in _HEADER.items()}
     claim = sections.get("claim", "")
 
-    out = ["## What this asks", ""]
     rnd = head["round"] or attrs.get("round", "?")
     lineage = m.group(1) if (m := _LINEAGE.search(body)) else "?"
-    out.append(f"- **Round** — {rnd}, lineage {lineage}")
-    out.append(f"- **Direction** — {attrs.get('author', '?')} wrote it, "
-               f"{attrs.get('reviewer', '?')} rules on it")
+    n_of_cap = _ROUND_OF.search(rnd)
+    round_word = (f"Round {n_of_cap.group(1)} of {n_of_cap.group(2)}"
+                  if n_of_cap else f"Round {rnd}")
+    out = [f"## What this asks — {round_word}, lineage {lineage}, "
+           f"{attrs.get('author', '?')} → {attrs.get('reviewer', '?')}", ""]
 
+    # ABNORMAL FIRST. Each of these is a line a person may have to act on;
+    # its absence is the normal state and prints nothing.
+    if n_of_cap and int(n_of_cap.group(1)) > int(n_of_cap.group(2)):
+        # Brief `round-cap-stamp-misreports`: this said "the breaker fired
+        # … a person decides whether this lineage continues", which is the
+        # misreading the envelope's own stamp taught — and the one that
+        # escaped the loop on lineage 26 round 3, where an author with
+        # `review.toml` open reported to the user that a fourth round
+        # "needs the user's authorization". It does not: the cap is
+        # advisory, nothing is gated, and the tool emits. The line stays
+        # FIRST, because past the cap is still the state a person may want
+        # to act on; it no longer tells them they must.
+        out.append(f"- **Round {n_of_cap.group(1)} is past the cap of "
+                   f"{n_of_cap.group(2)}** — advisory: nothing is gated and "
+                   f"no authorization is needed to continue; the envelope's "
+                   f"ledger report carries the convergence reading the count "
+                   f"stands in for")
     target = head["target"] or attrs.get("sha") or "?"
-    branch = attrs.get("branch")
-    out.append(f"- **Commit** — {target[:12]}"
-               + (f" on {branch}" if branch else "")
-               + (f", working tree {head['tree']}" if head["tree"] else ""))
-
     push = head["push"] or ""
     if push.startswith("LOCAL-ONLY"):
-        out.append("- **Reachable** — NO — this commit exists on this machine "
-                   "only. A reviewer elsewhere cannot fetch it.")
-    elif push:
-        # Round 1 F9: this said "any machine can fetch it". The Push line
-        # attests an ls-remote observation — that the ref is present on the
-        # remote — and says nothing about who may read that remote. A private
-        # repository is exactly the case where the stronger claim is false.
-        out.append("- **Reachable** — present on the remote and confirmed there "
-                   "after the push, so a client with access to that remote "
-                   "can fetch it")
-    else:
-        out.append("- **Reachable** — not stated")
-
+        out.append("- **Reachable — NO** — this commit exists on this machine "
+                   "only; a reviewer elsewhere cannot fetch it")
+    elif not push:
+        out.append("- **Reachable — not stated** — the envelope carries no "
+                   "push line")
+    # Round 1 F9: a present push line attests an ls-remote observation and
+    # nothing about who may read the remote, so the normal state says
+    # nothing at all rather than "any machine can fetch it".
+    if head["tree"] and "clean" not in head["tree"]:
+        out.append(f"- **Working tree {head['tree']}** at emission")
     if head["base"] and head["base"] == target:
-        out.append("- **Diff** — EMPTY — base and target are the same "
-                   "commit, so the diff shows nothing")
-    elif changed := (m.group(1) if (m := _CHANGED.search(claim)) else None):
-        out.append(f"- **Diff** — {changed}")
-
-    if m := _OBJECTIVE.search(claim):
-        out.append("- **Asking for** — " + _wrap(m.group(1)))
-    if m := _RISK.search(claim):
-        out.append("- **Author risk** — " + _wrap(m.group(1)))
-    if scope := sections.get("review scope", "").strip():
-        out.append("- **Scope** — " + _wrap(scope))
-
-    not_done = _count_bullets(claim, "Deliberately not done:")
-    if not_done:
-        out.append(f"- **Declared** — {not_done} thing(s) the author says are "
-                   f"deliberately not done — read them before ruling")
-    not_captured = _count_bullets(
-        sections.get("evidence", ""),
-        "NOT captured — this handoff cannot vouch for these:")
-    if not_captured:
-        out.append(f"- **Unevidenced** — {not_captured} thing(s) the author says "
-                   f"this handoff cannot vouch for")
-
+        out.append("- **Diff — EMPTY** — base and target are the same commit, "
+                   "so the diff shows nothing")
     records, err, _ = parse_attestations(sections.get("evidence", ""))
     if err or records is None:
-        out.append("- **Gates** — none readable in this envelope")
+        out.append("- **Gates — none readable in this envelope**")
     else:
-        passed = [r for r in records if r.get("exit_code") == 0]
-        bound = [r for r in records if r.get("binding") == "bound"]
-        line = (f"- **Gates** — {len(passed)} of {len(records)} passed")
-        if len(bound) == len(records) and records:
-            line += ", all bound to this exact commit"
-        else:
-            line += (f", only {len(bound)} of {len(records)} bound to this "
-                     f"commit — the rest prove nothing about it")
-        out.append(line)
-
+        out.extend(_gate_banners(records))
     states = _reference_states(sections.get("reference", ""))
+    # Round 1 F10: the states are distinct in the grammar; only the
+    # abnormal ones are named here, and by their own label.
+    abnormal_refs = {k: n for k, n in states.items()
+                     if n and k not in ("with a digest to check", "directories")}
+    if abnormal_refs:
+        out.append("- **References — " + ", ".join(
+            f"{n} {label}" for label, n in abnormal_refs.items()) + "**")
+
+    # THE NORMAL ACCOUNT: one line for the commit, one for the ask.
+    branch = attrs.get("branch")
+    where = f"`{target[:12]}`" + (f" on {branch}" if branch else "")
+    changed = (m.group(1) if (m := _CHANGED.search(claim)) else None)
+    out.append(f"- {where}" + (f"; {changed}" if changed else ""))
+    objective = (m.group(1) if (m := _OBJECTIVE.search(claim)) else "")
+    if objective:
+        if full:
+            out.append("- **Asks** — " + _wrap(" ".join(objective.split())))
+        else:
+            out.append("- **Asks** — " + _wrap(_first_sentence(objective)))
+    if full:
+        if m := _RISK.search(claim):
+            out.append("- **Author risk** — " + _wrap(m.group(1)))
+        if scope := sections.get("review scope", "").strip():
+            out.append("- **Scope** — " + _wrap(scope))
+
+    # THE TALLIES, one sentence: what the reviewer will read, which the
+    # person carrying the envelope cannot act on and need not count.
+    tallies = []
     if total := sum(states.values()):
-        # Round 1 F10: this said the tool "digested each one" for every
-        # reference, including those the envelope marks unavailable or carries
-        # with no digest at all. The states are distinct in the grammar and
-        # are reported distinctly here.
-        parts = [f"{n} {label}" for label, n in states.items() if n]
-        out.append(f"- **References** — {total} the reviewer must read — "
-                   + ", ".join(parts))
+        tallies.append(f"{total} reference(s)")
+    if not_done := _count_bullets(claim, "Deliberately not done:"):
+        tallies.append(f"{not_done} declared not done")
+    if not_captured := _count_bullets(
+            sections.get("evidence", ""),
+            "NOT captured — this handoff cannot vouch for these:"):
+        tallies.append(f"{not_captured} unevidenced")
     if stop := sections.get("stop conditions", "").strip():
-        n = len(_BULLETS.findall(stop))
-        if n:
-            out.append(f"- **Refuse if** — {n} stated stop condition(s)")
+        if n := len(_BULLETS.findall(stop)):
+            tallies.append(f"{n} stop condition(s)")
+    if tallies:
+        line = "- The reviewer reads " + ", ".join(tallies)
+        if not full:
+            line += f"; the whole claim: `{TOOL_NAME} brief <request> --full`"
+        out.append(line)
     return "\n".join(out)
+
+
+def _gate_banners(records: list) -> list[str]:
+    """The abnormal-gate lines of a request précis, target and advisory apart.
+
+    Tool feedback, pilot round 3 (brief `loupe-tool-feedback-pilot-2026-09`
+    item 5): one line said "1 of 20 did not pass: ci-evidence" and the
+    reviewer read a failure of the TARGET, while every blocking row was bound
+    and green — the red row was a non-blocking gate reporting the branch's
+    earlier CI history. `blocking` is the manifest's fact and the validator
+    holds the record to it, so the split is derived, not judged: a blocking
+    row that did not pass is the target's failure and says so; a non-blocking
+    one is advisory and says THAT, beside whether the blocking rows passed.
+    A record that is not an object counts as a blocking failure: what cannot
+    be read is never reported as advisory.
+    """
+    def row_id(r):
+        return str(r.get("id", "?")) if isinstance(r, dict) else "?"
+
+    def passed(r):
+        return isinstance(r, dict) and r.get("exit_code") == 0
+
+    def advisory(r):
+        return isinstance(r, dict) and r.get("blocking") is False
+
+    hard = [r for r in records if not passed(r) and not advisory(r)]
+    soft = [r for r in records if not passed(r) and advisory(r)]
+    unbound = [r for r in records
+               if not isinstance(r, dict) or r.get("binding") != "bound"]
+    out = []
+    if hard or unbound:
+        parts = []
+        if hard:
+            parts.append(f"{len(hard)} of {len(records)} BLOCKING gate(s) did "
+                         f"not pass AT THE TARGET: "
+                         + ", ".join(row_id(r) for r in hard))
+        if unbound:
+            parts.append(f"{len(unbound)} not bound to this commit")
+        out.append("- **Gates — " + "; ".join(parts) + "**")
+    if soft:
+        rest = ("every blocking gate passed at the target" if not hard
+                else "see the blocking failures above")
+        out.append(f"- **Advisory gates — {len(soft)} non-blocking gate(s) "
+                   f"did not pass: " + ", ".join(row_id(r) for r in soft)
+                   + f"** — not a failure of the target's blocking gates "
+                     f"({rest}); read the row's own output for what it "
+                     f"reports")
+    return out
+
+
+_SHORT = 12
+
+
+def _attestation_row(rec, request_sha: str | None) -> str:
+    """One table row. Every column is a field of the record, shortened at
+    most; a field that is absent prints `-`, never a default."""
+    def cell(value) -> str:
+        return "-" if value is None else " ".join(str(value).split()).replace("|", "\\|")
+
+    if "error" in rec:
+        result = f"NOT RUN: {rec.get('error')}"
+    else:
+        result = f"exit {rec.get('exit_code')}" if "exit_code" in rec else None
+    executed = rec.get("executed_sha")
+    target = rec.get("target_sha")
+    if executed is not None and executed == target and (
+            request_sha is None or target == request_sha):
+        ran_at = "= target"
+    else:
+        ran_at = (f"executed {cell(executed)[:_SHORT]} / claims "
+                  f"{cell(target)[:_SHORT]}")
+    run = rec.get("ci_run") if isinstance(rec.get("ci_run"), dict) else {}
+    by = (f"{rec.get('attested_by')} run {run.get('id', '-')} "
+          f"({run.get('conclusion', '-')})" if rec.get("attested_by")
+          else "this tool")
+    output = rec.get("output") if isinstance(rec.get("output"), dict) else {}
+    digest = output.get("sha256")
+    return "| " + " | ".join(cell(c) for c in (
+        rec.get("id"), result, rec.get("binding"), rec.get("tree"), ran_at,
+        "yes" if rec.get("blocking") is True
+        else "no" if rec.get("blocking") is False else None,
+        by, rec.get("command"),
+        f"sha256:{digest[:_SHORT]}" if isinstance(digest, str) else None,
+        # The pointer, whole (asked for in two rounds' tool feedback): a
+        # shortened digest names a log and cannot open it.
+        output.get("pointer"),
+    )) + " |"
+
+
+def compact_request(envelope: str, kept: str | None = None,
+                    tags: list[str] | None = None) -> str:
+    """The request as the reviewer reads it: every section verbatim, the
+    attestation objects as one table.
+
+    Tool feedback, pilot rounds 1 to 3 (brief
+    `loupe-tool-feedback-pilot-2026-09` items 1 and 2): `take` printed the
+    whole envelope every round, and 64% of a measured 29,589-byte request was
+    the attestation array — five of its twenty objects repeating one CI run
+    and a receipt each. The reviewer asked for "target SHA, gate, conclusion,
+    command, and content-addressed output pointer"; this prints those, plus
+    the binding, the tree and who executed, because those are the fields an
+    attestation can lie in.
+
+    What this is NOT: a second format. Validation, the digest, the kept copy
+    and the ledger all read the ORIGINAL bytes; this is a rendering of them
+    for a reader, and the kept path printed under the table is the full mode.
+    It never hides what it cannot read: a block that does not parse, or a
+    record that is not an object, leaves the envelope exactly as it was.
+    """
+    from . import wire
+    records, err, tag = parse_attestations(envelope, tags)
+    if err is not None or not records or not all(
+            isinstance(r, dict) for r in records):
+        return envelope
+    fence = wire.attestation_fence(tag)
+    block = re.search(r"```" + re.escape(fence) + r"\s*\n.*?\n```",
+                      envelope, re.DOTALL)
+    if block is None:
+        return envelope
+    request_sha = (m.group(1) if (m := re.search(
+        r'<[\w-]+-review-request\b[^>]*\bsha="([0-9a-f]{40})"', envelope))
+        else None)
+    full_at = (f"every field of every record, CI run and receipt objects "
+               f"included: {kept}" if kept else
+               "every field of every record is in the request file itself")
+    table = "\n".join([
+        f"{len(records)} attestation record(s), summarised by `{TOOL_NAME} "
+        f"take` from {len(block.group(0).encode('utf-8'))} bytes of JSON — "
+        f"{full_at}",
+        f"`= target` means executed_sha = target_sha"
+        + (f" = the request's sha {request_sha[:_SHORT]}" if request_sha
+           else "") + "; any other row prints both.",
+        "",
+        "| gate | result | binding | tree | ran at | blocking | executed by "
+        "| command | output | log |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+        *(_attestation_row(r, request_sha) for r in records),
+    ])
+    return envelope[:block.start()] + table + envelope[block.end():]
 
 
 def verdict_precis(parsed, source: str | None = None,

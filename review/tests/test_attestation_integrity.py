@@ -10,7 +10,7 @@ sufficient).
 import dataclasses
 import unittest
 
-from review import validate
+from review import emit, validate, vocab
 from review.tests.synth import ONE_GATE, complete_attestation, evidence_with
 
 REQUEST_SHA = "9" * 40
@@ -234,6 +234,223 @@ class TestF3AttestationSignalsAreIndependentlyRequired(unittest.TestCase):
             self.SOFT_GATE)
         self.assertEqual(errs(items), set())
         self.assertIn("A-NOT-RUN", {i.code for i in items})
+
+
+class TestACIAttestedRowClaimsOnlyWhatCIRan(unittest.TestCase):
+    """The three lies above, retried by a row whose EXECUTOR was CI (brief
+    `ci-attested-gates`, 2026-09-07).
+
+    A gate may now declare `attested_by = "ci"`, and the runner records the
+    Actions run's identity and conclusion instead of executing the command
+    here. That adds keys to the record — `attested_by`, `ci_run` — and an
+    added key must buy no immunity: every check in this module is about what
+    a row CLAIMS, and who ran the command changes none of them. The rows here
+    are the exact shapes `emit._ci_attestation` and `emit._ci_not_run` build;
+    `test_ci_attested_gates` proves the runner builds them, this proves the
+    validator still judges them.
+    """
+
+    RUN = {"id": 4242, "url": "https://github.com/acme/widget/actions/runs/4242",
+           "status": "completed", "conclusion": "success",
+           "head_sha": REQUEST_SHA, "workflow": "gates",
+           "completed": "2026-09-07T10:00:00Z"}
+
+    def ci_row(self, **over) -> dict:
+        rec = complete_attestation(
+            attested_by="ci", ci_run=dict(self.RUN),
+            tool_version="attested by ci: acme/widget gates run 4242 (success)",
+            target_sha=REQUEST_SHA, executed_sha=REQUEST_SHA)
+        # Round-3 F2/F4: the receipt row CI wrote for this gate, which the
+        # validator now requires beside the run.
+        rec["receipt"] = {"id": rec["id"], "command": rec["command"],
+                          "exit_code": 0, "duration_s": 1.5, "not_run": None,
+                          "artifact": vocab.ci_receipt_artifact(REQUEST_SHA),
+                          "sha": REQUEST_SHA, "tool_version": "loupe/test",
+                          "schema": vocab.CI_RECEIPT_SCHEMA}
+        rec.update(over)
+        return rec
+
+    # ---- round-3 F4: the receipt and the run are validated on their own
+    # terms, independently of the outer row, which stays green throughout.
+
+    def _codes(self, rec):
+        return errs(validate.validate_attestations(
+            evidence_with([rec]), ONE_GATE, request_sha=REQUEST_SHA))
+
+    def test_every_ci_run_field_is_required_and_typed(self):
+        for name, code, _ok, _why in validate._CI_RUN_FIELDS:
+            with self.subTest(field=name, mutation="deleted"):
+                rec = self.ci_row(); del rec["ci_run"][name]
+                self.assertIn(code, self._codes(rec))
+            with self.subTest(field=name, mutation="wrong type"):
+                rec = self.ci_row(); rec["ci_run"][name] = [] if name != "id" else {}
+                self.assertIn(code, self._codes(rec))
+
+    #: A value that fails each declared kind, so the parametrised test below
+    #: needs no per-field knowledge of its own.
+    WRONG_FOR_KIND = {"nonempty": 7, "int": {}, "number": {},
+                      "text_or_none": 7, "sha": "not-a-sha"}
+
+    def test_every_declared_receipt_field_is_required_and_typed(self):
+        """FALSIFICATION for round-3 F3.
+
+        Derived from `vocab.CI_RECEIPT_ROW` — the mapping `emit` BUILDS the
+        row from — rather than from the validator's own table, which is what
+        the finding named: the old test read `validate._CI_RECEIPT_FIELDS`,
+        so shrinking that table shrank what "every field" meant and the six
+        unchecked fields were invisible to the test and the validator alike.
+
+        MUTATION: drop a field from the authority and the emitted row loses
+        it too, so the receipt stops carrying what the record needs; narrow
+        a kind and the wrong-type case for that field goes green.
+        """
+        for name, (code, kind, _why) in vocab.CI_RECEIPT_ROW.items():
+            with self.subTest(field=name, mutation="deleted"):
+                rec = self.ci_row(); del rec["receipt"][name]
+                self.assertIn(code, self._codes(rec))
+            with self.subTest(field=name, mutation="wrong type"):
+                rec = self.ci_row()
+                rec["receipt"][name] = self.WRONG_FOR_KIND[kind]
+                self.assertIn(code, self._codes(rec))
+
+    def test_what_ci_emits_per_gate_is_declared_in_the_authority(self):
+        """The completeness direction the old test could not reach: every
+        key CI's OWN receipt writes for a gate is a key this validator was
+        told about. A new field in `gate_receipt` with no entry in the
+        authority fails here rather than riding into a record unchecked."""
+        gates = [{"id": "heavy", "command": ["true"], "blocking": True}]
+        doc = emit.gate_receipt(
+            REQUEST_SHA, gates,
+            {"heavy": {"id": "heavy", "command": "true", "exit_code": 0,
+                       "duration_s": 1.5}})
+        [row] = doc["gates"]
+        undeclared = sorted(set(row) - set(vocab.CI_RECEIPT_ROW))
+        self.assertEqual(undeclared, [],
+                         "CI writes a per-gate field the receipt authority "
+                         "does not declare, so nothing validates it")
+        # The document's own fields travel into the row beside the gate's,
+        # and they are declared too — all but `artifact`, which is this
+        # tool's name for where the document travelled rather than
+        # something CI wrote inside it.
+        document = sorted(set(doc) - {"gates"} - set(vocab.CI_RECEIPT_ROW))
+        self.assertEqual(document, [])
+        self.assertIn("artifact", vocab.CI_RECEIPT_ROW)
+
+    def test_a_receipt_in_another_grammar_is_refused(self):
+        rec = self.ci_row()
+        rec["receipt"]["schema"] = "loupe-gate-receipt/99"
+        self.assertIn("A-CI-RECEIPT-GRAMMAR", self._codes(rec))
+
+    def test_a_receipt_about_another_commit_is_refused(self):
+        # The outer row stays green: only the receipt's own SHA moves, and
+        # its artifact name moves with it so the name check is not what
+        # fires.
+        rec = self.ci_row()
+        rec["receipt"]["sha"] = OTHER_SHA
+        rec["receipt"]["artifact"] = vocab.ci_receipt_artifact(OTHER_SHA)
+        codes = self._codes(rec)
+        self.assertIn("A-CI-RECEIPT-TARGET", codes)
+        self.assertNotIn("A-CI-RECEIPT-ARTIFACT-NAME", codes)
+
+    def test_an_artifact_name_that_does_not_carry_its_commit_is_refused(self):
+        rec = self.ci_row()
+        rec["receipt"]["artifact"] = vocab.ci_receipt_artifact(OTHER_SHA)
+        codes = self._codes(rec)
+        self.assertIn("A-CI-RECEIPT-ARTIFACT-NAME", codes)
+        self.assertNotIn("A-CI-RECEIPT-TARGET", codes)
+
+    def test_a_missing_run_or_receipt_object_is_named(self):
+        rec = self.ci_row(); del rec["ci_run"]
+        self.assertIn("A-CI-RUN", self._codes(rec))
+        rec = self.ci_row(); del rec["receipt"]
+        self.assertIn("A-CI-RECEIPT", self._codes(rec))
+
+    def test_only_the_nested_values_change_and_the_outer_row_stays_green(self):
+        # The outer row keeps exit_code 0, binding bound, executed_sha at
+        # the target; only what the receipt or the run says is altered.
+        cases = {
+            "A-CI-SHA": ("ci_run", "head_sha", OTHER_SHA),
+            "A-CI-CONCLUSION": ("ci_run", "conclusion", "failure"),
+            "A-CI-INCOMPLETE": ("ci_run", "status", "in_progress"),
+            "A-CI-NOT-RUN": ("receipt", "not_run", "declared not-run in CI"),
+            "A-CI-GATE": ("receipt", "id", "some-other-gate"),
+            "A-CI-COMMAND": ("receipt", "command", "echo not-the-command"),
+            "A-CI-EXIT": ("receipt", "exit_code", 3),
+        }
+        for code, (obj, key, value) in cases.items():
+            with self.subTest(code=code):
+                rec = self.ci_row(); rec[obj][key] = value
+                self.assertIn(code, self._codes(rec))
+                self.assertEqual(rec["exit_code"], 0)
+                self.assertEqual(rec["executed_sha"], REQUEST_SHA)
+
+    def test_the_receipt_must_agree_with_the_request_target(self):
+        rec = self.ci_row()
+        items = validate.validate_attestations(
+            evidence_with([rec]), ONE_GATE, request_sha=OTHER_SHA)
+        self.assertIn("A-CI-REQUEST-SHA", errs(items))
+
+    def test_local_and_honest_not_run_rows_are_untouched_by_the_ci_checks(self):
+        local = complete_attestation(target_sha=REQUEST_SHA,
+                                     executed_sha=REQUEST_SHA)
+        self.assertNotIn("A-CI-RUN", self._codes(local))
+        self.assertNotIn("A-CI-RECEIPT", self._codes(local))
+
+    def test_a_complete_ci_row_validates(self):
+        items = validate.validate_attestations(
+            evidence_with([self.ci_row()]), ONE_GATE, request_sha=REQUEST_SHA)
+        self.assertEqual(errs(items), set())
+
+    def test_a_ci_row_still_needs_every_required_field(self):
+        # The added keys are not a substitute for the required ones: an
+        # `attested_by` that excused a missing exit code would let a row say
+        # "CI attested this" and never say what CI concluded.
+        for field in ("exit_code", "command", "target_sha", "output",
+                      "binding"):
+            with self.subTest(removed=field):
+                rec = self.ci_row()
+                del rec[field]
+                self.assertTrue(errs(validate.validate_attestations(
+                    evidence_with([rec]), ONE_GATE)),
+                    f"removing {field} from a CI row produced no error")
+
+    def test_a_failing_ci_conclusion_is_fatal_for_a_blocking_gate(self):
+        rec = self.ci_row(exit_code=1,
+                          ci_run={**self.RUN, "conclusion": "failure"})
+        self.assertIn("A-FAILED", errs(validate.validate_attestations(
+            evidence_with([rec]), ONE_GATE)))
+
+    def test_a_green_ci_run_for_another_commit_is_not_this_requests_evidence(self):
+        # RVW-T2(a) in its CI form, and the one this mechanism makes easy to
+        # get wrong: a run that really did pass, really did complete, and is
+        # about a different commit.
+        rec = self.ci_row(target_sha=OTHER_SHA, executed_sha=OTHER_SHA,
+                          ci_run={**self.RUN, "head_sha": OTHER_SHA})
+        self.assertIn("A-REQUEST-SHA", errs(validate.validate_attestations(
+            evidence_with([rec]), ONE_GATE, request_sha=REQUEST_SHA)))
+
+    def test_an_unattested_ci_gate_meets_the_not_run_requirements(self):
+        # `gh` absent, the repository unresolvable, or no completed run
+        # inside the timeout: no answer was obtained, so the record carries
+        # a reason and NONE of the fields only a run could produce.
+        rec = {"id": "tests", "blocking": True, "attested_by": "ci",
+               "error": ("not run: no completed run for " + REQUEST_SHA
+                         + " within 900s (45 poll(s) of acme/widget@main; "
+                           "1 run(s) at that SHA still in flight) — an "
+                           "unattested gate is not evidence")}
+        items = validate.validate_attestations(evidence_with([rec]), ONE_GATE)
+        self.assertNotIn("A-NOT-RUN-SHAPE", codes(items))
+        self.assertIn("A-NOT-RUN", errs(items))
+
+    def test_a_ci_row_that_waited_may_not_also_claim_a_run(self):
+        # The shape a future edit would reach for if it wanted the timeout
+        # record to "look complete": an error AND run-only fields. It is not
+        # a richer record, it is an incoherent one.
+        rec = {"id": "tests", "blocking": True, "attested_by": "ci",
+               "error": "not run: no completed run for " + REQUEST_SHA,
+               "exit_code": 0, "duration_s": 900.0}
+        self.assertIn("A-NOT-RUN-SHAPE", errs(validate.validate_attestations(
+            evidence_with([rec]), ONE_GATE)))
 
 
 if __name__ == "__main__":

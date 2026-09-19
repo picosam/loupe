@@ -67,7 +67,14 @@ DEFAULTS = {
     # nobody declared is not a budget of zero and not a budget of infinity,
     # and the cumulative-token breaker must be able to say which of the two
     # states it is in (round-4 F5).
-    "limits": {"round_cap": 3, "token_budget": None},
+    # `ci_timeout` (2026-09-07, brief `ci-attested-gates`) HAS a default,
+    # unlike its neighbour: a gate attested by CI must wait some finite
+    # time, and "the repository declared no ceiling" is not a state the
+    # poller can be in — it would either wait forever or refuse instantly,
+    # and both are decisions nobody made. 900 seconds is a judgment about
+    # how long a handoff may block on a runner, and it is config precisely
+    # so a slower project can move it.
+    "limits": {"round_cap": 3, "token_budget": None, "ci_timeout": 900},
     "wrapper": {"tag": TOOL_NAME},
     # The repository's declared MINIMUM reader version (2026-09-01, brief
     # config-keys-are-a-cross-installation-contract). `requires` has NO
@@ -115,6 +122,12 @@ class Config:
     #: is exactly the state `decisions` reports, so it is recorded at the one
     #: place the user's own bytes are read (`load` and `from_text`).
     declared: frozenset = field(default_factory=frozenset)
+    #: The dotted keys the file records as decided-undeclared, by the comment
+    #: line `vocab.decided_line` prints as such a key's `unset` (0.17.0).
+    #: Read from the raw text, since TOML parsing drops comments; only keys
+    #: whose off state IS that line count, so the marker cannot silence a
+    #: key that has a real off value to declare.
+    decided_undeclared: frozenset = field(default_factory=frozenset)
 
     @property
     def taxonomy_declared(self) -> bool:
@@ -178,7 +191,8 @@ class Config:
         supplied = dict(applied or {})
         supplied.setdefault(vocab.DECIDE_ROUND_CAP,
                             DEFAULTS["limits"]["round_cap"])
-        return vocab.decisions(self.declared, supplied)
+        return vocab.decisions(self.declared | self.decided_undeclared,
+                               supplied)
 
     @property
     def gate_commands(self) -> list[str]:
@@ -226,8 +240,14 @@ def caller_env() -> dict:
     (`emit._git`, `emit._git_bytes`, `emit._is_ancestor`, `config._git`,
     `transport._git`, `transport.run_bytes`), which after that fix is every
     child process the tool starts. Nothing in the package relies on a git
-    child seeing the hardened values: git consumes neither variable, and the
-    tool sets no GIT_* variables of its own.
+    child seeing the hardened values: git consumes neither variable.
+
+    ONE reader derives its child environment from this one rather than
+    using it whole, and says so where it does: `emit.generated_at_target`
+    strips every `GIT_*` name and sets `GIT_ATTR_NOSYSTEM`, because that
+    read's whole point is that no machine-local setting reaches its answer
+    (Ld9f75a1de8 round 1 F1). Nothing else sets a `GIT_*` variable, and a
+    door that passes no `env` still gets exactly what this returns.
 
     A gate — and a hook — is the REPOSITORY's command and must run in the
     environment the caller of loupe had, not the one the shim made for the
@@ -466,17 +486,47 @@ def _check_value(section: str, key: str, value, errors: list) -> None:
             f"'hand_back' field, not in config")
 
 
-def _check_gates(rows, errors: list) -> None:
+#: What a `[[gates]]` row may state. CLOSED, like every other section of
+#: this grammar: a misspelled key must not silently erase what it meant to
+#: declare. `attested_by` joined it on 2026-09-07 (brief
+#: `ci-attested-gates`), and joining it made this list a cross-installation
+#: contract exactly like `[roles] debug` was — see the seam documented below
+#: `CONFIG_DECLARED_ELSEWHERE`. An older reader meets the key here, as
+#: `gates[i] states unknown key(s) ['attested_by']`, and `[tool] requires`
+#: is what makes that refusal name the version skew instead of sending a
+#: person to repair a file that is correct.
+GATE_KEYS = ("id", "command", "blocking", "attested_by")
+
+#: The admitted executors of a declared gate. The tool runs it, or CI is
+#: asked what it concluded — and nothing else, BY NAME. A value outside this
+#: set is refused rather than treated as "not ci, so run it locally": that
+#: fallback would turn a typo into a silently stronger local loop, which is
+#: the shape of defect this repository refuses everywhere else.
+GATE_ATTESTERS = ("ci",)
+
+
+def _check_gates(rows, errors: list) -> bool:
+    """Judge the manifest; return whether any row stated an UNDECLARED key.
+
+    That return is what lets `check_shape` tell the two defect classes apart
+    here as it already does for sections and keys (2026-09-01, brief
+    `config-keys-are-a-cross-installation-contract`). An unknown gate key is
+    also exactly what a manifest written for a NEWER tool looks like from an
+    older reader — `attested_by` is the first key to prove it — and the
+    remedy for that is not "a person repairs review.toml".
+    """
     if not isinstance(rows, list):
         errors.append(_bad("gates", rows, "a list of tables"))
-        return
+        return False
+    undeclared = False
     for i, row in enumerate(rows):
         at = f"gates[{i}]"
         if not isinstance(row, dict):
             errors.append(_bad(at, row, "a table"))
             continue
-        unknown = sorted(set(row) - {"id", "command", "blocking"})
+        unknown = sorted(set(row) - set(GATE_KEYS))
         if unknown:
+            undeclared = True
             errors.append(f"{at} states unknown key(s) {unknown}")
         gid = row.get("id")
         if not isinstance(gid, str) or not gid.strip():
@@ -500,6 +550,14 @@ def _check_gates(rows, errors: list) -> None:
         if "blocking" in row and not isinstance(row["blocking"], bool):
             errors.append(_bad(f"{at} `blocking`", row["blocking"],
                                "true or false"))
+        if "attested_by" in row:
+            attester = row["attested_by"]
+            if not isinstance(attester, str) or attester not in GATE_ATTESTERS:
+                errors.append(
+                    f"{at} `attested_by` is {attester!r}, which names no "
+                    f"admitted attester: the only value is "
+                    f"{' or '.join(repr(a) for a in GATE_ATTESTERS)}, and "
+                    f"absent means this tool executes the gate itself")
     # Round 5 F2: the rows were judged one at a time, so the SHAPE was closed
     # and the IDENTITY was not. A gate id is the join key for blocking policy,
     # missing-gate checks, retained output (`<sha>/<id>.log`) and the
@@ -526,6 +584,7 @@ def _check_gates(rows, errors: list) -> None:
                     f"share a destination")
             else:
                 seen[key] = i
+    return undeclared
 
 
 # The config-evolution seam (2026-09-01, brief
@@ -678,7 +737,10 @@ def check_shape(user: dict, source: str) -> None:
                 continue
             _check_value(section, key, body[key], errors)
     if "gates" in user:
-        _check_gates(user["gates"], errors)
+        # An unknown GATE key is the same defect class as an unknown section
+        # or section key, and gets the same remedy: it is also what a
+        # manifest written for a newer tool looks like from here.
+        undeclared = _check_gates(user["gates"], errors) or undeclared
     if errors:
         remedy = (f"a person repairs {source}; every item above names the "
                   f"section, the key and the kind it must have")
@@ -719,6 +781,71 @@ def _declared(user: dict) -> frozenset:
     return frozenset(keys)
 
 
+def _comment_only_lines(text: str) -> list[str]:
+    """Every TOML comment token that is the only thing on its physical
+    line, outside every string form — basic, literal, and both multiline
+    forms — stripped (lineage 24 round 3 F2).
+
+    A decision is written by a person as a comment; the same characters
+    inside a string are data (a classification note quoting the line, for
+    one) and record nothing. `tomllib` drops comments, so this is the one
+    place the tool reads them, and it reads them with the same lexical
+    boundaries the parser applies: `#` opens a comment only outside a
+    string, a backslash escapes inside basic strings, and a single-line
+    string ends at its line. The text has already parsed as valid TOML
+    when this runs, so the scanner needs no error states of its own.
+    """
+    out = []
+    i, n, line_start, state = 0, len(text), 0, None
+    while i < n:
+        ch = text[i]
+        if state is None:
+            if text.startswith('"""', i):
+                state, i = '"""', i + 3
+            elif text.startswith("'''", i):
+                state, i = "'''", i + 3
+            elif ch == '"' or ch == "'":
+                state, i = ch, i + 1
+            elif ch == "#":
+                end = text.find("\n", i)
+                end = n if end < 0 else end
+                if text[line_start:i].strip() == "":
+                    out.append(text[i:end].strip())
+                i = end
+            else:
+                if ch == "\n":
+                    line_start = i + 1
+                i += 1
+            continue
+        # Inside a string.
+        if state in ('"', '"""') and ch == "\\":
+            i += 2
+            continue
+        if state == '"""' and text.startswith('"""', i):
+            state, i = None, i + 3
+        elif state == "'''" and text.startswith("'''", i):
+            state, i = None, i + 3
+        elif state in ('"', "'") and ch == state:
+            state, i = None, i + 1
+        else:
+            if ch == "\n":
+                line_start = i + 1
+                if state in ('"', "'"):
+                    state = None  # a single-line string never spans a line
+            i += 1
+    return out
+
+
+def _decided_undeclared(text: str) -> frozenset:
+    """The keys the raw document records as left undeclared by decision:
+    one comment line exactly equal to `vocab.decided_line(key)`,
+    surrounding whitespace aside, for a key whose off state is that line.
+    Comment TOKENS only — the same text inside any string is data."""
+    comments = set(_comment_only_lines(text))
+    return frozenset(key for key in vocab.decided_undeclared_keys()
+                     if vocab.decided_line(key) in comments)
+
+
 def _merged(user: dict) -> dict:
     merged = {}
     for section, defaults in DEFAULTS.items():
@@ -756,7 +883,7 @@ def from_text(text: str, like: "Config", source: str) -> "Config":
     return Config(repo_root=like.repo_root, repo_id=like.repo_id,
                   source=source, gates=user.get("gates", DEFAULT_GATES),
                   ledger_dir=like.ledger_dir, declared=_declared(user),
-                  **sections)
+                  decided_undeclared=_decided_undeclared(text), **sections)
 
 
 def legacy_state_dir(repo_id: str, home: Path | None = None) -> Path | None:
@@ -827,11 +954,12 @@ def load(repo_root: Path | None = None, ledger_dir: str | None = None,
         (Path(os.environ.get(env_var("CONFIG"), "")), "env:" + env_var("CONFIG")),
         (Path.home() / ".config" / TOOL_NAME / f"{repo_id}.toml", "user config"),
     ]
-    user, source = {}, "defaults"
+    user, source, text = {}, "defaults", ""
     for path, label in candidates:
         if path and path.is_file():
             try:
-                user = tomllib.loads(path.read_text(encoding="utf-8"))
+                text = path.read_text(encoding="utf-8")
+                user = tomllib.loads(text)
             except tomllib.TOMLDecodeError as exc:
                 raise ConfigError(
                     f"{path} ({label}) is not valid TOML: {exc}",
@@ -850,7 +978,8 @@ def load(repo_root: Path | None = None, ledger_dir: str | None = None,
     sections = _merged(user)
     cfg = Config(repo_root=repo_root, repo_id=repo_id, source=source,
                  gates=user.get("gates", DEFAULT_GATES),
-                 declared=_declared(user), **sections)
+                 declared=_declared(user),
+                 decided_undeclared=_decided_undeclared(text), **sections)
 
     env_dir = os.environ.get(env_var("STATE_DIR"))
     if ledger_dir or env_dir:

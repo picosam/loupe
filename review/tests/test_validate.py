@@ -4,6 +4,7 @@ import contextlib
 import dataclasses
 import io
 import json
+import os
 import tempfile
 import unittest
 import unittest.mock
@@ -15,7 +16,8 @@ from review.cli import cmd_ledger_add
 from review.digest import sha256_text
 from review.ledger import Ledger
 from review.tests import synth
-from review.tests.util import REPO_ROOT, CliArgs
+from review.tests._transport_fixtures import run_cli, scratch_tmp
+from review.tests.util import CliArgs, LINEAGE, REPO_ROOT
 
 CFG = config.load(REPO_ROOT)
 SHA = "9" * 40
@@ -362,7 +364,7 @@ class TestDispositionValidation(unittest.TestCase):
             self.assertNotEqual(code, 0)
             self.assertEqual(payload["ok"], False)
             self.assertIsNone(
-                transport.answered_verdict(cfg, self._disposition(), ledger),
+                transport.answered_verdict(cfg, self._disposition(), ledger, LINEAGE),
                 "the premise of this leg: nothing is retrievable yet")
             self.assertEqual(self._dispositions(root), [],
                              "a disposition whose verdict cannot be "
@@ -413,7 +415,7 @@ class TestDispositionValidation(unittest.TestCase):
         ledger.add_all(transport.verdict_events(
             v, self.DISPOSITION_ROUND, transport._digest_text(text),
             len(text.encode("utf-8"))))
-        transport.keep_bytes(cfg, self.DISPOSITION_ROUND, "verdict", text)
+        transport.keep_bytes(cfg, self.DISPOSITION_ROUND, "verdict", text, lineage=1)
         return text, v
 
     def _ingest(self, args, cfg):
@@ -449,7 +451,7 @@ class TestDispositionValidation(unittest.TestCase):
 
             # The premise, proved rather than assumed.
             against = transport.answered_verdict(cfg, self._disposition(),
-                                                 ledger)
+                                                 ledger,LINEAGE)
             self.assertIsNotNone(against, "the retrievable leg must retrieve")
             self.assertEqual(against.findings[0].fingerprint(), computed)
 
@@ -488,12 +490,13 @@ class TestDispositionValidation(unittest.TestCase):
             self.assertEqual(attacker.sha, v.sha, "same SHA is the premise")
             self.assertNotEqual(attacker.findings[0].fingerprint(), legit)
 
-            path = transport.exchange_path(cfg, self.DISPOSITION_ROUND,
-                                           "verdict")
+            path = transport.exchange_path(
+                cfg, self.DISPOSITION_ROUND, "verdict", lineage=1,
+                digest=transport._digest_text(original))
             path.write_text(attacker_text, encoding="utf-8")
 
             self.assertIsNone(
-                transport.answered_verdict(cfg, self._disposition(), ledger),
+                transport.answered_verdict(cfg, self._disposition(), ledger, LINEAGE),
                 "bytes that do not reproduce the recorded digest are not the "
                 "recorded verdict, however well-formed they are")
             code, _ = self._ingest(args, cfg)
@@ -506,7 +509,7 @@ class TestDispositionValidation(unittest.TestCase):
             # again, so the rule binds tampering and not the mechanism.
             path.write_text(original, encoding="utf-8")
             self.assertIsNotNone(
-                transport.answered_verdict(cfg, self._disposition(), ledger))
+                transport.answered_verdict(cfg, self._disposition(), ledger, LINEAGE))
 
     def test_a_kept_verdict_rewritten_to_crlf_is_not_the_recorded_one(self):
         """Lineage 17 round 5 F1, ruled 2026-08-30: the digest gate above
@@ -517,11 +520,12 @@ class TestDispositionValidation(unittest.TestCase):
         reads as unavailable, and the canonical copy still retrieves."""
         with self._fixture() as (root, cfg, args, ledger):
             original, _ = self._record_verdict(cfg, ledger)
-            path = transport.exchange_path(cfg, self.DISPOSITION_ROUND,
-                                           "verdict")
+            path = transport.exchange_path(
+                cfg, self.DISPOSITION_ROUND, "verdict", lineage=1,
+                digest=transport._digest_text(original))
             # Paired control first: the canonical LF copy retrieves.
             self.assertIsNotNone(
-                transport.answered_verdict(cfg, self._disposition(), ledger))
+                transport.answered_verdict(cfg, self._disposition(), ledger, LINEAGE))
             mutants = (("crlf", original.replace("\n", "\r\n")),
                        ("cr", original.replace("\n", "\r")),
                        ("mixed", original.replace("\n", "\r\n", 3)))
@@ -529,17 +533,17 @@ class TestDispositionValidation(unittest.TestCase):
                 path.write_bytes(mutant.encode("utf-8"))
                 self.assertIsNone(
                     transport.answered_verdict(cfg, self._disposition(),
-                                               ledger),
+                                               ledger,LINEAGE),
                     f"{name}: a byte-distinct copy was treated as the "
                     f"recorded verdict")
             # Undecodable bytes are unavailable too, never a traceback.
             path.write_bytes(b"\xff" + original.encode("utf-8"))
             self.assertIsNone(
-                transport.answered_verdict(cfg, self._disposition(), ledger))
+                transport.answered_verdict(cfg, self._disposition(), ledger, LINEAGE))
             # And the rule binds the rewrite, not the mechanism.
             path.write_text(original, encoding="utf-8")
             self.assertIsNotNone(
-                transport.answered_verdict(cfg, self._disposition(), ledger))
+                transport.answered_verdict(cfg, self._disposition(), ledger, LINEAGE))
 
     def test_two_verdicts_at_one_round_are_ambiguous_not_guessed(self):
         # The third refusal the required outcome names. One round holding two
@@ -552,7 +556,7 @@ class TestDispositionValidation(unittest.TestCase):
                 wire.parse_verdict(other), self.DISPOSITION_ROUND,
                 transport._digest_text(other), len(other.encode("utf-8"))))
             self.assertIsNone(
-                transport.answered_verdict(cfg, self._disposition(), ledger))
+                transport.answered_verdict(cfg, self._disposition(), ledger, LINEAGE))
             code, _ = self._ingest(args, cfg)
             self.assertNotEqual(code, 0)
             self.assertEqual(self._dispositions(root), [])
@@ -1637,11 +1641,17 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
         # resolved inside `ensure_pushed`, from the flags, against the
         # committed authority — so the right shape of this guard is that
         # there is no roles parameter to omit, not that it is required.
-        for boundary in list(params.values())[-2:]:
+        #
+        # `lineage` is the fourth and is REQUIRED for the same reason
+        # (brief `keyed-lineage`): a ledger holds several open reviews, so
+        # there is no "the" lineage to fall back to, and an emitter that
+        # derived one here could render a round into a review the caller
+        # never chose.
+        for boundary in params.values():
             self.assertIs(boundary.default, inspect.Parameter.empty,
                           f"{boundary.name} is optional again: an omitted "
                           f"capture is a capture nobody made")
-        self.assertEqual(len(params), 5, f"unexpected _emit signature "
+        self.assertEqual(len(params), 6, f"unexpected _emit signature "
                                          f"{list(params)}")
         self.assertNotIn("roles", params,
                          "a pre-commit role resolution is back in `_emit`: "
@@ -1935,6 +1945,141 @@ class TestUnbulletedClosureCannotVanish(unittest.TestCase):
         closures = wire.parse_closures(f"{FP_A} sustained: stands\n")
         self.assertEqual(len(closures), 1)
         self.assertFalse(closures[0].well_formed)
+
+
+class TestTheDeclaredResidueIsAFieldNotProse(unittest.TestCase):
+    """Brief `convergence-blind-to-reclassification`, the declared half.
+
+    `reclassified` names the PARENT by fingerprint and said nothing about
+    where the narrowed claim went, so the first cut read the descendant out
+    of the reviewer's own sentence. A sentence is not a grammar: the edge
+    existed only where the prose happened to name a round-local id, and
+    nothing asked the reviewer to name one. `Residue:` is the declaration,
+    in the `Field: value` idiom the finding block already uses.
+
+    The whole admitted domain runs through the REAL `loupe validate`, on a
+    file, in one table: the field absent, one id, two ids, an id no finding
+    of this verdict carries, an id shaped like another round's, a malformed
+    id, a fingerprint where an id belongs, a repeated id, a repeated
+    declaration, each non-`reclassified` closure term, and the whitespace
+    and case the grammar admits. The two paired controls are the last rows:
+    prose that merely CONTAINS the word is still prose, and a declaration
+    with no closure above it is a defect rather than a floating field.
+
+    FALSIFICATION. Mutation: drop the `rid not in finding_ids` check in
+    `validate.validate_closures` and the `F9`/`R1-F5` rows pass, which is
+    the record binding an edge to a finding that does not exist. Mutation:
+    drop the `c.closure != "reclassified"` check and the three non-
+    reclassified rows pass, which is descent claimed by a term that
+    declares none.
+    """
+
+    #: `<closures section>` -> the error codes `loupe validate` must report.
+    #: One table, because the rows only mean anything against each other.
+    PARENT = "fp2:836d98fc52230998"
+
+    def _closure(self, term="reclassified", note="High to Medium; narrowed",
+                 lines=()):
+        body = f"- {self.PARENT} {term}: {note}"
+        return "\n".join([body, *(f"  {line}" for line in lines)])
+
+    def _validate(self, closures):
+        """The real verb, on a real file, from the repository root."""
+        tmp = scratch_tmp(self, "residue-validate-")
+        path = tmp / "verdict.md"
+        path.write_text(synth.verdict_text(sha=SHA, findings=2,
+                                           closures=closures),
+                        encoding="utf-8")
+        code, payload = run_cli(REPO_ROOT, tmp, "validate", str(path),
+                                cwd=self.cwd)
+        self.assertIsInstance(payload, dict, payload)
+        return code, {i["code"] for i in payload.get("items", [])
+                      if i["level"] == "error"}
+
+    def setUp(self):
+        self.cwd = os.getcwd()
+        self.addCleanup(os.chdir, self.cwd)
+
+    def test_the_whole_admitted_domain_of_the_field(self):
+        cases = [
+            ("absent — a reclassification may leave no residue at all",
+             self._closure(), set()),
+            ("one id", self._closure(lines=["Residue: F1"]), set()),
+            ("two ids, comma separated",
+             self._closure(lines=["Residue: F1, F2"]), set()),
+            ("two ids, whitespace separated",
+             self._closure(lines=["Residue: F1 F2"]), set()),
+            ("an id no finding of this verdict carries",
+             self._closure(lines=["Residue: F9"]), {"C-RESIDUE-UNKNOWN"}),
+            ("an id shaped like another round's legacy finding",
+             self._closure(lines=["Residue: R1-F5"]), {"C-RESIDUE-UNKNOWN"}),
+            ("one known id and one unknown — refused for the unknown alone",
+             self._closure(lines=["Residue: F1, F9"]),
+             {"C-RESIDUE-UNKNOWN"}),
+            ("a malformed id", self._closure(lines=["Residue: F1."]),
+             {"C-RESIDUE-ID"}),
+            ("a fingerprint where a round-local id belongs",
+             self._closure(lines=[f"Residue: {self.PARENT}"]),
+             {"C-RESIDUE-ID"}),
+            ("declared and empty", self._closure(lines=["Residue:"]),
+             {"C-RESIDUE-ID"}),
+            ("the same id twice", self._closure(lines=["Residue: F1, F1"]),
+             {"C-RESIDUE-DUPLICATE"}),
+            ("two declarations on one closure",
+             self._closure(lines=["Residue: F1", "Residue: F2"]),
+             {"C-RESIDUE-DUPLICATE"}),
+            ("on `withdrawn`",
+             self._closure(term="withdrawn", note="the refutation lands",
+                           lines=["Residue: F1"]), {"C-RESIDUE-TERM"}),
+            ("on `sustained`",
+             self._closure(term="sustained", note="the evidence stands",
+                           lines=["Residue: F1"]), {"C-RESIDUE-TERM"}),
+            ("on `test_amendment ratified`",
+             self._closure(term="test_amendment ratified",
+                           note="the amended test is the right one",
+                           lines=["Residue: F1"]), {"C-RESIDUE-TERM"}),
+            ("lower case", self._closure(lines=["residue: F1"]), set()),
+            ("upper case", self._closure(lines=["RESIDUE: F1"]), set()),
+            ("space before the colon and around the value",
+             self._closure(lines=["Residue :   F1  "]), set()),
+            # The controls. A field is line-anchored, so prose that merely
+            # contains the word is a note; and a declaration answers the
+            # closure above it or it answers nothing.
+            ("prose containing the word is still a note",
+             self._closure(lines=["the residue: F1 is what remains"]), set()),
+            ("a declaration with no closure above it",
+             "Residue: F1\n" + self._closure(), {"C-SHAPE"}),
+        ]
+        for label, closures, expected in cases:
+            with self.subTest(label):
+                code, codes = self._validate(closures)
+                self.assertEqual(codes, expected)
+                self.assertEqual(code, 1 if expected else 0)
+
+    def test_the_declaration_is_not_swallowed_by_the_note(self):
+        """The vanishing act, one line down from C-UNBULLETED: before the
+        field existed this line WAS the note, which is how a reviewer's
+        declaration could be read as prose and then not read at all.
+
+        Mutation: delete the `_CLOSURE_RESIDUE_RE` branch from
+        `wire.parse_closures` and `residue` is empty while the note grows
+        the text — the state this field replaces."""
+        parsed = wire.parse_verdict(synth.verdict_text(
+            sha=SHA, findings=2,
+            closures=self._closure(lines=["Residue: F1"])))
+        self.assertEqual(parsed.closures[0].residue, ("F1",))
+        self.assertNotIn("Residue", parsed.closures[0].note)
+        self.assertIn("Residue: F1", parsed.closures[0].raw,
+                      "the raw line is kept: absent and unparseable are "
+                      "different states, and so are declared and dropped")
+
+    def test_a_declaration_is_still_an_ordinary_closure_otherwise(self):
+        """The paired control for the whole class: adding the field changes
+        nothing else about the record — the note still answers the evidence,
+        the fingerprint still binds, and an empty note still fails."""
+        _, codes = self._validate(self._closure(note="",
+                                                lines=["Residue: F1"]))
+        self.assertEqual(codes, {"C-EVIDENCE"})
 
 
 class TestTheCapturedClaimNamesItsReferences(unittest.TestCase):

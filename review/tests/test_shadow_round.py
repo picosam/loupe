@@ -16,7 +16,7 @@ from pathlib import Path
 from review import config, validate, wire
 from review.emit import emit_request
 from review.ledger import Ledger
-from review.tests.util import REPO_ROOT
+from review.tests.util import LINEAGE, REPO_ROOT
 
 CFG = config.load(REPO_ROOT)
 NO_GATES = dataclasses.replace(CFG, gates=[])
@@ -58,7 +58,7 @@ class TestShadowRound(unittest.TestCase):
                   "url": "ssh://example.invalid/shadow.git", "sha": head,
                   "committed": False}
         envelope = emit_request(NO_GATES, self.ledger, claim, base="HEAD",
-                                head="HEAD", reachability=record)
+                                head="HEAD", reachability=record, lineage=LINEAGE)
         # Symbolic refs must be resolved to object ids before binding (F16).
         self.assertNotIn('sha="HEAD"', envelope)
         self.assertIn("UNAVAILABLE", envelope)
