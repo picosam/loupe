@@ -233,10 +233,10 @@ def caller_env() -> dict:
     prepare-commit-msg, commit-msg and post-commit, `push` runs pre-push,
     every ref write can reach reference-transaction, and `status` consults
     a configured core.fsmonitor — and they inherited the hardened
-    environment because only `run_gates` passed this. On `beos` a pre-push
-    hook importing a sibling `tools` module died with ModuleNotFoundError
-    and refused a handoff; the same push in a clean environment was a
-    no-op success. So this is now applied at every `git` door as well
+    environment because only `run_gates` passed this. In one adopting
+    repository a pre-push hook importing a sibling `tools` module died with
+    ModuleNotFoundError and refused a handoff; the same push in a clean
+    environment was a no-op success. So this is now applied at every `git` door as well
     (`emit._git`, `emit._git_bytes`, `emit._is_ancestor`, `config._git`,
     `transport._git`, `transport.run_bytes`), which after that fix is every
     child process the tool starts. Nothing in the package relies on a git

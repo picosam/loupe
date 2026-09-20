@@ -309,8 +309,8 @@ def _ci_target(repo: Path, git=None) -> tuple[str, str]:
 # Brief `handoff-guards-generalized` (2026-09-18). `handoff` commits the
 # outstanding tracked work and pushes it BEFORE any gate runs, so a gate can
 # protect the envelope and never the commit. Every assumption that ordering
-# rests on has failed once: that the dirty paths are the author's (msx: a
-# killed suite left a corrupt-by-design fixture staged), that the
+# rests on has failed once: that the dirty paths are the author's (an
+# adopter's killed suite left a corrupt-by-design fixture staged), that the
 # environment can run the tool at all, that fixtures are gone when their
 # process is. The preflight NAMES what it found, before the commit, and
 # refuses the two states nobody could mean.

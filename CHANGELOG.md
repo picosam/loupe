@@ -5,6 +5,124 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.24.0
+
+Documentation, and one read-only verb. No key was added, nothing on the
+wire moved, and no reader floor has to move for this release: an
+installation at 0.23.0 and one at this version emit and validate
+identically. What is new in the tool itself is `loupe decide`, which reads
+and records nothing (last paragraph below).
+
+**A written upgrade pathway: `docs/upgrading.md`.** Re-running
+`docs/onboarding.md` on an already-onboarded repository upgrades nothing —
+it is a one-time, local pass, by design — and no page said what moving a
+pinned installation from one published version to another actually
+consists of. The new page is seven steps, each with the command that
+performs it, the check that proves it, and what skipping it costs: read
+the CHANGELOG across the versions you cross; move the pin to a published,
+PEELED commit, for both install forms — a provisioning script's tag and
+commit pair, and the `@<commit>` of `uvx --from git+…` or `uv tool
+install`, with `git ls-remote --tags <repo> 'refs/tags/vX.Y.Z^{}'` as the
+way to read the peeled id off the remote rather than guess it; raise
+`[tool] requires` to the floor the CONFIGURATION needs rather than to the
+newest version you happen to have installed, because it is the oldest
+reader that may take a round that the key is about; reinstall at the pin
+on every machine that authors or reviews and re-run `render-adapters
+--install` there; re-read the `decide` list against the new reader; re-run
+onboarding §8 against the new adapter text; and run one round, so the new
+reader's attestation is on the record. Two measured facts the page exists
+to name: the adapters regenerate from whatever is INSTALLED, never from
+the pin, so one repository can be governed by two different adapter texts
+at the same time; and a cloud environment is rebuilt by its provisioner on
+its next build while a person's machine is not, silently. It ends with an
+upgrader's table across 0.16.0, 0.17.0, 0.20.0, 0.22.0 and 0.23.0, drawn
+from those releases' own notes. The README's upgrade section, which said there
+was no update mechanism, now points at the page and states the boundary
+instead: upgrading is a procedure, not a verb, because the tool opens no
+network connection in its own code and cannot fetch its own successor.
+
+**What three real upgrades taught the page, folded in before it shipped.**
+A floor is raised by MARKERS as well as by keys: a line an older reader
+ignores in silence — the `# decided: <key> undeclared` comment honoured
+from 0.17.0, the `loupe-fixture: corrupt-by-design` marker honoured by the
+hand-off preflight from 0.22.0 — raises it exactly as an unreadable key
+does, because `[tool] requires` is the only thing that turns that silence
+into a refusal; the page works two floors out in full and shows why
+neither reaches 0.23.0, whose two additions degrade honestly. One
+measured floor came out at 0.17.0 while the tool stood at 0.23.0. 0.22.0
+is the one crossing in the tabled span that asks the ADOPTING repository
+to change its own tree, so it has its own sub-step: mark the
+corrupt-by-design fixtures your suite writes into the tracked tree, or
+declare `scope_paths` — with the three things that run taught, including
+that a test module spelling the marker out verbatim refuses every later
+hand-off that touches it. A grep for the old version separates live sites,
+which move, from records, which do not. A repository that tracks no
+rendered artefact has nothing in its tree to regenerate, which is the
+common case and now says so — told by the GENERATED markers the rendered
+text carries, never by filename, because the instruction block's ordinary
+home is a region inside `AGENTS.md` or `CLAUDE.md` and a filename search
+reports nothing for exactly the repository holding a stale copy; step 4
+carries the marker searches, the regenerate-and-diff recipe for an
+embedded region, and the version line that dates it at a glance. And a
+long span is read twice: the CHANGELOG
+for keys, floors and markers, then your own tracked files for sentences
+about the tool that a release has falsified — 0.16.0's re-keyed gate
+output path and 0.18.0's `LOUPE_GATE_HEAD` / `LOUPE_GATE_BASE` each did
+that to an adopter's own prose.
+
+**`loupe decide`** — a read-only verb that prints the `decide` list on
+demand: every optional key this repository never declared, each with its
+meaning, the value the tool applied, and the exact `review.toml` line for
+`set` and for `unset`. The list previously rode only on verbs that emit or
+record something, so an operator who had just moved a version pin had no
+way to ask what the new reader wants of their configuration without
+opening a round — three real upgrades on the day 0.23.0 was published each
+had to import the package by hand to read it. `decide` reuses the
+derivation the emitting verbs use — its entries are their entries — loads
+the configuration through the same layers and refuses on the same `[tool]
+requires` floor. It exits 0 whether the list is empty or not, records
+nothing, creates no state directory, and runs with no ledger, outside any
+lineage, on a detached HEAD and from a subdirectory. `roles.transport`
+reports what an emission from the current environment would resolve,
+resolved exactly as `handoff` resolves it. The "absent config asks once"
+rule in the adapters names the verb.
+
+
+**Onboarding's efficiency check asks the operator instead of deleting.**
+§8's third row told a session to delete every sentence in a repository
+instruction file that restates the user-level or machine-global file the
+session loaded. That is right only where every session reading the
+repository file also loads that global file. Where the repository has
+collaborators on the forge, organisation or cloud accounts that load no
+personal file, or agents on surfaces whose global file is a different one,
+the deletion removes rules those sessions need — and the row's own
+sentence, that the global file travels with nobody, is the reason it is
+wrong there. The row is now an evaluated question with the same three
+parts every time: MEASURE who reads this repository's file without the
+operator's global one (the collaborator case has a read-only forge command
+in the cell), LIST each sentence that restates it, and ASK the operator
+keep-or-delete per group of readers — keep recommended wherever such a
+reader exists, delete recommended only where a single operator's sessions
+are the only ones that read the file. A session no longer applies this
+silently.
+
+**The relay choice is put in front of the operator, in both forms.**
+Onboarding §8 and `docs/upgrading.md` §6 now state the choice a repository
+makes about how a round reaches the reviewer — a person carries every
+relay, or the repository declares an agent-relayed review window by name —
+and the upgrading page writes out the text of both answers so neither is
+the one an agent picks by default. The tool is untouched by this: it never
+invokes a reviewer, there is no configuration key for a window and none is
+planned, and the harness that would carry one is outside this tool and is
+not published with it, so a reader whose adapter does not carry the
+exception clause keeps the human relay and should.
+
+*For upgraders:* nothing to install, nothing to migrate, and no
+coordination between the two sides of a loop. Read `docs/upgrading.md`
+once before your next re-pin; and if a session ever deleted restating
+sentences from your instruction file under the old efficiency rule, §8's
+new form is the pass that puts that question back to you.
+
 ## 0.23.0
 
 Seven changes, all to what the tool SAYS or READS; none to what a round

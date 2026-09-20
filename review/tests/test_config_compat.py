@@ -50,11 +50,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from review import TOOL_VERSION, config, emit, validate, vocab, wire
+from review import (TOOL_NAME, TOOL_VERSION, adapters, config, emit,
+                    env_var, validate, vocab, wire)
 from review.emit import emit_request
 from review.ledger import Ledger
 from review.tests._transport_fixtures import (git_out, run_cli,
-                                              scratch_loop_repo, sh)
+                                              scratch_loop_repo, sh,
+                                              verdict_text)
 from review.tests.synth import CFG
 from review.tests.util import LINEAGE, REPO_ROOT
 
@@ -1098,6 +1100,426 @@ class TestTheMarkerIsAComment_NotStringData(unittest.TestCase):
         cfg = _read(text)
         self.assertIn(vocab.DECIDE_TOKEN_BUDGET, cfg.decided_undeclared)
         self.assertFalse(self._entry_present(cfg))
+
+
+# ---------------------------------------------------------------- `decide`
+#
+# The read-only door onto the same list (2026-09-19). Measured by an adopter
+# moving its version pin: the `decide` list rode only on verbs that emit or
+# record something, so "what does the reader I now run ask of my config, and
+# what does it honour?" had no command — the adopter imported the package and
+# called `config.load().decisions()` by hand.
+#
+# The property under test is EQUALITY, not plausibility: for one config
+# state, what `loupe decide` prints and what a real `loupe handoff` carries
+# in that same state are the same entry objects. The cases below therefore
+# build TWINS — two scratch repositories with identical `review.toml` bytes —
+# read one and emit from the other, and compare the parsed JSON.
+#
+# MUTATION: give `cli.cmd_decide` its own derivation with any divergence (a
+# dropped key, a different `applied`) and every twin row fails while the
+# config-level classes above still pass — those test the derivation, these
+# test that the verb reuses it.
+
+#: The optional keys, from the vocabulary table rather than from a number
+#: written here: a key added to `DECIDE_KEYS` joins these cases by itself.
+_OPTIONAL = [key for key, *_ in vocab.DECIDE_KEYS]
+
+#: An explicitly empty `LOUPE_CONFIG`, for the cases whose subject is what
+#: happens with NO in-tree config: the host running this suite may declare
+#: one, and it would silently become the answer. An empty value names no
+#: file, so the candidate is skipped without the variable being unset.
+_NO_ENV_CONFIG = {env_var("CONFIG"): ""}
+
+
+def _strip(text: str, keys) -> str:
+    """`review.toml` with the declarations of `keys` removed. Line-anchored,
+    so the commentary that quotes `debug = true` inside a `#` block — which
+    this repository's own config carries — is left alone."""
+    for key in keys:
+        name = key.rpartition(".")[2]
+        text = re.sub(rf"^{re.escape(name)}\s*=.*\n", "", text, flags=re.M)
+    return text
+
+
+def _declare(text: str, key: str, value) -> str:
+    """`review.toml` with `key` declared as `value` under its own section,
+    rendered by the same function that prints the entry's `set` line."""
+    section = key.rpartition(".")[0]
+    # Line-anchored, like `_strip`: this repository's config QUOTES
+    # `[limits]` inside its commentary before the header itself, and a
+    # declaration spliced into a comment line is not valid TOML.
+    out, n = re.subn(rf"^\[{re.escape(section)}\]$",
+                     lambda m: f"{m.group(0)}\n{vocab.toml_line(key, value)}",
+                     text, count=1, flags=re.M)
+    assert n == 1, f"no [{section}] header to declare {key} under"
+    return out
+
+
+#: What the fixture declares for each optional key when a case needs them
+#: ALL declared. The fixture's own values, never inherited: the scratch
+#: config is a copy of whichever `review.toml` this suite runs beside, and
+#: that is this workbench's (which declares every key) only HERE — in the
+#: extracted candidate it is the published example, which declares three
+#: fewer. Inheriting made "every optional key declared" true in one tree
+#: and false in the other, and `candidate-standalone` went red on exactly
+#: that (2026-09-20). `enforcement = "none"`, because `pr-approval` refuses
+#: the default branch the scratch round is emitted from.
+_DECLARED_VALUES = {
+    vocab.DECIDE_TRANSPORT: vocab.TRANSPORT_PATH,
+    vocab.DECIDE_DEBUG: False,
+    vocab.DECIDE_REVIEW_DEFAULT: "on",
+    vocab.DECIDE_ENFORCEMENT: "none",
+    vocab.DECIDE_ROUND_CAP: 5,
+    vocab.DECIDE_TOKEN_BUDGET: 250000,
+}
+
+
+def _declare_all(text: str) -> str:
+    """`review.toml` declaring EVERY optional key, whatever it declared
+    before: each is stripped and then written under its own section."""
+    assert set(_DECLARED_VALUES) == set(_OPTIONAL), (
+        "a new optional key has no fixture value")
+    text = _strip(text, _OPTIONAL)
+    for key in _OPTIONAL:
+        text = _declare(text, key, _DECLARED_VALUES[key])
+    return text
+
+
+class TestDecideReadsWhatTheEmittingVerbsAsk(unittest.TestCase):
+    """`loupe decide` prints the emitting verbs' `decide` list and nothing
+    else — the same entries, no round, no writes.
+
+    The twin is the control. A test asserting only that the output "looks
+    like" a decide list would pass a second implementation of the same
+    question, which is the defect this verb exists to retire: the operator's
+    answer to "what will `handoff` ask me?" must BE `handoff`'s question.
+    """
+
+    def _twins(self, prefix, transform=lambda text: text):
+        """Two scratch repositories carrying one config state: one to read
+        with `decide`, one to emit a real round from."""
+        pair = []
+        for side in ("read", "emit"):
+            scratch = scratch_loop_repo(self, f"{prefix}{side}-")
+            path = scratch.repo / "review.toml"
+            path.write_text(transform(path.read_text(encoding="utf-8")),
+                            encoding="utf-8")
+            # `--allow-empty`: one case's transform is the identity, and a
+            # state that needs no edit is a state, not a fixture failure.
+            sh("git", "-C", str(scratch.repo), "commit", "--allow-empty",
+               "-qam", "config")
+            scratch.state = scratch.tmp / "state"
+            pair.append(scratch)
+        return pair
+
+    def _decide(self, scratch, where=None, env=None):
+        return run_cli(where or scratch.repo, scratch.state, "decide",
+                       cwd=scratch.cwd, env=env)
+
+    def _handoff(self, scratch, env=None, local_only=True):
+        """A real round in the twin. `local_only` is how a remoteless
+        scratch repository emits at all; a round whose declared transport is
+        `paste` contradicts it by construction, so that case pushes to a
+        bare remote of its own instead (`_give_a_remote`)."""
+        code, rec = run_cli(scratch.repo, scratch.state, "handoff",
+                            "--claim-file", str(scratch.claim), "--base",
+                            scratch.base,
+                            *(["--local-only"] if local_only else []),
+                            cwd=scratch.cwd, env=env)
+        self.assertEqual(code, 0, rec)
+        return rec
+
+    def _give_a_remote(self, scratch):
+        bare = scratch.tmp / "origin.git"
+        sh("git", "init", "-q", "--bare", str(bare))
+        sh("git", "-C", str(scratch.repo), "remote", "add", "origin",
+           str(bare))
+        sh("git", "-C", str(scratch.repo), "push", "-q", "-u", "origin",
+           "main")
+
+    def _keys(self, rec):
+        return [entry["key"] for entry in rec["decide"]]
+
+    # ------------------------------------------------ the config partition
+
+    #: (case, transform over `review.toml`). The scratch config is this
+    #: repository's own with the transport line taken out, so it arrives
+    #: declaring every optional key but that one.
+    CONFIG_STATES = (
+        ("as it arrives", lambda t: t),
+        ("every optional key declared", lambda t: _declare_all(t)),
+        ("none declared", lambda t: _strip(t, _OPTIONAL)),
+        ("some declared",
+         lambda t: _strip(t, [vocab.DECIDE_DEBUG, vocab.DECIDE_TOKEN_BUDGET])),
+        ("a key decided undeclared by its comment line",
+         lambda t: _strip(t, [vocab.DECIDE_TOKEN_BUDGET])
+         + vocab.decided_line(vocab.DECIDE_TOKEN_BUDGET) + "\n"),
+        ("the comment line misspelt",
+         lambda t: _strip(t, [vocab.DECIDE_TOKEN_BUDGET])
+         + vocab.decided_line(vocab.DECIDE_TOKEN_BUDGET).replace(
+             "undeclared", "unset") + "\n"),
+    )
+
+    def test_the_entries_are_the_entries_handoff_carries(self):
+        for case, transform in self.CONFIG_STATES:
+            with self.subTest(case):
+                reader, emitter = self._twins("decide-twin-", transform)
+                code, reading = self._decide(reader)
+                self.assertEqual(code, 0, reading)
+                self.assertEqual(reading["decide"],
+                                 self._handoff(emitter)["decide"], case)
+
+    def test_each_config_state_reaches_its_own_answer(self):
+        """The paired controls that make the equality above mean something:
+        these states do not all produce the same list."""
+        answers = {}
+        for case, transform in self.CONFIG_STATES:
+            with self.subTest(case):
+                reader, _ = self._twins("decide-state-", transform)
+                code, rec = self._decide(reader)
+                self.assertEqual(code, 0, rec)
+                answers[case] = self._keys(rec)
+        self.assertEqual(answers["every optional key declared"], [])
+        self.assertEqual(answers["none declared"], _OPTIONAL)
+        # Derived, never restated: whatever the scratch config arrives
+        # undeclared, plus exactly the two keys this case strips.
+        self.assertEqual(sorted(answers["some declared"]),
+                         sorted(set(answers["as it arrives"])
+                                | {vocab.DECIDE_DEBUG,
+                                   vocab.DECIDE_TOKEN_BUDGET}))
+        self.assertNotEqual(answers["some declared"],
+                            answers["as it arrives"])
+        # The decision to leave a key undeclared ends the asking...
+        self.assertNotIn(
+            vocab.DECIDE_TOKEN_BUDGET,
+            answers["a key decided undeclared by its comment line"])
+        # ...and only the exact line does. A misspelt one is not honoured,
+        # so the key is asked about exactly as if it were not there.
+        self.assertIn(vocab.DECIDE_TOKEN_BUDGET,
+                      answers["the comment line misspelt"])
+
+    def test_an_empty_list_still_exits_zero(self):
+        """A reading is not a finding. The good state and the open question
+        leave by the same exit, so nothing downstream can read the code as a
+        verdict on the configuration."""
+        reader, _ = self._twins("decide-empty-", _declare_all)
+        code, rec = self._decide(reader)
+        self.assertEqual(code, 0, rec)
+        self.assertEqual(rec["decide"], [])
+        self.assertTrue(rec["ok"])
+
+    def test_the_user_level_config_governs_the_reading(self):
+        """`~/.config/<tool>/<repo-id>.toml` governs every LOCAL verb, and
+        this is one. No twin here: `handoff` refuses a target that tracks no
+        in-tree config, so the control is the same repository read with and
+        without the user-level file in reach."""
+        reader, _ = self._twins("decide-userconf-",
+                                lambda t: _strip(t, _OPTIONAL))
+        home = reader.tmp / "home"
+        (home / ".config" / TOOL_NAME).mkdir(parents=True)
+        repo_id = config.repo_identity(reader.repo)
+        (home / ".config" / TOOL_NAME / f"{repo_id}.toml").write_text(
+            "[roles]\n" + vocab.toml_line(vocab.DECIDE_REVIEW_DEFAULT,
+                                          vocab.REVIEW_DEFAULT_OFF) + "\n",
+            encoding="utf-8")
+        # The control: the in-tree file declares none of them, so the
+        # user-level key is the only thing that could remove one.
+        code, without = self._decide(reader)
+        self.assertEqual(code, 0, without)
+        self.assertIn(vocab.DECIDE_REVIEW_DEFAULT, self._keys(without))
+        (reader.repo / "review.toml").unlink()
+        code, with_user = self._decide(
+            reader, env={"HOME": str(home), **_NO_ENV_CONFIG})
+        self.assertEqual(code, 0, with_user)
+        self.assertEqual(with_user["config"], "user config")
+        self.assertNotIn(vocab.DECIDE_REVIEW_DEFAULT, self._keys(with_user))
+        # Every OTHER key is still asked: the user-level layer answered one
+        # question, not the whole file's worth.
+        self.assertEqual([k for k in _OPTIONAL
+                          if k != vocab.DECIDE_REVIEW_DEFAULT],
+                         self._keys(with_user))
+
+    def test_no_config_at_all_is_read_rather_than_refused(self):
+        """A directory with no config and no repository. What was never
+        declared is exactly the question here, so the verb answers it; the
+        refusals belong to the verbs that RULE, and `handoff` in the same
+        directory refusing is the control."""
+        scratch = scratch_loop_repo(self, "decide-bare-")
+        bare = scratch.tmp / "bare"
+        bare.mkdir()
+        state = scratch.tmp / "state"
+        code, rec = run_cli(bare, state, "decide", cwd=scratch.cwd,
+                            env=_NO_ENV_CONFIG)
+        self.assertEqual(code, 0, rec)
+        self.assertEqual(rec["config"], "defaults")
+        self.assertEqual(self._keys(rec), _OPTIONAL)
+        code, refused = run_cli(bare, state, "handoff", "--claim-file",
+                                str(scratch.claim), "--local-only",
+                                cwd=scratch.cwd, env=_NO_ENV_CONFIG)
+        self.assertNotEqual(code, 0, refused)
+        self.assertFalse(state.exists(), refused)
+
+    def test_a_version_floor_above_this_reader_refuses_here_too(self):
+        """The floor refuses at the config boundary, so it refuses for every
+        verb — including the one an operator runs precisely BECAUSE the pin
+        just moved. A reader below the floor may not answer questions about
+        a config it has declared itself unable to read."""
+        future = str(int(TOOL_VERSION.split(".")[0]) + 1) + ".0.0"
+        reader, _ = self._twins(
+            "decide-floor-",
+            lambda t: t + f'\n[tool]\nrequires = "{future}"\n')
+        code, rec = self._decide(reader)
+        self.assertNotEqual(code, 0, rec)
+        self.assertIn(future, rec["error"])
+        self.assertIn(rec["next_kind"], ("command", "blocked"))
+        # The control: the same reader, the same repository, a floor it
+        # meets — the refusal is the floor's, not the verb's.
+        ok, _ = self._twins("decide-floor-met-",
+                            lambda t: t + f'\n[tool]\nrequires = '
+                                          f'"{TOOL_VERSION}"\n')
+        code, met = self._decide(ok)
+        self.assertEqual(code, 0, met)
+
+    # ------------------------------------------------- the repository states
+
+    def test_the_repository_state_does_not_change_the_reading(self):
+        """No ledger, a subdirectory, an open round, a closed lineage, a
+        detached HEAD. The config's silence is a fact about the repository,
+        not about any round, so all of these answer the same."""
+        reader, _ = self._twins("decide-repo-",
+                                lambda t: _strip(t, _OPTIONAL))
+        code, no_ledger = self._decide(reader)
+        self.assertEqual(code, 0, no_ledger)
+        readings = {"no ledger": no_ledger}
+
+        sub = reader.repo / "nested" / "deeper"
+        sub.mkdir(parents=True)
+        code, readings["a subdirectory"] = self._decide(reader, where=sub)
+        self.assertEqual(code, 0, readings["a subdirectory"])
+        self.assertEqual(readings["a subdirectory"]["config"],
+                         no_ledger["config"])
+
+        opened = self._handoff(reader)
+        code, readings["an open round"] = self._decide(reader)
+        self.assertEqual(code, 0, readings["an open round"])
+
+        verdict = reader.tmp / "v.md"
+        verdict.write_text(verdict_text(sha=opened["sha"],
+                                        verdict="clean to advance"),
+                           encoding="utf-8")
+        code, closed = run_cli(reader.repo, reader.state, "close",
+                               "--verdict", str(verdict), cwd=reader.cwd)
+        self.assertEqual(code, 0, closed)
+        code, readings["a closed lineage"] = self._decide(reader)
+        self.assertEqual(code, 0, readings["a closed lineage"])
+
+        sh("git", "-C", str(reader.repo), "checkout", "-q", "--detach")
+        code, readings["a detached HEAD"] = self._decide(reader)
+        self.assertEqual(code, 0, readings["a detached HEAD"])
+
+        for case, rec in readings.items():
+            self.assertEqual(rec["decide"], no_ledger["decide"], case)
+
+    def test_outside_a_git_repository_it_still_reads_the_config_beside_it(self):
+        scratch = scratch_loop_repo(self, "decide-nogit-")
+        outside = scratch.tmp / "outside"
+        outside.mkdir()
+        (outside / "review.toml").write_text(
+            "[roles]\n" + vocab.toml_line(vocab.DECIDE_DEBUG, True) + "\n",
+            encoding="utf-8")
+        code, rec = run_cli(outside, scratch.tmp / "state", "decide",
+                            cwd=scratch.cwd, env=_NO_ENV_CONFIG)
+        self.assertEqual(code, 0, rec)
+        # The file was found where there is no repository to find it by.
+        self.assertNotIn(vocab.DECIDE_DEBUG, self._keys(rec))
+        self.assertIn(vocab.DECIDE_ENFORCEMENT, self._keys(rec))
+
+    # ----------------------------------------------------- it writes nothing
+
+    def _snapshot(self, root):
+        if not root.exists():
+            return None
+        return {str(p.relative_to(root)):
+                (p.read_bytes() if p.is_file() else None)
+                for p in sorted(root.rglob("*"))}
+
+    def test_it_writes_nothing_anywhere(self):
+        """Byte-identity of the state directory across the call, in both
+        states that matter: absent before (it must not be created) and
+        populated by an open round (it must not be touched)."""
+        reader, _ = self._twins("decide-readonly-",
+                                lambda t: _strip(t, _OPTIONAL))
+        tree = self._snapshot(reader.repo)
+
+        self.assertIsNone(self._snapshot(reader.state))
+        self._decide(reader)
+        self.assertIsNone(self._snapshot(reader.state),
+                          "a reading created a state directory")
+        self.assertEqual(self._snapshot(reader.repo), tree,
+                         "a reading wrote into the working tree")
+
+        self._handoff(reader)
+        before = self._snapshot(reader.state)
+        self.assertIsNotNone(before)
+        self._decide(reader)
+        self.assertEqual(self._snapshot(reader.state), before,
+                         "a reading changed the state directory")
+
+    # -------------------------------------------------- the transport entry
+
+    def test_the_transport_entry_is_resolved_rather_than_assumed(self):
+        """A reading opens no round, so there is no transport it resolved
+        FOR one. Printing the table's built-in value would tell an
+        environment that declares `paste` that `path` applies, so the verb
+        resolves the key exactly as `handoff` does — and the twin proves the
+        two resolutions are one."""
+        reader, emitter = self._twins("decide-transport-",
+                                      lambda t: _strip(t, _OPTIONAL))
+        env = {vocab.TRANSPORT_ENV: vocab.TRANSPORT_PASTE}
+        code, declared = self._decide(reader, env=env)
+        self.assertEqual(code, 0, declared)
+        self.assertEqual(
+            {e["key"]: e["applied"] for e in declared["decide"]}[
+                vocab.DECIDE_TRANSPORT], vocab.TRANSPORT_PASTE)
+        # The paired control: the same repository with the environment
+        # silent falls to the emission default instead.
+        code, silent = self._decide(reader)
+        self.assertEqual(code, 0, silent)
+        self.assertEqual(
+            {e["key"]: e["applied"] for e in silent["decide"]}[
+                vocab.DECIDE_TRANSPORT], vocab.TRANSPORT_EMISSION_DEFAULT)
+        # And under the environment's declaration the emitting verb reports
+        # the same value, which is what makes this a resolution rather than
+        # a second opinion about the same question.
+        self._give_a_remote(emitter)
+        self.assertEqual(declared["decide"],
+                         self._handoff(emitter, env=env,
+                                       local_only=False)["decide"])
+
+    def test_a_transport_outside_the_vocabulary_refuses(self):
+        """The declaration boundary is the tool's, not this verb's: an
+        unreadable declaration reaches the operator as the same typed
+        refusal every other reader gives it, with a remedy and a next_kind
+        rather than a traceback."""
+        reader, _ = self._twins(
+            "decide-badtransport-",
+            lambda t: _declare(_strip(t, _OPTIONAL),
+                               vocab.DECIDE_TRANSPORT, "carrier-pigeon"))
+        code, rec = self._decide(reader)
+        self.assertNotEqual(code, 0, rec)
+        self.assertIn("carrier-pigeon", rec["error"])
+        self.assertEqual(rec["next_kind"], "blocked")
+        self.assertTrue(rec["remedy"])
+
+    # ------------------------------------------------------- the verb surface
+
+    def test_the_ask_once_rule_names_the_verb(self):
+        """The adapters render the verb table from the parser, so the row
+        arrives by itself; the rule that tells an agent to USE it does not."""
+        rule = next(r for r in adapters.procedure()["both"]
+                    if r.startswith("Absent config asks once."))
+        self.assertIn(f"{TOOL_NAME} decide", rule)
 
 
 if __name__ == "__main__":

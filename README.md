@@ -132,6 +132,12 @@ acts. Output is JSON when stdout is not a TTY. `--as` is the one flag the common
 `take` records who ruled, and the tool cannot observe who is at the
 keyboard — it can only carry what is declared.
 
+`loupe decide` is the read-only companion to that loop: it prints every
+optional key your `review.toml` never declared, with the value the tool
+applied and the exact line that sets or unsets it, and it writes nothing —
+run it after moving a version pin, or whenever you want to see what this
+reader is deciding on your behalf.
+
 ## Install
 
 **Requirements**, as they are, not as a wishlist: Python 3.14.x, pinned
@@ -217,14 +223,19 @@ and are never pruned.
 
 ### Upgrade and uninstall
 
-The honest answer: **there is no update mechanism today, outside a
-package marketplace this project does not yet publish to.** `uvx`
-re-resolves its source on every invocation, so it tracks whatever the
-pointed-at branch holds automatically; `pip install`, a clone, or a
-vendored copy all stay exactly where you put them until you reinstall or
-`git pull` by hand. After updating a clone or a vendored copy, re-run
-`loupe render-adapters --install` (below) yourself — nothing does it for
-you, and an installed skill does not know its source moved.
+Upgrading is a **procedure, not a verb**: nothing here fetches its own
+successor, because the tool opens no network connection in its own code.
+Moving a repository from one pinned version to another is
+[docs/upgrading.md](docs/upgrading.md) — seven steps, each with the
+command that performs it and the check that proves it, covering both
+install forms, the version floor in `review.toml`, and the adapters,
+which regenerate from whatever is *installed* rather than from the pin.
+`uvx` re-resolves its source on every invocation, so it tracks whatever
+the pointed-at ref holds; `pip install`, a clone, or a vendored copy all
+stay exactly where you put them until you reinstall or `git pull` by
+hand. After updating a clone or a vendored copy, re-run `loupe
+render-adapters --install` (below) yourself — nothing does it for you,
+and an installed skill does not know its source moved.
 
 Uninstalling is plain file removal, because nothing here registers itself
 anywhere: delete `~/.claude/skills/loupe/` and `~/.codex/skills/loupe/`
@@ -276,7 +287,7 @@ name it at all, and the process keeps working with nothing installed.
 
 ## Status
 
-Version 0.23.0 — the version is bumped inside the reviewed round of any
+Version 0.24.0 — the version is bumped inside the reviewed round of any
 change that will be published, so `--version` discriminates publishes.
 Implemented and tested: the envelopes and validators, the gate manifest and
 attestation checks, roles and stamps, fingerprints with alias lineage, the

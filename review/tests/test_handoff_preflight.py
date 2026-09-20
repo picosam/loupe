@@ -218,7 +218,7 @@ class TestTheSweepPreflight(unittest.TestCase):
 
     def test_a_marked_change_refuses_and_no_flag_overrides_it(self):
         """FALSIFICATION. Mutation: skip the marker scan when the override
-        is set, and the msx fixture is published under a flag."""
+        is set, and the killed suite's fixture is published under a flag."""
         for allow in (False, True):
             with self.subTest(allow=allow), \
                     self.assertRaises(emit.SweepRefused) as ctx:
@@ -490,7 +490,7 @@ class TestTheEnvironmentLine(unittest.TestCase):
 
 
 class TestHandoffEndToEnd(unittest.TestCase):
-    """The msx case, reproduced: a suite killed at a timeout leaves a
+    """The adopter's case, reproduced: a suite killed at a timeout leaves a
     corrupt-by-design evidence file tracked by intent-to-add, and the next
     hand-off in that workspace would commit and push it."""
 
@@ -628,7 +628,7 @@ class TestHandoffEndToEnd(unittest.TestCase):
         code, out = self.handoff(self.claim())
         self.assertEqual(code, 0, out)
 
-    def test_the_msx_fixture_under_a_quoted_name_is_not_committed(self):
+    def test_the_killed_suites_fixture_under_a_quoted_name_is_not_committed(self):
         """W3 F1 end to end: the same fixture, named `café.md`."""
         evidence = self.repo / "docs" / "evidence"
         evidence.mkdir(parents=True)

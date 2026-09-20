@@ -19,9 +19,9 @@ RVW-T21 D2 (2026-08-29) widened the subject from gates to every child
 process the tool starts. A repository's git HOOKS are the repository's own
 code in the same trust position as a gate — `commit -a` runs pre-commit and
 commit-msg, `push` runs pre-push — and only `run_gates` passed the caller's
-environment, so a `beos` pre-push hook importing a sibling module died of
-the leaked PYTHONSAFEPATH and refused a handoff that the same push in a
-clean environment completed. FALSIFICATION: each of the six git doors is
+environment, so an adopting repository's pre-push hook importing a sibling
+module died of the leaked PYTHONSAFEPATH and refused a handoff that the same
+push in a clean environment completed. FALSIFICATION: each of the six git doors is
 driven with a polluted ambient environment and the env it hands to
 `subprocess.run` inspected (`TestEveryGitDoorGetsTheCallerEnvironment`),
 and a real hook of exactly the pilot's shape runs through `emit._git` in a
@@ -581,7 +581,7 @@ class TestARealHookRunsInTheCallerEnvironment(unittest.TestCase):
     """End to end: a real git hook, in a real scratch repository.
 
     RVW-T21 D2's own reproducer, reduced to what a suite can run. The
-    `beos` pre-push hook imported a sibling module and died under
+    adopting repository's pre-push hook imported a sibling module and died under
     PYTHONSAFEPATH; a pre-commit hook of the same shape is the same defect
     on the same handoff path (`emit._git(repo, "commit", "-a", ...)`) with
     no remote to reach. MUTATION: drop `env=caller_env()` from `emit._git`

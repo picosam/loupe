@@ -240,6 +240,12 @@ left the budget undeclared. (`loupe brief` proves nothing here: with no
 open request it reports the blocked state whether or not you are
 configured.)
 
+Then `loupe decide`: it prints every optional key you left undeclared — the
+value this reader applies, and the exact `review.toml` line to set or unset
+each — and exits 0 whether the list is empty or not. It records nothing, so
+it is safe before the first round, and an empty list means §§4 and 5 are
+settled.
+
 ## 7. Who approves? Answer before the first round
 
 Onboarding a review tool grants no merge authority. If the target branch is
@@ -466,16 +472,33 @@ deliberately not a style guide: no house style, no role assignments
 between named agents, no delegation policy — those are the owner's to add
 or not.
 
+**The relay is a choice, not a default, and it is the operator's:**
+either the repository states that review rounds are relayed by a person
+and that no agent invokes the other side of a round by any mechanism, or
+it declares an agent-relayed review window by name — granted by the
+operator per lineage, carried by a harness outside this tool, with the
+request's Roles line naming that harness as `relay=` instead of a person
+— and the second answer holds only where the installed adapter carries
+the exception clause and such a harness exists on the machine that would
+run it. Put both answers to the operator, write the one they choose into
+the instruction file and write nothing if they do not answer;
+[upgrading.md](upgrading.md) §6 carries each answer's text in full.
+
 **Conformity, compatibility, efficiency — one table per file.** For each
 repository instruction file present (`AGENTS.md`, `CLAUDE.md`,
 `GEMINI.md`; a symlinked pair counts once), report three checks and act
-on each:
+on each. The third is an evaluated question, not a rule a session applies
+by itself: a sentence that restates a global file is waste only if every
+session that reads this repository's file also loads that global file,
+and whether that is so is a fact about the readers, to be measured and
+then put to the operator. Measure it, list what you found, and ask —
+never delete on your own authority:
 
 | check | passes when | on failure |
 |---|---|---|
 | conformity | the file names the review tool, points at `review.toml` for roles, and carries floor items 1–5 | add what is missing |
 | compatibility | no rule contradicts the installed adapter (an agent forbidden to push when `handoff` pushes; a different tool named as the reviewer; a round started by the reviewer) | repair the repository file, never the adapter |
-| efficiency | no sentence restates the user-level or machine-global file the session loaded, except a project-specific override that says so in those words | delete the restatement; the global file is read here, never edited — it travels with nobody |
+| efficiency | every reader that loads this repository's file WITHOUT the operator's global file has been named, each sentence restating that global file is listed, and each has the operator's own keep-or-delete answer | measure, list, ask — in that order. Name the readers: collaborators on the forge (read-only, `gh api repos/<owner>/<repo>/collaborators --jq '.[].login'`), organisation, Team or cloud accounts that load no personal file, and other agents' surfaces whose global file is not the one this session loaded. List each restating sentence, then ask the operator, per group of readers, keep or delete: recommend KEEP wherever such a reader exists, and DELETE only where you are the single operator of a repository nobody else's session reads; the global file is read here, never edited — it travels with nobody, which is exactly why removing what it covers is the operator's call and never the session's |
 
 The table, then the diff, then agreement — the same discipline as every
 change on this page.

@@ -322,10 +322,10 @@ class TestTheClonesRepositoryIsCheckedBeforeTheFetch(unittest.TestCase):
 
     PUSH = {"state": "pushed", "ref": "refs/heads/main", "sha": SHA_B,
             "remote": "origin",
-            "url": "ssh://tester@example.invalid/beos.git"}
+            "url": "ssh://tester@example.invalid/adopter.git"}
 
     def happy_map(self):
-        return {("fetch", "ssh://tester@example.invalid/beos.git",
+        return {("fetch", "ssh://tester@example.invalid/adopter.git",
                  "refs/heads/main"): "",
                 ("cat-file", "-e", f"{SHA_B}^{{commit}}"): "",
                 ("cat-file", "-e", f"{SHA_A}^{{commit}}"): "",
@@ -354,7 +354,7 @@ class TestTheClonesRepositoryIsCheckedBeforeTheFetch(unittest.TestCase):
         with self.assertRaises(transport.Refusal) as ctx:
             transport.probe_target(
                 CFG, self.PUSH, SHA_B, SHA_A, git=runner,
-                remotes=["https://example.invalid/beos"])
+                remotes=["https://example.invalid/adopter"])
         self.assertIn("not present in this clone", str(ctx.exception))
         self.assertIn("fetch", [c[0] for c in runner.calls])
 

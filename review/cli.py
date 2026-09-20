@@ -2755,6 +2755,85 @@ def cmd_brief(args, cfg) -> int:
                     f"{source} is neither a review request nor a verdict")
 
 
+def _decide_text(entries: list, cfg) -> str:
+    """The `decide` list for a person: one block per key, with the section
+    the printed line belongs under. The JSON is the contract; this is the
+    same entries read aloud, and it derives every value from them."""
+    if not entries:
+        return (f"this repository declares every optional key "
+                f"({cfg.source}); there is nothing left to decide")
+    lines = [f"{len(entries)} key(s) this repository never declared "
+             f"({cfg.source}). Each `set`/`unset` line below is written "
+             f"verbatim into {config.CONFIG_BASENAME}, under the section "
+             f"named beside it.", ""]
+    for entry in entries:
+        section = entry["key"].rpartition(".")[0]
+        lines.append(f"{entry['key']} — under [{section}]")
+        lines.append(f"  {entry['meaning']}")
+        # The values as the JSON prints them: this text is the same result
+        # read aloud, and `False`/`None` are a second spelling of a payload
+        # a reader may also be parsing.
+        lines.append(f"  applied: {json.dumps(entry['applied'])}")
+        lines.append(f"  set:     {entry['set'] or '(no line declares it)'}")
+        lines.append(f"  unset:   {entry['unset'] or '(this key has no off '
+                                                     'state)'}")
+        lines.append("")
+    lines.append(f"`{vocab.DECIDE_TRANSPORT}` reports what an emission from "
+                 f"this environment would resolve now — the same resolution "
+                 f"`handoff` makes — not a value anyone declared.")
+    return "\n".join(lines)
+
+
+def cmd_decide(args, cfg) -> int:
+    """READ what this repository never declared, without emitting anything
+    (2026-09-19, the upgrade procedure's step 5).
+
+    The `decide` list has always ridden on results that emit or record
+    something — `handoff`, `emit-request`, `take`, `brief`. An operator who
+    has just moved a pin wants the same list for a different reason: what
+    does the reader I now run ask of my config, and what does it honour? The
+    only way to get it was to import the package and call
+    `config.load().decisions()` by hand, which is not a procedure step.
+
+    So this verb is a READING, and the shape follows from that word:
+
+      * ONE code path. It calls `_decide` — the same function the emitting
+        verbs call — so the entries are the emitting verbs' entries and
+        cannot drift from them. Re-deriving the list here would make the
+        answer to "what will `handoff` ask me?" a second implementation of
+        `handoff`'s question, which is the defect this verb exists to
+        retire.
+      * Exit 0 whether the list is empty or not. An empty list is the good
+        state and a full one is a question, and neither is a finding: a
+        reading reports, it does not rule.
+      * It writes NOTHING — no ledger event, no kept bytes, no lock, no
+        state directory. It never touches `_ledger`, which is what every
+        other verb here reaches for; there is no lineage to read, because
+        the config's silence is a fact about the repository rather than
+        about any round. That is also what lets it run outside a lineage,
+        with no ledger at all, on a detached HEAD and from a subdirectory:
+        `config.load` resolves the root, and nothing below it asks git
+        anything.
+
+    `roles.transport` is the one entry with a choice in it. The emitting
+    verbs report the transport they RESOLVED for the round they are about to
+    open; a reading opens no round, so there is no such value. Reporting the
+    table's built-in `path` would be a guess printed as a declaration — an
+    environment declaring `paste` would be told `path` is what applies.
+    So the verb resolves it exactly as `handoff` does, through
+    `emit.resolve_transport`, with no invocation flags because a reading has
+    none to give: the answer is what an emission from THIS environment would
+    carry now, with the config, environment and provider precedence that
+    resolution owns. A declaration outside the closed vocabulary refuses
+    there, through the same typed boundary every other reader passes.
+    """
+    applied = emit.resolve_transport(cfg)
+    entries = _decide(cfg, {vocab.DECIDE_TRANSPORT: applied})
+    _out({"ok": True, "config": cfg.source, "decide": entries},
+         _decide_text(entries, cfg))
+    return EXIT_OK
+
+
 def cmd_migrate_state(args, cfg) -> int:
     """Move state and config written under a FORMER tool name (§10.1, RVW-T6).
 
@@ -3201,6 +3280,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="also print the full envelope bytes, for a reviewer "
                          "on another machine to paste into `take -`")
     br.set_defaults(func=cmd_brief)
+
+    dc = sub.add_parser("decide",
+                        help="read what this repository never declared: one "
+                             "entry per undeclared optional key, with the "
+                             "value applied and the exact line that sets or "
+                             "unsets it; records nothing and emits nothing")
+    dc.set_defaults(func=cmd_decide)
 
     w = sub.add_parser("waive", help="record a human decision that something "
                                      "goes unaddressed: a commit that is not "

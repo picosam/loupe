@@ -176,7 +176,13 @@ def procedure() -> dict:
         "prints its `unset` as a comment line — `# decided: "
         "limits.token_budget undeclared` — and that line IS the answer: "
         "write it into `review.toml` under `[limits]` and the entry stops, "
-        "while the key stays undeclared and uncounted.",
+        "while the key stays undeclared and uncounted. "
+        f"`{paths.command(*paths.lits(TOOL_NAME, 'decide'))}` prints the "
+        "same list on demand, and is the ONLY way to read it without "
+        "emitting or recording anything: use it when nobody asked for a "
+        "round — after a version pin moves, or when the user asks what "
+        "this repository has left undeclared — and never run an emitting "
+        "verb to find out.",
         "Every request and every verdict result carries TWO fields, and they "
         "are two different kinds of text. `brief` is the plain-language "
         "account of what is being asked or ruled — give it to the human as "
