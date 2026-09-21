@@ -163,7 +163,7 @@ TOOL_NAME = "loupe"
 #   - the reviewer procedure gains the falsification-anchoring rule (D3):
 #     anchor in the reviewed tree wherever the defect admits it, and name
 #     an external mutable dependency in the finding when it does not.
-TOOL_VERSION = "0.24.0"
+TOOL_VERSION = "0.24.1"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never

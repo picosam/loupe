@@ -5,6 +5,43 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.24.1
+
+Documentation only; no behaviour changes, and nothing addressed to
+upgraders. This release adds no key, no marker and no envelope grammar, so
+nothing in it asks a reader floor to move. That is a statement about what
+the release REQUIRES, not a promise that the two versions are
+interchangeable everywhere, and two things tell them apart by design. The
+version string is one of the files the tool's content-derived identity is
+computed over, so a request emitted at 0.24.1 carries a different `tool`
+digest on its wrapper from one emitted at 0.24.0, as well as a different
+version on its attestations, and a reader at the other version reports the
+pair as `differs` — a report, never a refusal, and here the expected mark
+of a version bump rather than a sign of a drifted installation. And a
+repository that raises `[tool] requires` to 0.24.1 refuses a 0.24.0 reader
+with the floor named, which is the floor doing its job; under a floor at
+or below 0.24.0, or none, both readers accept the same valid envelope and
+refuse the same defective one.
+
+**`docs/upgrading.md` §6, Answer B, states two more places the window
+sentence declares nothing.** 0.24.0 shipped before its review finished;
+the review then closed clean, and along the way it tightened the reader of
+the window opt-in sentence in the one harness that reads it. The page that
+tells an adopter where to write that sentence now says what the reader
+does: an HTML comment is judged before a preformatted opener, so a tag
+named inside a comment opens nothing; a line carrying both a comment
+boundary and a raw tag outside it, in either order, is an unresolved
+context and refuses the whole file, inside a generic HTML block as at the
+top level; and a comment or a preformatted container opened inside a
+generic HTML block keeps its exclusion past the blank line that ends the
+block. Seven lines of prose, inside the list of contexts that page already
+gave. A sentence written as the page always said to write it — ordinary
+prose opening a paragraph, a list item or a heading — is read exactly as
+before.
+
+The version moves because a tree that differs from the published 0.24.0
+must not call itself 0.24.0.
+
 ## 0.24.0
 
 Documentation, and one read-only verb. No key was added, nothing on the

@@ -552,7 +552,13 @@ that looks for B is deliberately fail-closed, and it refuses far more
 contexts than it accepts. Write the sentence as ordinary prose, opening a
 paragraph, a list item or a heading, indented fewer than four columns.
 It declares NOTHING inside a fenced block, an indented block, a block
-quote, an HTML comment, a pre, code, script, style, textarea or xmp
+quote, an HTML comment (judged before a preformatted opener, so a tag named
+inside a comment opens nothing; a line that carries a comment boundary and a
+raw tag outside it, in either order, is an unresolved context and refuses
+the whole file, inside a generic HTML block as at the top level; a comment
+or a preformatted container opened inside such a block keeps its exclusion
+past the blank line that ends the block), a pre, code, script, style,
+textarea or xmp
 container, or a generic HTML block such as a div — and those last two
 extend to the end of their container, which for a fence means the end of
 the file and for an HTML block means the next blank line, so an unclosed
