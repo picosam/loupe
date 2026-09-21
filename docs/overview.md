@@ -66,9 +66,11 @@ author agent → relay (a human) → reviewer agent → verdict → relay → cl
 ```
 
 **Author runs `loupe handoff`.** This commits your outstanding tracked
-work, pushes the branch, runs the gate manifest — the repository's own
-list of commands (tests, linters, whatever it declares) that the tool
-executes itself rather than taking your word for — and then emits and
+work, runs the gate manifest at that commit — the repository's own list
+of commands (tests, linters, whatever it declares) that the tool executes
+itself rather than taking your word for — and pushes the branch only when
+no blocking gate failed (a gate the repository delegates to CI is awaited
+after the push, since CI can only judge a pushed commit); then it emits and
 validates a **request**: an envelope naming the exact commit, what you're
 claiming to have done, and every file reference the reviewer needs. It
 records the round, keeps a copy, prints the one command the reviewer runs,

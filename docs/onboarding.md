@@ -28,15 +28,11 @@ install, which is in the README.
   loupe render-adapters --check-install
   ```
 
-  Its default source is the `adapters/` directory beside the *installed*
-  package, which cwd does not affect. Whether that directory exists depends
-  on which install path you used, not on where you run the command: the
-  `uvx` wheel packages the `review` module alone, and the README's
-  documented minimal vendored layout (`review/` + `bin/loupe`, no
-  `adapters/`) is the same shape by design. Either one — or any other
-  install whose package root lacks an `adapters/` sibling — refuses with a
-  `--dir` remedy naming the rendered adapters to point at explicitly, rather
-  than proceeding into a misattributed failure.
+  Its source is the installed package's own rendering, so neither the cwd
+  nor the install form changes the answer: a `uvx` or `uv tool` install, a
+  clone and a vendored `review/` + `bin/loupe` all check the same way, with
+  nothing beside the package (from 0.25.0; `--dir <path>` reads rendered
+  files from a directory instead).
 
 If either fails, fix that first; every command below assumes a working
 install.
@@ -98,7 +94,10 @@ moves, because nothing else will tell you.
 ## 1. The configuration lives in the tree
 
 Copy `review.toml` from the loupe repository root into **your repository's
-root**, commit it, and edit every value — it is the generic example, and
+root** — from a clone, or, with none on the machine, from a throwaway
+shallow copy (`tmp="$(mktemp -d)" && git clone --quiet --depth 1 <repo>
+"$tmp" && cp "$tmp/review.toml" . && rm -rf "$tmp"`) — commit it, and edit
+every value — it is the generic example, and
 every one of its choices below is yours to remake.
 
 In-tree is not a style choice. A reviewed commit carries the rules it is
@@ -116,7 +115,8 @@ reviewable.
 
 ## 2. The gate manifest — what the repo can actually attest
 
-`handoff` runs every `[[gates]]` command itself, in the repo root, and
+`handoff` runs every `[[gates]]` command itself (except one CI attests,
+below), in the repo root, and
 records the exit code bound to the emitted SHA. Nothing is taken on the
 author's word. So the manifest must be what the repository can honestly
 attest:
@@ -131,6 +131,14 @@ attest:
 - **`blocking = true` honestly.** A blocking gate that exits non-zero makes
   the handoff refuse; a non-blocking one becomes a notice the reviewer
   reads. Do not invent gates the repository does not have.
+- **A gate that reads the review range runs locally.** The hand-off tells
+  the gates it runs itself the review base (`LOUPE_GATE_BASE`, beside
+  `LOUPE_GATE_HEAD`), but it does not run a gate declared
+  `attested_by = "ci"`: CI runs that one with no review base and the
+  hand-off takes CI's receipt, which binds the target commit but does not
+  prove the review base — so a range-sensitive gate (`git diff --check
+  "$LOUPE_GATE_BASE" "$LOUPE_GATE_HEAD"` is one) should not be
+  CI-attested.
 - **A guard over prose is advisory drift evidence by construction.** No
   lexical check holds a semantic guarantee, so a check over prose reports
   drift and the claims around it narrow to what the check actually owns —
@@ -496,8 +504,8 @@ never delete on your own authority:
 
 | check | passes when | on failure |
 |---|---|---|
-| conformity | the file names the review tool, points at `review.toml` for roles, and carries floor items 1–5 | add what is missing |
-| compatibility | no rule contradicts the installed adapter (an agent forbidden to push when `handoff` pushes; a different tool named as the reviewer; a round started by the reviewer) | repair the repository file, never the adapter |
+| conformity | the file names the review tool, points at `review.toml` for roles, and carries floor items 1–5; where it embeds the generated instruction block, `loupe render-adapters --check-embedded <file>` exits 0; on each machine whose agents load the skills, `loupe render-adapters --check-install` (no `--dir`) exits 0 | add what is missing; `--write-embedded <file>` regenerates a stale block, `--install` a stale skill |
+| compatibility | no rule contradicts the installed adapter (an agent forbidden to push when `handoff` pushes; a different tool named as the reviewer; a round started by the reviewer; a rule telling an agent to bypass the repository's own hooks so the tool's git calls fit its time limit, where the remedy is `[limits] git_timeout`; a rule telling an agent to read the tool's procedure or adapters from a sibling checkout rather than from the installed tool) | repair the repository file, never the adapter |
 | efficiency | every reader that loads this repository's file WITHOUT the operator's global file has been named, each sentence restating that global file is listed, and each has the operator's own keep-or-delete answer | measure, list, ask — in that order. Name the readers: collaborators on the forge (read-only, `gh api repos/<owner>/<repo>/collaborators --jq '.[].login'`), organisation, Team or cloud accounts that load no personal file, and other agents' surfaces whose global file is not the one this session loaded. List each restating sentence, then ask the operator, per group of readers, keep or delete: recommend KEEP wherever such a reader exists, and DELETE only where you are the single operator of a repository nobody else's session reads; the global file is read here, never edited — it travels with nobody, which is exactly why removing what it covers is the operator's call and never the session's |
 
 The table, then the diff, then agreement — the same discipline as every

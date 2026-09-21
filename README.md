@@ -84,9 +84,11 @@ unasked and a human carries every leg.
 
 ```
 author    loupe handoff --claim-file claim.json [--base <sha>]
-              → commits, pushes, observes the remote ref, runs the gate
-                manifest, emits + validates the request, records it, keeps
-                the bytes, prints the reviewer's command — then STOPS
+              → commits, runs the local gates (a red blocking one stops
+                it before the push), pushes, observes the remote ref,
+                awaits any CI-attested gates, emits + validates the
+                request, records it, keeps the bytes, prints the
+                reviewer's command — then STOPS
 reviewer  loupe take <request.md> --as <identity>
               → fetches the target, validates against the target's own
                 config, checks the stamped identity against the one you
@@ -108,7 +110,7 @@ sequenceDiagram
     actor H as human
     participant A as author agent
     participant R as reviewer agent
-    A->>A: work is done — handoff runs unasked, commit, push, gates, emit + record
+    A->>A: work is done — handoff runs unasked, commit, local gates, push, CI gates, emit + record
     A-->>H: request + relay, then stop
     H->>R: carry the request
     R->>R: take — fetch, verify references, print the diff command
@@ -172,7 +174,9 @@ $ loupe --version
 Both build the same wheel from `pyproject.toml` — the console script
 `loupe` is `review.cli:main` — in whatever environment is active; `uvx`
 re-resolves an isolated one on every invocation, `pip install` puts it
-wherever you ran `pip`. Neither packages `adapters/` (next section).
+wherever you ran `pip`. Neither packages an `adapters/` directory, and
+neither needs one: the agent adapters are rendered by the installed
+package itself (next section).
 
 **A clone**, when you want the tree itself: keep it together on disk and
 symlink its shim onto your PATH for a standalone copy with everything,
@@ -194,10 +198,22 @@ beside `<repo>/review/`.
 
 Then, in the repository you actually want reviewed, copy `review.toml`
 from this repository's root — it is the generic example, and also this
-repository's own configuration:
+repository's own configuration. From a clone:
 
 ```console
 $ cp loupe/review.toml .
+```
+
+or, with no clone of this repository on the machine at all, from a
+throwaway shallow copy that nothing afterwards depends on:
+
+```console
+$ tmp="$(mktemp -d)" && git clone --quiet --depth 1 <repo> "$tmp" && cp "$tmp/review.toml" . && rm -rf "$tmp"
+```
+
+and commit it:
+
+```console
 $ git add review.toml && git commit -m 'review: onboard loupe'
 ```
 
@@ -233,13 +249,14 @@ which regenerate from whatever is *installed* rather than from the pin.
 `uvx` re-resolves its source on every invocation, so it tracks whatever
 the pointed-at ref holds; `pip install`, a clone, or a vendored copy all
 stay exactly where you put them until you reinstall or `git pull` by
-hand. After updating a clone or a vendored copy, re-run `loupe
+hand. After any update, whatever the install form, re-run `loupe
 render-adapters --install` (below) yourself — nothing does it for you,
 and an installed skill does not know its source moved.
 
 Uninstalling is plain file removal, because nothing here registers itself
-anywhere: delete `~/.claude/skills/loupe/` and `~/.codex/skills/loupe/`
-for the agent skills, take `loupe` off PATH (drop the symlink, `pip
+anywhere: delete `~/.claude/skills/loupe/` and `~/.agents/skills/loupe/`
+for the agent skills (and `~/.codex/skills/loupe/`, where versions before
+0.25.0 put the Codex skill), take `loupe` off PATH (drop the symlink, `pip
 uninstall loupe`, or let an unused `uvx` cache expire on its own), and
 remove a vendored `review/` + `bin/loupe` from a repository like any other
 tracked files.
@@ -257,7 +274,7 @@ $ loupe render-adapters --install
 ```
 
 This writes `~/.claude/skills/loupe/SKILL.md` (Claude Code) and
-`~/.codex/skills/loupe/SKILL.md` (Codex), and never clobbers silently: if a
+`~/.agents/skills/loupe/SKILL.md` (Codex), and never clobbers silently: if a
 target already holds different bytes — your own hand edit, or an older
 render — those bytes are written out and proven recoverable *before* the
 target is overwritten, and the install reports where they went; if they
@@ -268,12 +285,36 @@ target later for drift with:
 $ loupe render-adapters --check-install
 ```
 
-**Both need `adapters/` sitting beside the installed package**, which a
-clone or a vendored copy has as a sibling directory automatically. The
-`uvx`/`pip` install does not package it — only the `review` module ships
-that way — so run `--install`/`--check-install` from a clone instead, or
-pass `--dir <path to the rendered adapters>` explicitly; the command
-refuses with that exact remedy if neither is available.
+**Both render from the installed package itself** (from 0.25.0): no
+`adapters/` directory, clone or checkout has to exist beside the install,
+so a `uvx`/`pip`/`uv tool` install and a clone behave identically, and
+every row names its source as `rendered by loupe <version> at <package
+path>`. `--dir <path>` reads rendered files from a directory instead,
+when that is what you want. (Through 0.24.x both commands read an
+`adapters/` sibling of the package and refused on a wheel install.)
+
+**Where the Codex skill goes — two claims, kept apart.** *Documented:*
+OpenAI's skills documentation
+(<https://learn.chatgpt.com/docs/build-skills>, retrieved 2026-09-21)
+names `$HOME/.agents/skills` as the user-scope skill directory; that is
+the path `--install` writes, and `CODEX_HOME` does not move it.
+*Observed*, separately, on 2026-09-21 with codex-cli 0.155.0-alpha.9.2
+(`codex debug prompt-input`, which makes no model call): Codex lists
+skills from both `$CODEX_HOME/skills` and `$HOME/.agents/skills`, and
+lists a name held in both twice. Versions before 0.25.0 installed the
+skill to `~/.codex/skills/loupe/`, so `--install` moves such a legacy
+copy — and one under `$CODEX_HOME/skills/loupe/` — out of discovery,
+keeping its bytes first exactly as it keeps a replaced skill's. It
+touches only loupe's own directory, and refuses, writing nothing, when
+that directory holds anything besides `SKILL.md`; `--check-install`
+reports a legacy copy still present as drift.
+
+**An instruction block embedded in a tracked file** — the `<!-- BEGIN
+GENERATED: loupe adapter` region of an `AGENTS.md` or `CLAUDE.md` — is
+checked against the current rendering with `loupe render-adapters
+--check-embedded <file>` and repaired, that region's bytes and no others,
+with `--write-embedded <file>`; [docs/upgrading.md](docs/upgrading.md)
+step 4 says what each refusal means.
 
 **Gemini and Antigravity get no generated skill here, by decision, not
 by any limit on what they can run.** `render-adapters` renders exactly
@@ -287,7 +328,7 @@ name it at all, and the process keeps working with nothing installed.
 
 ## Status
 
-Version 0.24.1 — the version is bumped inside the reviewed round of any
+Version 0.25.0 — the version is bumped inside the reviewed round of any
 change that will be published, so `--version` discriminates publishes.
 Implemented and tested: the envelopes and validators, the gate manifest and
 attestation checks, roles and stamps, fingerprints with alias lineage, the

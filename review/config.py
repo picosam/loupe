@@ -29,6 +29,19 @@ CONFIG_BASENAME = "review.toml"
 #: to two environment names.
 REQUIRES_KEY = "requires"
 
+#: The built-in ceiling, in seconds, on a `git` subprocess at a door that
+#: holds a configuration — and the default of `[limits] git_timeout`. It is
+#: 120 because 120 is what every such door hardcoded before the key existed
+#: (0.25.0): the old behaviour preserved, not a new judgment.
+GIT_TIMEOUT_DEFAULT_S = 120
+
+#: The release that first reads `[limits] git_timeout`. A configuration that
+#: declares the key is refused by every older installation (`[limits] states
+#: unknown key 'git_timeout'`), so a repository that declares it raises
+#: `[tool] requires` to this in the same commit — which is what the timeout
+#: refusal's remedy tells a person, from here rather than from a literal.
+GIT_TIMEOUT_SINCE = "0.25.0"
+
 # Round-3 F5: these defaults previously restated this repo's taxonomy, so a
 # repo with no config silently inherited llm's severities and classifications
 # instead of being told none were declared. Taxonomy now has NO built-in
@@ -74,7 +87,21 @@ DEFAULTS = {
     # and both are decisions nobody made. 900 seconds is a judgment about
     # how long a handoff may block on a runner, and it is config precisely
     # so a slower project can move it.
-    "limits": {"round_cap": 3, "token_budget": None, "ci_timeout": 900},
+    #
+    # `git_timeout` (0.25.0) HAS a default for `ci_timeout`'s reason — a git
+    # subprocess must not hang, so "no ceiling" is not a state a runner can
+    # be in — and for one of its own: 120 seconds is the number every git
+    # door hardcoded before the key existed, so an installation that
+    # declares nothing behaves exactly as every earlier one did. It is
+    # config because the ceiling covers the REPOSITORY's own code, not only
+    # the network: `commit -a` and `push` run that repository's hooks, and a
+    # `pre-push` that runs a full test gate is a legitimate design — one
+    # adopter's measured 133 s against the 120 s ceiling, and every push the
+    # tool made there died of a `TimeoutExpired` traceback. How long a
+    # repository's own gate may take is its judgment, as `ci_timeout` is.
+    # The one reader is `git_timeout()` below.
+    "limits": {"round_cap": 3, "token_budget": None, "ci_timeout": 900,
+               "git_timeout": GIT_TIMEOUT_DEFAULT_S},
     "wrapper": {"tag": TOOL_NAME},
     # The repository's declared MINIMUM reader version (2026-09-01, brief
     # config-keys-are-a-cross-installation-contract). `requires` has NO
@@ -211,6 +238,88 @@ class Config:
         return [g["id"] for g in self.gates]
 
 
+def git_timeout(cfg: "Config | None") -> int:
+    """The ceiling, in seconds, for a git subprocess run on `cfg`'s behalf:
+    `[limits] git_timeout` when declared, else its built-in default.
+
+    THE ONE READER (0.25.0). Every door that holds a configuration takes its
+    ceiling from here — `emit`'s and `transport`'s runners alike — because a
+    ceiling two modules each derive is two ceilings that can disagree, and
+    the failure mode is a push that respects the configuration beside a
+    commit that does not.
+
+    Tolerant of a half-built `cfg` on purpose: this runs on paths that
+    refuse a malformed configuration elsewhere (`check_shape` at load), and
+    a timeout reader is not where that refusal belongs. A value that passed
+    `_check_value` is an int of at least 1; anything else here means no
+    configuration layer is in hand, and the built-in is the honest answer.
+    """
+    limits = getattr(cfg, "limits", None)
+    if not isinstance(limits, dict):
+        return GIT_TIMEOUT_DEFAULT_S
+    declared = limits.get("git_timeout", GIT_TIMEOUT_DEFAULT_S)
+    if (isinstance(declared, bool) or not isinstance(declared, int)
+            or declared < 1):
+        return GIT_TIMEOUT_DEFAULT_S
+    return declared
+
+
+@dataclass(frozen=True)
+class GitCeiling:
+    """What a git door waits for, and where that number came from.
+
+    The number alone is not enough for the refusal a timeout owes (0.25.0):
+    a person deciding whether to raise the ceiling has to know whether the
+    ceiling they hit is one they CAN raise. `configurable` is False at a
+    door that holds no configuration — a reader given only a repository
+    root — where `[limits] git_timeout` does not reach and the remedy must
+    not pretend it does.
+    """
+    seconds: int
+    origin: str
+    configurable: bool
+    #: The configuration label (`repo:review.toml`, `user config`, …) a
+    #: person edits to move a configurable ceiling; empty otherwise.
+    source: str = ""
+
+
+def git_ceiling(cfg: "Config | None") -> GitCeiling:
+    """`git_timeout(cfg)` with its provenance, for a door that holds `cfg`.
+
+    The number is `git_timeout`'s and nothing else's; this adds only the
+    sentence the refusal prints about it. Declared means the loaded file's
+    own bytes state the key (`Config.declared`), which is the one place that
+    distinguishes "the repository said 120" from "nobody said anything".
+    """
+    seconds = git_timeout(cfg)
+    source = getattr(cfg, "source", "") or ""
+    declared = "limits.git_timeout" in (getattr(cfg, "declared", None)
+                                        or frozenset())
+    if declared:
+        origin = f"[limits] git_timeout = {seconds}, declared in {source}"
+    elif cfg is not None:
+        origin = (f"the built-in default of [limits] git_timeout "
+                  f"({seconds} s); "
+                  + (f"{source} does not declare the key"
+                     if source and source != "defaults"
+                     else "no configuration file declares it"))
+    else:
+        return built_in_git_ceiling(seconds)
+    return GitCeiling(seconds, origin, True,
+                      source if declared or source not in ("", "defaults")
+                      else f"repo:{CONFIG_BASENAME}")
+
+
+def built_in_git_ceiling(seconds: int = GIT_TIMEOUT_DEFAULT_S) -> GitCeiling:
+    """The ceiling of a door that holds NO configuration — a reader handed
+    only a repository root. Its number is the door's own built-in, and
+    `[limits] git_timeout` does not move it; the refusal says so."""
+    return GitCeiling(seconds,
+                      f"the built-in {seconds} s of a `git` door that "
+                      f"runs without a configuration in hand, so [limits] "
+                      f"git_timeout does not reach it", False)
+
+
 def caller_env() -> dict:
     """The environment the CALLER of the tool had, for any child process
     that may execute the REPOSITORY's or the USER's own code.
@@ -304,17 +413,85 @@ def caller_env() -> dict:
     return env
 
 
+def git_timeout_refusal(argv, ceiling: GitCeiling,
+                        state: str = "") -> tuple[str, str]:
+    """`(why, remedy)` for a git subprocess that ran past its ceiling — the
+    ONE wording every git door's timeout refusal carries (0.25.0).
+
+    Before 0.25.0 a timeout reached an agent as a `TimeoutExpired`
+    traceback at some doors and as a generic "did not complete" at others;
+    neither said which ceiling was in force, whether a person could move
+    it, or that the thing being waited on was usually the repository's own
+    hook. `argv` is the command exactly as it ran — `TimeoutExpired.cmd`,
+    `-C <root>` and every git-wide option included, so the refusal names
+    the repository too — rendered by the one command renderer with any
+    URL's userinfo removed (the rule the request stamp applies,
+    `emit._scrub_url`), because a fetch names a URL and a refusal is
+    printed. A word carrying a control character is shown escaped: a
+    diagnostic must never fail to render the failure it reports.
+
+    The remedy is a DECISION, and the tool takes neither side of it: raise
+    the ceiling, or make the hook or the remote faster. It never skips a
+    repository's hooks, which is the workaround a timer invites. Where the
+    door holds no configuration, raising the key would change nothing, and
+    the remedy says so instead of naming it.
+    """
+    from .emit import _scrub_url  # function-local: emit imports this module
+    words = [_scrub_url(str(a)) for a in argv]
+    words = [w.encode("unicode_escape").decode("ascii")
+             if any(ord(c) < 32 or ord(c) == 127 for c in w) else w
+             for w in words]
+    shown = paths.command(*words)
+    why = (f"`{shown}` did not finish within {ceiling.seconds} s and was "
+           f"stopped — the ceiling in force is {ceiling.origin}. Inside "
+           f"this ceiling `git` runs the repository's own hooks "
+           f"(pre-commit, pre-push, reference-transaction, …), its filters "
+           f"and its remotes, and something it waited on took longer"
+           + (f". {state}" if state else ""))
+    if ceiling.configurable:
+        remedy = (f"a person decides, and the tool decides neither way: "
+                  f"raise `[limits] git_timeout` in {ceiling.source} (a "
+                  f"whole number of seconds, at least 1 — a key only "
+                  f"{TOOL_NAME} {GIT_TIMEOUT_SINCE} and newer reads, so the "
+                  f"repository raises `[tool] {REQUIRES_KEY}` to "
+                  f"{GIT_TIMEOUT_SINCE} in the same commit), or make the "
+                  f"hook or the remote this command waited on faster. A "
+                  f"ceiling raised for a slow hook is also raised for an "
+                  f"unreachable remote. The tool never skips a repository's "
+                  f"hooks")
+    else:
+        remedy = (f"a person makes the hook, filter or remote this command "
+                  f"waited on faster: this door runs without a configuration "
+                  f"in hand, so `[limits] git_timeout` does not move its "
+                  f"ceiling. The tool never skips a repository's hooks")
+    return why, remedy
+
+
+#: This module's own git door's ceiling: it locates the repository before
+#: any configuration exists, so nothing declared can reach it.
+_LOCATE_TIMEOUT_S = 30
+
+
 def _git(repo_root: Path, *args: str) -> str | None:
     try:
         out = subprocess.run(
             ["git", "-C", str(repo_root), *args],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=_LOCATE_TIMEOUT_S,
             # RVW-T21 D2: `status` consults a configured core.fsmonitor
             # hook, and any of these reads may fire one on a repository
             # that has them; the caller's environment is the only one a
             # repository's own script can be expected to run in.
             env=caller_env(),
         )
+    except subprocess.TimeoutExpired as exc:
+        # This door runs BEFORE any configuration is loaded — it is how the
+        # repository and its identity are found — so its ceiling is its own
+        # built-in and the refusal is the config layer's typed one: `main`
+        # renders a ConfigError as a blocked exit with its remedy, where a
+        # bare TimeoutExpired used to escape as a traceback (0.25.0).
+        why, remedy = git_timeout_refusal(
+            exc.cmd, built_in_git_ceiling(_LOCATE_TIMEOUT_S))
+        raise ConfigError(why, code=1, remedy=remedy) from exc
     except OSError:
         return None
     return out.stdout.strip() if out.returncode == 0 else None
@@ -461,6 +638,12 @@ def _check_value(section: str, key: str, value, errors: list) -> None:
         errors.append(f"{where} must not be negative")
     if (section, key) == ("limits", "round_cap") and value < 1:
         errors.append(f"{where} must be at least 1")
+    # A zero ceiling is not "no ceiling", it is "refuse at once", and nobody
+    # declares that on purpose. Refused here, at load, rather than left to
+    # surface as a timeout on the first git call (0.25.0).
+    if (section, key) == ("limits", "git_timeout") and value < 1:
+        errors.append(f"{where} must be at least 1 (a whole number of "
+                      f"seconds)")
     # Round 4 F2: `relay` names WHO carried the request, the same fact the
     # claim's own `relay` member is closed to an actor identifier for
     # (review/emit.py's `validate_claim`). A blank value is not a defect —

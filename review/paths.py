@@ -449,10 +449,14 @@ def safe_token(value) -> str:
     return text
 
 
-def diff_command(repo_root, base: str, head: str) -> str:
+def diff_command(repo_root, base: str, head: str, *pathspecs: str) -> str:
     """THE diff command both sides print — the emitter into the envelope,
     `take` into the reviewer's result. One renderer, so the two surfaces
-    cannot disagree on quoting."""
+    cannot disagree on quoting.
+
+    `pathspecs` (0.25.0) limit it to the claim's `scope_paths` — the
+    request's second, scoped diff line — after a `--`, each quoted as one
+    shell word; none given, the command is byte-identical to before."""
     # Round 3 F1 (lineage 12). The command a human RUNS must resolve the
     # same object graph the tool read. Without this, a replacement ref on
     # the reviewer's machine shows them a diff that is not the diff the
@@ -460,7 +464,8 @@ def diff_command(repo_root, base: str, head: str) -> str:
     # nothing in the round would say so.
     return command(Lit("git"), Lit("-C"), repo_root,
                    Lit("--no-replace-objects"), Lit("diff"),
-                   f"{base}...{head}")
+                   f"{base}...{head}",
+                   *((Lit("--"), *pathspecs) if pathspecs else ()))
 
 
 def display_path(path) -> str:

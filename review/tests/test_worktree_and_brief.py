@@ -490,7 +490,14 @@ class TestPrecisIsDerived(unittest.TestCase):
             "Required outcome: say what the push line attests\n"
             "FALSIFICATION: command: `run the other test`\n"
             "\n## evidence checked\n\n- the diff\n")
-        text = brief.verdict_precis(v, source="/tmp/v.md")
+        # 0.25.0: the blocking set is the TARGET's declared taxonomy,
+        # supplied by the caller — the précis carries no default.
+        # Duck-typed: the précis reads exactly these three facts of it.
+        from types import SimpleNamespace
+        target = SimpleNamespace(
+            severities=["Blocker", "High", "Medium", "Low"],
+            blocking_severities=["Blocker", "High"], taxonomy_declared=True)
+        text = brief.verdict_precis(v, source="/tmp/v.md", governing=target)
         self.assertIn("unreviewed commit", text)      # the title, not a count
         self.assertIn("F1", text)
         self.assertIn("F2", text)

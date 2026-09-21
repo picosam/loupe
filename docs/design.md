@@ -59,7 +59,7 @@ Three points taken as settled:
 | Grammar and failure policy | inside the tool | zero |
 | Taxonomy, gate manifest, roles, limits | `review.toml` tracked at the reviewed repository's root — the one required footprint; `~/.config/loupe/<repo-id>.toml` governs local verbs only | one file |
 | Round ledger | `~/.local/state/loupe/<repo-id>/` by default | zero by default |
-| Agent adapters | user level (`~/.claude/skills/`, `~/.codex/skills/`) | zero |
+| Agent adapters | user level (`~/.claude/skills/`, `~/.agents/skills/`) | zero |
 
 Auto-detection has exactly one boundary. With no configuration the tool
 still discovers what is *observable* (gates are commands that exist or do
@@ -1053,8 +1053,10 @@ carries the one carrier the round declared.
   not the remote's default branch — refusing as `blocked` before anything
   is committed, pushed, run or emitted (a finding never dies by omission,
   and the next round is not opened until every one is answered); then
-  commit + push + observe, run the gate manifest, emit and validate the
-  request, record the request event, keep the bytes under the state
+  commit, run the local gates at that commit (a blocking one the request
+  validator would refuse stops the hand-off before the push, the local
+  commit named — 0.25.0), push + observe, await the CI-attested gates on the
+  pushed commit, emit and validate the request, record the request event, keep the bytes under the state
   directory's `exchange/`, print the reviewer's literal command, stop.
   Idempotent: on an unchanged tip with a warm, digest-verified copy it
   returns the same envelope without re-running gates or pushing.

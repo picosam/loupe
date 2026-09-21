@@ -1330,6 +1330,49 @@ class Ledger:
             follow(named.pop(), parent, self.EDGE_INFERRED)
         return edges
 
+    @staticmethod
+    def _thread_anchor_of(findings: list[dict], ident: str, resolve):
+        """The anchor a thread is filed under: the `anchor_path` of the
+        FIRST ruling bearing the identity, or None when none does.
+
+        ONE authority for "which anchor is this finding on" (public issue
+        #3): `convergence` files every thread under it and `hunted` groups
+        each round's rulings by the same field, so the validator's residue
+        notice asks this function rather than a copy of it. An empty
+        `anchor_path` is an anchor-less ruling, which convergence joins to
+        no anchor group; callers treat "" exactly that way.
+        """
+        return next((f.get("anchor_path") for f in findings
+                     if resolve(f.get("fp", "")) == ident), None)
+
+    def thread_anchor(self, fp: str, lineage: str) -> str | None:
+        """The anchor `convergence` files `fp`'s thread under in `lineage`,
+        or None when this ledger holds no ruling of that identity."""
+        return self._thread_anchor_of(self._all_rulings(lineage),
+                                      self.resolve(fp), self.resolve)
+
+    def ruled_before(self, fp: str, lineage: str,
+                     round_no: int | None) -> bool:
+        """Whether `fp`'s identity was ruled in `lineage` before `round_no`
+        (in any round at all when `round_no` is None) — the negation of
+        convergence's "first seen in this round", for a verdict that may
+        not be recorded yet."""
+        ident = self.resolve(fp)
+        return any(self.resolve(f.get("fp", "")) == ident
+                   and (round_no is None
+                        or int(f.get("round") or 0) < round_no)
+                   for f in self._all_rulings(lineage))
+
+    def verdict_round(self, sha: str | None, lineage: str) -> int | None:
+        """The round a verdict about `sha` rules in `lineage`: the open round
+        binding it, else the newest round whose request binds it (a verdict
+        re-validated after `close` recorded it), else None."""
+        open_round = self.round_for_sha(sha, lineage)
+        if open_round is not None:
+            return open_round
+        bound = self.rounds_for_sha(sha, lineage)
+        return max(bound) if bound else None
+
     def convergence(self, lineage: str) -> dict:
         """Is this lineage closing its findings, or hunting the same
         domains? A REPORT, not a verdict — read what it counts, not the
@@ -1445,8 +1488,8 @@ class Ledger:
                 "closures": [c.get("closure") for c in ident_closures],
                 "sustained": sustained,
                 "withdrawn": withdrawn,
-                "anchor": next((f.get("anchor_path") for f in findings
-                                if self.resolve(f.get("fp", "")) == ident), None),
+                "anchor": self._thread_anchor_of(findings, ident,
+                                                 self.resolve),
                 # The followed edge, in both directions, on the thread it
                 # belongs to — so a reader can check the continuity the
                 # counts below now assume instead of taking it on trust.

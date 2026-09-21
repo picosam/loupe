@@ -1887,8 +1887,12 @@ class TestTheAuthorDoorStampsTheCommittedRoles(unittest.TestCase):
         from review import cli, emit as _emit
         ran = []
 
-        def spy(cfg, target_sha, base=None):
-            ran.append(target_sha)
+        def spy(cfg, target_sha, base=None, **kw):
+            # 0.25.0 (gate before push): a hand-off calls the runner for its
+            # local half before the push and resumes it with `prior` after,
+            # so only a call that EXECUTES gates counts as a run.
+            if kw.get("prior") is None:
+                ran.append(target_sha)
             return []
 
         out = self.tmp / "request.md"

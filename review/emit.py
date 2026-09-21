@@ -28,7 +28,8 @@ from typing import Mapping
 
 from . import (TOOL_NAME, TOOL_VERSION, env_var, paths, refs,
                shape_identity, tool_identity, vocab, wire)
-from .config import Config, caller_env
+from .config import (Config, GitCeiling, built_in_git_ceiling, caller_env,
+                     git_ceiling)
 from .digest import sha256_text
 from .ledger import Ledger, render_cross_lineage_md, render_report_md
 
@@ -44,10 +45,33 @@ from .ledger import Ledger, render_cross_lineage_md, render_report_md
 NO_REPLACE = "--no-replace-objects"
 
 
+def _git_timeout(argv, ceiling: GitCeiling):
+    """The typed refusal for a git subprocess that ran past `ceiling`
+    (0.25.0): `transport.GitTimeout`, built here so every door in this
+    module raises the one class `main` renders as a blocked exit. `argv`
+    is the command as it ran (`TimeoutExpired.cmd`). Function-local import:
+    `transport` imports this module's siblings, and reaches for this module
+    the same way."""
+    from .transport import GitTimeout
+    return GitTimeout(argv, ceiling)
+
+
 def _git(repo_root: Path, *args: str, no_replace: bool = False,
-         git_options: tuple[str, ...] = (), env: dict | None = None) -> str:
+         git_options: tuple[str, ...] = (), env: dict | None = None,
+         ceiling: GitCeiling | None = None) -> str:
     # The timeout is §9bis.4's fail-don't-hang rule as much as hygiene: push
     # and ls-remote reach the network, and an unreachable remote must refuse.
+    #
+    # 0.25.0: the ceiling is the caller's `config.git_ceiling(cfg)` where the
+    # caller holds a configuration — `ensure_pushed`'s runner, which carries
+    # `commit -a` and `push` and so the repository's own hooks, is the
+    # measured case (an adopter's pre-push gate took 133 s against the old
+    # hardcoded 120) — and the door's built-in where it holds only a root.
+    # The rule is the door's, not the argv's, as for the environment below.
+    # The cost, stated where it is paid: a ceiling raised for a slow hook is
+    # also raised for an unreachable remote. A timeout is `GitTimeout`, a
+    # typed refusal naming the command, the ceiling and where it came from;
+    # every other subprocess failure stays the RuntimeError below.
     #
     # Round 4 F3: a timeout is an ADMITTED outcome — this call declares one —
     # and `TimeoutExpired` is not a `RuntimeError`, so it escaped every
@@ -73,11 +97,15 @@ def _git(repo_root: Path, *args: str, no_replace: bool = False,
     # One reader uses them — `generated_at_target`, to shut off the
     # machine-local attribute sources — and both default to today's
     # behaviour, so no other door moves.
+    ceiling = ceiling or built_in_git_ceiling()
     try:
         out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
                               "-C", str(repo_root), *git_options, *args],
-                             capture_output=True, text=True, timeout=120,
+                             capture_output=True, text=True,
+                             timeout=ceiling.seconds,
                              env=caller_env() if env is None else env)
+    except subprocess.TimeoutExpired as exc:
+        raise _git_timeout(exc.cmd, ceiling) from exc
     except subprocess.SubprocessError as exc:
         raise RuntimeError(
             f"a `git` subprocess did not complete: "
@@ -107,10 +135,16 @@ def _git_bytes(repo_root: Path, *args: str,
     # This one reads objects and fires no hook today; the rule is the
     # door's, not the subcommand's, so a future caller cannot reintroduce
     # the leak by passing a different argv here.
-    out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
-                          "-C", str(repo_root), *args],
-                         capture_output=True, timeout=120,
-                         env=caller_env())
+    # 0.25.0: it holds no configuration, so its ceiling is its built-in —
+    # and a timeout is the typed refusal, never a traceback.
+    ceiling = built_in_git_ceiling()
+    try:
+        out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
+                              "-C", str(repo_root), *args],
+                             capture_output=True, timeout=ceiling.seconds,
+                             env=caller_env())
+    except subprocess.TimeoutExpired as exc:
+        raise _git_timeout(exc.cmd, ceiling) from exc
     if out.returncode != 0:
         raise RuntimeError(
             f"a `git` subprocess failed: "
@@ -119,15 +153,26 @@ def _git_bytes(repo_root: Path, *args: str,
     return out.stdout
 
 
+#: `_is_ancestor`'s own ceiling. It holds no configuration, so nothing
+#: declared reaches it; named so the refusal and the call cannot disagree.
+_ANCESTRY_TIMEOUT_S = 60
+
+
 def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
     # Round 3 F1: ancestry is a statement about the object graph.
     # RVW-T21 D2: and it is read in the caller's environment, like every
     # other git door here.
-    out = subprocess.run(["git", NO_REPLACE, "-C", str(repo_root),
-                          "merge-base", "--is-ancestor", ancestor,
-                          descendant],
-                         capture_output=True, text=True, timeout=60,
-                         env=caller_env())
+    # 0.25.0: a timeout is the typed refusal, not a False — "did not answer
+    # in time" is not "is not an ancestor", and it used to be a traceback.
+    ceiling = built_in_git_ceiling(_ANCESTRY_TIMEOUT_S)
+    try:
+        out = subprocess.run(["git", NO_REPLACE, "-C", str(repo_root),
+                              "merge-base", "--is-ancestor", ancestor,
+                              descendant],
+                             capture_output=True, text=True,
+                             timeout=ceiling.seconds, env=caller_env())
+    except subprocess.TimeoutExpired as exc:
+        raise _git_timeout(exc.cmd, ceiling) from exc
     return out.returncode == 0
 
 
@@ -307,9 +352,10 @@ def _ci_target(repo: Path, git=None) -> tuple[str, str]:
 # ------------------------------------------------ the hand-off preflight
 #
 # Brief `handoff-guards-generalized` (2026-09-18). `handoff` commits the
-# outstanding tracked work and pushes it BEFORE any gate runs, so a gate can
-# protect the envelope and never the commit. Every assumption that ordering
-# rests on has failed once: that the dirty paths are the author's (an
+# outstanding tracked work BEFORE any gate runs — and until 0.25.0 pushed it
+# before any gate ran too — so a gate can protect the push and the envelope
+# and never the commit. Every assumption that ordering rests on has failed
+# once: that the dirty paths are the author's (an
 # adopter's killed suite left a corrupt-by-design fixture staged), that the
 # environment can run the tool at all, that fixtures are gone when their
 # process is. The preflight NAMES what it found, before the commit, and
@@ -651,6 +697,34 @@ def render_preflight_lines(reachability: dict) -> list[str]:
     return lines
 
 
+def _git_timeout_class():
+    """`transport.GitTimeout`, for an `except` clause in this module —
+    through a call because `transport` is imported function-locally here
+    (it reaches for this module the same way)."""
+    from .transport import GitTimeout
+    return GitTimeout
+
+
+class _typed_raw_timeout:
+    """Type a timeout raised by `_git_raw` — the candidate reader's door,
+    which holds only a repository root and lets `TimeoutExpired` escape —
+    as the one refusal every other door raises (0.25.0). Its ceiling is
+    that door's built-in, so the refusal says `[limits] git_timeout` does
+    not reach it. `state` says what the hand-off had done by then."""
+
+    def __init__(self, state: str):
+        self.state = state
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, exc, tb):
+        if kind is None or not issubclass(kind, subprocess.TimeoutExpired):
+            return False
+        raise _git_timeout(exc.cmd, built_in_git_ceiling(int(exc.timeout))
+                           ).within(self.state) from exc
+
+
 def ensure_pushed(cfg: Config, head: str | None = None,
                   local_only: bool = False,
                   commit_subject: str | None = None,
@@ -660,7 +734,8 @@ def ensure_pushed(cfg: Config, head: str | None = None,
                   reviewer_flag: str | None = None,
                   scope_paths=None,
                   allow_outside_scope: bool = False,
-                  candidate=None) -> dict:
+                  candidate=None, before_push=None,
+                  base: str | None = None) -> dict:
     """Make the review target fetchable BEFORE emission (§9bis.4, RVW-T7).
 
     Commits outstanding tracked work, pushes the reviewed branch, and returns
@@ -670,12 +745,49 @@ def ensure_pushed(cfg: Config, head: str | None = None,
     because a SHA the reviewer cannot fetch is not a review target and an
     envelope naming one is a false artifact.
 
+    `before_push` (0.25.0, public issue #2: gate before push) is called
+    with the record built so far — the commit made, its authority read, its
+    roles resolved, its destination derived — after every local refusal and
+    before anything leaves the machine: before the push, and before the
+    `--local-only` return, which pushes nothing. It may raise to refuse, and
+    a refusal there leaves the local commit, if one was made, for the
+    author to amend, exactly as `SweepRefused` and `AuthorityAbsent` do.
+    The hand-off passes the LOCAL gates here (`cli._emit`); None keeps the
+    old order for every other caller.
+
+    `base`, when given, is the review range's other end, and THIS is the
+    one place it is resolved (0.25.0 review round 1 F1): ONCE, before this
+    function's own commit and push, to the single commit it names at that
+    moment (`rev-parse --verify <base>^{commit}` — a tag peels to its
+    commit; a range, a tree, an option-shaped or an absent name refuses,
+    with nothing committed). So a symbolic or relative base means what it
+    meant when the author typed it, before the tool moved anything: `HEAD`
+    is the tip before the outstanding work was committed, `HEAD~1` its
+    parent, and the branch and its remote-tracking ref are read before the
+    commit and the push advance them. The id is handed to `before_push` as
+    `record["base"]` — the value every LOCAL gate is told — and returned
+    in the record under the same key, and the caller emits, measures and
+    validates THAT id, never the expression again: a second resolution
+    after the commit named another range than the gates had checked. The
+    guarantee stops at the gates the hand-off runs locally (0.25.0 review
+    round 2 F2): a CI-attested gate is not told this base — CI runs the
+    manifest with none, and the hand-off takes CI's receipt — so its
+    evidence binds the target commit but does not prove the review base,
+    and a range-sensitive gate must run locally, not `attested_by = "ci"`,
+    to receive it.
+
     `git` is the command runner — `(*args) -> stdout, raising RuntimeError on
     a nonzero exit` — injectable so every refusal state is testable without a
     network or a scratch repository.
     """
     repo = cfg.repo_root
-    run = git or (lambda *a: _git(repo, *a))
+    # 0.25.0: the declared ceiling, at the door. This runner carries `commit
+    # -a` (pre-commit, prepare-commit-msg, commit-msg, post-commit) and
+    # `push` (pre-push) below — the measured case — but the rule is the
+    # door's, as `caller_env`'s is, so no future argv here can fall back to
+    # the built-in. Cost: a ceiling raised for a slow hook is also raised
+    # for an unreachable remote.
+    run = git or (lambda *a: _git(repo, *a, ceiling=git_ceiling(cfg)))
 
     # RVW-T11 leg 2, and the one place the two declarations can contradict
     # each other. `--local-only` says review is genuinely same-clone;
@@ -717,6 +829,32 @@ def ensure_pushed(cfg: Config, head: str | None = None,
                 f"{branch}: the push publishes the branch tip, so an older "
                 f"target would stamp a remote ref the wrapper does not bind "
                 f"(§9bis.4)")
+    # The range's base, resolved ONCE and here, before the commit, for the
+    # same reason (0.25.0; review round 1 F1): the LOCAL gates run before
+    # the push and are told this id (a CI-attested gate is told none —
+    # round 2 F2), the emission binds this id, and a base that does not
+    # name exactly one commit refuses with nothing committed.
+    # `--verify` refuses what resolves to several lines (a range, an
+    # option-shaped value) and the `^{commit}` peel refuses a tree and
+    # turns an annotated tag into the commit a range can end at.
+    resolved_base = None
+    if base is not None:
+        try:
+            resolved_base = run("rev-parse", "--verify", f"{base}^{{commit}}")
+        except _git_timeout_class():
+            raise
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"the review base {base!r} does not name one commit here, "
+                f"so no range can be gated or emitted from it: nothing has "
+                f"been committed, pushed or emitted. Pass --base a single "
+                f"commit (an id, a branch, a tag, or an expression such as "
+                f"HEAD~1, read before the hand-off commits anything) ({exc})"
+            ) from exc
+    # Returned beside the reachability, for the caller to emit, measure and
+    # validate — present only when a base was given, so a caller that asked
+    # for none gets the record it always got.
+    resolved = {"base": resolved_base} if base is not None else {}
 
     porcelain = run("status", "--porcelain")
     untracked = [ln[3:] for ln in porcelain.splitlines()
@@ -736,7 +874,9 @@ def ensure_pushed(cfg: Config, head: str | None = None,
     # runner there is no tree to read, and `NoCandidate` says so.
     if candidate is None:
         candidate = CandidateCommit(repo) if git is None else NoCandidate()
-    changes = candidate.changes()
+    with _typed_raw_timeout("Nothing has been committed, pushed or "
+                            "emitted."):
+        changes = candidate.changes()
     sweep = sweep_preflight(changes, scope_paths, allow_outside_scope)
     environment = environment_report()
 
@@ -745,7 +885,32 @@ def ensure_pushed(cfg: Config, head: str | None = None,
         subject = commit_subject or (
             f"emit-request: outstanding work for round {round_no}"
             if round_no is not None else "emit-request: outstanding work")
-        run("commit", "-a", "-m", subject)
+        try:
+            run("commit", "-a", "-m", subject)
+        except _git_timeout_class() as exc:
+            # A commit stopped inside its hooks is stopped HOLDING the index
+            # lock (measured: `commit -a` writes the index under
+            # `index.lock` before pre-commit runs, and a killed git cannot
+            # remove it). Said here, because the re-run the remedy asks for
+            # would otherwise meet git's own lock refusal unexplained. The
+            # tool does not remove it: another git may hold it legitimately.
+            # Asked of git (`--git-path` knows a linked worktree's own
+            # index), never inferred; a git that cannot answer leaves the
+            # sentence out.
+            try:
+                lock = Path(run("rev-parse", "--git-path", "index.lock"))
+                lock = lock if lock.is_absolute() else repo / lock
+                lock = str(lock) if lock.exists() else ""
+            except RuntimeError:
+                lock = ""
+            raise exc.within(
+                "The hand-off was committing its outstanding work: nothing "
+                "was pushed or emitted, and the branch's newest commit says "
+                "whether this one was recorded before `git` was stopped"
+                + (f". `git` was stopped holding the index lock and {lock} "
+                   f"remains; `git` refuses to write the index until a "
+                   f"person removes it, once no `git` process is running"
+                   if lock else "")) from exc
         committed = True
 
     target = run("rev-parse", "HEAD")
@@ -758,7 +923,10 @@ def ensure_pushed(cfg: Config, head: str | None = None,
     # difference is refused with the commit named: nothing is pushed or
     # emitted, and the commit is the author's own to amend.
     if committed:
-        recorded = candidate.recorded(target)
+        with _typed_raw_timeout(
+                f"The hand-off committed {target[:12]} locally; nothing "
+                f"was pushed or emitted."):
+            recorded = candidate.recorded(target)
         if recorded is not None:
             # (status, path, MODE, blob): the mode is a tree-entry fact git
             # records and a hook can change alone (W4 F4).
@@ -848,10 +1016,13 @@ def ensure_pushed(cfg: Config, head: str | None = None,
                 f"--local-only while remote(s) exist ({', '.join(remotes)}): "
                 f"the flag exists for repos with no fetchable surface at "
                 f"all, never as a bypass of the push rule (§9bis.4)")
-        return {"state": "local-only", "branch": branch, "sha": target,
-                "committed": committed, "governing": governing,
-                "roles": effective_roles, "sweep": sweep,
-                "environment": environment}
+        record = {"state": "local-only", "branch": branch, "sha": target,
+                  "committed": committed, "governing": governing,
+                  "roles": effective_roles, "sweep": sweep,
+                  "environment": environment, **resolved}
+        if before_push is not None:
+            before_push(dict(record, base=resolved_base))
+        return record
     if not remotes:
         raise RuntimeError(
             "no remote configured: a SHA the reviewer cannot fetch is not a "
@@ -862,10 +1033,30 @@ def ensure_pushed(cfg: Config, head: str | None = None,
     remote, merge_ref = _resolve_push_destination(repo, branch, remotes, run)
 
     url = _scrub_url(run("remote", "get-url", remote))
+
+    # Gate before push (0.25.0). Everything above is local and refuses with
+    # nothing sent; the caller's check runs here, the last point before the
+    # push, and sees the record the push would carry.
+    if before_push is not None:
+        before_push({"state": "unpushed", "branch": branch, "ref": merge_ref,
+                     "remote": remote, "url": url, "sha": target,
+                     "committed": committed, "governing": governing,
+                     "roles": effective_roles, "sweep": sweep,
+                     "environment": environment, "base": resolved_base})
+
+    local = (f"committed {target[:12]} locally" if committed
+             else f"made no commit (HEAD is {target[:12]})")
     try:
         # Always an explicit refspec: a push that silently does nothing
         # (push.default surprises) is worse than one that fails (§9bis.4).
         run("push", remote, f"refs/heads/{branch}:{merge_ref}")
+    except _git_timeout_class() as exc:
+        # Before the generic catch below, which would re-describe a slow
+        # pre-push hook as a failed push and drop the one remedy that fits.
+        raise exc.within(
+            f"The hand-off {local} and emitted nothing; whether {branch} "
+            f"reached {remote} is unconfirmed until the remote is asked for "
+            f"{merge_ref} (`ls-remote`)") from exc
     except RuntimeError as exc:
         raise RuntimeError(
             f"push of {branch} to {remote} failed — refusing to emit: an "
@@ -873,7 +1064,14 @@ def ensure_pushed(cfg: Config, head: str | None = None,
             f"(§9bis.4). {exc}") from exc
 
     observed = ""
-    for line in run("ls-remote", remote, merge_ref).splitlines():
+    try:
+        listing = run("ls-remote", remote, merge_ref)
+    except _git_timeout_class() as exc:
+        raise exc.within(
+            f"The hand-off {local} and the push to {remote} returned, but "
+            f"the remote ref could not be observed; nothing was "
+            f"emitted") from exc
+    for line in listing.splitlines():
         parts = line.split("\t")
         if len(parts) == 2 and parts[1] == merge_ref:
             observed = parts[0]
@@ -888,7 +1086,7 @@ def ensure_pushed(cfg: Config, head: str | None = None,
             "remote": remote, "url": url, "sha": target,
             "committed": committed, "governing": governing,
             "roles": effective_roles, "sweep": sweep,
-            "environment": environment}
+            "environment": environment, **resolved}
 
 
 def diff_shape(repo_root: Path, base: str, head: str) -> dict:
@@ -935,7 +1133,11 @@ def _numstat_entries(repo_root: Path, base: str, head: str,
     `target_path` is the POST-image: the path that exists at the target,
     which is the tree whose attributes classify it. A generated file that
     was renamed into place is generated at the target under its new name,
-    and its old name is not a path there at all.
+    and its old name is not a path there at all. `source_path` is that old
+    name — a rename's or copy's pre-image, None for every other row. No
+    matcher judges it; it is kept because git's tree walk still visits it,
+    so a pathspec over its directory selects it (round-3 F1, the `Scoped:`
+    line).
 
     Defensive on the pairing rather than trusting it: the two reads are the
     same diff under the same options, so the rows correspond by position —
@@ -951,15 +1153,17 @@ def _numstat_entries(repo_root: Path, base: str, head: str,
     while i < len(tokens):
         a, d, path = tokens[i].split("\t", 2)
         i += 1
+        source = None
         if path == "":
             # A rename or copy: the two paths follow as their own records,
             # old then new.
             if i + 1 >= len(tokens):
                 return []
-            path = tokens[i + 1]
+            source, path = tokens[i], tokens[i + 1]
             i += 2
         entries.append({
             "target_path": path,
+            "source_path": source,
             "insertions": None if a == "-" else int(a),
             "deletions": None if d == "-" else int(d)})
     if len(entries) != len(display):
@@ -1819,7 +2023,14 @@ def _await_ci(cfg: Config, gates: list[dict], target_sha: str, run: str,
     """
     started = time.monotonic()
     try:
-        slug, branch = _ci_target(cfg.repo_root)
+        # 0.25.0: `_ci_target` holds only a root; the runner handed to it
+        # carries this configuration's ceiling, and a timeout is the typed
+        # refusal rather than "no coordinates" — did-not-answer-in-time is
+        # not unresolvable, and a person can act on the difference.
+        slug, branch = _ci_target(cfg.repo_root, git=lambda *a: _git(
+            cfg.repo_root, *a, ceiling=git_ceiling(cfg)))
+    except _git_timeout_class():
+        raise
     except RuntimeError as exc:
         return {g["id"]: _ci_not_run(
             g, f"not run: the CI coordinates are not resolvable, so no run "
@@ -1852,17 +2063,141 @@ def _await_ci(cfg: Config, gates: list[dict], target_sha: str, run: str,
         time.sleep(interval)
 
 
+@dataclasses.dataclass(frozen=True)
+class LocalGates:
+    """The LOCAL half of one hand-off's gate run: every manifest gate this
+    process executes, run at the commit BEFORE the push (0.25.0, public
+    issue #2) and carried to the emission, so that no gate runs twice.
+
+    `records` are the attestations in manifest order, exactly as the
+    envelope will carry them; `run` is the retention token the whole run
+    shares, so the CI-attested half that is awaited after the push retains
+    beside them, as one run's evidence always has. `base` is the review
+    base these gates were told (`<TOOL>_GATE_BASE`, None when none was):
+    the range a range-sensitive gate attested, which only a request naming
+    that same base may carry (0.25.0 review round 1 F1).
+    """
+    sha: str
+    run: str
+    records: tuple
+    base: str | None = None
+
+
+def run_local_gates(cfg: Config, target_sha: str, base: str | None = None,
+                    execute_ci_gates: bool = False) -> LocalGates:
+    """The half of `run_gates` that needs nothing from a remote: every gate
+    not attested by CI (all of them inside CI or under `execute_ci_gates`,
+    the split `run_gates` makes). Executed at the commit, before the push;
+    `run_gates(..., prior=...)` later adds the CI-attested half without
+    executing these again."""
+    token = run_token()
+    records = run_gates(cfg, target_sha, base=base,
+                        execute_ci_gates=execute_ci_gates, local_only=True,
+                        token=token)
+    return LocalGates(target_sha, token, tuple(records), base)
+
+
+def local_gate_failures(cfg: Config, local: LocalGates
+                        ) -> tuple[list[str], list]:
+    """`(failed gate ids, the validator's error items)` for the local half.
+
+    THE PREDICATE IS THE VALIDATOR'S, never a second one: each record is
+    judged by `validate.validate_attestations` — the very function the
+    emitted request is validated by — against the manifest's own row for
+    that gate and the commit the request will bind. Judged one record at a
+    time so the refusal can name every gate that failed, and because a
+    record's errors are its own: the manifest-level checks (a gate missing,
+    a gate undeclared) cannot fire on a half the runner built from the
+    manifest itself. So the refusal before the push and the validation
+    after the emission cannot disagree — on a failed exit, an unbound
+    tree, a not-run record, `not run: nested` included.
+    """
+    from .validate import errors_in, validate_attestations
+    rows = {g["id"]: g for g in cfg.gates}
+    failed, items = [], []
+    for rec in local.records:
+        one = dataclasses.replace(cfg, gates=[rows[rec["id"]]])
+        errors = errors_in(validate_attestations(
+            _attestation_block(cfg.wrapper_tag, [rec]), one,
+            request_sha=local.sha))
+        if errors:
+            failed.append(rec["id"])
+            items.extend(errors)
+    return failed, items
+
+
+class GatesRefused(RuntimeError):
+    """A blocking local gate did not pass, and the hand-off stopped BEFORE
+    the push (0.25.0, public issue #2: gate before push, no undo).
+
+    Nothing was pushed, emitted or recorded. The commit the hand-off made,
+    if it made one, is left for the author to amend or reset — the same
+    precedent `SweepRefused`'s read-back refusal and `AuthorityAbsent` set:
+    the tool does not undo its own commit. Carries the validator's items
+    and the commit, so the refusal names what failed without a second run.
+    """
+
+    def __init__(self, message: str, remedy: str, items, sha: str,
+                 outputs: dict):
+        super().__init__(message)
+        self.remedy = remedy
+        self.items = list(items)
+        self.sha = sha
+        self.outputs = dict(outputs)
+
+
+def gate_before_push(cfg: Config, record: dict, base: str | None = None,
+                     verb: str = "handoff") -> LocalGates:
+    """Run the local gates at `record`'s commit and refuse, before the push,
+    when the validator would refuse them after the emission.
+
+    `record` is what `ensure_pushed` hands its `before_push`: the commit,
+    whether the hand-off made it, and the governing configuration whose
+    manifest runs. Returns the `LocalGates` the emission carries; raises
+    `GatesRefused` otherwise.
+    """
+    sha = record["sha"]
+    local = run_local_gates(cfg, sha, base=base)
+    failed, items = local_gate_failures(cfg, local)
+    if not items:
+        return local
+    by_id = {r["id"]: r for r in local.records}
+    outputs = {gid: (by_id[gid].get("output") or {}).get("pointer", "")
+               for gid in failed if isinstance(by_id[gid].get("output"),
+                                               dict)}
+    where = (f"the hand-off committed its outstanding work locally at "
+             f"{sha}" if record.get("committed") else
+             f"no commit was made (HEAD is {sha})")
+    names = ", ".join(failed) if failed else "the local attestation block"
+    undo = (f"then amends or resets the local commit {sha[:12]} — the tool "
+            f"does not undo its own commit — and re-runs"
+            if record.get("committed") else "then commits the fix and re-runs")
+    raise GatesRefused(
+        f"{len(failed) or 1} local gate(s) did not pass at {sha[:12]}: "
+        f"{names} — judged by the request validator's own attestation rule "
+        f"before anything left this machine. Nothing was pushed, emitted or "
+        f"recorded; {where}",
+        remedy=(f"the author fixes what the failed gate(s) report (the "
+                f"items below; each gate's output is retained at the "
+                f"pointer named), {undo} `{TOOL_NAME} {verb}`"),
+        items=items, sha=sha, outputs=outputs)
+
+
 def run_gates(cfg: Config, target_sha: str,
               base: str | None = None, execute_ci_gates: bool = False,
-              ci_poll_interval: float = CI_POLL_INTERVAL_S) -> list[dict]:
+              ci_poll_interval: float = CI_POLL_INTERVAL_S, *,
+              local_only: bool = False, prior: LocalGates | None = None,
+              token: str | None = None) -> list[dict]:
     """Execute the declared gate manifest and return attestations (§5.1).
 
     `base` is the review range's other end (audit of 2026-09-05, finding
     4): handoff commits outstanding work BEFORE the gates run, so a gate
     that inspects the working tree — `git diff --check` was one — has
     nothing left to inspect and attests a clean tree that says nothing
-    about the commits under review. The range is exported to every gate as
-    `<TOOL>_GATE_BASE` and `<TOOL>_GATE_HEAD`; a gate that reads a range
+    about the commits under review. The range is exported to every gate
+    THIS RUN EXECUTES as `<TOOL>_GATE_BASE` and `<TOOL>_GATE_HEAD` (a
+    CI-attested gate's receipt comes from CI's own run, which is told no
+    review base — round 2 F2 of the 0.25.0 review); a gate that reads a range
     reads these, and a run with no base (a bare `loupe-gates` outside a
     handoff) exports only the head, so the gate can say what it fell back
     to rather than guess.
@@ -1882,31 +2217,101 @@ def run_gates(cfg: Config, target_sha: str,
 
     A gate declaring `attested_by = "ci"` is NOT executed here (2026-09-07,
     brief `ci-attested-gates`) unless this process is itself the CI runner
-    (`GITHUB_ACTIONS`) or the caller passes `execute_ci_gates`. Handoff's
-    ordering is push → gates, so the target commit is already on the remote
-    when this runs and the Actions API can be asked about that exact SHA;
-    CI's own per-gate RECEIPT for that SHA, not a second local execution and
-    not a run's conclusion, becomes the attestation (round-3 F2). See the
-    CI-attested section above for what that trades.
+    (`GITHUB_ACTIONS`) or the caller passes `execute_ci_gates`. CI's own
+    per-gate RECEIPT for the target SHA, not a second local execution and
+    not a run's conclusion, becomes the attestation (round-3 F2) — which
+    needs the SHA on the remote, so that half is awaited AFTER the push.
+
+    HAND-OFF ORDER, since 0.25.0 (public issue #2): commit → LOCAL gates →
+    push → CI-attested gates → emission. The two halves are one run: the
+    hand-off calls `run_local_gates` (this function with `local_only`) at
+    the commit, refuses before the push when the validator would refuse
+    the result (`gate_before_push`), and after the push calls this with
+    `prior`, which awaits the CI-attested half and merges both in manifest
+    order WITHOUT executing the local half again. `token` is the shared
+    retention token. Called with neither, this is the whole manifest in one
+    call, as `bin/loupe-gates` and every direct caller always had it.
     """
+    # Which gates this process executes, and which it waits for. INSIDE CI
+    # everything executes: the attestation has to be produced by somebody,
+    # and there the somebody is this run. `--execute-ci-gates` is the same
+    # escape hatch LOUPE_GATE_WORKERS=1 is — a way back to local execution
+    # that needs no code change.
+    ci_gates = ([] if os.environ.get(CI_ENV) or execute_ci_gates
+                else [g for g in cfg.gates
+                      if g.get("attested_by") == CI_ATTESTER])
+    ci_ids = {g["id"] for g in ci_gates}
+    local_gates = [g for g in cfg.gates if g["id"] not in ci_ids]
+    if prior is not None:
+        # The pre-run half must be THIS commit's and THIS manifest's local
+        # half, or the envelope would carry evidence about something else.
+        if prior.sha != target_sha:
+            raise RuntimeError(
+                f"the local gates were run at {prior.sha}, and the request "
+                f"binds {target_sha}: evidence about one commit cannot be "
+                f"carried by another's request")
+        if [r["id"] for r in prior.records] != [g["id"] for g in local_gates]:
+            raise RuntimeError(
+                f"the local gates run before the push "
+                f"({[r['id'] for r in prior.records]}) are not this "
+                f"manifest's local half ({[g['id'] for g in local_gates]})")
+        # And THIS range's (0.25.0 review round 1 F1): a range-sensitive
+        # gate attested the base it was told, so a request naming another
+        # base cannot carry it — the blocking gate would read as passed for
+        # a range it never checked. Compared as given: the hand-off hands
+        # both ends the one id `ensure_pushed` resolved before its commit.
+        if prior.base != base:
+            raise RuntimeError(
+                f"the local gates run before the push were told the review "
+                f"base {prior.base or '(none)'}, and the request names "
+                f"{base or '(none)'}: a gate's evidence about one range "
+                f"cannot be carried by a request about another")
+    order = local_gates if local_only else cfg.gates
+    wait = [] if local_only else ci_gates
+
     # Re-entrancy guard. A gate manifest that runs the test suite, whose
     # tests emit envelopes, would otherwise recurse forever — and it did on
     # first run. The guard is an inherited env var rather than a parameter
     # because the recursion crosses a process boundary, where a flag cannot
     # reach. A nested emission records the gates as not run rather than
-    # pretending they passed.
+    # pretending they passed. With `prior`, the half already recorded is
+    # kept exactly as recorded: it is the evidence the pre-push check judged.
     if os.environ.get(env_var("IN_GATE_RUN")):
-        return [{"id": g["id"], "blocking": g.get("blocking", False),
-                 "error": "not run: nested inside a gate execution"}
-                for g in cfg.gates]
+        nested = {g["id"]: {"id": g["id"],
+                            "blocking": g.get("blocking", False),
+                            "error": "not run: nested inside a gate execution"}
+                  for g in order}
+        if prior is not None:
+            nested.update({r["id"]: r for r in prior.records})
+        return [nested[g["id"]] for g in order]
+
+    ci_timeout = float(cfg.limits.get("ci_timeout", CI_TIMEOUT_DEFAULT_S)
+                       if isinstance(cfg.limits, dict) else
+                       CI_TIMEOUT_DEFAULT_S)
+    records: dict[str, dict] = {}
+    if prior is not None:
+        # The local half ran before the push and is not run again; only the
+        # CI-attested half is left, and it needs the pushed SHA.
+        records.update({r["id"]: r for r in prior.records})
+        if wait:
+            records.update(_await_ci(cfg, wait, target_sha, prior.run,
+                                     interval=ci_poll_interval,
+                                     timeout=ci_timeout))
+        return [records[g["id"]] for g in order]
 
     try:
-        executed_sha = _git(cfg.repo_root, "rev-parse", "HEAD")
-        porcelain = _git(cfg.repo_root, "status", "--porcelain")
+        executed_sha = _git(cfg.repo_root, "rev-parse", "HEAD",
+                            ceiling=git_ceiling(cfg))
+        porcelain = _git(cfg.repo_root, "status", "--porcelain",
+                         ceiling=git_ceiling(cfg))
+    except _git_timeout_class():
+        # A tree git did not describe in time is not "cannot identify": the
+        # typed refusal travels (0.25.0).
+        raise
     except RuntimeError as exc:
         return [{"id": g["id"], "blocking": g.get("blocking", False),
                  "error": f"not run: cannot identify the executed tree ({exc})"}
-                for g in cfg.gates]
+                for g in order]
 
     tree = "dirty" if porcelain else "clean"
     if executed_sha != target_sha:
@@ -1930,8 +2335,9 @@ def run_gates(cfg: Config, target_sha: str,
         env[env_var("GATE_BASE")] = base
     # One token for the whole manifest: the run is the unit of evidence, so
     # every gate of one run retains beside its siblings and a later run at
-    # the same commit lands somewhere else entirely.
-    run = run_token()
+    # the same commit lands somewhere else entirely. A hand-off's two halves
+    # are one run, and share the token its caller passes.
+    run = token or run_token()
 
     def run_one(gate: dict) -> dict:
         started = time.monotonic()
@@ -1987,31 +2393,16 @@ def run_gates(cfg: Config, target_sha: str,
     except ValueError:
         workers = 4
 
-    # Which gates this process executes, and which it waits for. INSIDE CI
-    # everything executes: the attestation has to be produced by somebody,
-    # and there the somebody is this run. `--execute-ci-gates` is the same
-    # escape hatch LOUPE_GATE_WORKERS=1 is — a way back to local execution
-    # that needs no code change.
-    ci_gates = ([] if os.environ.get(CI_ENV) or execute_ci_gates
-                else [g for g in cfg.gates
-                      if g.get("attested_by") == CI_ATTESTER])
-    ci_ids = {g["id"] for g in ci_gates}
-    local_gates = [g for g in cfg.gates if g["id"] not in ci_ids]
-    ci_timeout = float(cfg.limits.get("ci_timeout", CI_TIMEOUT_DEFAULT_S)
-                       if isinstance(cfg.limits, dict) else
-                       CI_TIMEOUT_DEFAULT_S)
-
     def wait_for_ci() -> dict:
-        return _await_ci(cfg, ci_gates, target_sha, run,
+        return _await_ci(cfg, wait, target_sha, run,
                          interval=ci_poll_interval, timeout=ci_timeout)
 
     workers = max(1, min(workers, len(local_gates) or 1))
-    records: dict[str, dict] = {}
     if workers == 1 or not local_gates:
         # The sequential path waits for CI FIRST: a poll that spends its
         # timeout is the long pole either way, and doing it up front keeps
         # the two halves in one obvious order for whoever is debugging.
-        if ci_gates:
+        if wait:
             records.update(wait_for_ci())
         for gate in local_gates:
             records[gate["id"]] = run_one(gate)
@@ -2020,15 +2411,16 @@ def run_gates(cfg: Config, target_sha: str,
         # before or after them: it is almost entirely sleep, and serialising
         # it would add the whole poll to a loop this change exists to
         # shorten. One extra worker, because it occupies a thread it never
-        # computes in.
+        # computes in. (A hand-off's CI half no longer rides here: it waits
+        # for the push, so it is awaited with `prior`, after it.)
         with concurrent.futures.ThreadPoolExecutor(
-                max_workers=workers + (1 if ci_gates else 0)) as pool:
-            waiting = pool.submit(wait_for_ci) if ci_gates else None
+                max_workers=workers + (1 if wait else 0)) as pool:
+            waiting = pool.submit(wait_for_ci) if wait else None
             for rec in pool.map(run_one, local_gates):
                 records[rec["id"]] = rec
             if waiting is not None:
                 records.update(waiting.result())
-    return [records[g["id"]] for g in cfg.gates]
+    return [records[g["id"]] for g in order]
 
 
 def _attestation_block(tag: str, attestations: list[dict]) -> str:
@@ -2585,7 +2977,7 @@ def check_enforcement(cfg: Config, git=None) -> None:
     if resolve_enforcement(cfg) != vocab.ENFORCEMENT_PR_APPROVAL:
         return
     repo = cfg.repo_root
-    run = git or (lambda *a: _git(repo, *a))
+    run = git or (lambda *a: _git(repo, *a, ceiling=git_ceiling(cfg)))
     try:
         branch = run("rev-parse", "--abbrev-ref", "HEAD")
     except RuntimeError:
@@ -2747,7 +3139,7 @@ def check_references(cfg: Config, references, git=None) -> None:
     to forbid. Only their PATH is constrained.
     """
     repo = cfg.repo_root
-    run = git or (lambda *a: _git(repo, *a))
+    run = git or (lambda *a: _git(repo, *a, ceiling=git_ceiling(cfg)))
     for i, ref in enumerate(references or []):
         raw = str(ref.get("path", ""))
         required = ref.get("required", True)
@@ -2939,7 +3331,8 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
                  author: str | None = None,
                  reviewer: str | None = None,
                  transport: str | None = None,
-                 debug: bool = False, *, lineage: str) -> str:
+                 debug: bool = False, *, lineage: str,
+                 local_gates: "LocalGates | None" = None) -> str:
     if not cfg.taxonomy_declared:
         raise RuntimeError(
             "no taxonomy declared for this repo: refusing to emit an envelope "
@@ -3008,6 +3401,18 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
                            "direction)")
 
     shape = diff_shape(repo, base, head)
+    # 0.25.0 (public issue #4): the claim's record-bound members. The CLI
+    # already refused what the ledger could refuse before anything was
+    # committed; this is the same function again, for the states the
+    # request renders. The gate ids are judged against the governing
+    # manifest `cfg` now is — the target's, which did not exist before the
+    # commit. The hand-off already judged them in its gate-before-push
+    # callback, before any gate ran or anything was pushed; this is the same
+    # function for a caller that reached `emit_request` directly.
+    record = (check_claim_record(claim, ledger, lineage, cfg)
+              if claim.get("carried_findings") or claim.get("attestation_map")
+              else None)
+    check_map_gates(claim, cfg, head)
     dirty = _git(repo, "status", "--porcelain")
     # Round-4 F8: the declared gate manifest reaches the metric here, not only
     # through the ledger API a test calls directly. Round-4 F5: so does the
@@ -3039,7 +3444,9 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
     changed = "\n".join(f"  {p}" for p in shown_paths)
     if generated_lines and not shown_paths:
         changed = "  (none — every changed path is generated by declaration)"
-    attestations = run_gates(cfg, head, base=base)
+    # `local_gates`: the half the hand-off ran before its push (0.25.0) —
+    # carried, never re-run; only the CI-attested half is awaited here.
+    attestations = run_gates(cfg, head, base=base, prior=local_gates)
     ev_cap = _attestation_block(cfg.wrapper_tag, attestations)
     ev_not = "\n".join(f"  - {x}" for x in claim.get("evidence_not_captured", []))
     stops = "\n".join(f"  - {x}" for x in claim.get("stop_conditions", []))
@@ -3080,6 +3487,12 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
         f"Target: {head}",
         _base_line(base, round_no, ledger),
         wire.executable_stamp("Diff", paths.diff_command(repo, base, head)),
+        # 0.25.0: the same diff limited to the paths the claim's
+        # scope_paths match, when it declares any — an executable stamp
+        # like the line above, or a line saying why none is given.
+        *([_scoped_stamp(lambda *specs: paths.diff_command(
+            repo, base, head, *specs), claim["scope_paths"], shape)]
+          if claim.get("scope_paths") else []),
         f"Tree:   {tree_state}",
         *render_preflight_lines(reachability or {}),
         *wire.render_push_lines(reachability),
@@ -3101,6 +3514,22 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
         "",
         changed,
         *generated_lines,
+        # 0.25.0 (public issue #4). Every block below is ADDITIVE: absent
+        # from the claim, it renders nothing, and the request reads exactly
+        # as a 0.24.x emitter wrote it. All of them sit in the Claim — the
+        # author's section — because each is the author's declaration; the
+        # machine values some of them quote are read from this envelope.
+        *(["", in_scope_line] if (in_scope_line := _in_scope_line(
+            shape, generated, claim.get("excluded_paths") or ())) else []),
+        *(_objectives_block(claim["objectives"], shape, generated,
+                            claim.get("excluded_paths") or ())
+          if claim.get("objectives") else []),
+        *(_carried_block(record, repo, base, head)
+          if claim.get("carried_findings") else []),
+        *(_attestation_map_block(record, attestations)
+          if claim.get("attestation_map") else []),
+        *(_observations_block(claim["observations"])
+          if claim.get("observations") else []),
         "",
         "Deliberately not done:",
         not_done or "  - (nothing declared)",
@@ -3151,6 +3580,8 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
           if claim.get("scope_paths") is not None
           else ["Scope paths: (none declared — the hand-off's sweep was not "
                 "held to a path list)", ""]),
+        *(_excluded_block(claim["excluded_paths"], shape)
+          if claim.get("excluded_paths") is not None else []),
         "## Stop conditions",
         "",
         stops or "  - (none)",
@@ -3403,7 +3834,615 @@ def validate_claim(value, path: Path) -> dict:
                     member=member)
             for i, ref in enumerate(item):
                 _check_reference(path, i, ref)
+        elif kind == "list_of_object":
+            _check_object_list(path, member, item)
     return value
+
+
+# ------------------------------------------ the claim's object-list members
+#
+# 0.25.0 (public issue #4, brief `take-objective-map`). A fourth member kind:
+# a list of objects, each member with its own closed field table in
+# `vocab.CLAIM_OBJECT_LIST_FIELDS`. Every defect is the same typed refusal as
+# every other claim defect, located by member path.
+
+#: The fingerprint grammar, derived from the minting function rather than
+#: restated: the version prefix and the digest length `fingerprint.compute`
+#: actually emits.
+def _fingerprint_re() -> "re.Pattern":
+    from .fingerprint import FP_VERSION, compute
+    width = len(compute("", "", "", "").split(":", 1)[1])
+    return re.compile(rf"{re.escape(FP_VERSION)}:[0-9a-f]{{{width}}}")
+
+
+_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+_GATE_ID_RE = re.compile(vocab.GATE_ID_RE)
+
+
+def _origin_parts(value: str):
+    """`(lineage, round)` for an origin in the `git:` round-reference body
+    grammar (`<lineage id>/<round>`, round >= 1), else None — the grammar is
+    `transport`'s, read rather than restated."""
+    from .transport import _ROUND_REFERENCE_RE
+    m = _ROUND_REFERENCE_RE.match(value)
+    if not m or int(m.group(2)) < 1:
+        return None
+    return m.group(1), int(m.group(2))
+
+
+_OBJECT_FIELD_WANT = {
+    "fingerprint": "a finding fingerprint as a verdict prints it "
+                   "(`fp2:` and 16 hex digits)",
+    "origin": "`<lineage id>/<round>`, the verdict the finding was ruled in "
+              "(round 1 or later)",
+    "carried_outcome": f"one of {', '.join(vocab.CARRIED_OUTCOMES)}",
+    "commits": "a 40-character lowercase commit id",
+    "gate_id": f"a gate id ({vocab.GATE_ID_RE}, at most "
+               f"{vocab.GATE_ID_MAX} characters)",
+}
+
+
+def _check_field_list(path: Path, where: str, value) -> None:
+    """A non-empty list of non-empty strings."""
+    if not isinstance(value, list):
+        raise ClaimDefective(
+            path, f"{where} must be a list of strings, not {_kind_of(value)}",
+            defect="type", member=where)
+    if not value:
+        raise ClaimDefective(
+            path, f"{where} is an empty list; it declares nothing — omit the "
+                  f"field instead", defect="empty", member=where)
+    for i, element in enumerate(value):
+        _check_string(path, f"{where}[{i}]", element, nonempty=True)
+
+
+def _check_object_field(path: Path, where: str, kind: str, value) -> None:
+    if kind in ("list_of_string", "scope_paths", "commits"):
+        _check_field_list(path, where, value)
+        if kind == "commits":
+            for i, sha in enumerate(value):
+                if not _COMMIT_RE.fullmatch(sha):
+                    raise ClaimDefective(
+                        path, f"{where}[{i}] is {sha!r}, which is not "
+                              f"{_OBJECT_FIELD_WANT[kind]}: an abbreviated "
+                              f"or symbolic name binds nothing a reviewer "
+                              f"can check", defect="shape",
+                        member=f"{where}[{i}]")
+        return
+    _check_string(path, where, value, nonempty=True)
+    ok = {"string": lambda v: True,
+          "fingerprint": lambda v: bool(_fingerprint_re().fullmatch(v)),
+          "origin": lambda v: _origin_parts(v) is not None,
+          "carried_outcome": lambda v: v in vocab.CARRIED_OUTCOMES,
+          "gate_id": lambda v: (bool(_GATE_ID_RE.fullmatch(v))
+                                and len(v) <= vocab.GATE_ID_MAX)}[kind]
+    if not ok(value):
+        raise ClaimDefective(
+            path, f"{where} is {value!r}, which is not "
+                  f"{_OBJECT_FIELD_WANT[kind]}", defect="shape", member=where)
+
+
+def _check_object_list(path: Path, member: str, item) -> None:
+    """One list-of-object member, closed on every axis: the container, its
+    emptiness, each element's kind, unknown fields, missing required ones,
+    and every field's type and grammar."""
+    table = vocab.CLAIM_OBJECT_LIST_FIELDS[member]
+    required = vocab.CLAIM_OBJECT_REQUIRED[member]
+    if not isinstance(item, list):
+        raise ClaimDefective(
+            path, f"member {member!r} must be a list of objects, not "
+                  f"{_kind_of(item)}", defect="type", member=member)
+    if not item:
+        raise ClaimDefective(
+            path, f"member {member!r} is an empty list; it declares nothing, "
+                  f"which is the absent state spelled differently — omit the "
+                  f"member instead", defect="empty", member=member)
+    seen_fps: dict[str, int] = {}
+    for i, element in enumerate(item):
+        where = f"{member}[{i}]"
+        if not isinstance(element, dict):
+            raise ClaimDefective(
+                path, f"{where} must be an object, not {_kind_of(element)}",
+                defect="type", member=where)
+        for field in element:
+            if field not in table:
+                raise ClaimDefective(
+                    path, f"{where} states unknown field {field!r}; an entry "
+                          f"of {member!r} carries "
+                          f"{', '.join(sorted(table))} and nothing else",
+                    defect="unknown", member=f"{where}.{field}")
+        for field in required:
+            if field not in element:
+                raise ClaimDefective(
+                    path, f"{where} states no {field!r}, which every entry of "
+                          f"{member!r} must carry", defect="missing",
+                    member=f"{where}.{field}")
+        for field, value in element.items():
+            _check_object_field(path, f"{where}.{field}", table[field], value)
+        # A carried fingerprint is the join key the attestation map resolves
+        # against; carried twice, it names two outcomes for one finding.
+        if member == "carried_findings":
+            fp = element["fingerprint"]
+            if fp in seen_fps:
+                raise ClaimDefective(
+                    path, f"{where}.fingerprint {fp!r} is already carried at "
+                          f"{member}[{seen_fps[fp]}]; one finding is carried "
+                          f"once, with one outcome", defect="duplicate",
+                    member=f"{where}.fingerprint")
+            seen_fps[fp] = i
+
+
+def _squash(text) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _origin_required(cfg: Config, ledger: Ledger, origin_lineage: str,
+                     origin_round: int, verdict_event: dict, ident: str):
+    """What the origin verdict required of the finding with identity
+    `ident`, read from the bytes THIS machine kept — or None when they are
+    not kept here or do not reproduce the recorded digest."""
+    from . import transport
+    carrier = (ledger.carrier_lineage_for_sha(verdict_event.get("sha"),
+                                              prefer=origin_lineage)
+               or origin_lineage)
+    _, text = transport.read_kept(cfg, origin_round, "verdict",
+                                  lineage=carrier,
+                                  digest=verdict_event.get("source_digest")
+                                  or "")
+    if text is None:
+        return None
+    for f in wire.parse_verdict(text).findings:
+        if ledger.resolve(f.fingerprint()) == ident:
+            return f.required_outcome
+    return None
+
+
+def check_map_gates(claim, cfg: Config, head: str) -> None:
+    """Refuse an `attestation_map` row naming a gate the GOVERNING manifest
+    does not declare — a map row can only point at an attestation the
+    request will carry.
+
+    One function, two callers (0.25.0): the hand-off's gate-before-push
+    callback, where it runs after the commit (the target's manifest exists
+    only then) and BEFORE any gate runs or anything is pushed; and
+    `emit_request`, for a direct caller that reached it another way."""
+    unknown_gates = sorted({row["gate"]
+                            for row in claim.get("attestation_map") or ()
+                            if row["gate"] not in cfg.gate_ids})
+    if unknown_gates:
+        from . import transport as _transport
+        raise _transport.Refusal(
+            f"the claim's attestation_map names gate(s) "
+            f"{', '.join(unknown_gates)} that the governing manifest at "
+            f"{head[:12]} does not declare "
+            f"({', '.join(cfg.gate_ids) or 'it declares none'}); a map row "
+            f"can only point at an attestation this request will carry. "
+            f"No gate was run and nothing was pushed or recorded",
+            "", remedy="a person corrects the claim's attestation_map to "
+                       "name declared gates, or declares the gate in "
+                       "review.toml, and re-runs the hand-off")
+
+
+def check_claim_record(claim, ledger: Ledger, lineage: str, cfg: Config,
+                       path: Path | None = None) -> dict:
+    """The claim's record-bound members judged against THIS machine's ledger
+    (0.25.0, public issue #4): refusals raise ClaimDefective, everything
+    else is returned as per-entry STATES the request renders.
+
+    Called twice, from one function so the two cannot disagree: by the CLI
+    BEFORE `ensure_pushed` commits anything — the earliest point both the
+    ledger and the lineage are known, which is where a refusal costs the
+    author nothing — and by `emit_request`, which renders the states.
+
+    Refused, because the ledger that could answer is in hand:
+      * a carried fingerprint absent from its origin verdict when that
+        verdict IS recorded in this ledger — the claim names a finding the
+        record says was never ruled there;
+      * an attestation-map fingerprint that resolves neither to a standing
+        disposition of this lineage's previous round nor to a carried
+        entry — a map row about no finding this request answers.
+    Stated, never refused, because this machine cannot know:
+      * an origin verdict this ledger does not hold — "not verifiable
+        here": the author may be on another machine than the round was;
+      * a `required` the author typed that differs from the kept origin
+        verdict's `Required outcome` — the verdict's own text is what the
+        request shows, and the difference is named beside it.
+    """
+    def refuse(where: str, detail: str):
+        raise ClaimDefective(path, f"{where} {detail}", defect="record",
+                             member=where)
+
+    if not claim.get("carried_findings") and not claim.get("attestation_map"):
+        # Nothing record-bound declared: no ledger read at all, so a claim
+        # without these members costs and risks exactly what it did before.
+        return {"carried": [], "answered": {}, "previous": None, "mapped": []}
+    carried = []
+    answered: dict[str, str] = {}
+    for i, entry in enumerate(claim.get("carried_findings") or ()):
+        where = f"carried_findings[{i}]"
+        fp, origin = entry["fingerprint"], entry["origin"]
+        origin_lineage, origin_round = _origin_parts(origin)
+        ident = ledger.resolve(fp)
+        verdicts = [e for e in ledger.current(origin_lineage)
+                    if e.get("event") == "verdict"
+                    and e.get("round") == origin_round]
+        state = {"index": i, "fingerprint": fp, "origin": origin,
+                 "outcome": entry["outcome"], "fix": list(entry.get("fix")
+                                                          or ()),
+                 "in_ledger": bool(verdicts), "typed": entry.get("required"),
+                 "required": entry.get("required"), "required_from": (
+                     "author" if entry.get("required") else None),
+                 "required_note": None}
+        if verdicts:
+            ruled = {ledger.resolve(e.get("fp", ""))
+                     for e in ledger.findings_in_round(origin_round,
+                                                       origin_lineage)}
+            if ident not in ruled:
+                refuse(f"{where}.fingerprint",
+                       f"is {fp!r}, and the origin verdict {origin} is "
+                       f"recorded in this ledger without that finding — "
+                       f"it rules {len(ruled)} finding(s), none with this "
+                       f"identity. Name a finding that verdict ruled, or the "
+                       f"verdict that ruled this one")
+            found = _origin_required(cfg, ledger, origin_lineage,
+                                     origin_round, verdicts[-1], ident)
+            if found is None:
+                state["required_note"] = (
+                    "the origin verdict is recorded here but its bytes are "
+                    "not kept on this machine, so `required` was not "
+                    "compared")
+            else:
+                if state["typed"] and _squash(state["typed"]) != _squash(
+                        found):
+                    state["required_note"] = (
+                        "the claim's `required` differs from the origin "
+                        "verdict's Required outcome, which is shown")
+                state["required"], state["required_from"] = found, "origin"
+        carried.append(state)
+        answered.setdefault(ident, f"carried from {origin}")
+
+    previous = next_round(ledger, lineage) - 1
+    if previous >= 1:
+        for d in ledger.standing_dispositions(lineage, round_no=previous):
+            answered.setdefault(
+                ledger.resolve(d.get("fp") or d.get("fingerprint") or ""),
+                f"round {previous} {d.get('finding_id', '?')} "
+                f"({d.get('disposition', '?')})")
+    mapped = []
+    for i, row in enumerate(claim.get("attestation_map") or ()):
+        ident = ledger.resolve(row["fingerprint"])
+        mapped.append({"fingerprint": row["fingerprint"], "ident": ident,
+                       "gate": row["gate"], "test": row.get("test"),
+                       "answers": answered.get(ident)})
+        if ident not in answered:
+            refuse(f"attestation_map[{i}].fingerprint",
+                   f"is {row['fingerprint']!r}, which resolves to no "
+                   f"standing disposition of round {previous} of this "
+                   f"lineage and to no carried_findings entry — a map row "
+                   f"must name a finding this request answers"
+                   if previous >= 1 else
+                   f"is {row['fingerprint']!r}, and this request opens its "
+                   f"lineage, so only a carried_findings entry can be "
+                   f"mapped — this one is not carried")
+    return {"carried": carried, "answered": answered, "previous": previous,
+            "mapped": mapped}
+
+
+#: The longest `Scoped:` command the envelope renders, in UTF-8 bytes.
+#: Linux caps ONE exec argument at 131,072 bytes (MAX_ARG_STRLEN) — what
+#: `sh -c '<line>'` hands the shell — and macOS caps a whole exec at 1 MiB.
+#: Half the smaller figure leaves room for the rest of an invocation. A
+#: longer command is WITHHELD with its reason, never truncated: a shortened
+#: path list is exactly the disagreement round-2 F3 closed.
+SCOPED_COMMAND_MAX = 65_536
+
+
+def _pathspecs(scope_paths, changed: list[str],
+               sources=()) -> tuple[list[str], list[str]]:
+    """(the changed paths `in_scope` matches, the git pathspecs that select
+    exactly those out of every path the span's tree walk visits) —
+    `changed` being the span's RAW post-image paths, the spellings every
+    other scope surface matches, and `sources` its renames' (and copies')
+    pre-image paths.
+
+    Round-2 F3 (0.25.0): this used to hand the claim's own patterns to git,
+    and git is a second matcher. Its wildmatch reads `[^a]` as a negation
+    where `fnmatchcase` reads a literal caret, reads `\\` as an escape and
+    `[[:digit:]]` as a class, and a pathspec without a wildcard also selects
+    everything BELOW it, so an exact entry naming a directory showed that
+    directory's contents where `in_scope` selects nothing. Now the one
+    matcher decides the set and git is only told its members, so the two
+    agree by construction.
+
+    Round-3 F1: agreeing on the set `in_scope` judges is not enough,
+    because git's tree walk does not judge that set. It runs BEFORE rename
+    detection and visits both ends of every rename, and a directory
+    pathspec selects the old end of a rename that left the directory — a
+    deletion `in_scope`, which judges post-image paths only, never chose.
+    So the pathspecs are computed against the WALKED set, `changed` plus
+    `sources`, and the rename treatment is stated once: in_scope judges a
+    rename by its target and never by its source, so the command selects
+    no source. A rename whose target is in scope therefore shows as a
+    whole-file addition of that target, wherever its source lies, and one
+    whose target is out of scope shows nothing, even when its source lies
+    under a matched prefix. The command's paths are exactly the matched
+    set; git's rename detection then runs among those paths only, so it
+    can pair two of them but never name a path outside them.
+
+      - every pathspec is `:(literal)`: no pattern reaches git at all;
+      - a `dir/` entry that matches a changed path is emitted as itself
+        (a file named `dir` is not selected by it; measured), and every
+        walked path below `dir/` that is not matched — a rename source,
+        since every changed path there IS matched — is excluded by name
+        with `:(exclude,literal)`, so a prefix stays one word plus one per
+        source instead of one word per file;
+      - an exclusion `:(exclude,literal)q` also drops everything below
+        `q/`, and that can hold a matched path: a source file `dir/x`
+        renamed away while `dir/x/child` is added. A prefix whose
+        exclusions would drop a matched path is NOT compressed, and its
+        matched paths are emitted by name instead — a literal
+        `dir/x/child` does not select the file `dir/x` (measured);
+      - every other matched path is emitted as itself;
+      - git also selects, for a literal `p`, every walked path below `p/`,
+        which exists only when `p` is a file at one end of the span and a
+        directory at the other. Each such path `in_scope` does not match —
+        a changed path, or a source a rename took out of that directory —
+        is excluded by name. That cannot drop a matched path: a walked
+        path below a file `p` exists only at the end where `p` is a
+        directory, and is a file there, so nothing lies below it.
+
+    An empty match returns no pathspec, and the caller must then render no
+    command: `git diff A...B --` naming nothing is the WHOLE span."""
+    changed = list(dict.fromkeys(changed))
+    matched = [p for p in changed if in_scope(p, scope_paths)]
+    if not matched:
+        return [], []
+    chosen = set(matched)
+    walked = list(dict.fromkeys([*changed, *sources]))
+
+    def keeps_chosen(q: str) -> bool:
+        return not any(c == q or c.startswith(q + "/") for c in chosen)
+
+    prefixes, covered = [], set()
+    for entry in dict.fromkeys(scope_paths):
+        if entry.endswith("/"):
+            below = [p for p in matched if p.startswith(entry)]
+            if below and all(keeps_chosen(q) for q in walked
+                             if q.startswith(entry) and q not in chosen):
+                prefixes.append(entry)
+                covered.update(below)
+    files = [p for p in matched if p not in covered]
+    specs = ([f":(literal){e}" for e in prefixes]
+             + [f":(literal){p}" for p in files])
+    specs += [f":(exclude,literal){q}" for q in walked if q not in chosen
+              and (any(q.startswith(e) for e in prefixes)
+                   or any(q.startswith(p + "/") for p in files))]
+    return matched, specs
+
+
+def _scoped_stamp(render, scope_paths, shape: dict) -> str:
+    """The envelope's `Scoped:` line: the span's diff limited to what the
+    claim's `scope_paths` match, as a command — or, when no command can say
+    exactly that, a line that says why and runs nothing. `render(*specs)` is
+    the caller's `paths.diff_command` over the span, so the one declared
+    diff renderer stays at its one declared call site."""
+    label = f"{'Scoped:':<8}"
+    entries = shape.get("entries") or []
+    if shape.get("file_list") and not entries:
+        # `_numstat_entries` could not pair the raw spellings with the
+        # rows: the paths git would need are unknown, and a display
+        # spelling (C-quoted, or a composite rename) names no file.
+        return (f"{label}withheld — the span's raw paths could not be "
+                f"read, so no command can name the in-scope paths exactly")
+    matched, specs = _pathspecs(
+        scope_paths, [e["target_path"] for e in entries],
+        [e["source_path"] for e in entries if e.get("source_path")])
+    if not specs:
+        return (f"{label}none — no changed path in the span matches the "
+                f"claim's scope_paths (a diff naming no path would show "
+                f"the whole span, so no command is given)")
+    cmd = render(*specs)
+    size = len(str(cmd).encode("utf-8"))
+    if size > SCOPED_COMMAND_MAX:
+        return (f"{label}withheld — the claim's scope_paths match "
+                f"{len(matched)} changed paths, and the command selecting "
+                f"exactly them is {size} bytes, over the "
+                f"{SCOPED_COMMAND_MAX}-byte bound for one command line; the "
+                f"Diff line above is the whole span")
+    return wire.executable_stamp("Scoped", cmd)
+
+
+def _span_rows(shape: dict) -> list[dict]:
+    """Per changed path: the display spelling, the raw post-image spelling
+    the matchers read, and its two counts (None for binary)."""
+    entries = shape.get("entries") or []
+    if entries:
+        return [{"path": e["path"], "raw": e["target_path"],
+                 "insertions": e["insertions"], "deletions": e["deletions"]}
+                for e in entries]
+    return [{"path": p, "raw": p, "insertions": None, "deletions": None}
+            for p in shape.get("file_list", [])]
+
+
+def _in_scope_line(shape: dict, generated: set, excluded) -> str | None:
+    """`In scope: N files, I insertions, D deletions (...)` — the span less
+    the paths generated by declaration and those `excluded_paths` matches —
+    or None when nothing is subtracted, so a round that declares and marks
+    nothing renders exactly as before."""
+    rows = _span_rows(shape)
+    gen = [r for r in rows if r["raw"] in generated]
+    excl = [r for r in rows if r["raw"] not in generated
+            and excluded and in_scope(r["raw"], excluded)]
+    if not gen and not excl:
+        return None
+    kept = [r for r in rows if r["raw"] not in generated
+            and not (excluded and in_scope(r["raw"], excluded))]
+    ins = sum(r["insertions"] or 0 for r in kept)
+    dels = sum(r["deletions"] or 0 for r in kept)
+    return (f"In scope: {len(kept)} files, {ins} insertions, {dels} "
+            f"deletions (machine-computed: the span less {len(gen)} path(s) "
+            f"generated by declaration and {len(excl)} matched by "
+            f"excluded_paths)")
+
+
+def _cell(value) -> str:
+    return " ".join(str(value).split()).replace("|", "\\|")
+
+
+def _notice_line(label: str, items: list[str]) -> str:
+    return f"Notice — {label} ({len(items)}): " + ", ".join(items)
+
+
+def _objectives_block(objectives, shape: dict, generated: set,
+                      excluded) -> list[str]:
+    rows = _span_rows(shape)
+    scoped = [r for r in rows if r["raw"] not in generated
+              and not (excluded and in_scope(r["raw"], excluded))]
+    out = ["", "Objectives — the author's map; the changed files are "
+               "computed by the tool from the span, matching each "
+               "objective's paths (exact path, `dir/` prefix or glob):", "",
+           "| objective | declared paths | changed files it maps | tests | "
+           "references |", "|---|---|---|---|---|"]
+    unmatched = []
+    for obj in objectives:
+        hits = [r["path"] for r in rows if in_scope(r["raw"], obj["paths"])]
+        for p in obj["paths"]:
+            if not any(in_scope(r["raw"], [p]) for r in rows):
+                unmatched.append(f"`{p}` ({obj['title']})")
+        out.append("| " + " | ".join(_cell(c) for c in (
+            obj["title"], ", ".join(f"`{p}`" for p in obj["paths"]),
+            ", ".join(hits) or "(none)",
+            ", ".join(obj.get("tests") or ()) or "-",
+            ", ".join(obj.get("references") or ()) or "-")) + " |")
+    unmapped = [r["path"] for r in scoped
+                if not any(in_scope(r["raw"], o["paths"]) for o in objectives)]
+    notices = []
+    if unmapped:
+        notices.append(_notice_line(
+            "changed file(s) in scope that no objective maps", unmapped))
+    if unmatched:
+        notices.append(_notice_line(
+            "objective path(s) that match no changed file", unmatched))
+    return out + ([""] + notices if notices else [])
+
+
+def _fix_in_span(repo: Path, sha: str, base: str, head: str) -> bool:
+    """Whether commit `sha` is in `base..head`: an ancestor of the head and
+    not of the base — the emitter's own ancestry door, replacement off. A
+    SHA this clone does not hold is an ancestor of nothing, so it is in no
+    span here."""
+    return (_is_ancestor(repo, sha, head)
+            and not _is_ancestor(repo, sha, base))
+
+
+def _carried_block(record: dict, repo: Path, base: str,
+                   head: str) -> list[str]:
+    out = ["", "Carried findings — findings of earlier verdicts this request "
+               "answers, as the author declares them; each is checked against "
+               "this machine's ledger:", ""]
+    unverifiable, differs, outside = [], [], []
+    for c in record["carried"]:
+        fixes = []
+        for sha in c["fix"]:
+            inside = _fix_in_span(repo, sha, base, head)
+            fixes.append(f"`{sha[:12]}`"
+                         + ("" if inside else " (NOT in this review's span)"))
+            if not inside:
+                outside.append(f"`{sha[:12]}` ({c['fingerprint']})")
+        line = (f"- `{c['fingerprint']}` · origin {c['origin']} · "
+                f"**{c['outcome']}**"
+                + (f" — fix: {', '.join(fixes)}" if fixes else ""))
+        out.append(line)
+        if not c["in_ledger"]:
+            unverifiable.append(f"`{c['fingerprint']}` ({c['origin']})")
+            out.append("  - origin verdict not in this ledger — not "
+                       "verifiable here")
+        if c["required"]:
+            source = ("the origin verdict, kept on this machine"
+                      if c["required_from"] == "origin"
+                      else "typed by the author")
+            out.append(f"  - required ({source}): {_squash(c['required'])}")
+        if c["required_note"]:
+            out.append(f"  - {c['required_note']}")
+            if "differs" in c["required_note"]:
+                differs.append(f"`{c['fingerprint']}`")
+    notices = []
+    if unverifiable:
+        notices.append(_notice_line(
+            "carried finding(s) whose origin verdict is not in this ledger, "
+            "so not verifiable here", unverifiable))
+    if differs:
+        notices.append(_notice_line(
+            "carried finding(s) whose `required` differs from the origin "
+            "verdict's", differs))
+    if outside:
+        notices.append(_notice_line(
+            "fix commit(s) outside this review's span", outside))
+    return out + ([""] + notices if notices else [])
+
+
+def _attestation_map_block(record: dict,
+                           attestations: list[dict]) -> list[str]:
+    by_gate = {a.get("id"): a for a in attestations if isinstance(a, dict)}
+    out = ["", "Finding-to-attestation map — the author maps each finding to "
+               "a gate; the command, result and binding are read from this "
+               "request's own attestation block, never typed:", "",
+           "| finding | answers | gate | test | command | result | binding |",
+           "|---|---|---|---|---|---|---|"]
+    weak = []
+    for row in record["mapped"]:
+        rec = by_gate.get(row["gate"], {})
+        if "error" in rec:
+            result = f"NOT RUN: {rec.get('error')}"
+        else:
+            result = (f"exit {rec.get('exit_code')}" if "exit_code" in rec
+                      else "-")
+        if rec.get("exit_code") != 0 or rec.get("binding") != "bound":
+            weak.append(f"`{row['fingerprint']}` → {row['gate']}")
+        out.append("| " + " | ".join(_cell(c) for c in (
+            f"`{row['fingerprint']}`", row["answers"] or "-",
+            row["gate"], row["test"] or "-",
+            rec.get("command", "-"), result,
+            rec.get("binding", "-"))) + " |")
+    mapped = {row["ident"] for row in record["mapped"]}
+    uncovered = [f"`{ident}` ({what})"
+                 for ident, what in record["answered"].items()
+                 if ident not in mapped]
+    notices = []
+    if weak:
+        notices.append(_notice_line(
+            "mapped gate(s) whose attestation did not pass or is not bound",
+            weak))
+    if uncovered:
+        notices.append(_notice_line(
+            "finding(s) this request answers that no map row covers — "
+            "rerun these", uncovered))
+    return out + ([""] + notices if notices else [])
+
+
+def _observations_block(observations) -> list[str]:
+    out = ["", "Author-typed observations — typed by the author, NOT this "
+               "hand-off's attestations; this tool ran and checked none of "
+               "them:", ""]
+    for o in observations:
+        out.append(f"- `{_squash(o['command'])}` → {_squash(o['result'])} "
+                   f"— context: {_squash(o['context'])}")
+    return out
+
+
+def _excluded_block(excluded, shape: dict) -> list[str]:
+    rows = _span_rows(shape)
+    if not excluded:
+        return ["Excluded paths: (declared empty — nothing excluded)", ""]
+    out = ["Excluded paths — declared out of this review's scope (exact "
+           "path, `dir/` prefix or glob), subtracted from the in-scope "
+           "counts:"]
+    for entry in excluded:
+        n = sum(1 for r in rows if in_scope(r["raw"], [entry]))
+        out.append(f"  - `{entry}` ("
+                   + (f"matches {n} span path(s)" if n
+                      else "matches no span path") + ")")
+    return out + [""]
 
 
 def parse_claim(text: str, path: Path) -> dict:

@@ -69,8 +69,9 @@ $ uv tool install 'git+<repo>@<commit>'
 
 `uvx` re-resolves on every invocation, so it tracks exactly what the
 `@<commit>` names and nothing else; `uv tool install` puts `loupe` on
-PATH until you install over it. Neither packages `adapters/` — step 4
-says what that costs and how to answer it.
+PATH until you install over it. Neither packages an `adapters/`
+directory, and from 0.25.0 neither needs one: step 4 takes the adapters
+from the installed package itself.
 
 **Pin the peeled commit, never an unpublished ref.** A tag that exists
 only on the machine that made it, a branch tip, a local ref: none of
@@ -92,15 +93,19 @@ check which before pinning anything.
 
 ## 1. Read the CHANGELOG between your pin and the target
 
+`CHANGELOG.md` is a file of the published repository, and reading it
+needs nothing on this machine but network access to that repository —
+the repository's own web page, or a throwaway shallow copy that nothing
+after this step depends on:
+
 ```console
-$ git show <target-commit>:CHANGELOG.md
+$ tmp="$(mktemp -d)" && git clone --quiet --depth 1 --branch <target-tag> <repo> "$tmp"
+$ cat "$tmp/CHANGELOG.md" && rm -rf "$tmp"
 ```
 
-or, in a clone you already have:
-
-```console
-$ git -C <clone> log --oneline <current-commit>..<target-commit> -- CHANGELOG.md
-```
+Under form A the pinned clone holds it once fetched —
+`git -C "$loupe_dir" show <target-commit>:CHANGELOG.md` — but no step of
+this page requires that clone to exist.
 
 Three things to name per version, not one: a configuration **key** it
 adds; a **marker** the reader newly honours somewhere in your tree; and a
@@ -123,10 +128,10 @@ falsify a sentence you wrote and nothing will tell you. Two measured
 instances from a repository crossing eleven versions: 0.16.0 re-keyed
 retained gate output to `gate-output/<sha>/<run>/`, which falsified a
 path written into that repository's own configuration comments; and
-0.18.0 began exporting `LOUPE_GATE_HEAD` and `LOUPE_GATE_BASE` to every
-gate, which falsified the stated reason a gate had been removed — the
-reason was that a gate could not know the review range, and by then it
-could.
+0.18.0 began exporting `LOUPE_GATE_HEAD` and `LOUPE_GATE_BASE` to the
+gates a hand-off runs, which falsified the stated reason a gate had been
+removed — the reason was that a gate could not know the review range, and
+by then it could.
 
 **Check:** you can name, per version crossed, which of the three kinds it
 is (or that it is none), and every sentence your own tree asserts about
@@ -333,13 +338,26 @@ $ loupe render-adapters --install
 $ loupe render-adapters --check-install
 ```
 
+**Nothing in this step needs a clone, a checkout beside the install, or a
+second machine.** From 0.25.0, `--install` and `--check-install` take the
+adapters from the installed package's own rendering — the Claude skill,
+the Codex skill and the instruction block are text the running `loupe`
+renders, not files it looks for beside itself — so a machine holding
+only the adopting repository and the pin installs and verifies them the
+same way under form A and form B. Each row names its source as `rendered
+by loupe <version> at <package path>`. (Through 0.24.x both commands read
+an `adapters/` directory beside the installed package, which a wheel
+install never has, and refused without `--dir`; that dependency is gone.
+`--dir <path>` still reads rendered files from a directory when that is
+exactly what you want.)
+
 **In most repositories there is nothing here to regenerate in the tree,
 and that is the normal case.** The adapters are installed
-machine-globally — `~/.claude/skills/loupe/`, `~/.codex/skills/loupe/` —
+machine-globally — `~/.claude/skills/loupe/`, `~/.agents/skills/loupe/` —
 and the repository holds no rendered copy of them. For such a repository
-this step is entirely the three commands above, run on each machine, and
-the working tree does not change at all: do not go hunting for files that
-do not exist. Tell which kind you are before you look:
+this step is entirely the commands above, run on each machine, and the
+working tree does not change at all: do not go hunting for files that do
+not exist. Tell which kind you are before you look:
 
 ```console
 $ git grep -n -e 'BEGIN GENERATED: loupe adapter' -e 'END GENERATED: loupe adapter'
@@ -370,6 +388,25 @@ instruction block pasted into a tracked file, a vendored skill — and
 that copy is now the stale one: regenerate it from the new install and
 commit it, in the same commit discipline as step 2.
 
+**The Codex skill moves in 0.25.0.** `--install` now writes it to
+`~/.agents/skills/loupe/SKILL.md`, the user-scope path OpenAI's skills
+documentation names (retrieved 2026-09-21); 0.24.x and earlier wrote
+`~/.codex/skills/loupe/SKILL.md`, a path observed to work and never
+documented. Observed separately, the same day: Codex lists skills from
+both `$CODEX_HOME/skills` and `~/.agents/skills`, and lists one name
+twice when both hold it. So `--install` moves the old copy out of
+discovery — `~/.codex/skills/loupe/`, and `$CODEX_HOME/skills/loupe/`
+when `CODEX_HOME` points elsewhere — keeping its bytes first under the
+state directory's `replaced-adapters/`, exactly where a replaced skill's
+bytes go, and removing only loupe's own directory. A legacy directory
+holding anything besides `SKILL.md` refuses the install with nothing
+written, for a person to sort out; `--check-install` reports a legacy
+copy still present as `legacy_present`. On a machine still running
+0.24.x, `--check-install` looks in the old place and reports the Codex
+skill `absent` once 0.25.0 has moved it: that is the version skew this
+step exists to end, not a broken install — reinstall that machine at the
+pin rather than restoring the old path.
+
 **The one-glance staleness check, before any of that.** The rendered
 block names the version it came from — `Tool version X` in the
 instruction block, `at tool version X` in a skill — so the embedded copy
@@ -381,54 +418,65 @@ $ loupe --version
 ```
 
 Two different numbers is the answer. The same number is not proof: a
-re-render at the same version can still differ, which is what the diff
+re-render at the same version can still differ, which is what the check
 below is for.
 
 ### Regenerating an embedded block
 
-The tool renders into a directory; it has no verb that rewrites a region
-inside one of your files, and none that checks one. So render beside your
-tree and replace the region between the markers yourself — everything
-from the `BEGIN GENERATED` line through the `END GENERATED` line,
-inclusive, and nothing outside it:
+The tool checks, and rewrites, the region itself — everything from the
+line beginning `<!-- BEGIN GENERATED: loupe adapter` through the
+`<!-- END GENERATED: loupe adapter -->` line, inclusive, and nothing
+outside it:
 
 ```console
-$ tmp="$(mktemp -d)"
-$ loupe render-adapters --dir "$tmp"
-$ sed -n '/BEGIN GENERATED: loupe adapter/,/END GENERATED: loupe adapter/p' AGENTS.md > "$tmp/embedded.md"
-$ diff -u "$tmp/embedded.md" "$tmp/instructions-block.md"
+$ loupe render-adapters --check-embedded AGENTS.md
+$ loupe render-adapters --write-embedded AGENTS.md
 ```
 
-`render-adapters --dir` writes all three kinds there —
-`instructions-block.md`, `claude/SKILL.md`, `codex/SKILL.md` — from the
-installation it is run from, so run it on a machine already reinstalled
-at the pin. The `diff` is the check: **no output is the proof the
-embedded region equals the current rendering**, and any output is the
-patch you have not applied yet. Run the same pair against `CLAUDE.md`,
-and against each vendored skill with its own rendered file, one per
-embedded copy. `render-adapters --check` does not cover any of this: it
-compares whole rendered files under a directory, and an embedded region
-is not one of them.
+`--check-embedded` compares the region with the block this installation
+renders, so run it on a machine already reinstalled at the pin: **exit 0
+is the proof the embedded region equals the current rendering.** A stale
+region exits 1 naming `--write-embedded` as the next command, which
+replaces exactly the region's bytes and writes every byte outside it back
+unchanged. A file the check cannot judge is refused by name, and the
+write refuses it too, with nothing written: no markers
+(`missing_markers`), a BEGIN never closed or an END with no BEGIN
+(`unbalanced_begin`, `unbalanced_end`), the two in the wrong order
+(`end_before_begin`), a second region (`duplicated`), a BEGIN inside a
+region (`nested`), carriage returns inside the region (`crlf`), a file
+that is not UTF-8 (`not_utf8`). Markers are lines beginning at column 0
+and no Markdown is parsed, so a marker line quoted at column 0 in a
+fenced example counts as one — indent the example. A symlinked file
+(`CLAUDE.md -> AGENTS.md`) is followed to its target for reading and
+writing, and the result says so: check each real file once.
+
+A vendored skill is a whole rendered file, not a region. Render beside
+it into a scratch directory and compare:
+
+```console
+$ tmp="$(mktemp -d)" && loupe render-adapters --dir "$tmp"
+$ diff -u <your vendored SKILL.md> "$tmp/claude/SKILL.md"
+```
+
+(`codex/SKILL.md` for a vendored Codex skill.) No output is the proof;
+any output is the patch you have not applied yet.
 
 **Check:** `loupe --version` prints the target on every machine, and
-`--check-install` exits 0 on every machine. Under form B the packaged
-wheel carries no `adapters/` sibling, so `--check-install` refuses with a
-remedy naming `--dir`: point it at rendered adapters from a clone of the
-same pinned commit, or keep a clone for this purpose. A refusal here is
-the install shape telling you the truth, not a failure to work around.
-Where you do track a rendered copy, the check is that regenerating it
-leaves no diff.
+`--check-install` exits 0 on every machine — under either install form,
+with no `--dir` and nothing beside the package. Where you embed the
+block, `--check-embedded` exits 0 for every file that carries it; where
+you vendor a skill, the `diff` is empty.
 
 **Skipped — and this is the step the page exists to name.** Two measured
 consequences, neither of which announces itself:
 
 - **The adapters regenerate from whatever is installed, never from the
-  pin.** `render-adapters --install` reads the package it is run from. So
-  a machine still carrying the old install writes the old adapter text,
-  and one repository ends up governed by two different agent
-  instructions depending on whose machine the session runs on. Nothing
-  compares them across machines; `--check-install` only compares one
-  machine against its own install.
+  pin.** `render-adapters --install` renders from the package it is run
+  from. So a machine still carrying the old install writes the old
+  adapter text, and one repository ends up governed by two different
+  agent instructions depending on whose machine the session runs on.
+  Nothing compares them across machines; `--check-install` only compares
+  one machine against its own install.
 - **A cloud environment is rebuilt by the provisioner; a person's
   machine is not.** The environment that is created fresh for every
   session picks up step 2's new pin on its next build, with no further
@@ -486,7 +534,7 @@ one machine behind reintroduces it on that machine alone.
 ## 6. Re-run onboarding §8 with the new adapter text, and put the relay choice to the operator
 
 ```console
-$ grep -n 'agent-relayed window' ~/.claude/skills/loupe/SKILL.md ~/.codex/skills/loupe/SKILL.md
+$ grep -n 'agent-relayed window' ~/.claude/skills/loupe/SKILL.md ~/.agents/skills/loupe/SKILL.md
 ```
 
 Onboarding §8 makes the repository's agent instruction files true. Run
@@ -631,6 +679,7 @@ substitute.
 | 0.20.0 | Two kinds of note. The `lineage` attribute on the request wrapper needs no coordination — an older reader tolerates it, an older envelope carries none, nothing migrates and no command rewrites older rows. But `attested_by = "ci"` on a gate row and `[limits] ci_timeout` are new keys, unreadable to earlier installations, which refuse naming the version skew; adopt them once both sides of your loop parse them. | Declaring a CI-attested gate before the other side can read it makes the target refuse on the reviewer's machine, which is the wrong end of the round to discover it. Raise `[tool] requires` with the keys, not after them. |
 | 0.22.0 | The hand-off preflight runs ahead of the commit. `scope_paths` is a new optional claim member — an exact path, a directory prefix ending in `/`, or a glob; `[]` is a declaration that this round sweeps nothing, and a claim that omits it sweeps as before. A swept file carrying the marker line `loupe-fixture:` followed by `corrupt-by-design` is refused outright, with no flag that overrides it. Two header lines, `Swept:` and `Env:`, which older readers ignore; `Env:` also reports whether the process ran as root, which is worth having where tests behave differently under root in a container. An interpreter below the floor now gets a sentence instead of a stack trace. **The one crossing in this span that asks your own tree to change — see step 3a.** | A repository whose suite writes fixtures into its real tree owes either that marker in the fixtures or a declared `scope_paths` on the claim. Owing neither, a hand-off run after an interrupted suite publishes a corrupt-by-design fixture under the author's envelope. |
 | 0.23.0 | Reporting and reading only; nothing a round binds changes. A `reclassified` closure may carry a `Residue:` continuation line naming the findings its narrowed claim went into, so convergence follows the thread instead of reading it as new. Generated paths get their own heading in the request's span — opt in by marking them `linguist-generated` in `.gitattributes` and committing it; a repository that marks nothing gets the span it always got, byte for byte. Upgraders: nothing to do, and no reader floor has to move. | Little, directly — a verdict carrying `Residue:` validates on 0.22.0 and on 0.16.0. The one exception: `import-legacy`'s closed event grammar on an older installation refuses a ledger row carrying the `residue` member. |
+| 0.25.0 | Three things move. Re-run `render-adapters --install` on every machine: the Codex skill moves to the documented `~/.agents/skills/loupe/`, and the install keeps a legacy `~/.codex/skills/loupe/` copy and moves it out of discovery. With no `--dir`, `--install` and `--check-install` render from the installed package, so no install form needs anything beside it. `[limits] git_timeout` is a new key: declare it only after every machine that authors or reviews the repository runs 0.25.0, and raise `[tool] requires` to 0.25.0 in the same commit. Five claim members are new: `carried_findings`, `objectives`, `observations`, `attestation_map` and `excluded_paths`. The hand-off now gates before it pushes. A red blocking gate refuses with the local commit named, for the author to amend. | A machine left at 0.24.x reads the Codex skill from the old path, and reports the migrated copy `absent`. A machine holding both paths lists the skill to Codex twice until a 0.25.0 `--install` runs. An older reader refuses a `review.toml` that declares `git_timeout`. An author at 0.24.x refuses a claim carrying any of the new members, while a reviewer at 0.24.x still takes the request. |
 
 ## What this page does not do
 

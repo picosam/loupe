@@ -5,6 +5,226 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.25.0
+
+**For upgraders — read before crossing this version.** Three things move.
+
+1. **Re-run `loupe render-adapters --install` on every machine** whose agents
+   load the skills. The Codex skill moves to the path OpenAI documents,
+   `~/.agents/skills/loupe/SKILL.md`. The install keeps any legacy
+   `~/.codex/skills/loupe/` copy, then moves it out of Codex's discovery.
+   Until it runs, a machine holding both lists the skill to Codex twice.
+2. **`[limits] git_timeout` is a new key.** Declare it only after every
+   machine that authors or reviews the repository runs 0.25.0, and raise
+   `[tool] requires` to `0.25.0` in the same commit: an older installation
+   refuses a configuration that declares it.
+3. **The claim gains five members.** An author on 0.24.x refuses a claim
+   file carrying any of them as an unknown member. A reviewer on 0.24.x
+   still takes the request (measured below).
+
+What does NOT move: no wrapper attribute, no required request section, no
+attestation field, no verdict grammar. A 0.24.1 reader validates, briefs and
+takes a 0.25.0 request carrying every new claim member, measured with the
+published 0.24.1: `validate` reports no items, `brief` and `take` succeed.
+Two cases break that. If the target commit's `review.toml` declares
+`git_timeout`, the 0.24.x reader refuses the unknown key. If it raises
+`[tool] requires` to 0.25.0, that floor refuses the older reader by name.
+As at every version bump, the `tool` digest on a request's wrapper
+differs from a 0.24.x reader's own, and the reader reports that as
+`differs`, never as a refusal.
+
+**A configurable git ceiling, and a typed refusal on any git timeout.**
+Every git door hardcoded 120 seconds. `commit -a` and `push` run the
+repository's own hooks, and git runs `pre-push` even when there is nothing
+to send. One adopting repository's `pre-push` gate took 133 s, so every
+push the tool made there died of a raw `subprocess.TimeoutExpired`: a
+traceback at `respond --out`'s envelope push, a generic failure elsewhere.
+
+- `[limits] git_timeout` takes whole seconds, at least 1, default 120.
+  That is the old number, so a configuration that declares nothing
+  behaves exactly as before.
+- One reader, `config.git_timeout`, feeds every git door that holds a
+  configuration: the hand-off's commit, push and observation, the envelope
+  carrier's push and fetch, the reviewer's fetch, and the authority,
+  reference, enforcement and waiver reads. A door with no configuration
+  keeps its built-in and says so.
+- A timeout at ANY git door is now a blocked refusal (exit 1, `next:
+  null`). It names the command as it ran, the ceiling and where it came
+  from, and what the verb had already done: the local commit it made, a
+  push it could not confirm, an envelope it kept.
+- The remedy is a person's decision: raise the key, or make the hook or
+  remote faster. The tool never skips a repository's hooks. A commit
+  stopped inside its hooks leaves git's `index.lock` behind; the refusal
+  names it and does not remove it.
+- The cost, stated: a ceiling raised for a slow hook is also raised for an
+  unreachable remote.
+
+**Gate before push (issue #2).** `handoff` and `emit-request` used to
+commit, push, and then run the gates, so a red blocking gate refused an
+emission whose commit was already on the remote. The order is now:
+
+1. commit, with the same preflight;
+2. run the LOCAL gates at that commit;
+3. refuse if the request validator would refuse them;
+4. push and observe the remote ref;
+5. await the CI-attested gates on the pushed commit (CI can judge only a
+   pushed commit);
+6. emit.
+
+The gates still run once per hand-off, and the refusal in step 3 uses the
+validator's own rule, so it and the post-emission validation cannot
+disagree. A red blocking gate stops the hand-off with nothing pushed,
+emitted or recorded. The refusal names the local commit (or says no
+commit was made) and every failed gate, with the validator's items and
+each gate's retained output. The tool does not undo its commit; the
+author amends or resets it.
+
+- An advisory gate's red stops nothing. `--local-only` gates before it
+  emits. A warm re-run is unchanged.
+- An attestation always binds to a commit, as it did.
+- Cost: the CI-attested wait no longer overlaps the local gates.
+- Result shape: a red gate is a blocked refusal before the push
+  (`error`, `remedy`, `items`, `sha`, `gate_output`) instead of the
+  post-push validation's item list.
+- One review base, for the gates the hand-off runs locally. A symbolic or
+  relative `--base` (`HEAD`, `HEAD~1`, the branch, its remote-tracking
+  ref, a tag) is resolved once, before the hand-off commits outstanding
+  work. That one commit id is what every local gate is told, what `Base:`
+  stamps, and what the shape and the post-emission validation measure.
+  Anything that is not exactly one commit (a range, a tree, an absent
+  name) refuses before anything is committed. A CI-attested gate is
+  outside this guarantee: CI runs it with no review base, and the hand-off
+  takes CI's receipt, so that evidence binds the target commit but does
+  not prove the review base. A range-sensitive gate (one that reads
+  `LOUPE_GATE_BASE`) must run locally, not `attested_by = "ci"`, to get
+  it. That limit is not new in 0.25.0; only the promise is.
+
+**The verdict précis counts blocking findings by the target's taxonomy.**
+`validate`, `close` and `brief` took the blocking set from the built-in
+literals `Blocker` and `High`, compared case-sensitively. A repository
+declaring lowercase severities read "7 findings, of which 0 block" over a
+blocking `high` finding. They now read `review.toml` at the verdict's
+target commit and judge each finding by the validator's own rule, naming
+the §5.3a downgrade beside the finding. No built-in severity names remain.
+
+- A severity the taxonomy does not declare is listed under its own
+  heading.
+- A taxonomy with no blocking list says so.
+- An unresolvable target says blocking cannot be judged.
+- `validate` without `--from-target` now reads the target's `review.toml`
+  for the précis only.
+- Wire: none; the précis is a rendering.
+
+**Adapters need nothing beside the installed package (the user's ruling:
+no adopter step may depend on a same-machine scenario).** With no `--dir`,
+`render-adapters --install` and `--check-install` render from the running
+package. Through 0.24.x they read an `adapters/` directory beside the
+package, which a `uvx`/`uv tool` install never has, so they refused there
+and `docs/upgrading.md` told adopters to point `--dir` at a clone. Now any
+install form installs and verifies its own adapters. `--dir <path>` keeps
+the directory-sourced behaviour. `docs/upgrading.md` §4 and the README's
+install section need no clone.
+
+**`render-adapters --check-embedded <file>` and `--write-embedded <file>`
+(issue #5).** They check, and replace, exactly the generated instruction
+block embedded in a tracked file (the `BEGIN`/`END GENERATED: loupe
+adapter` region) against the current rendering. Every byte outside the
+region is untouched.
+
+- Refused by name: missing, unbalanced, out-of-order, duplicated and
+  nested markers; carriage returns in the region; bytes that are not
+  UTF-8; absent paths, directories and non-regular files.
+- A symlinked file is followed, and the result says so.
+- A stale region's recovery is the runnable `--write-embedded`.
+
+**The Codex skill's install path (issue #1).** `--install` writes the Codex
+skill to `~/.agents/skills/loupe/SKILL.md`, the user-scope path OpenAI
+documents (Build skills, retrieved 2026-09-21), instead of
+`~/.codex/skills/loupe/SKILL.md`. The old path was only ever observed to
+work, never documented. On 2026-09-21, codex-cli 0.155.0-alpha.9.2 listed
+skills from both roots, and a name present in both twice.
+
+- A legacy copy under `~/.codex/skills/loupe/`, or under
+  `$CODEX_HOME/skills/loupe/` when that is distinct, is kept byte for byte
+  under the state directory's `replaced-adapters/`. Its bytes are proven
+  equal to the copy's and re-read just before removal, and only then is it
+  removed from discovery. The copy stays where it is when it is not UTF-8,
+  when a kept file already holds other bytes, or when it changed after it
+  was read.
+- `--install` and `--check-install` judge an installed adapter by its
+  bytes. A copy that differs from the rendering only in line endings is now
+  `stale` and `replaced`, with its bytes kept, rather than `in_sync`. An
+  installed copy that is not UTF-8 is kept and replaced, where it used to
+  fail as a usage error.
+- A legacy directory holding anything besides `SKILL.md` refuses the
+  whole install, which writes nothing.
+- `--check-install` reports a legacy copy still present as drift.
+- A 0.24.x `--install` run from a clone writes the old path back, and the
+  next 0.25.0 `--install` moves it out again.
+
+**A validator notice for a reclassification without its residue (issue
+#3).** `validate` reports `C-RESIDUE-UNDECLARED` when a `reclassified`
+closure declares no `Residue:` while the same verdict raises a new finding
+on the closed finding's anchor. "Same anchor" is convergence's own rule,
+now one shared function. `C-RESIDUE-UNCHECKED` says when this machine's
+ledger cannot judge. Both are notices: the exit status never changes.
+
+**Reviewer requests (issue #4).**
+
+- **`take --compact`**: pointers only — the kept path, digest, byte size,
+  lineage, round, target, checkout state, précis, the target's `decide`
+  list (the default take's, the empty list included) and the next command.
+  On a 38,804-byte request it printed 1,654 bytes against the default's
+  27,999; that measurement predates `decide` joining it. The default and
+  `--full` are unchanged.
+- **Five new claim members.** Four are a new member kind, a non-empty list
+  of objects with a closed field table:
+  - `carried_findings` — `fingerprint`, `origin` (`<lineage>/<round>`),
+    `outcome` (`fixed | deferred | superseded`; withdrawal is the
+    reviewer's act), optional `required` and `fix`. A fingerprint its
+    in-ledger origin never ruled is refused before anything is committed.
+    An origin this ledger does not hold is stated "not verifiable here",
+    never refused. `required` is read from the kept origin verdict. Fix
+    commits outside the span are marked.
+  - `objectives` — `title`, `paths` (the `scope_paths` grammar), optional
+    `tests` and `references`. The request renders objective → changed
+    files, naming unmapped in-scope files and paths that match nothing.
+  - `observations` — `command`, `result`, `context`. Hand-typed gate
+    observations, rendered in the Claim under a heading that says they are
+    NOT this hand-off's attestations.
+  - `attestation_map` — `fingerprint`, `gate`, optional `test`. Each row
+    must answer a finding: the previous round's standing disposition or a
+    carried entry. Its gate must be in the target's manifest; that is
+    checked after the commit, before any gate runs or anything is pushed.
+    Rows render the attested command, exit and binding from the request's
+    own attestation block.
+
+  The fifth, `excluded_paths`, is a list in the `scope_paths` grammar:
+  span paths declared out of this review, one prefix or glob instead of
+  one line per file.
+- **A `Scoped:` diff command** beside the full one, when the claim declares
+  `scope_paths`. It names exactly the changed paths those entries match, as
+  literal pathspecs, chosen by the same matcher as the objective table and
+  the `In scope:` count; a matched `dir/` prefix stays one word. No pattern
+  is handed to git, whose matching reads `[^a]`, backslashes and POSIX
+  classes differently and selects everything below a bare directory name.
+  When nothing matches, the line reads `none`, because a diff naming no
+  path is the whole span. A command over 65,536 bytes is withheld with its
+  size, never shortened. The matcher judges a rename by its new path, so
+  the command never selects a rename's old path: a matched `dir/` excludes
+  by name each rename source it would also reach, and a rename into scope
+  shows as a whole-file addition of its target (the `Diff:` line still
+  shows the rename).
+- **An `In scope:` count** — the span less generated-by-declaration and
+  excluded paths — shown in the request précis beside the machine total.
+  It sits after the total, so a 0.24.x reader's recomputation still
+  matches the total.
+- **The scope report accounts for patterns.** A changed path matched by
+  `scope_paths`, `excluded_paths` or an objective's `paths` counts as
+  named, so `R-SCOPE-UNNAMED` fires less often.
+
+The version moves because every change above travels.
+
 ## 0.24.1
 
 Documentation only; no behaviour changes, and nothing addressed to

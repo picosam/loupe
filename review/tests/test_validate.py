@@ -1121,7 +1121,31 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
     # automatically.
     VALID = {"string": "x", "list_of_string": ["a"],
              "references": [{"path": "review.toml", "required": True,
-                             "note": "n"}]}
+                             "note": "n"}],
+             # 0.25.0: the fourth kind's valid value is PER MEMBER — each
+             # object-list member has its own field table — so the kind
+             # entry names that and `_valid` looks the member up.
+             "list_of_object": "per member: VALID_OBJECTS"}
+
+    # One valid entry per object-list member, every field of its table
+    # stated. The attestation map maps the carried fingerprint, so a full
+    # claim resolves without a ledger (a map row must name a finding the
+    # request answers — `emit.check_claim_record`).
+    VALID_OBJECTS = {
+        "carried_findings": [{"fingerprint": "fp2:0123456789abcdef",
+                              "origin": "Lfeedbeef00/2", "outcome": "fixed",
+                              "required": "r", "fix": ["a" * 40]}],
+        "objectives": [{"title": "t", "paths": ["review/"],
+                        "tests": ["t"], "references": ["r.md"]}],
+        "observations": [{"command": "c", "result": "r", "context": "x"}],
+        "attestation_map": [{"fingerprint": "fp2:0123456789abcdef",
+                             "gate": "tests", "test": "t"}],
+    }
+
+    def _valid(self, member, kind):
+        if kind == "list_of_object":
+            return self.VALID_OBJECTS[member]
+        return self.VALID[kind]
 
     # A wrong value per kind: every JSON kind the member may NOT be, plus the
     # wrong-element case for the two container kinds.
@@ -1129,6 +1153,10 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
         "string": [None, True, 3, [], {}],
         "list_of_string": [None, True, 3, "x", {}, [1], [None]],
         "references": [None, True, 3, "x", {}, [1], ["x"], [None]],
+        # 0.25.0: and the empty list, which the fourth kind refuses as the
+        # absent state spelled differently.
+        "list_of_object": [None, True, 3, "x", {}, [], [1], ["x"], [None],
+                           [[]]],
     }
 
     def setUp(self):
@@ -1306,7 +1334,7 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
 
     def test_missing_required_members(self):
         for member in vocab.CLAIM_REQUIRED:
-            body = {m: self.VALID[k] for m, k in vocab.CLAIM_FIELDS.items()
+            body = {m: self._valid(m, k) for m, k in vocab.CLAIM_FIELDS.items()
                     if m != member}
             self._assert_refused(json.dumps(body), f"missing {member}")
         for member in vocab.CLAIM_REFERENCE_REQUIRED:
@@ -1353,7 +1381,7 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
         constraint exists to prevent could return under a passing test."""
         for member in vocab.CLAIM_NONEMPTY:
             for blank in ("", " ", "\t\n", "   "):
-                body = {m: self.VALID[k]
+                body = {m: self._valid(m, k)
                         for m, k in vocab.CLAIM_FIELDS.items()}
                 body[member] = blank
                 self._assert_refused(json.dumps(body),
@@ -1566,7 +1594,7 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
         self._assert_crosses(
             '{"objective": "x", "references": [{"path": "review.toml"}]}',
             "minimal valid", expect_reads=1)
-        full = {m: self.VALID[k] for m, k in vocab.CLAIM_FIELDS.items()}
+        full = {m: self._valid(m, k) for m, k in vocab.CLAIM_FIELDS.items()}
         self._assert_crosses(json.dumps(full), "full valid", expect_reads=1)
 
     def test_the_claim_is_read_once_all_the_way_to_git(self):
@@ -1579,7 +1607,7 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
         from review import emit
         from review.cli import cmd_handoff
         path = self.tmp / "deep.json"
-        body = json.dumps({m: self.VALID[k]
+        body = json.dumps({m: self._valid(m, k)
                            for m, k in vocab.CLAIM_FIELDS.items()})
         path.write_text(body, encoding="utf-8")
         reads = []
@@ -1662,7 +1690,7 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
         path = self.tmp / "shape.json"
         for body in ('{"objective": "x", '
                      '"references": [{"path": "a.md"}]}',
-                     json.dumps({m: self.VALID[k]
+                     json.dumps({m: self._valid(m, k)
                                  for m, k in vocab.CLAIM_FIELDS.items()})):
             path.write_text(body, encoding="utf-8")
             claim = emit.capture_claim(path).claim

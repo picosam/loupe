@@ -206,6 +206,67 @@ def validate_closures(v: Verdict, answering: list[dict] | None = None
     return items
 
 
+def residue_items(v: Verdict, ledger, lineage: str | None) -> list[Item]:
+    """Public issue #3: a `reclassified` closure that declares no `Residue:`
+    while THIS verdict raises a new finding on the closed finding's anchor.
+
+    A NOTICE, never an error — the exit status is unchanged. Reclassifying
+    with no residue is legal (the rest may simply be fixed), and a new
+    finding on the same anchor may be an unrelated claim. But the pair is
+    exactly the shape `convergence` cannot read without a declaration: it
+    counts the new fingerprint as a fresh finding on a recurring anchor —
+    the `hunted` signal — unless the closure's note happens to name it, and
+    that inference is the fallback the `Residue:` field exists to replace.
+    So the reviewer is told, by finding id, where a declaration would decide
+    what the prose leaves to a reading.
+
+    "Same anchor" and "new" are convergence's own, read from the ledger that
+    computes them: `Ledger.thread_anchor` is the anchor convergence files
+    the closed thread under, and a finding is new when its identity was not
+    ruled in an earlier round (`Ledger.ruled_before`). An anchor-less
+    finding matches nothing, as it joins no anchor group there. A closed
+    fingerprint this ledger holds no ruling of has no known anchor here; that
+    is stated as its own notice rather than passed in silence.
+    """
+    if ledger is None or not lineage:
+        return []
+    items: list[Item] = []
+    verdict_round = None
+    for c in v.closures:
+        if not c.well_formed or c.closure != "reclassified" or c.residue:
+            continue
+        anchor = ledger.thread_anchor(c.fp, lineage)
+        if anchor is None:
+            items.append(_notice(
+                "C-RESIDUE-UNCHECKED",
+                f"{c.fp}: reclassified with no `Residue:`, and this ledger "
+                f"holds no ruling of that fingerprint in lineage {lineage}, "
+                f"so whether this verdict raises a new finding on its anchor "
+                f"cannot be checked here"))
+            continue
+        if not anchor:
+            continue            # an anchor-less thread joins no anchor group
+        if verdict_round is None:
+            verdict_round = ledger.verdict_round(v.sha, lineage) or 0
+        on_anchor = [f.id for f in v.findings
+                     if f.anchor_path == anchor
+                     and not ledger.ruled_before(f.fingerprint(), lineage,
+                                                 verdict_round or None)]
+        if on_anchor:
+            ids = ", ".join(on_anchor)
+            items.append(_notice(
+                "C-RESIDUE-UNDECLARED",
+                f"{c.fp}: reclassified with no `Residue:` line, while this "
+                f"verdict raises new finding(s) {ids} on the closed "
+                f"finding's anchor `{anchor}`. If {ids} carries what remains "
+                f"of the narrowed claim, declare `Residue: {ids}` under the "
+                f"closure — without it convergence counts {ids} as a fresh "
+                f"finding on a recurring anchor unless the note happens to "
+                f"name exactly one of them; if {ids} is an unrelated claim, "
+                f"nothing needs to change"))
+    return items
+
+
 def _required_closures(v: Verdict, answering: list[dict] | None) -> list[Item]:
     """§5.2: a verdict that leaves a refutation, or an accepted(test_amended),
     without a closure fails validation.
@@ -372,7 +433,10 @@ def _section_grammar_items(v: Verdict) -> list[Item]:
 
 
 def validate_verdict(v: Verdict, cfg: Config,
-                     answering: list[dict] | None = None) -> list[Item]:
+                     answering: list[dict] | None = None,
+                     ledger=None, lineage: str | None = None) -> list[Item]:
+    """`ledger` and `lineage`, when supplied, add the residue notice
+    (`residue_items`, public issue #3) — notices only, so no exit changes."""
     items: list[Item] = taxonomy_guard(cfg)
     if items:
         return items
@@ -416,6 +480,7 @@ def validate_verdict(v: Verdict, cfg: Config,
                           "unavailable references"))
 
     items.extend(validate_closures(v, answering))
+    items.extend(residue_items(v, ledger, lineage))
 
     sev_rank = {s: i for i, s in enumerate(cfg.severities)}
     expected_ids = [f"F{i}" for i in range(1, len(v.findings) + 1)]
@@ -1647,6 +1712,19 @@ def claim_text(claim: dict) -> str:
                 if hasattr(ref, "get"):
                     parts.extend(str(ref.get(k, ""))
                                  for k in ("path", "note"))
+        # 0.25.0: every authored string inside an object-list member, by
+        # the member's own field table — a path named in an objective's
+        # tests or a carried finding's `required` is named.
+        elif kind == "list_of_object" and isinstance(value, (list, tuple)):
+            for entry in value:
+                if not hasattr(entry, "get"):
+                    continue
+                for field in vocab.CLAIM_OBJECT_LIST_FIELDS[member]:
+                    v = entry.get(field)
+                    if isinstance(v, str):
+                        parts.append(v)
+                    elif isinstance(v, (list, tuple)):
+                        parts.extend(x for x in v if isinstance(x, str))
     return "\n".join(parts)
 
 
@@ -1656,17 +1734,42 @@ def names_path(text: str, path: str) -> bool:
                      f"(?![{_PATH_BOUNDARY}])", text) is not None
 
 
+def claim_patterns(claim: dict) -> list[str]:
+    """Every path pattern the claim declares in the `scope_paths` grammar:
+    `scope_paths`, `excluded_paths` and each objective's `paths` (0.25.0)."""
+    out: list[str] = []
+    for member in ("scope_paths", "excluded_paths"):
+        value = claim.get(member)
+        if isinstance(value, (list, tuple)):
+            out.extend(p for p in value if isinstance(p, str))
+    for obj in claim.get("objectives") or ():
+        if hasattr(obj, "get") and isinstance(obj.get("paths"),
+                                              (list, tuple)):
+            out.extend(p for p in obj["paths"] if isinstance(p, str))
+    return out
+
+
 def scope_gaps(claim: dict, changed_paths) -> list[str]:
     """Changed paths the claim accounts for NOWHERE — neither as a
-    reference, nor named anywhere in its authored prose.
+    reference, nor named anywhere in its authored prose, nor matched by a
+    path pattern it declares.
 
     A claim that states nothing (the recorded no-claim state) asserts no
     scope, so it contradicts no diff and there is nothing to report.
+
+    0.25.0 (public issue #4): a path matched by `scope_paths`,
+    `excluded_paths` or any objective's `paths` is accounted for — through
+    `emit.in_scope`, the one matcher the hand-off's sweep already holds a
+    commit to, so a `dir/` prefix or a glob accounts for exactly the paths
+    it admits there and no others.
     """
     if not claim:
         return []
+    from .emit import in_scope
     text = claim_text(claim)
-    return [p for p in changed_paths if not names_path(text, p)]
+    patterns = claim_patterns(claim)
+    return [p for p in changed_paths
+            if not names_path(text, p) and not in_scope(p, patterns)]
 
 
 def scope_items(claim: dict, changed_paths) -> list[Item]:
@@ -1687,7 +1790,9 @@ def scope_items(claim: dict, changed_paths) -> list[Item]:
     by name — to the one person who can say which.
 
     "Accounted for" is the claim naming the path anywhere it authors:
-    a reference entry, the review scope, a stop condition, deliberately-not.
+    a reference entry, the review scope, a stop condition, deliberately-not
+    — or, since 0.25.0, a path pattern it declares matching it
+    (`scope_paths`, `excluded_paths`, an objective's `paths`; `scope_gaps`).
     Generated artefacts a commit regenerates are named there like anything
     else — the tool carries no list of which files a repository generates,
     because that list is identity rather than mechanism and does not travel

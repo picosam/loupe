@@ -148,6 +148,12 @@ CLAIM_LIST_FIELDS = (
     # commit to. Optional: a claim without it sweeps as before, and the
     # request says so on its face.
     "scope_paths",
+    # Span paths declared OUT of this review's scope (0.25.0, public issue
+    # #4): the path-prefix form the reviewer asked for, in the `scope_paths`
+    # grammar and matched by the same one matcher (`emit.in_scope`), instead
+    # of one prose line per file. Subtracted from the request's in-scope
+    # counts and counted as accounted for by the claim-versus-span report.
+    "excluded_paths",
     "deliberately_not",
     "evidence_not_captured",
     "stop_conditions",
@@ -158,12 +164,61 @@ CLAIM_LIST_FIELDS = (
 # The reference manifest: digested, labelled, never dropped.
 CLAIM_REFERENCES_FIELD = "references"
 
-# member -> kind. The three kinds are the whole grammar; a member added here
+# The FOURTH kind (0.25.0, public issue #4 and brief `take-objective-map`):
+# a list of objects, each member with its OWN closed field table. Field kinds
+# are the ones below and nothing else; `emit.validate_claim` refuses an
+# unknown field, a missing required one, a wrong type and a value outside a
+# field's grammar, each by its member path (`carried_findings[0].origin`).
+#
+#   string          a non-empty string
+#   list_of_string  a non-empty list of non-empty strings
+#   scope_paths     the same, each in the `scope_paths` grammar
+#   fingerprint     a finding fingerprint as `wire.Finding.fingerprint` mints
+#   origin          `<lineage id>/<round>`, the `git:` round-reference body
+#   carried_outcome one of CARRIED_OUTCOMES
+#   commits         a non-empty list of 40-hex commit ids
+#   gate_id         a gate id in GATE_ID_RE's grammar
+CLAIM_OBJECT_LIST_FIELDS = {
+    # Findings of EARLIER verdicts this request answers — typically another
+    # lineage's, which the reviewer cannot see from this one's ledger.
+    "carried_findings": {"fingerprint": "fingerprint", "origin": "origin",
+                         "outcome": "carried_outcome", "required": "string",
+                         "fix": "commits"},
+    # The author's map from each objective to the paths it touches; the
+    # request computes which changed files each one covers.
+    "objectives": {"title": "string", "paths": "scope_paths",
+                   "tests": "list_of_string", "references": "list_of_string"},
+    # Gate runs the author TYPED — never attestations, rendered as such.
+    "observations": {"command": "string", "result": "string",
+                     "context": "string"},
+    # Finding -> the gate (and optionally the test) whose attestation in
+    # THIS request covers it.
+    "attestation_map": {"fingerprint": "fingerprint", "gate": "gate_id",
+                        "test": "string"},
+}
+CLAIM_OBJECT_REQUIRED = {
+    "carried_findings": ("fingerprint", "origin", "outcome"),
+    "objectives": ("title", "paths"),
+    "observations": ("command", "result", "context"),
+    "attestation_map": ("fingerprint", "gate"),
+}
+# What the AUTHOR claims about a carried finding in this span. Closed, and
+# each term asks the reviewer for exactly one act: `fixed` — check the fix
+# (the `fix` commits say where); `deferred` — note that it stays open, on
+# purpose, and rule on whether that may stand; `superseded` — check that the
+# code the finding named no longer exists in the form it named. `withdrawn`
+# is deliberately NOT a term: withdrawal is the reviewer's closure
+# (CLOSURES), and an author "withdrawing" a reviewer's finding is the death
+# by omission the symmetry rule forbids.
+CARRIED_OUTCOMES = ("fixed", "deferred", "superseded")
+
+# member -> kind. The four kinds are the whole grammar; a member added here
 # without a kind the validator knows is a refusal, not a silent admission.
 CLAIM_FIELDS = {
     **{f: "string" for f in CLAIM_STRING_FIELDS},
     **{f: "list_of_string" for f in CLAIM_LIST_FIELDS},
     CLAIM_REFERENCES_FIELD: "references",
+    **{f: "list_of_object" for f in CLAIM_OBJECT_LIST_FIELDS},
 }
 
 # One reference object. `path` is required and non-empty: a reference with no

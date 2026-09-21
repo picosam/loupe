@@ -55,7 +55,8 @@ except ImportError:  # pragma: no cover - exercised only where it is absent
 
 from . import (TOOL_NAME, paths, refs, shape_identity, tool_identity,
                validate, vocab, wire)
-from .config import Config, caller_env
+from .config import (Config, GitCeiling, built_in_git_ceiling, caller_env,
+                     git_ceiling, git_timeout_refusal)
 from .digest import sha256_file, sha256_text
 from .fingerprint import LineageError, alias_event, resolve_identity
 from .fingerprint import compute as fp_compute
@@ -148,6 +149,42 @@ class Refusal(RuntimeError):
         self.items = list(items or [])
 
 
+class GitTimeout(Refusal):
+    """A git subprocess ran past its ceiling (0.25.0).
+
+    Every git door converts `subprocess.TimeoutExpired` into this, so no
+    verb exits on a traceback when a hook, a filter or a remote is slow.
+    It is a `Refusal` — and so a `RuntimeError`, the class every caller of
+    a git door already names (round 4 F3) — and `main` renders it as a
+    blocked exit: `next` is null, because no command repairs a slow hook,
+    and `remedy` is the decision a person takes (`config.
+    git_timeout_refusal`, the one wording).
+
+    A caller that wraps a git failure in a refusal of its own passes this
+    one through untouched: its remedy is the true one, and a wrapper's
+    ("make the remote writable", "restore access") would send a person to
+    fix something that is not broken.
+
+    `argv` is the command exactly as it ran (`TimeoutExpired.cmd`; the
+    message renders it with URL userinfo removed); `ceiling` is the
+    `config.GitCeiling` that was in force.
+    """
+
+    def __init__(self, argv, ceiling: GitCeiling, state: str = ""):
+        why, remedy = git_timeout_refusal(argv, ceiling, state)
+        super().__init__(why, "", remedy=remedy)
+        self.argv = tuple(str(a) for a in argv)
+        self.ceiling = ceiling
+        self.state = state
+
+    def within(self, state: str) -> "GitTimeout":
+        """The same refusal, saying what the verb had already done when
+        the ceiling fell — a local commit, an unconfirmed push. A caller
+        that knows adds it; the timeout itself is unchanged."""
+        joined = f"{self.state} {state}".strip() if self.state else state
+        return GitTimeout(self.argv, self.ceiling, joined)
+
+
 #: Round 1 F1 (lineage 12). `git replace` installs a ref under
 #: `refs/replace/` — or under whatever `GIT_REPLACE_REF_BASE` names — and
 #: every ordinary object lookup then transparently returns the REPLACEMENT.
@@ -161,18 +198,40 @@ class Refusal(RuntimeError):
 NO_REPLACE = "--no-replace-objects"
 
 
-def _git(repo_root: Path, *args: str, timeout: int = 120,
-         no_replace: bool = False) -> str:
+def _git(repo_root: Path, *args: str, no_replace: bool = False,
+         ceiling: GitCeiling | None = None) -> str:
     # RVW-T21 D2: the caller's environment, not the shim's hardened one.
     # `take`'s `fetch` writes refs and fires reference-transaction where a
     # repository has one, and `status` consults a configured
     # core.fsmonitor; both are the repository's own scripts, in the same
     # trust position as a gate. Applied at the door rather than per
     # subcommand.
-    out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
-                          "-C", str(repo_root), *args],
-                         capture_output=True, text=True, timeout=timeout,
-                         env=caller_env())
+    #
+    # 0.25.0: the ceiling is the CALLER's `config.git_ceiling(cfg)` — every
+    # runner below that holds a configuration passes it, so `[limits]
+    # git_timeout` reaches every subcommand this door carries (the door's
+    # rule, not the argv's, as for the environment above). A caller with no
+    # configuration in hand gets the built-in. The cost, stated where it is
+    # paid: a ceiling raised for a slow hook is also raised for an
+    # unreachable remote, so a hung network call takes that much longer to
+    # refuse. And a timeout is a typed refusal here — until 0.25.0 this door
+    # let `TimeoutExpired` escape, which is where `respond --out`'s envelope
+    # push died with a traceback — while every other subprocess failure
+    # becomes the `RuntimeError` its callers already name, as `emit._git`'s
+    # does (round 4 F3).
+    ceiling = ceiling or built_in_git_ceiling()
+    try:
+        out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
+                              "-C", str(repo_root), *args],
+                             capture_output=True, text=True,
+                             timeout=ceiling.seconds, env=caller_env())
+    except subprocess.TimeoutExpired as exc:
+        raise GitTimeout(exc.cmd, ceiling) from exc
+    except subprocess.SubprocessError as exc:
+        raise RuntimeError(
+            f"a `git` subprocess did not complete: "
+            f"`{paths.command(paths.Lit('git'), *args)}` — "
+            f"{type(exc).__name__}: {exc}") from exc
     if out.returncode != 0:
         raise RuntimeError(
             f"a `git` subprocess failed: "
@@ -392,9 +451,12 @@ def carrier_remote(cfg: Config, git=None) -> str:
     a decision (§9bis.3) — the same rule, and the same refusal, that
     `ensure_pushed` applies to the branch push this rides beside.
     """
-    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    run = git or (lambda *a: _git(cfg.repo_root, *a,
+                                  ceiling=git_ceiling(cfg)))
     try:
         remotes = [r for r in run("remote").splitlines() if r.strip()]
+    except GitTimeout:
+        raise
     except RuntimeError as exc:
         raise _carrier_refusal(
             f"the configured remotes could not be read: {exc}",
@@ -413,6 +475,8 @@ def carrier_remote(cfg: Config, git=None) -> str:
     branch = ""
     try:
         branch = run("rev-parse", "--abbrev-ref", "HEAD")
+    except GitTimeout:
+        raise
     except RuntimeError:
         branch = ""
     if branch and branch != "HEAD":
@@ -440,10 +504,17 @@ def _blob_of(cfg: Config, text: str, git=None) -> str:
     """
     if git is not None:
         return git("hash-object", "-w", "--stdin")
-    out = subprocess.run(
-        ["git", "-C", str(cfg.repo_root), "hash-object", "-w", "--stdin"],
-        input=text.encode("utf-8"), capture_output=True, timeout=120,
-        env=caller_env())
+    # A door of its own (it writes stdin, which `_git` does not carry), so
+    # it takes the configured ceiling and types its timeout itself (0.25.0).
+    ceiling = git_ceiling(cfg)
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(cfg.repo_root), "hash-object", "-w",
+             "--stdin"],
+            input=text.encode("utf-8"), capture_output=True,
+            timeout=ceiling.seconds, env=caller_env())
+    except subprocess.TimeoutExpired as exc:
+        raise GitTimeout(exc.cmd, ceiling) from exc
     if out.returncode != 0:
         raise _carrier_refusal(
             f"the envelope could not be written to the object store: "
@@ -462,13 +533,23 @@ def push_envelope(cfg: Config, lineage: str, round_no: int, kind: str,
     own ref. The force is bounded to `refs/<tool>/…`, a namespace nothing
     else writes — the branch push `ensure_pushed` performs is untouched by
     this and stays non-forced.
+
+    The push runs the REPOSITORY's `pre-push` hook, as the branch push
+    does, under the configured `[limits] git_timeout`; a timeout is the
+    typed `GitTimeout`, passed through rather than re-described as an
+    unwritable remote (0.25.0).
     """
-    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    run = git or (lambda *a: _git(cfg.repo_root, *a,
+                                  ceiling=git_ceiling(cfg)))
     remote = carrier_remote(cfg, git=git)
     ref = carrier_ref(lineage, round_no, kind)
     blob = _blob_of(cfg, text, git=git)
     try:
         run("push", remote, f"+{blob}:{ref}")
+    except GitTimeout as exc:
+        raise exc.within(
+            f"The {kind} envelope is kept locally; whether its ref {ref} "
+            f"reached {remote} is unconfirmed") from exc
     except RuntimeError as exc:
         raise _carrier_refusal(
             f"the {kind} envelope could not be pushed to {ref} at "
@@ -489,12 +570,15 @@ def fetch_envelope(cfg: Config, lineage: str, round_no: int, kind: str,
     the read names an exact ref rather than `FETCH_HEAD`, which any other
     fetch in the same clone would overwrite.
     """
-    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    run = git or (lambda *a: _git(cfg.repo_root, *a,
+                                  ceiling=git_ceiling(cfg)))
     remote = carrier_remote(cfg, git=git)
     ref = carrier_ref(lineage, round_no, kind)
     reference = round_reference(lineage, round_no)
     try:
         run("fetch", remote, f"+{ref}:{ref}")
+    except GitTimeout:
+        raise
     except RuntimeError as exc:
         raise _carrier_refusal(
             f"{remote} carries no {kind} envelope for {reference} ({ref}): "
@@ -509,6 +593,8 @@ def fetch_envelope(cfg: Config, lineage: str, round_no: int, kind: str,
         # downstream is computed from them — but they must at least be the
         # bytes the fetch brought in.
         data = run_bytes(cfg, git, "cat-file", "blob", ref, no_replace=True)
+    except GitTimeout:
+        raise
     except _UNUSABLE as exc:
         raise _carrier_refusal(
             f"{ref} was fetched from {remote} but its bytes could not be "
@@ -1488,7 +1574,8 @@ def read_source_authority(cfg: Config, commit_ref: str, fetch: bool = True,
     `git` is injectable exactly as `take`'s and `probe_target`'s are, so
     every refusal below is testable without a network or a remote.
     """
-    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True))
+    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True,
+                                  ceiling=git_ceiling(cfg)))
     read = (lambda *a: run_bytes(cfg, git, *a, no_replace=True))
     try:
         remotes = [r for r in run("remote").splitlines() if r.strip()]
@@ -1514,6 +1601,8 @@ def read_source_authority(cfg: Config, commit_ref: str, fetch: bool = True,
             # observed tips into the object store, and a pruned clone is the
             # one whose local refs cannot outlive what the remote carries.
             run("fetch", "--prune", remote)
+        except GitTimeout:
+            raise
         except _UNUSABLE as exc:
             return None, [
                 f"cannot fetch {remote} ({exc}): the anchor is judged against "
@@ -1542,6 +1631,8 @@ def read_source_authority(cfg: Config, commit_ref: str, fetch: bool = True,
                    "state, which a person with a shell can write")
     try:
         refs_with = refs_containing(commit)
+    except GitTimeout:
+        raise
     except _UNUSABLE as exc:
         return None, [f"cannot ask {remote} which refs carry "
                       f"{commit[:12]} ({exc})"]
@@ -2886,9 +2977,15 @@ def current_branch(cfg: Config, git=None) -> str:
     branch is what tells them apart. A detached HEAD and an unreadable
     repository both answer "", which every caller reads as unknown.
     """
-    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    run = git or (lambda *a: _git(cfg.repo_root, *a,
+                                  ceiling=git_ceiling(cfg)))
     try:
         return known_branch(run("rev-parse", "--abbrev-ref", "HEAD"))
+    except GitTimeout:
+        # A git that did not answer in time is not a detached HEAD: the
+        # typed refusal travels, rather than an "unknown" that would let
+        # the verb go on to choose a lineage by it (0.25.0).
+        raise
     except RuntimeError:
         return ""
 
@@ -3346,7 +3443,8 @@ def cached_handoff(cfg: Config, ledger: Ledger, round_no: int, lineage: str,
     helper without it and requires a cold answer, not a TypeError: an API
     whose default is safe is stronger than one whose contract is documented.
     """
-    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    run = git or (lambda *a: _git(cfg.repo_root, *a,
+                                  ceiling=git_ceiling(cfg)))
     try:
         head = run("rev-parse", "HEAD")
         dirty = run("status", "--porcelain")
@@ -3650,7 +3748,8 @@ def probe_target(cfg: Config, push: dict | None, sha: str,
     # target — presence, ancestry, the configuration — so the runner
     # itself disables replacement. The flag is git-wide and cannot ride as
     # a subcommand argument, so this is the only place it can go.
-    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True))
+    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True,
+                                  ceiling=git_ceiling(cfg)))
     result = {"sha": sha, "base": base}
     if push is None:
         raise Refusal("the request carries no reachability stamp: a SHA the "
@@ -3663,6 +3762,8 @@ def probe_target(cfg: Config, push: dict | None, sha: str,
         try:
             run("cat-file", "-e", f"{obj}^{{commit}}")
             return True
+        except GitTimeout:
+            raise
         except RuntimeError:
             return False
 
@@ -3699,6 +3800,11 @@ def probe_target(cfg: Config, push: dict | None, sha: str,
         try:
             run("fetch", push["url"], push["ref"])
             result["fetch"] = f"fetched {push['ref']} from {push['url']}"
+        except GitTimeout:
+            # Not "the target is unreachable": the remote or a hook was
+            # slower than the ceiling, and the remedy is that decision
+            # (0.25.0).
+            raise
         except RuntimeError as exc:
             raise Refusal(
                 f"cannot fetch the reviewed ref: {exc}. The stamp says the "
@@ -3789,7 +3895,7 @@ def probe_references(cfg: Config, reference_section: str,
     # working-tree branch (`sha is None`) is a different state and is left
     # alone: there is no object graph in it to replace.
     run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=sha
-                                  is not None))
+                                  is not None, ceiling=git_ceiling(cfg)))
 
     def kind(path: str) -> str | None:
         """'blob' | 'tree' | None, at the target when `sha` is given, else
@@ -3855,11 +3961,15 @@ def run_bytes(cfg: Config, git, *args: str,
         return git(*args).encode("utf-8")
     # Round 4 F3, the byte reader's half of the same normalisation.
     # RVW-T21 D2: and the caller's environment, like every other git door.
+    # 0.25.0: and the configured ceiling, typed on timeout like `_git`.
+    ceiling = git_ceiling(cfg)
     try:
         out = subprocess.run(["git", *([NO_REPLACE] if no_replace else []),
                               "-C", str(cfg.repo_root), *args],
-                             capture_output=True, timeout=120,
+                             capture_output=True, timeout=ceiling.seconds,
                              env=caller_env())
+    except subprocess.TimeoutExpired as exc:
+        raise GitTimeout(exc.cmd, ceiling) from exc
     except subprocess.SubprocessError as exc:
         raise RuntimeError(
             f"a `git` subprocess did not complete: "
@@ -3924,7 +4034,8 @@ def resolve_authority(cfg: Config, sha: str,
     # This is the ONE resolver all three doors call, so hardening it here is
     # what makes the author, `take` and `validate --from-target` inherit the
     # guarantee — there is no second read to forget.
-    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True))
+    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True,
+                                  ceiling=git_ceiling(cfg)))
     fix = (f"the AUTHOR repairs the configuration in the target commit and "
            f"re-emits; a reviewer does not edit the rules it is judged by")
     try:
@@ -4032,7 +4143,8 @@ def governing_for(cfg: Config, sha: str, git=None) -> Config:
     # target — presence, ancestry, the configuration — so the runner
     # itself disables replacement. The flag is git-wide and cannot ride as
     # a subcommand argument, so this is the only place it can go.
-    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True))
+    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True,
+                                  ceiling=git_ceiling(cfg)))
     drop = ("a person validates without the declaration, accepting that "
             "whatever configuration this checkout resolves NOW is a "
             "different authority from the one the request was judged under")
@@ -4175,7 +4287,8 @@ def reviewer_checkout(cfg: Config, sha: str, git=None) -> dict:
     A dirty tree at the target is still `at-target`, with `tree` saying
     dirty: the two facts are separate and both are printed.
     """
-    run = git or (lambda *a: _git(cfg.repo_root, *a))
+    run = git or (lambda *a: _git(cfg.repo_root, *a,
+                                  ceiling=git_ceiling(cfg)))
     try:
         head = run("rev-parse", "HEAD")
     except RuntimeError:
@@ -4641,7 +4754,8 @@ def waive(cfg: Config, ledger: Ledger, sha: str, reason: str, by: str,
     # could let a waiver name one commit while recording another — and a
     # waiver is the record that says a commit was deliberately not
     # reviewed, which makes it exactly the wrong place to be wrong.
-    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True))
+    run = git or (lambda *a: _git(cfg.repo_root, *a, no_replace=True,
+                                  ceiling=git_ceiling(cfg)))
     try:
         resolved = run("rev-parse", "--verify", f"{sha}^{{commit}}")
     except RuntimeError as exc:

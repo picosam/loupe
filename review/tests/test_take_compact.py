@@ -10,6 +10,12 @@ Brief `loupe-tool-feedback-pilot-2026-09` (three debug rounds, 2026-09-17/18):
 5. one banner line conflated a non-blocking gate's red with a failure of
    the target.
 
+And, from public issue #4 (a reviewer's request, 2026-09-21): `take
+--compact`, pointers only — kept path, digest, byte size, lineage, round,
+target SHA, the checkout's state, the précis, the target's `decide` list
+(round-1 F5 of the 0.25.0 review) and the next command — with every check
+and record of the default take unchanged.
+
 What these tests hold, and what they do not. They hold the RENDERING to the
 record: every deviation an attestation can carry is printed, nothing outside
 the attestation block changes by a byte, and what cannot be parsed is left
@@ -18,13 +24,17 @@ reader, and every check still runs over the original bytes.
 """
 
 import json
+import os
+import re
 import subprocess
 import unittest
 from pathlib import Path
 
-from review import TOOL_NAME, brief, cli, transport, wire
+from review import (TOOL_NAME, brief, cli, config, env_var, transport, vocab,
+                    wire)
 from review.emit import _git
 from review.tests._transport_fixtures import run_cli, scratch_loop_repo, sh
+from review.tests.util import REPO_ROOT
 
 SHA = "a" * 40
 OTHER = "b" * 40
@@ -311,6 +321,296 @@ class TestTakeEndToEnd(unittest.TestCase):
         code, unborn = self.take(empty, "state-unborn")
         self.assertEqual(code, 0, unborn)
         self.assertEqual(unborn["head"]["state"], "unknown")
+
+    # ------------------------------------------------ `--compact` (issue #4)
+
+    COMPACT_KEYS = {"ok", "kept", "digest", "bytes", "lineage", "round",
+                    "sha", "reviewer", "head", "brief", "decide", "diff",
+                    "then"}
+
+    def test_compact_carries_pointers_only(self):
+        """Public issue #4, the reviewer's request: a pointer-only `take`.
+
+        FALSIFICATION. Mutations: return the default payload under
+        `--compact` and the key-set assertion fails (`request_view`,
+        `references`, `target`, `tool` appear); return before
+        `transport.take` records and keeps anything and the kept file is
+        missing from THIS take's state; report the view's size as `bytes`
+        and the size assertion fails."""
+        code, default = self.take(self.reviewer, "state-d")
+        self.assertEqual(code, 0, default)
+        code, compact = self.take(self.reviewer, "state-c", "--compact")
+        self.assertEqual(code, 0, compact)
+        self.assertEqual(set(compact), self.COMPACT_KEYS)
+        kept = Path(compact["kept"])
+        self.assertTrue(kept.is_file())
+        self.assertTrue(kept.is_relative_to(self.tmp / "state-c"),
+                        "the compact take must keep and record exactly as "
+                        "the default does")
+        self.assertEqual(compact["bytes"], kept.stat().st_size)
+        self.assertEqual(kept.read_bytes(),
+                         Path(self.rec["kept"]).read_bytes())
+        for key in ("digest", "lineage", "round", "sha", "reviewer",
+                    "head", "brief", "decide", "diff", "then"):
+            self.assertEqual(compact[key], default[key], key)
+        self.assertEqual(compact["sha"], self.head)
+        self.assertNotIn("envelope", compact)
+        self.assertNotIn("request_view", compact)
+
+    def test_compact_and_full_are_one_choice(self):
+        code, payload = self.take(self.reviewer, "state-x", "--compact",
+                                  "--full")
+        self.assertEqual(code, 2, payload)
+        self.assertFalse((self.tmp / "state-x").exists(),
+                         "a usage error must record nothing")
+
+    def test_compact_through_the_real_entry_point_is_smaller(self):
+        """`bin/loupe take` as a subprocess, default against `--compact`,
+        on the same request: the compact result is a fraction of the
+        default's bytes and parses as the same pointers."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in (env_var("IN_GATE_RUN"), env_var("GATE_HEAD"),
+                            env_var("GATE_BASE"), env_var("STATE_DIR"),
+                            vocab.TRANSPORT_ENV)
+               and k not in {var for var, _v, _t
+                             in vocab.TRANSPORT_PROVIDER_SIGNALS}}
+        sizes = {}
+        for label, extra in (("default", []), ("compact", ["--compact"])):
+            proc = subprocess.run(
+                [str(REPO_ROOT / "bin" / "loupe"), "--ledger-dir",
+                 str(self.tmp / f"state-sub-{label}"), "take",
+                 self.rec["kept"], "--as", "codex", *extra],
+                cwd=self.reviewer, env=env, capture_output=True,
+                stdin=subprocess.DEVNULL, timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            sizes[label] = len(proc.stdout)
+            payload = json.loads(proc.stdout)
+        self.assertEqual(set(payload), self.COMPACT_KEYS)
+        self.assertLess(sizes["compact"], sizes["default"])
+
+
+# The keys the real CLI's environment must not inherit from the suite: a
+# gate run's own marks, a state or config redirection, and any transport
+# declaration of the host.
+_TAKE_DROP = ({env_var("IN_GATE_RUN"), env_var("GATE_HEAD"),
+               env_var("GATE_BASE"), env_var("STATE_DIR"),
+               env_var("CONFIG"), vocab.TRANSPORT_ENV}
+              | {var for var, _v, _t in vocab.TRANSPORT_PROVIDER_SIGNALS})
+
+#: Every key `take` can report as undeclared, in the table's own order.
+_DECIDE = tuple(key for key, *_ in vocab.DECIDE_KEYS)
+_DECLARED_LINE = re.compile(
+    r"^(transport|debug|review_default|enforcement|round_cap|token_budget)"
+    r"\s*=.*\n", re.M)
+
+
+def _declare_none(toml: str) -> str:
+    """The target states none of `_DECIDE` (the scratch copy of this
+    repository's config already omits `transport`)."""
+    return _DECLARED_LINE.sub("", toml)
+
+
+def _declare_all(toml: str) -> str:
+    """The target states every key of `_DECIDE`."""
+    return _DECLARED_LINE.sub("", toml).replace(
+        "\n[roles]\n",
+        '\n[roles]\ntransport = "path"\ndebug = true\n'
+        'review_default = "on"\nenforcement = "none"\n', 1).replace(
+        "\n[limits]\n",
+        "\n[limits]\nround_cap = 3\ntoken_budget = 600000\n", 1)
+
+
+class TestCompactKeepsTheTargetsDecisions(unittest.TestCase):
+    """Round-1 F5 of the 0.25.0 review: `take --compact` dropped `decide`,
+    the TARGET commit's undeclared keys, which `take` computes from the
+    configuration that governed the request and which exist only in the
+    take's result. The kept request stamps the value applied
+    (`transport="path"`), never that the key was undeclared, so following
+    the compact pointer recovers nothing; and a target that omits a key and
+    one that declares it printed identically, so the adapter's "absent
+    config asks once" rule could not fire. Reproduced by the reviewer with
+    an undeclared `roles.transport`: default take returned the pending
+    choice, compact omitted it.
+
+    FALSIFICATION, through the real CLI (`bin/loupe take` as a subprocess,
+    HOME redirected, gate and transport variables popped, each take in its
+    own state directory), default against `--compact` on the same request:
+
+    - nonempty: the reviewer's case (only `roles.transport` undeclared);
+      every kind `take` can produce (a target declaring none of the six
+      keys: a set/unset pair of TOML lines, a set line with no off state
+      whose applied value is the take's own, a set line rendered from the
+      applied cap, and an off state that is the decided-undeclared comment
+      line); the take's own applied value under `--transport paste`; and a
+      target whose `# decided:` line suppresses its entry;
+    - empty: a target declaring all six, where `decide` is PRESENT and
+      empty, never absent (the paired control of the reviewer's case);
+    - a reviewer checkout whose declarations differ from the target, both
+      ways: the take reports the target's list, while `loupe decide` in
+      that checkout reports the checkout's own, a different one;
+    - on every row, compact still omits the request prose and the
+      attestation table the default carries.
+
+    Mutations (the track report records each one's own result): drop
+    `decide` from the compact payload; compute it from this checkout's
+    configuration; omit it when empty; carry only the keys.
+    """
+
+    COMPACT_KEYS = {"ok", "kept", "digest", "bytes", "lineage", "round",
+                    "sha", "reviewer", "head", "brief", "decide", "diff",
+                    "then"}
+    PROSE_AND_ATTESTATIONS = {"request_view", "envelope", "references",
+                              "target", "tool", "transport"}
+
+    def scenario(self, edit):
+        """A scratch round whose TARGET commit's `review.toml` is `edit` of
+        the scratch copy, handed off, with a reviewer clone of the remote."""
+        s = scratch_loop_repo(self, "takedec-", name="author",
+                              objective="compact decisions")
+        cfg = s.repo / "review.toml"
+        cfg.write_text(edit(cfg.read_text(encoding="utf-8")),
+                       encoding="utf-8")
+        sh("git", "-C", str(s.repo), "commit", "-q", "--allow-empty", "-am",
+           "declarations")
+        s.home = s.tmp / "home"
+        s.home.mkdir()
+        remote = s.tmp / "remote.git"
+        s.reviewer = s.tmp / "reviewer"
+        sh("git", "init", "-q", "--bare", "-b", "main", str(remote))
+        sh("git", "-C", str(s.repo), "remote", "add", "origin", str(remote))
+        sh("git", "-C", str(s.repo), "push", "-q", "-u", "origin", "main")
+        sh("git", "clone", "-q", str(remote), str(s.reviewer))
+        for k, v in (("user.name", "r"), ("user.email", "r@example.invalid"),
+                     ("commit.gpgsign", "false")):
+            sh("git", "-C", str(s.reviewer), "config", k, v)
+        code, s.rec = run_cli(s.repo, s.tmp / "state-author", "handoff",
+                              "--claim-file", str(s.claim), "--base", s.base,
+                              cwd=s.cwd, env={"HOME": str(s.home)})
+        self.assertEqual(code, 0, s.rec)
+        s.target = _git(s.repo, "rev-parse", "HEAD")
+        return s
+
+    def loupe(self, s, state, *argv):
+        env = {k: v for k, v in os.environ.items() if k not in _TAKE_DROP}
+        env["HOME"] = str(s.home)
+        proc = subprocess.run(
+            [str(REPO_ROOT / "bin" / "loupe"), "--ledger-dir",
+             str(s.tmp / state), *argv],
+            cwd=s.reviewer, env=env, capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=120)
+        try:
+            return proc.returncode, json.loads(proc.stdout), proc.stdout
+        except json.JSONDecodeError:
+            raise AssertionError(f"not JSON (exit {proc.returncode}): "
+                                 f"{proc.stdout!r} {proc.stderr!r}") from None
+
+    def both(self, s, tag, *extra):
+        """Default and compact take of the same request; returns the one
+        `decide` list they must share."""
+        code, default, _ = self.loupe(s, f"state-{tag}-d", "take",
+                                      s.rec["kept"], "--as", "codex", *extra)
+        self.assertEqual(code, 0, default)
+        code, compact, raw = self.loupe(s, f"state-{tag}-c", "take",
+                                        s.rec["kept"], "--as", "codex",
+                                        "--compact", *extra)
+        self.assertEqual(code, 0, compact)
+        self.assertEqual(compact.get("decide", "<absent>"),
+                         default["decide"])
+        self.assertEqual(set(compact), self.COMPACT_KEYS)
+        self.assertFalse(self.PROSE_AND_ATTESTATIONS & set(compact))
+        self.assertIn("## Claim", default["request_view"],
+                      "the paired control: the default carries the prose")
+        self.assertNotIn("## Claim", raw)
+        self.assertNotIn(wire.attestation_fence(TOOL_NAME), raw)
+        self.assertEqual(compact["sha"], s.target)
+        return default["decide"]
+
+    def test_the_reviewers_case_an_undeclared_target_key_survives(self):
+        # Every key declared but `transport`, built from this module's own
+        # helper and never from whatever review.toml sits at the root: the
+        # extracted candidate's is the public example, which declares a
+        # different set (the 0.25.0 round-2 hand-off's CI failure).
+        s = self.scenario(lambda toml: _declare_all(toml).replace(
+            'transport = "path"\n', "", 1))
+        decide = self.both(s, "one")
+        self.assertEqual(decide, [{
+            "key": vocab.DECIDE_TRANSPORT,
+            "meaning": vocab.DECIDE_KEYS[0][1],
+            "applied": "path", "set": 'transport = "path"', "unset": None}])
+        # Why compact must carry it: the kept request stamps the value
+        # applied and nothing that says it was never declared.
+        kept = Path(s.rec["kept"]).read_text(encoding="utf-8")
+        self.assertNotIn(vocab.DECIDE_TRANSPORT, kept)
+
+    def test_a_fully_declared_target_is_empty_and_present(self):
+        """The reviewer's paired case, with the reviewer's own edit: the
+        scratch copy declares the other five, and this adds the sixth."""
+        s = self.scenario(_declare_all)
+        self.assertEqual(self.both(s, "all"), [])
+
+    def test_every_decision_kind_take_can_produce(self):
+        s = self.scenario(_declare_none)
+        decide = self.both(s, "none")
+        self.assertEqual([d["key"] for d in decide], list(_DECIDE))
+        self.assertEqual(decide, vocab.decisions(frozenset(), {
+            vocab.DECIDE_TRANSPORT: "path",
+            vocab.DECIDE_ROUND_CAP: config.DEFAULTS["limits"]["round_cap"]}))
+        by = {d["key"]: d for d in decide}
+        # A set/unset pair of TOML lines.
+        self.assertEqual((by[vocab.DECIDE_DEBUG]["set"],
+                          by[vocab.DECIDE_DEBUG]["unset"]),
+                         ("debug = true", "debug = false"))
+        # A set line with no off state, the applied value the take's own.
+        self.assertEqual((by[vocab.DECIDE_TRANSPORT]["applied"],
+                          by[vocab.DECIDE_TRANSPORT]["unset"]),
+                         ("path", None))
+        # A set line rendered from the applied cap.
+        cap = config.DEFAULTS["limits"]["round_cap"]
+        self.assertEqual(by[vocab.DECIDE_ROUND_CAP]["set"],
+                         f"round_cap = {cap}")
+        # An off state that is the decided-undeclared comment line.
+        self.assertEqual(by[vocab.DECIDE_TOKEN_BUDGET]["unset"],
+                         "# decided: limits.token_budget undeclared")
+        # The applied value is this take's: the reviewer's correction.
+        paste = self.both(s, "paste", "--transport", "paste")
+        self.assertEqual({d["key"]: d["applied"] for d in paste}
+                         [vocab.DECIDE_TRANSPORT], "paste")
+        self.assertEqual([d["key"] for d in paste], list(_DECIDE))
+
+    def test_a_decided_undeclared_line_is_honoured_in_both(self):
+        s = self.scenario(lambda toml: _declare_none(toml).replace(
+            "\n[limits]\n",
+            "\n[limits]\n# decided: limits.token_budget undeclared\n", 1))
+        decide = self.both(s, "decided")
+        self.assertEqual([d["key"] for d in decide],
+                         [k for k in _DECIDE
+                          if k != vocab.DECIDE_TOKEN_BUDGET])
+
+    def test_a_reviewer_checkout_declaring_otherwise_does_not_answer(self):
+        """The target's list, whatever this checkout says. Paired control
+        on each side: `loupe decide`, the verb that DOES read this
+        checkout, reports the checkout's own, different list."""
+        for target_edit, checkout_edit, name in (
+                (_declare_none, _declare_all, "target none, checkout all"),
+                (_declare_all, _declare_none, "target all, checkout none")):
+            with self.subTest(case=name):
+                s = self.scenario(target_edit)
+                cfg = s.reviewer / "review.toml"
+                cfg.write_text(checkout_edit(cfg.read_text(
+                    encoding="utf-8")), encoding="utf-8")
+                sh("git", "-C", str(s.reviewer), "commit", "-qam",
+                   "the reviewer's checkout declares otherwise")
+                self.assertNotEqual(_git(s.reviewer, "rev-parse", "HEAD"),
+                                    s.target)
+                code, local, _ = self.loupe(s, "state-local", "decide")
+                self.assertEqual(code, 0, local)
+                decide = self.both(s, "differs")
+                target_keys = ([] if target_edit is _declare_all
+                               else list(_DECIDE))
+                self.assertEqual([d["key"] for d in decide], target_keys)
+                self.assertNotEqual([d["key"] for d in local["decide"]],
+                                    target_keys,
+                                    "the checkout must really differ")
 
 
 if __name__ == "__main__":

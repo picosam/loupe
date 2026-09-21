@@ -166,6 +166,14 @@ PROSE_KEYS = (
     # brief ci-attested-gates (2026-09-07): the gate row's attester, the run
     # it names, and the limit the poll runs under.
     "attested_by", "ci_run", "ci_timeout",
+    # 0.25.0: `[limits] git_timeout`, the ceiling on a git subprocess —
+    # there because `commit` and `push` run the REPOSITORY's hooks and a
+    # repository may take longer at them than the built-in allows. Read,
+    # never run, like every `[limits]` key beside it: a number a person
+    # edits in configuration, never one a command sets. Classified for the
+    # advisory scan, which reads `config.DEFAULTS`' literal keys; nothing
+    # prints it as a top-level result key today.
+    "git_timeout",
     # Lineage 7 round 1: which INSTALLATION wrote the envelope and which is
     # reading it, with the verdict on whether they agree. Read, never run —
     # and deliberately not a command, because the tool takes no position on
@@ -416,10 +424,13 @@ def cmd_validate(args, cfg) -> int:
             round_cap=_lineage_read.effective_round_cap(
                 governing.round_cap, judged_lineage))
     elif kind == "verdict":
+        # Public issue #3: the residue notice reads this ledger's record of
+        # the closed findings' anchors (notices only; the exit is unchanged).
         items = validate_verdict(
             parsed, governing,
             answering=_dispositions_answered(_lineage_read, parsed,
-                                             judged_lineage))
+                                             judged_lineage),
+            ledger=_lineage_read, lineage=judged_lineage)
     elif kind == vocab.AUTHORIZATION_KIND:
         items = validate_authorization(parsed, governing)
     else:
@@ -449,7 +460,17 @@ def cmd_validate(args, cfg) -> int:
     # agent improvising. The précis still goes out either way: describing a
     # broken envelope is how its author finds out what is broken.
     is_verdict = kind == "verdict" and parsed.wrapped
-    precis = (brief.verdict_precis(parsed, source=args.envelope)
+    # 0.25.0 (an adopter's lowercase taxonomy read "0 block"): which
+    # findings block is the TARGET's declared taxonomy's to say. `--from-target` already resolved it; without the flag the
+    # précis still asks the target (validation keeps the authority the
+    # invocation chose), and an unresolvable target is stated, never
+    # replaced by this checkout's rules or a literal.
+    if is_verdict:
+        taxonomy, unresolved = ((governing, None) if args.from_target
+                                else brief.target_taxonomy(cfg, parsed.sha))
+    precis = (brief.verdict_precis(parsed, source=args.envelope,
+                                   governing=taxonomy,
+                                   unresolved=unresolved)
               if is_verdict else None)
     # RVW-T11: the topology comes from this machine's own record of the
     # round, never from the verdict document — see the note on the relay
@@ -1502,9 +1523,19 @@ def _debug_flag(args) -> bool | None:
 
 def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
           selected_transport: str, lineage: str):
-    """emit-request's body, shared with handoff: push, emit, validate.
-    Returns (envelope, parsed, scope) or an int exit code, where `scope` is
-    the non-blocking claim-versus-span report (`validate.scope_items`).
+    """emit-request's body, shared with handoff: commit, gate, push, emit,
+    validate. Returns (envelope, parsed, scope) or an int exit code, where
+    `scope` is the non-blocking claim-versus-span report
+    (`validate.scope_items`).
+
+    GATE BEFORE PUSH (0.25.0, public issue #2; ruled: no undo). The local
+    gates run at the commit, inside `ensure_pushed`'s `before_push`, after
+    every local refusal and before anything leaves the machine. A blocking
+    one that the request validator would refuse stops the hand-off there —
+    nothing pushed, emitted or recorded, the local commit named for the
+    author to amend or reset. Otherwise the push goes ahead, the
+    CI-attested gates are awaited on the pushed SHA, and the emission
+    carries both halves; no gate runs twice.
 
     Round 2 F1 (lineage 12): the effective roles are NOT passed in. They are
     resolved inside `ensure_pushed`, against the committed authority, from
@@ -1522,9 +1553,52 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
     digest and the ledger attested the first.
     """
     claim = captured.claim
-    # §9bis.4: commit outstanding work, push the reviewed branch, observe the
-    # remote ref — BEFORE emission, refusing every state that cannot yield a
-    # fetchable target. The record is what the envelope stamps.
+    # 0.25.0 (public issue #4): the claim's record-bound members, judged
+    # against this ledger BEFORE anything is committed — the first point
+    # both the ledger and the lineage are in hand (`emit.check_claim_record`
+    # says what refuses and what is only stated).
+    try:
+        emit.check_claim_record(claim, ledger, lineage, cfg,
+                                path=Path(args.claim_file)
+                                if getattr(args, "claim_file", None) else None)
+    except emit.ClaimDefective as exc:
+        return _claim_defect_exit(exc)
+    # The review range's base, derived as `emit_request` derives it — the
+    # author's `--base`, else the SHA the lineage's last verdict ruled on —
+    # and derived HERE because the gates now run before the push and are
+    # told it (0.25.0). This is the EXPRESSION; `ensure_pushed` resolves it
+    # once, before its own commit, and everything after that uses the id it
+    # returns (review round 1 F1, below).
+    base = args.base
+    if base is None:
+        verdicts = [e for e in ledger.current(lineage)
+                    if e.get("event") == "verdict"]
+        if verdicts:
+            base = max(verdicts, key=lambda e: e["round"])["sha"]
+    local_gates = None
+
+    def gate_before_push(record: dict) -> None:
+        # The governing configuration's manifest, at the commit, with the
+        # base the emission will bind. Refuses by raising GatesRefused.
+        nonlocal local_gates
+        # The claim's attestation_map names gates of the GOVERNING manifest,
+        # which exists only now that the commit does — judged here, before
+        # any gate runs and before anything is pushed (0.25.0; the same
+        # function `emit_request` applies for a direct caller).
+        emit.check_map_gates(claim, record["governing"], record["sha"])
+        if base is None:
+            # The refusal `emit_request` has always made, raised before the
+            # gates and the push rather than after them: a request with no
+            # range cannot be emitted, so nothing is run or sent for one.
+            raise RuntimeError("no prior verdict in the ledger; pass --base")
+        local_gates = emit.gate_before_push(record["governing"], record,
+                                            base=record["base"],
+                                            verb=args.command)
+
+    # §9bis.4: commit outstanding work, gate it, push the reviewed branch,
+    # observe the remote ref — BEFORE emission, refusing every state that
+    # cannot yield a fetchable, gated target. The record is what the
+    # envelope stamps.
     try:
         record = emit.ensure_pushed(cfg, head=args.head,
                                     local_only=args.local_only,
@@ -1537,7 +1611,9 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
                                                           None),
                                     scope_paths=claim.get("scope_paths"),
                                     allow_outside_scope=getattr(
-                                        args, "allow_outside_scope", False))
+                                        args, "allow_outside_scope", False),
+                                    base=base,
+                                    before_push=gate_before_push)
     except (emit.AuthorityAbsent, emit.RoleSelectionError,
             emit.SweepRefused) as exc:
         # RVW-T17: ONE catch, reached by both author doors, because both
@@ -1545,6 +1621,14 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
         # two author doors accepting different states — has no second place
         # to live any more.
         return _blocked("", str(exc), remedy=exc.remedy)
+    except emit.GatesRefused as exc:
+        # Blocked: no command repairs a red gate. The validator's own items
+        # travel, so the author reads what failed without a second run.
+        return _blocked("", str(exc), remedy=exc.remedy,
+                        extra={"items": [i.as_dict() for i in exc.items],
+                               "sha": exc.sha, "gate_output": exc.outputs},
+                        lead="\n".join(f"{i.level}: [{i.code}] {i.message}"
+                                       for i in exc.items))
     # U-1. What governs the emission is the authority resolved FROM THE
     # TARGET, not this checkout's config. The two are routinely different
     # and nothing compared them: `LOUPE_CONFIG` names an out-of-tree file
@@ -1565,17 +1649,28 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
     # the cache key and it catches an unassigned or rejected identity before
     # any git call — but it is not what reaches the envelope.
     roles = record["roles"]
-    envelope = emit.emit_request(governing, ledger, claim, base=args.base,
+    # 0.25.0 review round 1 F1 (High): THE ONE BASE. `ensure_pushed`
+    # resolved the expression before its commit and told every LOCAL gate
+    # that id (round 2 F2: a CI-attested gate is told none — CI runs it
+    # base-less, so its receipt binds the target commit, not this base,
+    # and a range-sensitive gate must run locally to receive it); the
+    # emission, the shape and the validation below take the SAME
+    # id, never the expression again. Forwarding `args.base` here resolved
+    # it a second time AFTER the commit and the push — `HEAD~1` then named
+    # the old tip, `HEAD` and the branch the new commit, `origin/main` the
+    # pushed one — so a blocking range gate passed for A..C while the
+    # request named B..C, over which it fails. (`emit.run_gates` now also
+    # refuses a local half told another base than the request names.)
+    base = record["base"]
+    envelope = emit.emit_request(governing, ledger, claim, base=base,
                                  head=record["sha"], reachability=record,
                                  author=roles[0], reviewer=roles[1],
                                  transport=selected_transport,
                                  debug=emit.resolve_debug(cfg,
                                                           _debug_flag(args)),
-                                 lineage=lineage)
+                                 lineage=lineage,
+                                 local_gates=local_gates)
     parsed = wire.parse_request(envelope)
-    base = args.base or max((e for e in ledger.current(lineage)
-                             if e.get("event") == "verdict"),
-                            key=lambda e: e["round"])["sha"]
     shape = emit.diff_shape(cfg.repo_root, base, parsed.sha)
     items = validate_request(parsed, governing,
                              recomputed_shape=(shape["files"],
@@ -2092,6 +2187,40 @@ def cmd_take(args, cfg) -> int:
     # bytes and nothing else, so a consumer that pipes it onward is never
     # handed a rendering under that name.
     verbatim = rec.pop("envelope")
+    if getattr(args, "compact", False):
+        # Public issue #4, reviewer request (2026-09-21): pointers only. The
+        # take above ran every check and wrote every record exactly as the
+        # default does — this chooses what is PRINTED, never what is done.
+        # The request itself is the kept file; `--full` and the default
+        # remain the two renderings of it.
+        #
+        # `decide` is not presentation (round-1 F5 of the 0.25.0 review):
+        # it is the TARGET commit's undeclared keys, computed by `take` from
+        # the configuration that governed this request, and it exists only
+        # in this result — the kept request stamps the value applied, never
+        # that it was undeclared, and reading this checkout's configuration
+        # answers for a different commit whenever the two differ. Dropping
+        # it made "the target declares this" and "the target never did"
+        # print identically, so the adapter's ask-once rule never fired. It
+        # is carried whole, empty list included, exactly as the default
+        # take carries it.
+        compact = {"ok": True, "kept": rec.get("kept"),
+                   "digest": rec["digest"],
+                   "bytes": len(verbatim.encode("utf-8")),
+                   "lineage": rec.get("lineage"), "round": rec["round"],
+                   "sha": rec["sha"], "reviewer": rec["reviewer"],
+                   "head": rec["head"], "brief": rec["brief"],
+                   "decide": rec["decide"],
+                   "diff": rec["diff"], "then": rec["then"]}
+        _out(compact,
+             f"kept:   {compact['kept']}\n"
+             f"digest: {compact['digest']} ({compact['bytes']} bytes)\n"
+             f"--- taken: lineage {compact['lineage']} round "
+             f"{compact['round']} target {compact['sha']} as reviewer "
+             f"{compact['reviewer']}\n\n{compact['brief']}\n\n"
+             f"{render_checkout(compact['head'], compact['sha'])}"
+             f"diff:   {compact['diff']}\nthen:   {compact['then']}")
+        return EXIT_OK
     if args.full:
         rec["envelope"] = shown = verbatim
     else:
@@ -2480,7 +2609,10 @@ def cmd_close(args, cfg) -> int:
         except transport.Refusal as exc:
             return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
         rec["ok"] = True
-        rec["brief"] = brief.verdict_precis(parsed_verdict, source=args.verdict)
+        # 0.25.0: the blocking set is the target's, the authority this
+        # close already judged the verdict under — one resolution, not two.
+        rec["brief"] = brief.verdict_precis(parsed_verdict, source=args.verdict,
+                                            governing=governing)
         rec["relay"] = brief.verdict_relay(
             parsed_verdict, source=args.verdict, transport=carrier,
             reference=_round_reference(carrier, rec.get("round"),
@@ -2741,11 +2873,16 @@ def cmd_brief(args, cfg) -> int:
                             remedy=f"a person appends the terminal newline "
                                    f"to {paths.display_path(source)} and "
                                    f"re-runs this command")
+        # 0.25.0: the blocking set is the target's declared taxonomy,
+        # resolved by the authority `validate --from-target` and `close` use.
+        taxonomy, unresolved = brief.target_taxonomy(cfg, as_verdict.sha)
         rec = {"kind": "verdict", "source": source, "ok": True,
                "decide": _decide(cfg), "sha": as_verdict.sha,
                "lineage": lineage, "open_lineages": elsewhere,
                "brief": brief.verdict_precis(as_verdict, source=source,
-                                             full=args.full),
+                                             full=args.full,
+                                             governing=taxonomy,
+                                             unresolved=unresolved),
                "relay": relay_text}
         _out(rec, f"{rec['brief']}\n\n{rec['relay']}")
         return EXIT_OK
@@ -2893,54 +3030,85 @@ def cmd_render_adapters(args, cfg) -> int:
     were found rounds behind the source, advertising a `respond` step with no
     falsification record and a verb table missing `waive`. Rendering a
     procedure nobody reads is not a procedure. `--install` is the deploy the
-    gate could never be: it refuses to install adapters that are themselves
-    stale, keeps whatever it replaces, and reports every target it touched.
+    gate could never be: it keeps whatever it replaces, and reports every
+    target it touched.
+
+    0.25.0, install independence (ruling 5, 2026-09-21): with no `--dir`,
+    `--install` and `--check-install` take their source from THIS
+    installation's own rendering and read no directory at all, so a wheel
+    install with nothing beside it installs and verifies exactly as a clone
+    does. `--dir` keeps the directory-sourced behaviour, including the
+    refusal to install a stale tracked copy. `--check-embedded` and
+    `--write-embedded` judge and repair an instruction block embedded in a
+    tracked file (public issue #5).
     """
+    if (getattr(args, "check_embedded", None) is not None
+            or getattr(args, "write_embedded", None) is not None):
+        return _cmd_embedded(args)
     if args.dir:
         directory = Path(args.dir)
     elif args.check_install or args.install:
-        # RVW-T21 D1: these two modes are machine-global (they ask about
-        # ~/.claude/skills/, ~/.codex/skills/, not the repository underfoot),
-        # so their default source is the package's own adapters/ sibling,
-        # never the cwd repo's — that default exists only in the tool's own
-        # checkout and failed this check everywhere else. `render` and
-        # `--check` are repo-local and keep the cwd-relative default below.
-        directory = adapters.machine_global_dir()
-        if not directory.is_dir():
-            return _blocked(
-                "",
-                f"no adapters/ directory beside the installed package "
-                f"({directory}) — the machine-global install modes do not "
-                f"fall back to the current repository's adapters/",
-                remedy=f"pass --dir <path to the rendered adapters> "
-                       f"explicitly")
+        # Machine-global modes: the running package's rendering, from no
+        # directory. The 0.24.x default (an `adapters/` sibling of the
+        # installed package) is gone, not demoted to a fallback — an answer
+        # that depends on whether a checkout sits beside the package is the
+        # same-machine dependency the ruling removed.
+        directory = None
     else:
         directory = cfg.repo_root / adapters.ADAPTERS_DIR
+    install_cmd = paths.command(*paths.lits(TOOL_NAME, "render-adapters",
+                                            "--install"))
     if args.check_install:
         rows = adapters.check_install(directory)
         drift = [r for r in rows if r["status"] != "in_sync"]
-        if drift:
+        why = ("installed adapter(s) differ from the rendered copies: "
+               + "; ".join(_drift_line(r) for r in drift))
+        if any(r["status"] == "legacy_blocked" for r in drift):
+            # `--install` would refuse this state, so naming it as the next
+            # command would hand an agent a step that cannot succeed.
             return _blocked(
-                paths.command(*paths.lits(TOOL_NAME, "render-adapters",
-                                          "--install")),
-                "installed adapter(s) differ from the rendered copies: "
-                + "; ".join(_drift_line(r) for r in drift))
+                "", why,
+                remedy="a person sorts out the legacy skill directory named "
+                       "above — only a directory holding loupe's own "
+                       "SKILL.md and nothing else is ever moved — then runs "
+                       f"`{install_cmd}`",
+                extra={"install": rows})
+        if drift:
+            return _blocked(install_cmd, why, extra={"install": rows})
         _out({"ok": True, "install": rows},
-             "\n".join(f"in sync  {r['target']}" for r in rows))
+             "\n".join(([f"source   {rows[0]['source']}"] if rows else [])
+                       + [f"in sync  {r['target']}" for r in rows]))
         return EXIT_OK
     if args.install:
         # Never install what the gate would reject: a stale tracked copy
         # deployed everywhere is the drift this verb exists to end, spread
-        # rather than fixed.
-        stale = adapters.check_all(directory)
-        if stale:
-            return _blocked(
-                paths.command(*paths.lits(TOOL_NAME, "render-adapters")),
-                "refusing to install adapters that are themselves stale: "
-                + ", ".join(stale))
+        # rather than fixed. Only a DIRECTORY source can be stale; this
+        # package's own rendering is current by definition.
+        if directory is not None:
+            stale = adapters.check_all(directory)
+            if stale:
+                return _blocked(
+                    paths.command(*paths.lits(TOOL_NAME, "render-adapters")),
+                    "refusing to install adapters that are themselves stale: "
+                    + ", ".join(stale))
         keep = cfg.ledger_dir / "replaced-adapters" if cfg.ledger_dir else None
         rows = adapters.install_all(directory, keep_dir=keep)
         rendered = "\n".join(_install_line(r) for r in rows)
+        blocked = [r for r in rows if r["status"] == "blocked"]
+        if blocked:
+            return _blocked(
+                "",
+                "refusing to install: "
+                + "; ".join(f"{r['kind']} legacy copy at {r['target']}: "
+                            f"{r['error']}" for r in blocked)
+                + " — nothing was written or moved",
+                remedy="a person sorts out the named legacy skill directory "
+                       "— only a directory holding loupe's own SKILL.md and "
+                       "nothing else is ever moved, and the tool will not "
+                       "decide which of two things in it to keep — then "
+                       "re-runs this command",
+                extra={"installed": rows},
+                detail=rendered)
         failed = [r for r in rows if r["status"] == "failed"]
         if failed:
             # Every attempted target travels with the refusal, installed and
@@ -2948,7 +3116,7 @@ def cmd_render_adapters(args, cfg) -> int:
             # stops at the first it cannot, so a bare failure message would
             # make a partial deployment indistinguishable from none.
             touched = [r for r in rows
-                       if r["status"] in ("installed", "replaced")]
+                       if r["status"] in ("installed", "replaced", "migrated")]
             return _blocked(
                 "",
                 "could not install: "
@@ -2984,20 +3152,92 @@ def cmd_render_adapters(args, cfg) -> int:
     return EXIT_OK
 
 
+def _embedded_command(flag: str, given: str) -> str:
+    """`loupe render-adapters <flag> <file>`, or "" when the path cannot be
+    rendered as one shell word (a control character) — a blocked exit then,
+    never a command an agent could not run as printed."""
+    try:
+        return paths.command(*paths.lits(TOOL_NAME, "render-adapters"),
+                             paths.token(flag), given)
+    except ValueError:
+        return ""
+
+
+def _cmd_embedded(args) -> int:
+    """`--check-embedded` / `--write-embedded` (public issue #5): the one
+    region of a tracked file between the rendered block's own marker lines,
+    judged against — or replaced by — this installation's rendering of
+    `instructions-block`. Every structural defect is refused by name in
+    `status`; a stale region's next command is the write."""
+    write = args.write_embedded is not None
+    flag = "--write-embedded" if write else "--check-embedded"
+    given = args.write_embedded if write else args.check_embedded
+    if args.dir:
+        return _blocked(
+            _embedded_command(flag, given),
+            f"--dir does not apply to {flag}: an embedded region is always "
+            f"judged against this installation's own rendering",
+            code=EXIT_USAGE,
+            remedy=f"run {flag} without --dir")
+    try:
+        info = (adapters.write_embedded(given) if write
+                else adapters.check_embedded(given))
+    except adapters.EmbeddedRefusal as exc:
+        return _blocked("", str(exc),
+                        code=EXIT_USAGE if exc.usage else EXIT_FINDINGS,
+                        remedy=exc.remedy,
+                        extra={"path": given, "status": exc.status,
+                               "data": exc.data})
+    followed = (f"followed the symbolic link {info['path']} to "
+                f"{info['target']}, which is the file read"
+                + (" and written" if write else ""))
+    payload = {"path": info["path"], "target": info["target"],
+               "status": info["status"], "source": info["source"],
+               "source_digest": info["source_digest"],
+               "digest": info["digest"], "data": info["data"]}
+    if info["followed"]:
+        payload["note"] = followed
+    where = (f"{info['target']} lines {info['begin_line']}-"
+             f"{info['end_line']}")
+    lead = f"{followed}\n" if info["followed"] else ""
+    if info["status"] == "stale":
+        return _blocked(
+            _embedded_command("--write-embedded", given),
+            f"the embedded {TOOL_NAME} adapter block at {where} differs from "
+            f"the block {info['source']}",
+            remedy="a person replaces the region between the markers with "
+                   "the current rendering",
+            extra=payload, lead=lead.rstrip("\n"))
+    state = "now equals" if info["status"] == "written" else "equals"
+    _out({"ok": True, **payload},
+         f"{lead}the embedded block at {where} {state} the block "
+         f"{info['source']}")
+    return EXIT_OK
+
+
 def _drift_line(row: dict) -> str:
     """One `check_install` drift row, rendered for a person: the failing
     SIDE's own path, never the healthy other side (RVW-T21 D1) — a
     `source_*` status points at `source`, everything else (including the
-    target-side `unreadable`) points at `target`, exactly as it always did."""
+    target-side `unreadable` and both legacy statuses) points at `target`,
+    exactly as it always did. A legacy row names what supersedes it, and a
+    blocked one why it cannot be moved."""
     path = row["source"] if row["status"].startswith("source_") else row["target"]
-    return f"{row['kind']} {row['status']} at {path}"
+    line = f"{row['kind']} {row['status']} at {path}"
+    if row["status"].startswith("legacy_"):
+        line += f" (superseded by {row['superseded_by']}"
+        line += f": {row['error']})" if row.get("error") else ")"
+    return line
 
 
 def _install_line(row: dict) -> str:
     """One install row, rendered for a person: what happened to which path,
-    and where the bytes it replaced went."""
+    and where the bytes it replaced — or the legacy copy it moved — went."""
     line = f"{row['status']:<10} {row['target']}"
-    if row.get("kept"):
+    if row["status"] == "migrated":
+        line += (f"  (legacy copy superseded by {row['superseded_by']}: "
+                 f"moved out of discovery, kept at {row['kept']})")
+    elif row.get("kept"):
         line += f"  (replaced {row['replaced_digest'][:12]}, kept at "
         line += f"{row['kept']})"
     if row.get("error"):
@@ -3158,7 +3398,7 @@ def build_parser() -> argparse.ArgumentParser:
     def emission_flags(sp):
         sp.add_argument("--claim-file",
                         help="JSON with the authored Claim content")
-        sp.add_argument("--base", help="override the derived base SHA")
+        sp.add_argument("--base", help="the review range's base — a commit id, branch, tag or expression such as HEAD~1, resolved once to a commit id BEFORE the hand-off commits outstanding work (default: the SHA the lineage's last verdict ruled on). That id is what the gates run locally are told; a CI-attested gate is not told it, so its receipt binds the target commit but does not prove the review base, and a range-sensitive gate must run locally to receive it")
         sp.add_argument("--head", help="override HEAD")
         sp.add_argument("--local-only", action="store_true",
                         help="declare that no remote exists and the target "
@@ -3240,11 +3480,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "[roles] reviewer names the repository's default "
                          "direction, not who is at the keyboard. Must equal "
                          "the envelope's stamp")
-    tk.add_argument("--full", action="store_true",
-                    help="print the request verbatim, every attestation "
-                         "object included. The default prints the same "
-                         "request with those objects as one table; the kept "
-                         "file `take` names always holds the exact bytes")
+    tk_view = tk.add_mutually_exclusive_group()
+    tk_view.add_argument("--full", action="store_true",
+                         help="print the request verbatim, every attestation "
+                              "object included. The default prints the same "
+                              "request with those objects as one table; the "
+                              "kept file `take` names always holds the exact "
+                              "bytes")
+    tk_view.add_argument("--compact", action="store_true",
+                         help="print pointers only: the kept path, its "
+                              "digest and byte size, lineage, round, target "
+                              "SHA, whether this checkout is the target, the "
+                              "précis, the target's `decide` list and the "
+                              "next command — no request prose, no "
+                              "attestation table. Everything `take` checks "
+                              "and records is unchanged")
     tk.add_argument("--no-fetch", action="store_true",
                     help="do not run the stamped fetch; still requires the "
                          "target to be present in this clone")
@@ -3364,22 +3614,42 @@ def build_parser() -> argparse.ArgumentParser:
                              "Codex skill, instruction block) from one "
                              "source; --check is a drift gate, --install "
                              "deploys them where the agents read them, "
-                             "--check-install reports drift there (§6.3)")
+                             "--check-install reports drift there, "
+                             "--check-embedded judges a block embedded in "
+                             "a tracked file (§6.3)")
     ra_mode = ra.add_mutually_exclusive_group()
     ra_mode.add_argument("--check", action="store_true",
                          help="the drift gate: are the tracked copies current")
     ra_mode.add_argument("--install", action="store_true",
-                         help="deploy the rendered adapters to the paths the "
-                              "agents load them from; keeps whatever it "
-                              "replaces and names it")
+                         help="deploy this installation's rendering to the "
+                              "paths the agents load it from; keeps whatever "
+                              "it replaces and names it, and moves a legacy "
+                              "copy out of discovery the same way")
     ra_mode.add_argument("--check-install", action="store_true",
-                         help="report drift between the rendered copies and "
-                              "the installed ones (not a gate: a machine "
-                              "with no install is not a broken build)")
-    ra.add_argument("--dir", help="output directory (default: <repo>/adapters "
-                                  "for render and --check; the installed "
-                                  "package's own adapters/ sibling for "
-                                  "--install and --check-install)")
+                         help="report drift between this installation's "
+                              "rendering and the installed copies, legacy "
+                              "copies included (not a gate: a machine with "
+                              "no install is not a broken build)")
+    ra_mode.add_argument("--check-embedded", metavar="FILE",
+                         help="compare the block embedded in FILE — from the "
+                              "line beginning `<!-- BEGIN GENERATED: "
+                              f"{TOOL_NAME} adapter` through the `<!-- END "
+                              f"GENERATED: {TOOL_NAME} adapter -->` line — "
+                              "with this installation's rendering; a "
+                              "symlinked FILE is followed, and a missing, "
+                              "unbalanced, duplicated or nested marker is "
+                              "refused by name")
+    ra_mode.add_argument("--write-embedded", metavar="FILE",
+                         help="replace exactly that region of FILE with this "
+                              "installation's rendering, every byte outside "
+                              "it unchanged; refuses everything "
+                              "--check-embedded refuses")
+    ra.add_argument("--dir", help="the rendered adapters' directory (default: "
+                                  "<repo>/adapters for render and --check; "
+                                  "without it --install and --check-install "
+                                  "read no directory — their source is this "
+                                  "installation's own rendering; not accepted "
+                                  "with --check-embedded or --write-embedded)")
     ra.set_defaults(func=cmd_render_adapters)
     return p
 

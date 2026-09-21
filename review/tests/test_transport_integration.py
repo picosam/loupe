@@ -945,7 +945,12 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
                             cwd=scratch.cwd)
         self.assertEqual(code, 0, out)
         start = out.index("What changed (")
-        return out[start:out.index("\nDeliberately not done:")]
+        end = out.index("\nDeliberately not done:")
+        # 0.25.0: the in-scope count is its own block AFTER the span (it
+        # renders whenever a path is generated or excluded); the span this
+        # helper returns ends before it. `test_claim_members` owns it.
+        scoped = out.find("\n\nIn scope: ", start, end)
+        return out[start:scoped + 1 if scoped != -1 else end]
 
     def _lists(self, span):
         """(header, the ordinary listing, the generated listing)."""

@@ -163,7 +163,7 @@ TOOL_NAME = "loupe"
 #   - the reviewer procedure gains the falsification-anchoring rule (D3):
 #     anchor in the reviewed tree wherever the defect admits it, and name
 #     an external mutable dependency in the finding when it does not.
-TOOL_VERSION = "0.24.1"
+TOOL_VERSION = "0.25.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never
@@ -310,6 +310,7 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_command_boundary.py": TESTS,
     "review/tests/test_cli_exits.py": TESTS,
     "review/tests/test_close_authority.py": TESTS,
+    "review/tests/test_claim_members.py": TESTS,
     "review/tests/test_concurrent_rounds.py": TESTS,
     "review/tests/test_config_compat.py": TESTS,
     "review/tests/test_convergence.py": TESTS,
@@ -319,10 +320,14 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_falsification_record.py": TESTS,
     "review/tests/test_fingerprint.py": TESTS,
     "review/tests/test_gate_environment.py": TESTS,
+    "review/tests/test_gate_before_push.py": TESTS,
+    "review/tests/test_git_timeout.py": TESTS,
     "review/tests/test_git_reads.py": TESTS,
     "review/tests/test_paths.py": TESTS,
     "review/tests/test_prune.py": TESTS,
+    "review/tests/test_precis_taxonomy.py": TESTS,
     "review/tests/test_reachability.py": TESTS,
+    "review/tests/test_residue_notice.py": TESTS,
     "review/tests/test_retention_by_lineage.py": TESTS,
     "review/tests/test_readme_walkthrough.py": TESTS,
     "review/tests/test_reference_domain.py": TESTS,

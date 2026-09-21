@@ -4,19 +4,30 @@ drift from the CLI's verb surface; the tracked copies are byte-guarded.
 FALSIFICATIONS: a verb the CLI has and the adapter omits (or the reverse)
 fails; two adapters with different bodies fail; a tracked adapter that
 differs from the render fails `--check`. Everything here is read-only except
-one temp-dir round trip that self-skips where writes are denied. The
+the temp-dir round trips, which self-skip where writes are denied. The
 install tests never touch a real agent directory: every target is a temp
-path passed in explicitly, and the CLI test patches `install_targets`.
+path passed in explicitly, the in-process CLI tests patch `install_targets`
+(and `legacy_targets`' interlock keeps a substituted target from reaching
+any legacy path under the real HOME), and every subprocess test runs
+`bin/loupe` — or the package alone — with HOME redirected into its own
+temp tree.
 """
 import contextlib
+import hashlib
 import json
 import io
+import os
 import re
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
-from review import TOOL_NAME, TOOL_VERSION, adapters, cli, config, vocab
+from review import (TOOL_NAME, TOOL_VERSION, adapters, cli, config, env_var,
+                    vocab)
 from review.digest import sha256_text
 from review.tests.util import REPO_ROOT, public_path, spec_path
 
@@ -728,6 +739,11 @@ class TestShippedRestatements(unittest.TestCase):
         # per-repository by construction.
         "LEGACY_IMPORT_ROW_KINDS", "LEGACY_SOURCE_REQUIRED",
         "LEGACY_SOURCE_ENVELOPE_FACTS", "LEGACY_MANIFEST_REQUIRED",
+        # 0.25.0, the carried-finding outcome vocabulary: a member grammar
+        # of the claim, which the validator owns like every other claim
+        # grammar; the adapters render it DERIVED. If the shipped docs come
+        # to spell it out, it moves to RESTATEMENTS.
+        "CARRIED_OUTCOMES",
     }
 
     @classmethod
@@ -1227,32 +1243,36 @@ class TestInstall(unittest.TestCase):
         target = self.targets[kind]
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(edited, encoding="utf-8")
-        real_read = Path.read_text
+        # The read-back is `read_bytes` since round-1 F2 of the 0.25.0
+        # review (a text read-back proved nothing about line endings), so
+        # that is the method the lying destination stands in for.
+        real_read = Path.read_bytes
 
         def truncating(self_path, *a, **k):
             if Path(self_path).parent == self.keep:
-                return "truncated"
+                return b"truncated"
             return real_read(self_path, *a, **k)
 
-        with unittest.mock.patch.object(Path, "read_text", truncating):
+        with unittest.mock.patch.object(Path, "read_bytes", truncating):
             rows = {r["kind"]: r for r in adapters.install_all(
                 self.rendered, targets={kind: target}, keep_dir=self.keep)}
         self.assertEqual(rows[kind]["status"], "failed", rows)
         self.assertEqual(target.read_text(encoding="utf-8"), edited,
                          "an unproven copy must not license the overwrite")
 
-        # And a read-back that cannot decode at all is the same refusal, not
-        # an escaping ValueError: the kept copy is proof only if reading it
-        # back is a question with an answer (round-10 F1, second handler).
-        def undecodable(self_path, *a, **k):
+        # And a read-back that cannot be answered at all is the same
+        # refusal, not an escaping exception: the kept copy is proof only if
+        # reading it back is a question with an answer (round-10 F1, second
+        # handler). Nothing decodes any more, so the unanswerable read is an
+        # I/O error rather than a UnicodeDecodeError.
+        def unreadable(self_path, *a, **k):
             if Path(self_path).parent == self.keep:
-                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1,
-                                         "invalid start byte")
+                raise OSError(5, "Input/output error", str(self_path))
             return real_read(self_path, *a, **k)
 
         for stray in self.keep.iterdir():
             stray.unlink()
-        with unittest.mock.patch.object(Path, "read_text", undecodable):
+        with unittest.mock.patch.object(Path, "read_bytes", unreadable):
             rows = {r["kind"]: r for r in adapters.install_all(
                 self.rendered, targets={kind: target}, keep_dir=self.keep)}
         self.assertEqual(rows[kind]["status"], "failed", rows)
@@ -1559,148 +1579,1130 @@ class TestInstall(unittest.TestCase):
         self.assertTrue(payload["ok"])
 
 
-class TestMachineGlobalDefaultDir(unittest.TestCase):
-    """RVW-T21 D1, second half: `--check-install` and `--install` ask a
-    machine-global question (what's under `~/.claude/skills/`,
-    `~/.codex/skills/`), so their default source — when `--dir` is not
-    given — must not be `<cwd repo>/adapters`: that directory exists only
-    in the tool's own checkout, and every other repository sent the check
-    looking for sources that were not there. `--check` and the bare render
-    are repo-local (a drift gate / generation for THIS repository) and keep
-    the cwd-relative default.
+#: The environment names a scratch run must not inherit: this suite is itself
+#: run BY a gate (`tests`), which marks its children, and the host may carry
+#: a CODEX_HOME, a state directory or a transport declaration of its own.
+_INHERITED = (env_var("IN_GATE_RUN"), env_var("GATE_HEAD"),
+              env_var("GATE_BASE"), env_var("STATE_DIR"), env_var("CONFIG"),
+              "CODEX_HOME", "PYTHONPATH", "PYTHONSAFEPATH")
 
-    FALSIFICATIONS, one per test: see each docstring.
+
+def scratch_env(home: Path, state: Path, **extra) -> dict:
+    """HOME and the state directory redirected into the test's own temp
+    tree, every inherited gate or Codex name removed, then `extra`."""
+    env = {k: v for k, v in os.environ.items() if k not in _INHERITED}
+    env["HOME"] = str(home)
+    env[env_var("STATE_DIR")] = str(state)
+    env.update(extra)
+    return env
+
+
+def run_loupe(argv, *, cwd, env, launcher=None):
+    """The REAL entry point as a subprocess — `bin/loupe` of this tree
+    unless `launcher` names another — returning (exit, parsed JSON)."""
+    cmd = list(launcher or [str(REPO_ROOT / "bin" / "loupe")])
+    proc = subprocess.run([*cmd, *argv], cwd=cwd, env=env,
+                          capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, timeout=120)
+    try:
+        return proc.returncode, json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise AssertionError(f"not JSON (exit {proc.returncode}): "
+                             f"{proc.stdout!r} {proc.stderr!r}") from None
+
+
+class _Scratch(unittest.TestCase):
+    """A temp tree with a HOME, a state directory and an unrelated cwd."""
+
+    def setUp(self):
+        try:
+            self.tmp = Path(tempfile.mkdtemp(prefix="adapters-scratch-"))
+        except OSError as exc:
+            self.skipTest(f"filesystem writes denied ({exc})")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.home = self.tmp / "home"
+        self.state = self.tmp / "state"
+        self.cwd = self.tmp / "elsewhere"
+        for d in (self.home, self.state, self.cwd):
+            d.mkdir()
+
+    def env(self, **extra):
+        return scratch_env(self.home, self.state, **extra)
+
+    def loupe(self, *argv, env=None, launcher=None):
+        return run_loupe(list(argv), cwd=self.cwd, env=env or self.env(),
+                         launcher=launcher)
+
+    @property
+    def documented(self):
+        return self.home / ".agents" / "skills" / TOOL_NAME / "SKILL.md"
+
+    @property
+    def claude(self):
+        return self.home / ".claude" / "skills" / TOOL_NAME / "SKILL.md"
+
+    def legacy_at(self, root: Path, text="an older loupe skill\n",
+                  extra=None) -> Path:
+        path = root / "skills" / TOOL_NAME / "SKILL.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        for name in extra or ():
+            (path.parent / name).write_text("someone's notes\n",
+                                             encoding="utf-8")
+        return path
+
+
+class TestInstallIndependence(_Scratch):
+    """D (0.25.0, the user's ruling 5 of 2026-09-21): no adopter step may
+    depend on a same-machine scenario. A machine holding only the adopting
+    repository and the published pin must install and verify its adapters.
+
+    Measured on 0.24.1 under `uv tool install`: `--check-install` and
+    `--install` with no `--dir` refused, "no adapters/ directory beside the
+    installed package". So these tests run the package ALONE — `review/`
+    copied into a temp dir, with no `adapters/`, no `bin/` and no checkout
+    anywhere near it — from an unrelated cwd, HOME redirected. The source is
+    now the running package's rendering; a directory planted where the old
+    default looked must change nothing.
+
+    FALSIFICATION. Mutations: restore the package-sibling default (the
+    0.24.x `directory = installation_root() / "adapters"`) and the
+    package-alone test refuses where it must install; source a no-`--dir`
+    row from any directory and the planted-marker test sees the marker.
     """
 
     def setUp(self):
-        import argparse
-        try:
-            self.tmp = Path(tempfile.mkdtemp(prefix="adapters-default-dir-"))
-        except OSError as exc:
-            self.skipTest(f"filesystem writes denied ({exc})")
-        self.addCleanup(lambda: __import__("shutil").rmtree(
-            self.tmp, ignore_errors=True))
-        # A fake cfg, decoupled from the real repo: `cwd-repo` is never
-        # created, so any code path that still reads `cfg.repo_root /
-        # "adapters"` finds nothing there — the sharpest possible signal
-        # that the default did NOT move to the package sibling.
-        self.cfg = argparse.Namespace(repo_root=self.tmp / "cwd-repo",
-                                      ledger_dir=self.tmp / "state")
+        super().setUp()
+        self.pkg = self.tmp / "site"
+        shutil.copytree(REPO_ROOT / "review", self.pkg / "review",
+                        ignore=shutil.ignore_patterns("tests", "__pycache__"))
+        self.launcher = [sys.executable, "-B", "-m", "review"]
 
-    def _run(self, **flags):
-        import argparse
-        modes = {"check": False, "install": False, "check_install": False,
-                 "dir": None}
-        modes.update(flags)
-        args = argparse.Namespace(**modes)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            code = cli.cmd_render_adapters(args, self.cfg)
-        return code, json.loads(buf.getvalue())
+    def alone(self, *argv):
+        return self.loupe(*argv, launcher=self.launcher,
+                          env=self.env(PYTHONPATH=str(self.pkg),
+                                       PYTHONSAFEPATH="1"))
 
-    def test_machine_global_dir_is_the_package_sibling(self):
-        """A pure path computation — no filesystem touched — so it is
-        testable without any install-mode plumbing at all.
+    def test_the_package_alone_installs_and_verifies_its_adapters(self):
+        self.assertFalse((self.pkg / "adapters").exists())
+        label = (f"rendered by {TOOL_NAME} {TOOL_VERSION} at "
+                 f"{(self.pkg / 'review').resolve()}")
+        code, before = self.alone("render-adapters", "--check-install")
+        self.assertEqual(code, 1, before)
+        self.assertEqual(before["next"],
+                         f"{TOOL_NAME} render-adapters --install")
+        self.assertEqual({r["status"] for r in before["install"]},
+                         {"absent"})
+        code, done = self.alone("render-adapters", "--install")
+        self.assertEqual(code, 0, done)
+        self.assertEqual({r["status"] for r in done["installed"]},
+                         {"installed"})
+        self.assertEqual({r["source"] for r in done["installed"]}, {label})
+        self.assertEqual(self.claude.read_text(encoding="utf-8"),
+                         adapters.render("claude-skill"))
+        self.assertEqual(self.documented.read_text(encoding="utf-8"),
+                         adapters.render("codex-skill"))
+        code, after = self.alone("render-adapters", "--check-install")
+        self.assertEqual(code, 0, after)
+        self.assertEqual({r["status"] for r in after["install"]},
+                         {"in_sync"})
+        self.assertEqual({r["source"] for r in after["install"]}, {label})
 
-        FALSIFICATION: hardcode `machine_global_dir` to return
-        `installation_root() / "somewhere-else"` and this fails.
-        """
-        import unittest.mock
-        fake_root = self.tmp / "pkg-root"
-        with unittest.mock.patch.object(adapters, "installation_root",
-                                        lambda: fake_root):
-            self.assertEqual(adapters.machine_global_dir(),
-                             fake_root / adapters.ADAPTERS_DIR)
+    def test_a_directory_where_the_old_default_looked_changes_nothing(self):
+        """The synthetic marker: rendered-looking files planted beside the
+        package (the 0.24.x default) and under the cwd (the pre-RVW-T21
+        one). Neither may reach any no-`--dir` output, byte for byte."""
+        self.alone("render-adapters", "--install")
+        code, clean = self.alone("render-adapters", "--check-install")
+        self.assertEqual(code, 0, clean)
+        for root in (self.pkg, self.cwd):
+            for rel in adapters.OUTPUTS.values():
+                planted = root / adapters.ADAPTERS_DIR / rel
+                planted.parent.mkdir(parents=True, exist_ok=True)
+                planted.write_text("SYNTHETIC MARKER\n", encoding="utf-8")
+        code, planted = self.alone("render-adapters", "--check-install")
+        self.assertEqual(code, 0, planted)
+        self.assertEqual(planted, clean)
+        code, reinstall = self.alone("render-adapters", "--install")
+        self.assertEqual({r["status"] for r in reinstall["installed"]},
+                         {"unchanged"})
+        self.assertNotIn("SYNTHETIC",
+                         self.documented.read_text(encoding="utf-8"))
 
-    def test_check_install_and_install_default_to_the_package_sibling(self):
-        """With no `--dir`, `--check-install` and `--install` must read the
-        package's own `adapters/` sibling, never `cfg.repo_root /
-        "adapters"` — proven by leaving `cfg.repo_root` pointing at a
-        directory that does not exist at all, and putting a freshly
-        rendered, in-sync copy ONLY at the faked package sibling. Only a
-        default that actually reads the package sibling can succeed here.
-
-        FALSIFICATION: restore the old
-        `directory = Path(args.dir) if args.dir else cfg.repo_root / ADAPTERS_DIR`
-        for these two modes and this fails — `cfg.repo_root / "adapters"`
-        does not exist, so `--install` would refuse with "adapters(s) are
-        themselves stale" (missing counts as stale) instead of the `code ==
-        0` / `installed` result asserted below, and `--check-install`
-        would come back with every row `source_absent` instead of
-        `in_sync`.
-        """
-        import unittest.mock
-        pkg_adapters = self.tmp / "pkg-root" / adapters.ADAPTERS_DIR
-        adapters.render_all(pkg_adapters)
-        targets = {kind: self.tmp / "home" / kind / "SKILL.md"
-                  for kind in adapters.INSTALL}
-        with unittest.mock.patch.object(
-                adapters, "installation_root", lambda: self.tmp / "pkg-root"), \
-                unittest.mock.patch.object(
-                    adapters, "install_targets", lambda: targets):
-            code, payload = self._run(install=True)
-            self.assertEqual(code, 0, payload)
-            self.assertEqual({r["status"] for r in payload["installed"]},
-                             {"installed"})
-            for kind, target in targets.items():
-                self.assertEqual(target.read_text(encoding="utf-8"),
-                                 adapters.render(kind))
-
-            code, payload = self._run(check_install=True)
-        self.assertEqual(code, 0, payload)
-        self.assertTrue(payload["ok"])
-
-    def test_check_install_and_install_blocked_when_package_sibling_absent(self):
-        """A wheel install (no `adapters/` beside the package) must refuse
-        structurally, with a remedy naming `--dir` — never proceed into a
-        misattributed drift/stale report against nothing.
-
-        FALSIFICATION: skip the `directory.is_dir()` guard for these two
-        modes and this fails — `check_install`/`install_all` would instead
-        run against a directory that does not exist, producing
-        `source_absent` rows (or, before D1's first half, the misdirected
-        `unreadable`) rather than the blocked, `--dir`-naming refusal this
-        test requires.
-        """
-        import unittest.mock
-        empty_root = self.tmp / "no-adapters-here"
-        empty_root.mkdir()
-        with unittest.mock.patch.object(adapters, "installation_root",
-                                        lambda: empty_root):
-            for flags in ({"check_install": True}, {"install": True}):
-                with self.subTest(flags=flags):
-                    code, payload = self._run(**flags)
-                    self.assertNotEqual(code, 0)
-                    self.assertEqual(payload["next_kind"], "blocked")
-                    self.assertIsNone(payload["next"])
-                    self.assertIn("--dir", payload["remedy"])
+    def test_dir_keeps_the_directory_sourced_behaviour(self):
+        """The paired control: `--dir` still reads the directory, names it
+        in every row, reports `source_absent` for a missing one and refuses
+        to install a stale tracked copy."""
+        rendered = self.tmp / "rendered"
+        adapters.render_all(rendered)
+        code, done = self.alone("render-adapters", "--install",
+                                "--dir", str(rendered))
+        self.assertEqual(code, 0, done)
+        self.assertEqual(
+            {r["source"] for r in done["installed"]},
+            {str(rendered / adapters.OUTPUTS[k])
+             for k in ("claude-skill", "codex-skill")})
+        (rendered / adapters.OUTPUTS["codex-skill"]).write_text(
+            "stale\n", encoding="utf-8")
+        code, refused = self.alone("render-adapters", "--install",
+                                   "--dir", str(rendered))
+        self.assertEqual(code, 1, refused)
+        self.assertEqual(refused["next"], f"{TOOL_NAME} render-adapters")
+        code, drift = self.alone("render-adapters", "--check-install",
+                                 "--dir", str(rendered))
+        self.assertEqual(code, 1, drift)
+        rows = {r["kind"]: r for r in drift["install"]}
+        self.assertEqual(rows["codex-skill"]["status"], "stale")
+        code, missing = self.alone("render-adapters", "--check-install",
+                                   "--dir", str(self.tmp / "nothing"))
+        self.assertEqual(code, 1, missing)
+        self.assertEqual({r["status"] for r in missing["install"]},
+                         {"source_absent"})
 
     def test_check_and_render_keep_the_cwd_relative_default(self):
-        """The control: `--check` (and the bare render, which shares the
-        same `else` branch) must NOT be redirected to the package sibling —
-        it stays `cfg.repo_root / "adapters"`, repo-local by design. Proven
-        two ways: `machine_global_dir` must never even be CALLED, and the
-        result must come from `cfg.repo_root`, which here carries a
-        deliberately EMPTY `adapters/` (so a wrongly-redirected default
-        reading some other, populated directory would not silently pass).
-
-        FALSIFICATION: route `--check` through the machine-global branch
-        too (drop the `elif args.check_install or args.install`
-        distinction) and this fails on both counts — `machine_global_dir`
-        gets called (raising here), and if it were allowed to run, nothing
-        makes `cfg.repo_root/adapters` (empty) equal to whatever the
-        package sibling happens to hold.
-        """
-        import unittest.mock
-        (self.cfg.repo_root / adapters.ADAPTERS_DIR).mkdir(parents=True)
-        with unittest.mock.patch.object(
-                adapters, "machine_global_dir",
-                side_effect=AssertionError(
-                    "machine_global_dir() must not be called for --check")):
-            code, payload = self._run(check=True)
-        self.assertNotEqual(code, 0, "an empty adapters/ is all-stale")
+        """`--check` and the bare render are repo-local and keep
+        `<repo>/adapters`: an empty one there is all-stale, and the
+        refusal names that directory, not the package."""
+        import argparse
+        cfg = argparse.Namespace(repo_root=self.tmp / "cwd-repo",
+                                 ledger_dir=self.state)
+        (cfg.repo_root / adapters.ADAPTERS_DIR).mkdir(parents=True)
+        args = argparse.Namespace(check=True, install=False,
+                                  check_install=False, dir=None,
+                                  check_embedded=None, write_embedded=None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.cmd_render_adapters(args, cfg)
+        payload = json.loads(buf.getvalue())
+        self.assertNotEqual(code, 0)
         self.assertEqual(payload["next"], f"{TOOL_NAME} render-adapters")
-        self.assertIn(str(self.cfg.repo_root), payload["error"])
+        self.assertIn(str(cfg.repo_root), payload["error"])
+
+
+class TestCodexSkillPath(_Scratch):
+    """G (public issue #1), ruled 2026-09-21: OpenAI's documentation
+    decides, and it names `$HOME/.agents/skills` as the user scope. Codex
+    also lists `$CODEX_HOME/skills` (measured the same day), and lists one
+    name twice when both hold it — so a legacy `~/.codex/skills/loupe/`
+    copy is moved OUT of discovery by `--install`, kept first, and reported
+    as drift by `--check-install` while it is still there.
+
+    Every row runs `bin/loupe` as a subprocess with HOME redirected: the
+    only way migration is reachable at all (`legacy_targets`' interlock).
+
+    FALSIFICATION, per guard: drop the preflight and the extra-file row
+    writes the target; drop `_preserve` from the migration and the kept
+    copy is missing; drop the legacy rows from `check_install` and a
+    present legacy copy reads in sync; drop the real-path de-duplication
+    and CODEX_HOME=~/.codex reports one copy twice.
+    """
+
+    OLD = "an older loupe skill\n"
+
+    def kept_dir(self):
+        return self.state / "replaced-adapters"
+
+    def statuses(self, rows):
+        return sorted((r["kind"], r["status"]) for r in rows)
+
+    def test_fresh_home_installs_at_the_documented_path(self):
+        code, done = self.loupe("render-adapters", "--install")
+        self.assertEqual(code, 0, done)
+        self.assertTrue(self.documented.is_file())
+        self.assertFalse((self.home / ".codex").exists(),
+                         "the legacy root must not be created")
+        code, check = self.loupe("render-adapters", "--check-install")
+        self.assertEqual(code, 0, check)
+        self.assertEqual(self.statuses(check["install"]),
+                         [("claude-skill", "in_sync"),
+                          ("codex-skill", "in_sync")])
+
+    def test_a_legacy_copy_alone_is_drift_then_migrated_and_kept(self):
+        legacy = self.legacy_at(self.home / ".codex", self.OLD)
+        other = self.home / ".codex" / "skills" / "other" / "SKILL.md"
+        other.parent.mkdir(parents=True)
+        other.write_text("another skill\n", encoding="utf-8")
+        code, check = self.loupe("render-adapters", "--check-install")
+        self.assertEqual(code, 1, check)
+        self.assertEqual(check["next"],
+                         f"{TOOL_NAME} render-adapters --install")
+        rows = {r["target"]: r for r in check["install"]}
+        self.assertEqual(rows[str(legacy)]["status"], "legacy_present")
+        self.assertEqual(rows[str(legacy)]["superseded_by"],
+                         str(self.documented))
+        self.assertEqual(rows[str(self.documented)]["status"], "absent")
+        code, done = self.loupe("render-adapters", "--install")
+        self.assertEqual(code, 0, done)
+        rows = {r["target"]: r for r in done["installed"]}
+        self.assertEqual(rows[str(legacy)]["status"], "migrated")
+        self.assertEqual(Path(rows[str(legacy)]["kept"]).read_text(
+            encoding="utf-8"), self.OLD)
+        self.assertEqual(Path(rows[str(legacy)]["kept"]).parent,
+                         self.kept_dir())
+        self.assertFalse(legacy.parent.exists(),
+                         "the legacy loupe directory must leave discovery")
+        self.assertEqual(other.read_text(encoding="utf-8"), "another skill\n",
+                         "another skill must never be touched")
+        self.assertTrue((self.home / ".codex" / "skills").is_dir())
+        self.assertEqual(self.documented.read_text(encoding="utf-8"),
+                         adapters.render("codex-skill"))
+        code, check = self.loupe("render-adapters", "--check-install")
+        self.assertEqual(code, 0, check)
+
+    def test_legacy_beside_a_current_documented_copy(self):
+        self.loupe("render-adapters", "--install")
+        legacy = self.legacy_at(self.home / ".codex", self.OLD)
+        code, check = self.loupe("render-adapters", "--check-install")
+        self.assertEqual(code, 1, check)
+        self.assertIn(("codex-skill", "legacy_present"),
+                      self.statuses(check["install"]))
+        self.assertIn(("codex-skill", "in_sync"),
+                      self.statuses(check["install"]))
+        code, done = self.loupe("render-adapters", "--install")
+        self.assertEqual(code, 0, done)
+        self.assertEqual(self.statuses(done["installed"]),
+                         [("claude-skill", "unchanged"),
+                          ("codex-skill", "migrated"),
+                          ("codex-skill", "unchanged")])
+        self.assertFalse(legacy.exists())
+
+    def test_a_legacy_directory_holding_anything_else_is_refused(self):
+        legacy = self.legacy_at(self.home / ".codex", self.OLD,
+                                extra=["notes.md"])
+        code, check = self.loupe("render-adapters", "--check-install")
+        self.assertEqual(code, 1, check)
+        self.assertEqual(check["next_kind"], "blocked")
+        self.assertIsNone(check["next"])
+        self.assertIn(("codex-skill", "legacy_blocked"),
+                      self.statuses(check["install"]))
+        code, done = self.loupe("render-adapters", "--install")
+        self.assertEqual(code, 1, done)
+        self.assertEqual(done["next_kind"], "blocked")
+        self.assertIn("notes.md", done["error"])
+        self.assertEqual({r["status"] for r in done["installed"]},
+                         {"blocked"})
+        self.assertEqual(legacy.read_text(encoding="utf-8"), self.OLD)
+        self.assertTrue((legacy.parent / "notes.md").is_file())
+        self.assertFalse(self.documented.exists(), "nothing may be written")
+        self.assertFalse(self.claude.exists(), "nothing may be written")
+        self.assertFalse(self.kept_dir().exists(), "nothing may be kept")
+
+    def test_a_symlinked_legacy_directory_is_refused(self):
+        real = self.tmp / "elsewhere-skill"
+        real.mkdir()
+        (real / "SKILL.md").write_text(self.OLD, encoding="utf-8")
+        link = self.home / ".codex" / "skills" / TOOL_NAME
+        link.parent.mkdir(parents=True)
+        link.symlink_to(real, target_is_directory=True)
+        code, done = self.loupe("render-adapters", "--install")
+        self.assertEqual(code, 1, done)
+        self.assertIn("symbolic link", done["error"])
+        self.assertEqual((real / "SKILL.md").read_text(encoding="utf-8"),
+                         self.OLD)
+        self.assertFalse(self.documented.exists())
+
+    def test_codex_home_set_and_distinct_is_a_second_legacy_root(self):
+        codex_home = self.tmp / "codex-home"
+        first = self.legacy_at(self.home / ".codex", "first\n")
+        second = self.legacy_at(codex_home, "second\n")
+        env = self.env(CODEX_HOME=str(codex_home))
+        code, check = self.loupe("render-adapters", "--check-install",
+                                 env=env)
+        self.assertEqual(code, 1, check)
+        legacy = sorted(r["target"] for r in check["install"]
+                        if r["status"] == "legacy_present")
+        self.assertEqual(legacy, sorted([str(first), str(second)]))
+        code, done = self.loupe("render-adapters", "--install", env=env)
+        self.assertEqual(code, 0, done)
+        kept = sorted(Path(r["kept"]).read_text(encoding="utf-8")
+                      for r in done["installed"] if r["status"] == "migrated")
+        self.assertEqual(kept, ["first\n", "second\n"])
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        self.assertTrue(self.documented.is_file(),
+                        "CODEX_HOME must not move the documented path")
+        self.assertFalse((codex_home / ".agents").exists())
+
+    def test_codex_home_equal_to_the_default_is_one_root(self):
+        legacy = self.legacy_at(self.home / ".codex", self.OLD)
+        for spelling in (str(self.home / ".codex"),
+                         str(self.home / ".codex") + "/",
+                         str(self.home / "x" / ".." / ".codex")):
+            with self.subTest(spelling=spelling):
+                code, check = self.loupe(
+                    "render-adapters", "--check-install",
+                    env=self.env(CODEX_HOME=spelling))
+                self.assertEqual(code, 1, check)
+                present = [r for r in check["install"]
+                           if r["status"] == "legacy_present"]
+                self.assertEqual([r["target"] for r in present],
+                                 [str(legacy)])
+
+    def test_a_relative_codex_home_names_no_legacy_root(self):
+        self.legacy_at(self.cwd / "rel", self.OLD)
+        code, check = self.loupe("render-adapters", "--check-install",
+                                 env=self.env(CODEX_HOME="rel"))
+        self.assertEqual(code, 1, check)
+        self.assertFalse(any(r["status"].startswith("legacy_")
+                             for r in check["install"]))
+
+    def test_an_unwritable_retention_directory_leaves_the_legacy_copy(self):
+        legacy = self.legacy_at(self.home / ".codex", self.OLD)
+        self.kept_dir().write_text("occupied by a file\n", encoding="utf-8")
+        code, done = self.loupe("render-adapters", "--install")
+        self.assertEqual(code, 1, done)
+        self.assertEqual(done["next_kind"], "blocked")
+        rows = {r["target"]: r for r in done["installed"]}
+        self.assertEqual(rows[str(legacy)]["status"], "failed")
+        self.assertIs(rows[str(legacy)]["preserved"], False)
+        self.assertEqual(legacy.read_text(encoding="utf-8"), self.OLD,
+                         "an unkept legacy copy must stay where it was")
+        code, check = self.loupe("render-adapters", "--check-install")
+        self.assertEqual(code, 1, check)
+        self.assertIn(("codex-skill", "legacy_present"),
+                      self.statuses(check["install"]))
+
+    def test_a_legacy_copy_is_never_moved_while_its_target_failed(self):
+        """Removing the old copy while the documented one could not be
+        written would leave Codex no loupe skill at all."""
+        legacy = self.legacy_at(self.home / ".codex", self.OLD)
+        (self.home / ".agents").mkdir()
+        (self.home / ".agents" / "skills").write_text(
+            "a file where the skills directory belongs\n", encoding="utf-8")
+        code, done = self.loupe("render-adapters", "--install")
+        self.assertEqual(code, 1, done)
+        rows = {r["target"]: r for r in done["installed"]}
+        self.assertEqual(rows[str(self.documented)]["status"], "failed")
+        self.assertEqual(rows[str(legacy)]["status"], "failed")
+        self.assertIn("not moved", rows[str(legacy)]["error"])
+        self.assertEqual(legacy.read_text(encoding="utf-8"), self.OLD)
+        self.assertFalse(self.kept_dir().exists())
+
+    def test_the_interlock_keeps_substituted_targets_off_the_real_home(self):
+        """A test that substitutes its own targets reaches no legacy path,
+        whatever it forgets to patch: legacy candidates exist only beside
+        the documented target itself."""
+        self.assertEqual(adapters.legacy_targets(
+            {"codex-skill": self.tmp / "x" / "SKILL.md"}), {})
+        self.assertEqual(adapters.legacy_targets({}), {})
+        with unittest.mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            os.environ.pop("CODEX_HOME", None)
+            self.assertEqual(
+                adapters.legacy_targets(),
+                {"codex-skill": [self.home / ".codex" / "skills" / TOOL_NAME
+                                 / "SKILL.md"]})
+
+    def test_a_legacy_path_that_is_the_target_by_real_path_is_not_legacy(self):
+        """A symlinked `~/.codex/skills` onto `~/.agents/skills`: the two
+        paths are one file, and moving it would remove what was just
+        installed."""
+        (self.home / ".agents" / "skills").mkdir(parents=True)
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "skills").symlink_to(
+            self.home / ".agents" / "skills", target_is_directory=True)
+        code, done = self.loupe("render-adapters", "--install")
+        self.assertEqual(code, 0, done)
+        self.assertNotIn("migrated", {r["status"] for r in done["installed"]})
+        self.assertTrue(self.documented.is_file())
+        code, check = self.loupe("render-adapters", "--check-install")
+        self.assertEqual(code, 0, check)
+
+    def test_the_install_line_states_the_documented_path_and_the_observation(self):
+        text = adapters.render("codex-skill")
+        self.assertIn(f"Install: `~/.agents/skills/{TOOL_NAME}/SKILL.md`",
+                      text)
+        self.assertIn("https://learn.chatgpt.com/docs/build-skills", text)
+        self.assertIn("retrieved 2026-09-21", text)
+        self.assertIn("Observed, separately: observed 2026-09-21", text)
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+class TestRetainedBytesAreTheOriginalBytes(_Scratch):
+    """Round-1 F2 of the 0.25.0 review: legacy migration deleted the
+    original after keeping a NORMALIZED copy. `_legacy_state` read the
+    legacy SKILL.md with `read_text`, whose universal-newline decoding turns
+    CRLF and a lone CR into LF; `_preserve` wrote that text, proved it by
+    reading it back as text, and the original was unlinked. Measured by the
+    reviewer through `render-adapters --install` in a scratch HOME: legacy
+    bytes b'a\\r\\nb\\r\\n' exited 0, `migrated`, with the original gone and
+    the kept file holding b'a\\nb\\n'.
+
+    FALSIFICATION, the spec row by row. Every row runs `bin/loupe` as a
+    subprocess with HOME redirected (the only way migration is reachable:
+    `legacy_targets`' interlock), except the two fault-injected rows, which
+    run `cli.main` in-process because a lying filesystem and a concurrent
+    edit cannot be planted from outside a process:
+
+    - LF, CRLF, lone CR, mixed endings, no final newline (both kinds) and
+      valid non-ASCII UTF-8, each in BOTH legacy locations (`~/.codex` and
+      a distinct `$CODEX_HOME`), comparing the kept `read_bytes()`, its
+      digest, its name and the reported digests with the original bytes
+      BEFORE asserting the source is gone;
+    - the reviewer's reproduction as written (`--ledger-dir`,
+      `CODEX_HOME=$HOME/.codex`), LF/CRLF/CR/invalid;
+    - two legacy copies of one text with different endings: two kept files;
+    - controls that must refuse and leave the legacy copy byte-identical:
+      invalid UTF-8, an unwritable retention directory, and an existing
+      retained file whose DECODED text agrees but whose raw endings differ
+      (both directions, and lone CR), beside the paired control where the
+      existing file holds exactly the bytes;
+    - the other `_preserve` caller, a replaced installed adapter: the same
+      endings kept byte for byte, a copy differing ONLY in line endings is
+      `stale`/`replaced` rather than `in_sync`/`unchanged`, an invalid-UTF-8
+      target is kept and replaced, and the same planted-endings refusal.
+
+    Mutations (the track report records each one's own result): read the
+    legacy copy with `read_text` again; compare an existing kept file as
+    text; read back as text; drop the UTF-8 requirement; read a replaced
+    target as text; judge `check_install` as text; drop the re-read before
+    removal; ignore a retention failure.
+    """
+
+    ENDINGS = {
+        "LF": b"line one\nline two\n",
+        "CRLF": b"line one\r\nline two\r\n",
+        "lone CR": b"line one\rline two\r",
+        "mixed": b"line one\r\nline two\nline three\rline four\r\n",
+        "no final newline, CRLF": b"line one\r\nline two",
+        "no final newline, LF": b"line one\nline two",
+        # NEL and U+2028 are line breaks to `str.splitlines`, never to a
+        # file read; they ride along to prove nothing else is rewritten.
+        "non-ASCII UTF-8": ("café — 日本語 "
+                            "\U0001F50D\r\nnaïvex y\n"
+                            ).encode("utf-8"),
+        "non-ASCII UTF-8, LF": "caf\u00e9 \u2014 \u65e5\u672c\n".encode(
+            "utf-8"),
+    }
+    INVALID = b"\xff\xfe not UTF-8\r\n"
+
+    def locations(self, i):
+        """(label, HOME, state, legacy root, env) for row `i`, each in its
+        own fresh tree."""
+        out = []
+        for label in ("~/.codex", "distinct $CODEX_HOME"):
+            base = self.tmp / f"row-{i}-{len(out)}"
+            home, state = base / "home", base / "state"
+            home.mkdir(parents=True)
+            state.mkdir()
+            if label == "~/.codex":
+                root, env = home / ".codex", scratch_env(home, state)
+            else:
+                root = base / "codex-home"
+                env = scratch_env(home, state, CODEX_HOME=str(root))
+            out.append((label, home, state, root, env))
+        return out
+
+    @staticmethod
+    def plant(root: Path, data: bytes) -> Path:
+        path = root / "skills" / TOOL_NAME / "SKILL.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def cli_in(self, env, *argv):
+        return run_loupe(list(argv), cwd=self.cwd, env=env)
+
+    def assert_kept_exactly(self, row, original, state):
+        """The retention proof, bytes FIRST: the kept content, its digest,
+        the digest the row reports, then the name and the place."""
+        kept = Path(row["kept"])
+        self.assertEqual(kept.read_bytes(), original)
+        self.assertEqual(_sha(kept.read_bytes()), _sha(original))
+        self.assertEqual(row["replaced_digest"], _sha(original))
+        self.assertEqual(kept.name,
+                         f"{row['kind']}-{_sha(original)[:12]}.md")
+        self.assertEqual(kept.parent, state / "replaced-adapters")
+
+    def assert_survives(self, path, row, original):
+        """The invariant every refusal protects, stated on bytes and
+        asserted BEFORE any status: the original bytes still exist exactly,
+        in place or at the path the row names as kept."""
+        found = [path.read_bytes()] if path.is_file() else []
+        kept = Path(row.get("kept") or "")
+        if row.get("kept") and kept.is_file():
+            found.append(kept.read_bytes())
+        self.assertIn(original, found)
+
+    # ------------------------------------------------------------ the matrix
+
+    def test_every_ending_is_kept_byte_for_byte_in_both_locations(self):
+        for i, (name, original) in enumerate(self.ENDINGS.items()):
+            for label, home, state, root, env in self.locations(i):
+                with self.subTest(ending=name, location=label):
+                    legacy = self.plant(root, original)
+                    code, check = self.cli_in(env, "render-adapters",
+                                              "--check-install")
+                    self.assertEqual(code, 1, check)
+                    (present,) = [r for r in check["install"]
+                                  if r["target"] == str(legacy)]
+                    self.assertEqual(present["status"], "legacy_present")
+                    code, done = self.cli_in(env, "render-adapters",
+                                             "--install")
+                    self.assertEqual(code, 0, done)
+                    (row,) = [r for r in done["installed"]
+                              if r["target"] == str(legacy)]
+                    self.assertEqual(row["status"], "migrated", row)
+                    # Bytes and digests FIRST; only then the removal.
+                    self.assert_kept_exactly(row, original, state)
+                    self.assertEqual(present["target_digest"],
+                                     _sha(original))
+                    self.assertFalse(legacy.exists())
+                    self.assertFalse(legacy.parent.exists())
+
+    def test_the_reviewers_reproduction_as_written(self):
+        """The reviewer's reproduction script's `retention()`, unchanged in
+        shape: `--ledger-dir`, `CODEX_HOME=$HOME/.codex`, no state variable.
+        Measured on the unfixed head: LF exact, CRLF and CR migrated with
+        normalized bytes, invalid refused."""
+        cases = [("LF", b"a\nb\n"), ("CRLF", b"a\r\nb\r\n"),
+                 ("CR", b"a\rb\r"), ("invalid_UTF8", b"\xff\r\n")]
+        for name, raw in cases:
+            with self.subTest(case=name):
+                p = self.tmp / f"repro-{name}"
+                home = p / "home"
+                old = self.plant(home / ".codex", raw)
+                env = scratch_env(home, p / "unused-state",
+                                  CODEX_HOME=str(home / ".codex"))
+                env.pop(env_var("STATE_DIR"))
+                code, out = self.cli_in(env, "--ledger-dir", str(p / "state"),
+                                        "render-adapters", "--install")
+                moved = [r for r in out["installed"]
+                         if r["status"] == "migrated"]
+                if name == "invalid_UTF8":
+                    self.assertEqual(code, 1, out)
+                    self.assertEqual(moved, [])
+                    self.assertEqual(old.read_bytes(), raw)
+                    continue
+                self.assertEqual(code, 0, out)
+                (row,) = moved
+                self.assertEqual(Path(row["kept"]).read_bytes(), raw)
+                self.assertEqual(row["replaced_digest"], _sha(raw))
+                self.assertFalse(old.exists())
+
+    def test_two_copies_of_one_text_with_different_endings_are_two_kept(self):
+        """Under the defect both normalized to one text, one digest and one
+        kept file: the second copy "matched" the first's kept bytes and was
+        deleted with nothing of its own kept."""
+        (_l, home, state, codex_home, env), = self.locations("two")[1:]
+        lf = self.plant(home / ".codex", self.ENDINGS["LF"])
+        crlf = self.plant(codex_home, self.ENDINGS["CRLF"])
+        code, done = self.cli_in(env, "render-adapters", "--install")
+        self.assertEqual(code, 0, done)
+        rows = {r["target"]: r for r in done["installed"]
+                if r["status"] == "migrated"}
+        self.assert_kept_exactly(rows[str(lf)], self.ENDINGS["LF"], state)
+        self.assert_kept_exactly(rows[str(crlf)], self.ENDINGS["CRLF"], state)
+        self.assertNotEqual(rows[str(lf)]["kept"], rows[str(crlf)]["kept"])
+        self.assertFalse(lf.exists())
+        self.assertFalse(crlf.exists())
+
+    # ------------------------------------------------ refusals and controls
+
+    def assert_refused_intact(self, env, legacy, original, state, *,
+                              blocked):
+        code, done = self.cli_in(env, "render-adapters", "--install")
+        rows = {r["target"]: r for r in done["installed"]}
+        self.assert_survives(legacy, rows.get(str(legacy), {}), original)
+        self.assertEqual(code, 1, done)
+        self.assertNotIn("migrated", {r["status"] for r in rows.values()})
+        self.assertEqual(legacy.read_bytes(), original,
+                         "a refused legacy copy must stay byte-identical")
+        if blocked:
+            self.assertEqual({r["status"] for r in rows.values()},
+                             {"blocked"})
+            self.assertFalse((state / "replaced-adapters").exists())
+        return done, rows
+
+    def test_invalid_utf8_is_refused_in_both_locations(self):
+        for label, home, state, root, env in self.locations("bad"):
+            with self.subTest(location=label):
+                legacy = self.plant(root, self.INVALID)
+                code, check = self.cli_in(env, "render-adapters",
+                                          "--check-install")
+                self.assertEqual(code, 1, check)
+                self.assertIsNone(check["next"])
+                self.assertIn(("codex-skill", "legacy_blocked"),
+                              sorted((r["kind"], r["status"])
+                                     for r in check["install"]))
+                done, _rows = self.assert_refused_intact(
+                    env, legacy, self.INVALID, state, blocked=True)
+                self.assertIn("utf-8", done["error"].lower())
+                self.assertFalse((home / ".agents").exists(),
+                                 "nothing may be written")
+                self.assertFalse((home / ".claude").exists())
+
+    def test_a_retention_failure_leaves_the_bytes_in_both_locations(self):
+        for label, home, state, root, env in self.locations("keepfail"):
+            with self.subTest(location=label):
+                original = self.ENDINGS["CRLF"]
+                legacy = self.plant(root, original)
+                occupied = state / "replaced-adapters"
+                occupied.write_bytes(b"occupied by a file\r\n")
+                _done, rows = self.assert_refused_intact(
+                    env, legacy, original, state, blocked=False)
+                self.assertEqual(rows[str(legacy)]["status"], "failed")
+                self.assertIs(rows[str(legacy)]["preserved"], False)
+                self.assertEqual(occupied.read_bytes(),
+                                 b"occupied by a file\r\n")
+
+    def test_an_existing_kept_file_must_agree_in_bytes_not_in_text(self):
+        """The finding's own case: a retained file already at the digest's
+        name whose DECODED text equals the original's but whose raw endings
+        differ. `read_text` on both sides called them equal; only bytes can
+        tell them apart. The last row is the paired control (exactly the
+        bytes), which is the one idempotent success."""
+        rows_spec = [
+            ("CRLF original, LF kept", b"a\r\nb\r\n", b"a\nb\n"),
+            ("LF original, CRLF kept", b"a\nb\n", b"a\r\nb\r\n"),
+            ("lone-CR original, LF kept", b"a\rb\r", b"a\nb\n"),
+        ]
+        for i, (name, original, planted) in enumerate(rows_spec):
+            for label, home, state, root, env in self.locations(f"k{i}"):
+                with self.subTest(case=name, location=label):
+                    self.assertEqual(
+                        planted.decode().splitlines(),
+                        original.decode().splitlines(),
+                        "the planted copy must agree as decoded text")
+                    legacy = self.plant(root, original)
+                    keep = state / "replaced-adapters"
+                    keep.mkdir()
+                    at = keep / f"codex-skill-{_sha(original)[:12]}.md"
+                    at.write_bytes(planted)
+                    _done, rows = self.assert_refused_intact(
+                        env, legacy, original, state, blocked=False)
+                    self.assertEqual(rows[str(legacy)]["status"], "failed")
+                    self.assertIs(rows[str(legacy)]["preserved"], False)
+                    self.assertIn("different bytes",
+                                  rows[str(legacy)]["error"])
+                    self.assertEqual(at.read_bytes(), planted,
+                                     "the planted file must not be touched")
+        controls = [("LF", self.ENDINGS["LF"]),
+                    ("mixed", self.ENDINGS["mixed"])]
+        for i, (name, original) in enumerate(controls):
+            for label, home, state, root, env in self.locations(f"exact{i}"):
+                with self.subTest(case=f"control: exactly the bytes, {name}",
+                                  location=label):
+                    legacy = self.plant(root, original)
+                    keep = state / "replaced-adapters"
+                    keep.mkdir()
+                    at = keep / f"codex-skill-{_sha(original)[:12]}.md"
+                    at.write_bytes(original)
+                    code, done = self.cli_in(env, "render-adapters",
+                                             "--install")
+                    self.assertEqual(code, 0, done)
+                    (row,) = [r for r in done["installed"]
+                              if r["target"] == str(legacy)]
+                    self.assertEqual(row["status"], "migrated")
+                    self.assertEqual(Path(row["kept"]), at)
+                    self.assert_kept_exactly(row, original, state)
+                    self.assertEqual(list(keep.iterdir()), [at])
+                    self.assertFalse(legacy.exists())
+
+    # ---------------------------------- the other caller: a replaced target
+
+    def test_a_replaced_installed_adapter_is_kept_byte_for_byte(self):
+        """`_preserve`'s other caller reads the installed copy it replaces,
+        and its bytes can differ the same way: a hand edit saved with CRLF
+        was kept normalized, then overwritten."""
+        for i, (name, edit) in enumerate(self.ENDINGS.items()):
+            for kind, rel in (("claude-skill", ".claude"),
+                              ("codex-skill", ".agents")):
+                with self.subTest(ending=name, kind=kind):
+                    base = self.tmp / f"rep-{i}-{kind}"
+                    home, state = base / "home", base / "state"
+                    state.mkdir(parents=True)
+                    target = home / rel / "skills" / TOOL_NAME / "SKILL.md"
+                    target.parent.mkdir(parents=True)
+                    original = b"hand-edited " + edit
+                    target.write_bytes(original)
+                    env = scratch_env(home, state)
+                    code, done = self.cli_in(env, "render-adapters",
+                                             "--install")
+                    self.assertEqual(code, 0, done)
+                    (row,) = [r for r in done["installed"]
+                              if r["target"] == str(target)]
+                    self.assertEqual(row["status"], "replaced")
+                    self.assert_kept_exactly(row, original, state)
+                    self.assertEqual(target.read_bytes(),
+                                     adapters.render(kind).encode("utf-8"))
+
+    def test_a_copy_differing_only_in_line_endings_is_not_in_sync(self):
+        """`in_sync`/`unchanged` meant "the same text after newline
+        translation", so a CRLF copy of the rendered text read as current
+        and reported the rendered text's digest as its own. It is `stale`,
+        with the digest of what is on disk, and `--install` keeps it before
+        replacing it. Paired control: the LF rendering is `in_sync` and
+        `unchanged`."""
+        home, state = self.tmp / "crlf-home", self.tmp / "crlf-state"
+        state.mkdir()
+        env = scratch_env(home, state)
+        code, done = self.cli_in(env, "render-adapters", "--install")
+        self.assertEqual(code, 0, done)
+        code, again = self.cli_in(env, "render-adapters", "--install")
+        self.assertEqual({r["status"] for r in again["installed"]},
+                         {"unchanged"})
+        target = home / ".claude" / "skills" / TOOL_NAME / "SKILL.md"
+        original = adapters.render("claude-skill").replace(
+            "\n", "\r\n").encode("utf-8")
+        target.write_bytes(original)
+        code, check = self.cli_in(env, "render-adapters", "--check-install")
+        self.assertEqual(code, 1, check)
+        rows = {r["target"]: r for r in check["install"]}
+        self.assertEqual(rows[str(target)]["status"], "stale")
+        self.assertEqual(rows[str(target)]["target_digest"], _sha(original))
+        self.assertNotEqual(rows[str(target)]["target_digest"],
+                            rows[str(target)]["source_digest"])
+        code, done = self.cli_in(env, "render-adapters", "--install")
+        self.assertEqual(code, 0, done)
+        (row,) = [r for r in done["installed"] if r["target"] == str(target)]
+        self.assertEqual(row["status"], "replaced")
+        self.assert_kept_exactly(row, original, state)
+        code, check = self.cli_in(env, "render-adapters", "--check-install")
+        self.assertEqual(code, 0, check)
+
+    def test_an_invalid_utf8_installed_adapter_is_kept_and_replaced(self):
+        """Measured before the fix: `--check-install` and `--install` both
+        exited 2 as a USAGE error carrying a decode message. A replaced
+        target's bytes are kept whatever they are: they are the user's."""
+        home, state = self.tmp / "bad-home", self.tmp / "bad-state"
+        state.mkdir()
+        env = scratch_env(home, state)
+        target = home / ".claude" / "skills" / TOOL_NAME / "SKILL.md"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.INVALID)
+        code, check = self.cli_in(env, "render-adapters", "--check-install")
+        self.assertEqual(code, 1, check)
+        rows = {r["target"]: r for r in check["install"]}
+        self.assertEqual(rows[str(target)]["status"], "stale")
+        self.assertEqual(rows[str(target)]["target_digest"],
+                         _sha(self.INVALID))
+        code, done = self.cli_in(env, "render-adapters", "--install")
+        self.assertEqual(code, 0, done)
+        (row,) = [r for r in done["installed"] if r["target"] == str(target)]
+        self.assertEqual(row["status"], "replaced")
+        self.assert_kept_exactly(row, self.INVALID, state)
+
+    def test_a_replaced_target_refuses_a_kept_file_agreeing_only_as_text(self):
+        home, state = self.tmp / "t-home", self.tmp / "t-state"
+        env = scratch_env(home, state)
+        target = home / ".claude" / "skills" / TOOL_NAME / "SKILL.md"
+        target.parent.mkdir(parents=True)
+        original = b"hand edit\nsecond line\n"
+        target.write_bytes(original)
+        keep = state / "replaced-adapters"
+        keep.mkdir(parents=True)
+        at = keep / f"claude-skill-{_sha(original)[:12]}.md"
+        at.write_bytes(b"hand edit\r\nsecond line\r\n")
+        code, done = self.cli_in(env, "render-adapters", "--install")
+        (row,) = [r for r in done["installed"] if r["target"] == str(target)]
+        self.assert_survives(target, row, original)
+        self.assertEqual(code, 1, done)
+        self.assertEqual(row["status"], "failed")
+        self.assertIs(row["preserved"], False)
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(at.read_bytes(), b"hand edit\r\nsecond line\r\n")
+
+    # ------------------------------------------------- fault-injected rows
+
+    def in_process(self, env, *argv):
+        """`cli.main` with the same redirected environment, for the rows
+        whose fault must be planted inside the process."""
+        buf = io.StringIO()
+        before = os.getcwd()
+        os.chdir(self.cwd)
+        try:
+            with unittest.mock.patch.dict(os.environ, env, clear=True):
+                with contextlib.redirect_stdout(buf):
+                    code = cli.main(list(argv))
+        finally:
+            os.chdir(before)
+        return code, json.loads(buf.getvalue())
+
+    def test_a_kept_copy_stored_with_other_endings_is_not_proof(self):
+        """A destination that stores different line endings from the bytes
+        it was handed (what a text-mode write does on a platform that
+        writes CRLF) must fail the read-back. A text read-back cannot see
+        it: both sides decode to one text. Both callers, same proof."""
+        real = adapters._write_synced
+
+        def crlf_writer(target, data):
+            real(target, data.replace(b"\n", b"\r\n"))
+
+        home, state = self.tmp / "w-home", self.tmp / "w-state"
+        env = scratch_env(home, state)
+        legacy = self.plant(home / ".codex", b"a\nb\n")
+        edited = home / ".claude" / "skills" / TOOL_NAME / "SKILL.md"
+        edited.parent.mkdir(parents=True)
+        edited.write_bytes(b"hand edit\n")
+        with unittest.mock.patch.object(adapters, "_write_synced",
+                                        crlf_writer):
+            code, done = self.in_process(env, "render-adapters", "--install")
+        rows = {r["target"]: r for r in done["installed"]}
+        for path, original in ((legacy, b"a\nb\n"), (edited, b"hand edit\n")):
+            self.assert_survives(path, rows[str(path)], original)
+        self.assertEqual(code, 1, done)
+        for path, original in ((legacy, b"a\nb\n"), (edited, b"hand edit\n")):
+            self.assertEqual(rows[str(path)]["status"], "failed", rows)
+            self.assertIs(rows[str(path)]["preserved"], False)
+            self.assertIn("does not read back", rows[str(path)]["error"])
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_a_legacy_copy_that_changes_before_removal_stays(self):
+        """The legacy copy is read before any target is written. If it
+        changes before the removal, what was kept is not what removing it
+        would delete: it stays, holding the newer bytes, and the earlier
+        bytes stay kept."""
+        real = adapters._write_synced
+        home, state = self.tmp / "r-home", self.tmp / "r-state"
+        env = scratch_env(home, state)
+        legacy = self.plant(home / ".codex", b"first\r\n")
+
+        def concurrent_edit(target, data):
+            real(target, data)
+            if data == b"first\r\n":
+                legacy.write_bytes(b"edited meanwhile\r\n")
+
+        with unittest.mock.patch.object(adapters, "_write_synced",
+                                        concurrent_edit):
+            code, done = self.in_process(env, "render-adapters", "--install")
+        (row,) = [r for r in done["installed"] if r["target"] == str(legacy)]
+        self.assert_survives(legacy, row, b"edited meanwhile\r\n")
+        self.assertEqual(code, 1, done)
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("no longer holds", row["error"])
+        self.assertEqual(Path(row["kept"]).read_bytes(), b"first\r\n")
+        self.assertEqual(legacy.read_bytes(), b"edited meanwhile\r\n")
+
+
+class TestEmbeddedRegion(_Scratch):
+    """E (public issue #5): `--check-embedded <file>` compares the one
+    region between the rendered block's own marker lines with this
+    installation's rendering, and `--write-embedded <file>` replaces exactly
+    that region. The partition, one row per input kind, each through
+    `bin/loupe` as a subprocess:
+
+      current · stale · missing markers · BEGIN only · END only · END before
+      BEGIN · two regions · nested BEGIN · empty file · absent path · a
+      directory · non-UTF-8 bytes · a symlink · CRLF in the region · CRLF
+      outside it · a marker quoted in a fenced block · no final newline
+
+    RULES CHOSEN (stated here and in `review/adapters.py`): markers are
+    LEXICAL — a line beginning, at column 0, with the BEGIN or END prefix,
+    no Markdown parsed, so a marker quoted at column 0 in a fenced example
+    counts and makes the structure ambiguous (refused); a region carrying a
+    carriage return is refused as `crlf`, while CRLF outside the region is
+    not judged and is written back as it was.
+
+    FALSIFICATION, per guard: drop the nested check and a BEGIN inside a
+    region is read as the region; drop the duplicate check and the second
+    region is silently ignored; drop the CR check and a CRLF region reads
+    stale and is rewritten LF; write the whole rendering over the file and
+    the outside-bytes assertion fails.
+    """
+
+    BLOCK = None
+
+    def setUp(self):
+        super().setUp()
+        self.block = adapters.render("instructions-block")
+        self.head = "# Project\n\nSome rules.\n\n"
+        self.tail = "\n## After\n\nMore rules.\n"
+
+    def file(self, text, name="AGENTS.md", raw=None):
+        path = self.cwd / name
+        if raw is not None:
+            path.write_bytes(raw)
+        else:
+            path.write_text(text, encoding="utf-8", newline="")
+        return path
+
+    def check(self, path, *extra):
+        return self.loupe("render-adapters", "--check-embedded", str(path),
+                          *extra)
+
+    def write(self, path):
+        return self.loupe("render-adapters", "--write-embedded", str(path))
+
+    def assert_refused(self, path, status, code=1):
+        before = path.read_bytes() if path.is_file() else None
+        for verb in (self.check, self.write):
+            with self.subTest(verb=verb.__name__, status=status):
+                got, payload = verb(path)
+                self.assertEqual(got, code, payload)
+                self.assertEqual(payload["status"], status, payload)
+                self.assertEqual(payload["next_kind"], "blocked")
+                self.assertIsNone(payload["next"])
+                self.assertTrue(payload["remedy"])
+                if before is not None:
+                    self.assertEqual(path.read_bytes(), before,
+                                     "a refused write changed the file")
+
+    def stale_block(self):
+        return self.block.replace("## What this is", "## What this WAS", 1)
+
+    def test_rendering_carries_exactly_one_marker_pair(self):
+        lines = self.block.split("\n")
+        self.assertEqual(sum(l.startswith(adapters.EMBEDDED_BEGIN)
+                             for l in lines), 1)
+        self.assertEqual(sum(l.startswith(adapters.EMBEDDED_END)
+                             for l in lines), 1)
+        self.assertTrue(self.block.endswith("-->\n"))
+
+    def test_current(self):
+        path = self.file(self.head + self.block + self.tail)
+        code, payload = self.check(path)
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["status"], "current")
+        self.assertEqual(payload["source_digest"], payload["digest"])
+        self.assertEqual(payload["data"]["begin_line"], 5)
+        before = path.stat().st_mtime_ns
+        code, payload = self.write(path)
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["status"], "current")
+        self.assertEqual(path.stat().st_mtime_ns, before,
+                         "a current region must not be rewritten")
+
+    def test_stale_is_repaired_and_nothing_outside_moves(self):
+        head = self.head + "trailing space here   \n\t\n"
+        tail = self.tail + "\u2028 separator \x0c kept\n"
+        path = self.file(head + self.stale_block() + tail)
+        code, payload = self.check(path)
+        self.assertEqual(code, 1, payload)
+        self.assertEqual(payload["status"], "stale")
+        self.assertEqual(payload["next_kind"], "command")
+        self.assertEqual(payload["next"], f"{TOOL_NAME} render-adapters "
+                                          f"--write-embedded {path}")
+        path.chmod(0o640)
+        code, payload = self.write(path)
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["status"], "written")
+        after = path.read_bytes()
+        self.assertEqual(after, (head + self.block + tail).encode("utf-8"))
+        self.assertTrue(after.startswith(head.encode("utf-8")))
+        self.assertTrue(after.endswith(tail.encode("utf-8")))
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        code, payload = self.check(path)
+        self.assertEqual(code, 0, payload)
+
+    def test_a_region_ending_the_file_without_a_newline_is_stale(self):
+        path = self.file(self.head + self.block.rstrip("\n"))
+        code, payload = self.check(path)
+        self.assertEqual(code, 1, payload)
+        self.assertEqual(payload["status"], "stale")
+        self.write(path)
+        self.assertEqual(path.read_text(encoding="utf-8"),
+                         self.head + self.block)
+
+    def test_missing_markers(self):
+        self.assert_refused(self.file(self.head + self.tail),
+                            "missing_markers")
+
+    def test_empty_file(self):
+        self.assert_refused(self.file(""), "missing_markers")
+
+    def test_begin_only(self):
+        begin = self.block.split("\n", 1)[0] + "\n"
+        self.assert_refused(self.file(self.head + begin + self.tail),
+                            "unbalanced_begin")
+
+    def test_end_only(self):
+        end = self.block.rstrip("\n").rsplit("\n", 1)[1] + "\n"
+        self.assert_refused(self.file(self.head + end + self.tail),
+                            "unbalanced_end")
+
+    def test_end_before_begin(self):
+        begin, rest = self.block.split("\n", 1)
+        body, end = rest.rstrip("\n").rsplit("\n", 1)
+        text = end + "\n" + body + "\n" + begin + "\n"
+        self.assert_refused(self.file(text), "end_before_begin")
+
+    def test_two_regions(self):
+        self.assert_refused(
+            self.file(self.head + self.block + self.tail + self.block),
+            "duplicated")
+
+    def test_nested_begin(self):
+        begin = self.block.split("\n", 1)[0] + "\n"
+        text = self.head + begin + self.block + self.tail
+        self.assert_refused(self.file(text), "nested")
+
+    def test_a_marker_quoted_in_a_fenced_block_counts(self):
+        begin = self.block.split("\n", 1)[0]
+        example = f"```markdown\n{begin}\n```\n\n"
+        self.assert_refused(self.file(example + self.block), "nested")
+        # The control: the same example indented off column 0 is prose.
+        indented = f"```markdown\n  {begin}\n```\n\n"
+        code, payload = self.check(self.file(indented + self.block))
+        self.assertEqual(code, 0, payload)
+
+    def test_crlf_in_the_region_is_refused(self):
+        crlf = (self.head + self.block).replace("\n", "\r\n")
+        self.assert_refused(self.file(crlf), "crlf")
+
+    def test_crlf_outside_the_region_is_not_judged_and_kept(self):
+        head = self.head.replace("\n", "\r\n")
+        path = self.file(head + self.stale_block() + "tail\r\n")
+        code, payload = self.write(path)
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(path.read_bytes(),
+                         (head + self.block + "tail\r\n").encode("utf-8"))
+
+    def test_non_utf8(self):
+        raw = (self.head + self.block).encode("utf-8") + b"\xff\xfe\n"
+        self.assert_refused(self.file(None, raw=raw), "not_utf8")
+
+    def test_absent_path(self):
+        self.assert_refused(self.cwd / "NOPE.md", "absent", code=2)
+
+    def test_a_directory(self):
+        (self.cwd / "dir.md").mkdir()
+        self.assert_refused(self.cwd / "dir.md", "directory", code=2)
+
+    def test_a_fifo_is_refused_before_any_read(self):
+        """A named pipe would block the read forever: the file kind is
+        checked before anything is opened."""
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no named pipes on this platform")
+        fifo = self.cwd / "pipe.md"
+        os.mkfifo(fifo)
+        self.assert_refused(fifo, "not_a_file", code=2)
+
+    def test_a_dangling_symlink_is_absent(self):
+        (self.cwd / "CLAUDE.md").symlink_to(self.cwd / "AGENTS.md")
+        self.assert_refused(self.cwd / "CLAUDE.md", "absent", code=2)
+
+    def test_a_symlink_is_followed_for_reading_and_writing(self):
+        target = self.file(self.head + self.stale_block() + self.tail)
+        link = self.cwd / "CLAUDE.md"
+        link.symlink_to("AGENTS.md")
+        code, payload = self.check(link)
+        self.assertEqual(code, 1, payload)
+        self.assertEqual(payload["status"], "stale")
+        self.assertEqual(payload["target"], str(target.resolve()))
+        self.assertIn("followed the symbolic link", payload["note"])
+        code, payload = self.write(link)
+        self.assertEqual(code, 0, payload)
+        self.assertIn("written", payload["note"])
+        self.assertTrue(link.is_symlink(), "the link itself must survive")
+        self.assertEqual(target.read_text(encoding="utf-8"),
+                         self.head + self.block + self.tail)
+
+    def test_dir_is_refused_with_the_embedded_modes(self):
+        path = self.file(self.head + self.block)
+        code, payload = self.check(path, "--dir", str(self.tmp))
+        self.assertEqual(code, 2, payload)
+        self.assertEqual(payload["next"], f"{TOOL_NAME} render-adapters "
+                                          f"--check-embedded {path}")
+
+    def test_the_modes_are_mutually_exclusive(self):
+        path = self.file(self.head + self.block)
+        code, payload = self.loupe("render-adapters", "--check-embedded",
+                                   str(path), "--install")
+        self.assertEqual(code, 2, payload)
+        self.assertFalse(self.documented.exists())
 
 
 class TestAdapterEnumerationsAreDerived(unittest.TestCase):
@@ -1747,6 +2749,17 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
         "CLAIM_REFERENCE_REQUIRED": {"CLAIM_REFERENCE_REQUIRED": None},
         "VERDICTS": {"VERDICT_CLEAN": "zz-verdict-clean-sentinel",
                      "VERDICT_CHANGES": "zz-verdict-changes-sentinel"},
+        # 0.25.0: the object-list members render with their own field
+        # tables (`adapters._claim_members`). The tables are a mapping of
+        # mappings, which the by-shape patch cannot reach, so the patch is
+        # a function of the authority: one sentinel field per member.
+        "CARRIED_OUTCOMES": {"CARRIED_OUTCOMES": None},
+        "CLAIM_OBJECT_LIST_FIELDS": {"CLAIM_OBJECT_LIST_FIELDS": lambda v: (
+            {m: {**t, f"zz-{m}-field": "string"} for m, t in v.items()},
+            [f"zz-{m}-field" for m in v])},
+        "CLAIM_OBJECT_REQUIRED": {"CLAIM_OBJECT_REQUIRED": lambda v: (
+            {m: (*r, f"zz-{m}-required") for m, r in v.items()},
+            [f"zz-{m}-required" for m in v])},
     }
 
     #: Vocabularies the advisory scan may flag in adapter text without a
@@ -1925,6 +2938,12 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
         Returns (patches, expected sentinel strings)."""
         patches, expected = {}, []
         for attr, fixed in attrs.items():
+            if callable(fixed):
+                # A nested authority (0.25.0): the entry computes its own
+                # patch from the live value, and names its sentinels.
+                patches[attr], more = fixed(getattr(vocab, attr))
+                expected.extend(more)
+                continue
             if fixed is not None:
                 patches[attr] = fixed
                 expected.append(fixed)
