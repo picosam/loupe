@@ -55,5 +55,14 @@ if [ "${PYTHONPATH+set}" = set ]; then
 else
     unset LOUPE_CALLER_PYTHONPATH
 fi
+# The interpreter, by its versioned name first (2026-09-22). The package
+# supports exactly one minor (REQUIRES_PYTHON in review/__init__.py), and a
+# machine's bare `python3` is whatever its package manager last linked:
+# Homebrew moves that alias to a new minor on its own schedule. Naming the
+# minor keeps this launcher on the supported interpreter wherever one is
+# installed. The bare name is the fallback; the package's first statement
+# names both versions when that one is too old.
+PYTHON=python3.15
+command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python3
 LOUPE_SHIM=1 PYTHONSAFEPATH=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    exec python3 -m review "$@"
+    exec "$PYTHON" -m review "$@"

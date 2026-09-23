@@ -119,6 +119,11 @@ def _claim_members() -> str:
             f"{', '.join(f'`{o}`' for o in vocab.CARRIED_OUTCOMES)}"
             for f, kind in vocab.CLAIM_OBJECT_LIST_FIELDS[m].items()
             if kind == "carried_outcome")
+        # 0.26.0: optional fields an entry declares together or not at all.
+        extra += "".join(
+            "; " + " and ".join(f"`{f}`" for f in group)
+            + " are declared together"
+            for group in vocab.CLAIM_OBJECT_TOGETHER.get(m, ()))
         return f"`{m}` (a list of objects: {fields}{extra})"
     return ", ".join(member(m) for m in sorted(vocab.CLAIM_FIELDS))
 

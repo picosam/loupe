@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from review import (IDENTITY_ARTEFACTS,
@@ -515,6 +516,19 @@ class TestTheDispositionDoorCompares(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
         self.cfg = dataclasses.replace(synth.NO_GATES, ledger_dir=self.tmp)
         self.synth = synth
+        # 0.26.0: a response to a recorded verdict is judged under the
+        # verdict's TARGET configuration (brief
+        # `unverifiable-breaker-target-authority`). These verdicts are filed
+        # at synthetic SHAs no clone holds, so this class states the
+        # assumption its fixture always made — the target's configuration IS
+        # this config — and keeps testing its own subject. The authority
+        # itself is held through the real entry point in
+        # `test_blocking_authority`.
+        patcher = unittest.mock.patch.object(
+            transport, "governing_for",
+            side_effect=lambda cfg, sha, git=None: self.cfg)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _recorded_round(self):
         """A request and its verdict recorded the way the loop records

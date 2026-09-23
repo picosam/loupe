@@ -178,6 +178,8 @@ CLAIM_REFERENCES_FIELD = "references"
 #   carried_outcome one of CARRIED_OUTCOMES
 #   commits         a non-empty list of 40-hex commit ids
 #   gate_id         a gate id in GATE_ID_RE's grammar
+#   path            a repository path a reference manifest line can carry
+#                   (`refs.path_error` finds nothing wrong with it)
 CLAIM_OBJECT_LIST_FIELDS = {
     # Findings of EARLIER verdicts this request answers — typically another
     # lineage's, which the reviewer cannot see from this one's ledger.
@@ -185,9 +187,13 @@ CLAIM_OBJECT_LIST_FIELDS = {
                          "outcome": "carried_outcome", "required": "string",
                          "fix": "commits"},
     # The author's map from each objective to the paths it touches; the
-    # request computes which changed files each one covers.
+    # request computes which changed files each one covers. 0.26.0 (brief
+    # `take-objective-map` item 5): an objective may also name an AUTHORITY
+    # — a committed inventory, one member per line, read at the target — and
+    # the members it COVERS; the request compares the two sets both ways.
     "objectives": {"title": "string", "paths": "scope_paths",
-                   "tests": "list_of_string", "references": "list_of_string"},
+                   "tests": "list_of_string", "references": "list_of_string",
+                   "authority": "path", "covers": "list_of_string"},
     # Gate runs the author TYPED — never attestations, rendered as such.
     "observations": {"command": "string", "result": "string",
                      "context": "string"},
@@ -201,6 +207,13 @@ CLAIM_OBJECT_REQUIRED = {
     "objectives": ("title", "paths"),
     "observations": ("command", "result", "context"),
     "attestation_map": ("fingerprint", "gate"),
+}
+# Optional fields an entry declares together or not at all (0.26.0): an
+# authority with nothing covered compares nothing, and members covered with
+# no authority are compared with nothing — either alone is a claim no check
+# reads, refused at capture like any other defect of the grammar.
+CLAIM_OBJECT_TOGETHER = {
+    "objectives": (("authority", "covers"),),
 }
 # What the AUTHOR claims about a carried finding in this span. Closed, and
 # each term asks the reviewer for exactly one act: `fixed` — check the fix

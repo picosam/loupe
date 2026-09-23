@@ -264,7 +264,11 @@ class WarmCache:
 
     def cached(self, **kw):
         """`cached_handoff` for round 1 under this scaffold; `kw` is the
-        key dimension under test (roles, transport, debug, ...)."""
+        key dimension under test (roles, transport, debug, ...). The base
+        is the one the scaffold's request names (`request_text`'s default),
+        stated because an unstated base is cold (public issue #7); a test
+        of the base itself passes its own."""
+        kw.setdefault("base", SHA_A)
         return transport.cached_handoff(self.cfg, self.ledger, 1, LINEAGE,
                                         git=self.git,
                                         claim_digest=self.claim_digest, **kw)

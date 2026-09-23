@@ -395,7 +395,18 @@ class TestDispositionValidation(unittest.TestCase):
             d_path.write_text(self._forged_envelope(), encoding="utf-8")
             args = argparse.Namespace(envelope=str(d_path), round=None,
                                       tokens=None, ledger_dir=str(root))
-            yield root, cfg, args, Ledger(root)
+            # 0.26.0: `ledger add` judges a disposition under the answered
+            # verdict's TARGET configuration (brief
+            # `unverifiable-breaker-target-authority`). This fixture files
+            # its verdict at a synthetic SHA no clone holds, so it states
+            # the assumption it always made — the target's configuration IS
+            # this config — and keeps testing its own subject; the authority
+            # itself is held through the real entry point in
+            # `test_blocking_authority`.
+            with unittest.mock.patch.object(
+                    transport, "governing_for",
+                    side_effect=lambda _cfg, _sha, git=None: cfg):
+                yield root, cfg, args, Ledger(root)
 
     @staticmethod
     def verdict_body(title=None, sev="Medium"):

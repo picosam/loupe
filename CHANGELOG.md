@@ -5,6 +5,191 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.26.0
+
+**For upgraders — read before crossing this version.** Two things move.
+
+**Python 3.15 is the one supported interpreter.** `requires-python` is
+now `>=3.15,<3.16`, replacing `>=3.14,<3.15`. The package still
+supports exactly one minor, because its scope scanner is closed against
+the `ast` grammar of the interpreter that gates it. Under 3.14 the
+package refuses at its first statement and names both versions.
+
+**This release is published on the 3.15.0 release candidate, as if
+final.** Until 3.15.0 final ships, run `uv python install 3.15` BEFORE
+the pinned install. A `uvx`/`uv tool` install provisions 3.15 from the
+declared range only once a 3.15.0 final exists that your `uv` knows
+about: PEP 440 orders `3.15.0rc2` below `3.15`, so `>=3.15` excludes the
+rc from a download, and uv finds no release candidate for it. Measured
+with uv 0.12.18 and an empty interpreter store, it answered "No
+interpreter found for Python >=3.15, <3.16"; after `uv python install
+3.15` (which installs 3.15.0rc2 from a plain `3.15` request) the same
+`uvx --from` install ran and reported this version. An rc that is
+already installed IS used. The copy-based launchers (`bin/loupe`,
+`loupe-approve`) now try `python3.15` before `python3`, so a machine
+whose bare `python3` is another minor still runs the tool when a 3.15
+exists.
+
+Keep `review.toml` in TOML 1.0 while any machine that authors or reviews
+the repository runs a release below 0.26.0. Python 3.15's `tomllib`
+reads TOML 1.1, and 3.14's reads 1.0, so such a reader refuses 1.1-only
+syntax as invalid TOML and names the line and column. Rewriting that
+line in its 1.0 spelling is the whole repair.
+
+**An objective gains two optional fields, `authority` and `covers`**
+(below). An author on 0.25.x refuses a claim whose `objectives` entry
+carries either, as an unknown field: measured with the published 0.25.0,
+"objectives[0] states unknown field 'authority'". A reviewer on 0.25.0
+still takes the request.
+
+What does NOT move: no key, no claim member (the two fields sit inside the
+existing `objectives` member), no wrapper attribute, no request section,
+no verdict grammar. A 0.25.0 reader takes a 0.26.0 request. Measured with
+the published 0.25.0 on a request carrying an `Authority —` block and its
+notice, a `Scoped:` line and the new `Env:` wording: `take`, `validate`
+and `brief` exit 0, `validate` reports no items, and the tool agreement
+reads `differs`, never a refusal. As at every version bump, the `tool`
+digest differs.
+
+**Measured before the move, on 3.15.0rc2** (2026-09-22, a scratch clone,
+the same clone under 3.14.7 as the control):
+
+| suite | tests | 3.15-only non-passes | cause |
+|---|---|---|---|
+| `review/tests` | 2,079 | 4 | the declared 3.14 interval |
+| `tools/tests` | 979 | 0 | — |
+| the candidate's suite | 1,733 | 4 | the same four |
+| park and approve candidates | | 0 | — |
+
+None of those failures came from the tool's behaviour. The grammar gate
+passes unchanged. PEP 810's `lazy import` adds one field, `is_lazy`, to
+`Import` and `ImportFrom`. Both are classified transparent, which is
+correct: a lazy import defers the imported module's code, not an
+evaluation in the scope being scanned. PEP 798 admits a starred element
+in a comprehension and a `DictComp` without a value, and both nodes are
+already transparent.
+
+**The request's `Env:` line no longer guesses the reviewer's reader
+(issue #8).** When the `loupe` on the hand-off's PATH was not the running
+installation, the line went on to say that a same-machine reviewer runs
+that one. That is a claim about another process's PATH, and it is false
+wherever a harness puts its own reader first on the reviewer's PATH. The
+line now states what the hand-off observed and names where the other half
+is observed: `` `loupe` on PATH is 0.25.0, NOT this 0.26.0 (this process's
+PATH; the reviewer's `take` reports the reader it ran) ``. No reader parses
+the line, so an older reader shows the new text as it is.
+
+**`take` shows the target's open decisions at a terminal (issue #9).**
+`take` reports the keys the TARGET commit's configuration never declared
+(`decide`), but it did so only in its JSON result, so a person reading the
+terminal never saw them. The default and the `--compact`
+renderings now print a `decide:` block after the `head:` line: the count,
+the configuration it was read from, and for each key the lines `loupe
+decide` prints (meaning, applied value, `set` and `unset`). A target that
+declares every optional key prints `decide: none` rather than nothing. The
+JSON result is unchanged.
+
+**`take` gives the reviewer a scoped diff for their own checkout (issue
+#10).** A request whose claim declares `scope_paths` carries a `Scoped:`
+line: the span's diff limited to the matched paths, as a command for the
+AUTHOR's checkout (`git -C <author root> …`). `take` re-rendered `Diff:`
+for the reviewer's checkout and gave no scoped counterpart. Its result now
+carries `scoped`, the request's own pathspecs over the request's own range,
+rooted where `diff` is rooted and run like it, and both renderings print a
+`scoped:` line under `diff:`.
+
+- The pathspecs are read from the request, not recomputed, because which
+  paths the claim's `scope_paths` match is the emitter's decision and the
+  reviewer's command must select the same set.
+- They are re-rendered only from a line in the form the emitter writes:
+  the range of the request's own `Base:` and target, then literal
+  pathspecs only. Anything else gives `scoped: null` and a `scoped_note`
+  saying why: no line, the emitter's own `none` or `withheld`, a second
+  `Scoped:` line, another range, a pattern pathspec, or quoting that does
+  not parse.
+- Result shape: `take` and `take --compact` gain the keys `scoped` and
+  `scoped_note`. A request from a 0.25.0 author carries the same `Scoped:`
+  form and gets a reviewer-local command too (measured: the published 0.25.0
+  emitting, this version taking).
+
+**A changed `--base` at an unchanged tip is no longer dropped (issue #7).**
+Re-running `handoff` on an unchanged tip serves the kept request without
+re-running gates or pushing. The review base was not part of that
+decision, so a second `handoff --base Y` returned `cached: true` with
+`Base:` still naming the first base. The base is now part of the key,
+chosen over refusing a changed base: a refusal at an unchanged tip would
+leave no repair but a new commit, while a corrected base is an authored
+input like a corrected claim, which already re-emits the round.
+
+- The base compared is the one a fresh emission from the same arguments
+  would use: `--base`, else the commit the last verdict ruled on. It is
+  resolved as the fresh emission resolves it and must equal the kept
+  request's `Base:`. So `--base <id>`, an abbreviation of it and `HEAD~2`
+  naming the same commit are all served from the cache, and on round 2 a
+  re-run without `--base` still is.
+- Anything else re-emits the round, and the emission's own checks then
+  apply. On round 1, re-running without `--base` after a hand-off that gave
+  one now refuses with "no prior verdict in the ledger; pass --base",
+  where it used to return the kept request: repeat the `--base`. A symbolic
+  base is read when the re-run starts, as a fresh emission reads it, so a
+  ref that moved since the first hand-off names the commit it names now.
+
+**One authority for whether a finding blocks (issue #6).** 0.25.0 judged
+the verdict précis by the TARGET commit's `review.toml`, as `close` and
+`validate --from-target` already did. Three other readers of the same
+question still used the CHECKOUT's configuration:
+
+- the `blocking` stamp `respond --out` and `ledger add` write on a
+  falsification run;
+- the `unverifiable` breaker's judgment of a run that carries no stamp,
+  in `ledger report`, the hand-off's preflight and the request's own
+  ledger report;
+- the rule that a blocking finding cannot be `deferred` or answered with
+  `preference`.
+
+So in a round where the checkout's blocking list differed from the
+reviewed commit's, for example with a taxonomy edit in flight, a finding
+the précis called blocking could be deferred, or have its unexecutable test
+stamped non-blocking, and the reverse. Measured before the change: every
+row where the two lists differ answered by the checkout. All three now
+read the configuration of the commit the finding's verdict ruled on.
+
+- A response to a RECORDED verdict is validated, rendered and stamped
+  under that verdict's target, resolved once. As at `close`, a target this
+  clone cannot resolve refuses and names the fetch. A verdict not yet
+  recorded can only be previewed (`--out` refuses it), and is judged under
+  the checkout as before.
+- An unstamped run is judged against the blocking list of the commit its
+  finding's round ruled on, and one whose target cannot be resolved is
+  unjudgeable and does not fire, as before.
+- Nothing crosses installations: the stamp is the field it always was.
+
+**An objective can name the inventory that decides whether it is complete
+(brief `take-objective-map` item 5).** The recorded case: a request
+claimed three disposition ingresses complete while the tool's own
+inventory listed a fourth, and only the reviewer noticed. An `objectives`
+entry may now carry `authority`, the path of a committed inventory, and
+`covers`, the members the objective claims. The two are declared together
+or not at all, and `authority` takes the reference-path grammar.
+
+- The request reads the inventory AT THE TARGET commit, through the
+  readers the reference manifest already uses (a symlink or a submodule is
+  refused), never the working tree. The format is UTF-8 text, one member
+  per line, blank lines and `#` lines skipped, at most 1 MiB.
+- The two sets are compared both ways, as exact strings. Under the
+  objectives table an `Authority —` block names each inventory with its
+  digest and member count, then what it lists that the objective does not
+  cover and what the objective covers that it does not list.
+- Each discrepancy is also a `Notice —` line, which the précis carries, and
+  so is an inventory that cannot be read at the target: not tracked, not a
+  regular file, not UTF-8, or over the bound. It reports and never refuses:
+  whether the inventory is right is the reviewer's call.
+- The smallest version, named as such: the inventory is a plain file the
+  repository's own tooling writes. Selecting members out of a structured
+  inventory, such as a JSON document, is not built. `take` does not
+  recompute the comparison, so a hand-edited request could misstate it,
+  as it could the objectives table.
+
 ## 0.25.0
 
 **For upgraders — read before crossing this version.** Three things move.

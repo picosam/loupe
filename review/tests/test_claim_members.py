@@ -140,7 +140,8 @@ class TestGrammarPartition(_Loop):
                              "outcome": "fixed", "required": "r",
                              "fix": ["a" * 40]},
         "objectives": {"title": "t", "paths": ["f.txt"], "tests": ["t"],
-                       "references": ["r.md"]},
+                       "references": ["r.md"], "authority": "inventory.txt",
+                       "covers": ["a"]},
         "observations": {"command": "c", "result": "r", "context": "x"},
         "attestation_map": {"fingerprint": FP, "gate": "unit", "test": "t"},
     }
@@ -156,6 +157,9 @@ class TestGrammarPartition(_Loop):
         "origin": [3, "", "L1", "L1/0", "/1", "L 1/1", "L1/x"],
         "carried_outcome": [3, "", "withdrawn", "Fixed"],
         "gate_id": [3, "", "a/b", ".x", "x" * 65],
+        # 0.26.0: a path in the reference-manifest grammar.
+        "path": [3, [], "", "  ", "a b", "-x", "dir/", "/abs", "../x",
+                 "a/./b", "a//b"],
     }
 
     @classmethod

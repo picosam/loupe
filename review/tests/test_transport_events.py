@@ -138,6 +138,19 @@ class TestResponseLifecycle(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(
             self.tmp, ignore_errors=True))
         self.cfg = dataclasses.replace(CFG, ledger_dir=self.tmp)
+        # 0.26.0: a response to a recorded verdict is judged under the
+        # verdict's TARGET configuration (brief
+        # `unverifiable-breaker-target-authority`). These verdicts are filed
+        # at synthetic SHAs no clone holds, so this class states the
+        # assumption its fixture always made — the target's configuration IS
+        # this config — and keeps testing its own subject. The authority
+        # itself is held through the real entry point in
+        # `test_blocking_authority`.
+        patcher = unittest.mock.patch.object(
+            transport, "governing_for",
+            side_effect=lambda cfg, sha, git=None: self.cfg)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _respond(self, verdict, out=True, **data):
         vpath = self.tmp / "v.md"

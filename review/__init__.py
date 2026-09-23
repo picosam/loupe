@@ -32,8 +32,8 @@ record is exactly what this protects).
 # equal to the package metadata's `requires-python`.
 import sys as _sys
 
-REQUIRES_PYTHON = (3, 14)
-REQUIRES_PYTHON_BELOW = (3, 15)
+REQUIRES_PYTHON = (3, 15)
+REQUIRES_PYTHON_BELOW = (3, 16)
 
 if _sys.version_info[:2] < REQUIRES_PYTHON:
     raise SystemExit(
@@ -163,7 +163,7 @@ TOOL_NAME = "loupe"
 #   - the reviewer procedure gains the falsification-anchoring rule (D3):
 #     anchor in the reviewed tree wherever the defect admits it, and name
 #     an external mutable dependency in the finding when it does not.
-TOOL_VERSION = "0.25.0"
+TOOL_VERSION = "0.26.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never
@@ -335,6 +335,13 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_role_stamp.py": TESTS,
     "review/tests/test_shadow_round.py": TESTS,
     "review/tests/test_handoff_preflight.py": TESTS,
+    # 0.26.0: the real-entry helper and the modules that hold issues #7,
+    # #9/#10 and the one blocking authority.
+    "review/tests/_real_cli.py": TESTS,
+    "review/tests/test_handoff_base_cache.py": TESTS,
+    "review/tests/test_take_terminal.py": TESTS,
+    "review/tests/test_blocking_authority.py": TESTS,
+    "review/tests/test_objective_authority.py": TESTS,
     "review/tests/test_take_compact.py": TESTS,
     "review/tests/test_tool_identity.py": TESTS,
     "review/tests/_transport_fixtures.py": TESTS,

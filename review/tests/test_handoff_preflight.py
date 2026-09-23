@@ -130,7 +130,9 @@ class TestTheInterpreterGuard(unittest.TestCase):
             cwd=str(self.INIT.parent.parent),
             env={"PATH": "/usr/bin:/bin", "PYTHONPATH": ""})
         self.assertNotEqual(done.returncode, 0)
-        self.assertIn("needs Python 3.14 or newer", done.stderr)
+        from review import REQUIRES_PYTHON
+        self.assertIn(f"needs Python {REQUIRES_PYTHON[0]}.{REQUIRES_PYTHON[1]} "
+                      f"or newer", done.stderr)
         self.assertIn("Nothing was read, committed, pushed or emitted",
                       done.stderr)
         self.assertNotIn("Traceback", done.stderr)
@@ -654,6 +656,101 @@ class TestHandoffEndToEnd(unittest.TestCase):
         self.assertIn("Swept:  nothing — the hand-off committed no "
                       "outstanding work",
                       Path(out["kept"]).read_text(encoding="utf-8"))
+
+
+class TestTheEnvLineStatesOnlyThisProcess(unittest.TestCase):
+    """Public issue #8 (loupe 0.26.0): the `Env:` line said that "a
+    same-machine reviewer runs" the `loupe` on the hand-off's PATH. That is
+    an inference about another process's PATH, false wherever a harness
+    scopes its own reader into the reviewer's environment. Ruled: DROP the
+    inference, keep the observed fact, and point at the one place that
+    observes the reviewer's reader — its own `take`.
+
+    Through the real entry point: `bin/loupe emit-request --out` (the
+    uncached emitter) in a scratch repository, the PATH built per row from
+    the suite's own with every directory holding a `loupe` removed and, on
+    three rows, a stub `loupe` put first. The version numbers are read from
+    the package, never restated.
+
+    | class        | the PATH's `loupe`             | expected tail            |
+    |--------------|--------------------------------|--------------------------|
+    | absent       | none                           | no `loupe` on PATH       |
+    | this version | prints TOOL_VERSION            | …, this one              |
+    | another      | prints TOOL_VERSION + "-other" | NOT this …, the pointer  |
+    | unreadable   | exits 1                        | unreadable, NOT this …   |
+
+    MUTATION: restore the old tail (" — a same-machine reviewer runs that
+    one") and the `another` and `unreadable` rows fail; the other two stay
+    green, which is the paired control.
+    """
+
+    POINTER = ("(this process's PATH; the reviewer's `take` reports the "
+               "reader it ran)")
+
+    def setUp(self):
+        from review.tests._real_cli import Scratch
+        self.s = Scratch(self, "env-line-")
+        self.rows = 0
+
+    def path_for(self, stub: str | None) -> str:
+        name = review.TOOL_NAME
+        kept = [d for d in os.environ.get("PATH", "").split(os.pathsep)
+                if d and not (Path(d) / name).exists()]
+        # The launcher finds its interpreter on PATH, and a user-level bin
+        # directory commonly holds the interpreter beside an installed
+        # `loupe` — so the directory that is dropped for the second must
+        # not take the first with it. This suite's own interpreter, under
+        # both names the launcher tries.
+        interp = self.s.root / "interpreter"
+        if not interp.is_dir():
+            interp.mkdir()
+            minor = f"python{sys.version_info[0]}.{sys.version_info[1]}"
+            for alias in (minor, "python3"):
+                (interp / alias).symlink_to(sys.executable)
+        kept.insert(0, str(interp))
+        if stub is None:
+            return os.pathsep.join(kept)
+        self.rows += 1
+        where = self.s.root / f"stub-{self.rows}"
+        where.mkdir()
+        (where / name).write_text("#!/bin/sh\n" + stub, encoding="utf-8")
+        (where / name).chmod(0o755)
+        return os.pathsep.join([str(where), *kept])
+
+    def env_line(self, stub: str | None) -> str:
+        from review.tests._real_cli import loupe
+        self.rows += 1
+        out = self.s.root / f"request-{self.rows}.md"
+        code, payload, stdout, stderr = loupe(
+            self.s, "emit-request", "--claim-file", str(self.s.claim),
+            "--base", self.s.base, "--out", str(out),
+            env={"PATH": self.path_for(stub)})
+        self.assertEqual(code, 0, (stdout, stderr))
+        (line,) = [l for l in out.read_text(encoding="utf-8").splitlines()
+                   if l.startswith("Env:")]
+        return line
+
+    def test_each_state_of_the_path(self):
+        name, version = review.TOOL_NAME, review.TOOL_VERSION
+        with self.subTest(row="absent"):
+            line = self.env_line(None)
+            self.assertTrue(line.endswith(f"no `{name}` on PATH"), line)
+        with self.subTest(row="this version"):
+            line = self.env_line(f"echo '{name} {version}'\n")
+            self.assertTrue(line.endswith(
+                f"`{name}` on PATH is {version}, this one"), line)
+        with self.subTest(row="another"):
+            line = self.env_line(f"echo '{name} {version}-other'\n")
+            self.assertTrue(line.endswith(
+                f"`{name}` on PATH is {version}-other, NOT this {version} "
+                f"{self.POINTER}"), line)
+            self.assertNotIn("reviewer runs", line)
+        with self.subTest(row="unreadable"):
+            line = self.env_line("exit 1\n")
+            self.assertTrue(line.endswith(
+                f"`{name}` on PATH is unreadable, NOT this {version} "
+                f"{self.POINTER}"), line)
+            self.assertNotIn("reviewer runs", line)
 
 
 if __name__ == "__main__":

@@ -46,7 +46,9 @@ def _tty() -> bool:
 # only exit. What it does not reach is stated where those surfaces are
 # enforced instead: envelope stamp lines (`wire.executable_stamp`), fenced
 # relay lines (`brief._fence`), and the adapters' command slots.
-RUNNABLE_KEYS = ("next", "reviewer_next", "diff")
+# `scoped` (0.26.0, public issue #10): `take`'s reviewer-local scoped diff,
+# the request's `Scoped:` pathspecs rooted in this checkout — run like `diff`.
+RUNNABLE_KEYS = ("next", "reviewer_next", "diff", "scoped")
 
 # Every top-level key a structured result may carry that an agent READS
 # rather than runs. Together with RUNNABLE_KEYS this is THE result schema,
@@ -156,6 +158,9 @@ PROSE_KEYS = (
     # relays to the author — never a command, and never an exit: the
     # comparison reports and does not refuse.
     "scope",
+    # Why `take` gives no reviewer-local `scoped` command, when it gives none
+    # (0.26.0, public issue #10) — read, never run.
+    "scoped_note",
     "status", "subtype", "superseded",
     "tag", "target", "taxonomy", "test_digest", "then", "threads", "title",
     "to",
@@ -576,6 +581,25 @@ def cmd_respond(args, cfg) -> int:
                                 carried=_carried_by(args.verdict, None))
     except LineageUnchoosable as exc:
         return _blocked("", str(exc), remedy=exc.remedy)
+    # 0.26.0 (brief `unverifiable-breaker-target-authority`): WHICH
+    # configuration judges this answer. A RECORDED verdict was judged by
+    # `close` under its target commit's `review.toml`, and the précis read
+    # the same file; answering it under this checkout's made a second
+    # authority for one question — whether a finding blocks — so a taxonomy
+    # edit in flight could let a blocking finding be deferred, or stamp its
+    # falsification run non-blocking. The response to a recorded verdict is
+    # judged, validated and stamped under that target, resolved once here;
+    # it refuses when the target cannot be resolved, as `close` does. A
+    # verdict not (yet) recorded can only be previewed — `--out` refuses it
+    # below — and is judged under this checkout, as before.
+    recorded = transport.recorded_verdict(
+        ledger, lineage, digest=sha256_text(verdict_text))
+    governing = cfg
+    if recorded is not None:
+        try:
+            governing = transport.governing_for(cfg, recorded["sha"])
+        except transport.Refusal as exc:
+            return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
     # Sweep F2: a disposition is an answer to a VALID, RECORDED verdict, not
     # a free-standing assertion. This verb used to parse whatever file it
     # was handed and go straight to building the response — an unwrapped
@@ -583,7 +607,7 @@ def cmd_respond(args, cfg) -> int:
     # disposition events at a caller-supplied SHA with exit 0. The verdict
     # is validated first, in every mode.
     items = validate_verdict(
-        verdict, cfg,
+        verdict, governing,
         answering=_dispositions_answered(ledger, verdict, lineage))
     if errors_in(items):
         return _finish(items,
@@ -602,9 +626,8 @@ def cmd_respond(args, cfg) -> int:
     # one; a value supplied in the JSON may only agree. Without --out the
     # envelope is rendered and printed, not recorded, so a verdict that does
     # not (yet) resolve is not itself refused here — only a resolving one
-    # whose author disagrees is, below.
-    recorded = transport.recorded_verdict(
-        ledger, lineage, digest=sha256_text(verdict_text))
+    # whose author disagrees is, below. (`recorded` is resolved above, where
+    # it also chooses the governing configuration.)
     if args.out:
         if recorded is None:
             close_cmd = paths.command(
@@ -710,11 +733,11 @@ def cmd_respond(args, cfg) -> int:
                 rec[key] = derived
         records.append(rec)
     envelope = wire.emit_disposition(
-        tag=cfg.wrapper_tag,
+        tag=governing.wrapper_tag,
         verdict_sha=data.get("verdict_sha") or verdict.sha or "",
         head=data["head"], author=data.get("author", cfg.roles["author"]),
         round_no=int(data.get("round", 0)), dispositions=records)
-    items = validate_disposition(wire.parse_disposition(envelope), cfg,
+    items = validate_disposition(wire.parse_disposition(envelope), governing,
                                  against=verdict)
     if errors_in(items):
         respond_cmd = paths.command(
@@ -730,7 +753,8 @@ def cmd_respond(args, cfg) -> int:
         # RVW-T9: a written disposition is the author's half of the round;
         # record and keep it here so the loop needs no manual `ledger add`.
         rec = transport.record_response(cfg, ledger, envelope,
-                                        against=verdict, lineage=lineage)
+                                        against=verdict, lineage=lineage,
+                                        governing=governing)
         _out({"ok": True, "out": args.out, "dispositions": len(records),
               "kept": rec["kept"], "events_added": rec["events_added"],
               "next": paths.command(*paths.lits(TOOL_NAME, "handoff"))},
@@ -1130,13 +1154,20 @@ def cmd_ledger_add(args, cfg) -> int:
             return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
         parsed.attrs["author"] = resolved
         parsed.data["author"] = resolved
-        items = validate_disposition(parsed, cfg, against=against)
+        # 0.26.0: the answered verdict's TARGET judges the answer and stamps
+        # its runs — the same one authority `respond --out` uses (brief
+        # `unverifiable-breaker-target-authority`); unresolvable refuses.
+        try:
+            governing = transport.governing_for(cfg, against.sha or "")
+        except transport.Refusal as exc:
+            return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
+        items = validate_disposition(parsed, governing, against=against)
         if errors_in(items):
             return _finish(items,
                            paths.command(*paths.lits(TOOL_NAME, "validate"),
                                          args.envelope))
         added += ledger.add_all(
-            transport.disposition_events(parsed, against, cfg),
+            transport.disposition_events(parsed, against, governing),
             lineage=lineage)
         # Round-1 F3. This is the ONE door a disposition can arrive at from
         # another installation — `respond --out` writes and records in one
@@ -1253,11 +1284,14 @@ def cmd_ledger_report(args, cfg) -> int:
         lineage = _read_lineage(ledger, cfg, "ledger report")
     except LineageUnchoosable as exc:
         return _blocked("", str(exc), remedy=exc.remedy)
+    # 0.26.0: a run's blocking state is judged by the configuration of the
+    # commit its finding was ruled on, not this checkout's
+    # (`transport.target_blocking`).
     report = ledger.report(lineage,
                            ledger.effective_round_cap(cfg.round_cap, lineage),
                            gate_manifest=cfg.gate_ids,
                            token_budget=cfg.token_budget,
-                           blocking_severities=cfg.blocking_severities)
+                           blocking_at=transport.target_blocking(cfg))
     if args.format == "md" or (args.format is None and _tty()):
         print(render_report_md(report))
     else:
@@ -1521,6 +1555,25 @@ def _debug_flag(args) -> bool | None:
     return None
 
 
+def _review_base(args, ledger, lineage: str) -> str | None:
+    """The review base EXPRESSION an emission from these arguments uses:
+    the author's `--base`, else the SHA the lineage's last verdict ruled
+    on, else None (no range can be emitted).
+
+    One derivation for two readers (public issue #7, 0.26.0): `_emit`, which
+    hands it to `ensure_pushed` to resolve, and the warm cache, which must
+    key on the base a cold emission from the same arguments would use. The
+    cache used to key on neither, so a second `--base` at an unchanged tip
+    was served the first one's envelope."""
+    base = args.base
+    if base is None:
+        verdicts = [e for e in ledger.current(lineage)
+                    if e.get("event") == "verdict"]
+        if verdicts:
+            base = max(verdicts, key=lambda e: e["round"])["sha"]
+    return base
+
+
 def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
           selected_transport: str, lineage: str):
     """emit-request's body, shared with handoff: commit, gate, push, emit,
@@ -1569,12 +1622,7 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
     # told it (0.25.0). This is the EXPRESSION; `ensure_pushed` resolves it
     # once, before its own commit, and everything after that uses the id it
     # returns (review round 1 F1, below).
-    base = args.base
-    if base is None:
-        verdicts = [e for e in ledger.current(lineage)
-                    if e.get("event") == "verdict"]
-        if verdicts:
-            base = max(verdicts, key=lambda e: e["round"])["sha"]
+    base = _review_base(args, ledger, lineage)
     local_gates = None
 
     def gate_before_push(record: dict) -> None:
@@ -1985,7 +2033,8 @@ def cmd_handoff(args, cfg) -> int:
             transport=selected_transport,
             author_flag=getattr(args, "author", None),
             reviewer_flag=getattr(args, "reviewer", None),
-            debug=emit.resolve_debug(cfg, _debug_flag(args)))
+            debug=emit.resolve_debug(cfg, _debug_flag(args)),
+            base=_review_base(args, ledger, lineage))
         if cached is not None:
             # RVW-T17, the call site the redesign had to rule on rather than
             # inherit: this branch returns BEFORE `_emit`, so it never reaches
@@ -2187,6 +2236,9 @@ def cmd_take(args, cfg) -> int:
     # bytes and nothing else, so a consumer that pipes it onward is never
     # handed a rendering under that name.
     verbatim = rec.pop("envelope")
+    # The configuration `decide` was computed from, named on the terminal
+    # beside the list (public issue #9): the target's, which `take` resolved.
+    decide_source = (rec.get("target") or {}).get("config") or "the target"
     if getattr(args, "compact", False):
         # Public issue #4, reviewer request (2026-09-21): pointers only. The
         # take above ran every check and wrote every record exactly as the
@@ -2211,7 +2263,8 @@ def cmd_take(args, cfg) -> int:
                    "sha": rec["sha"], "reviewer": rec["reviewer"],
                    "head": rec["head"], "brief": rec["brief"],
                    "decide": rec["decide"],
-                   "diff": rec["diff"], "then": rec["then"]}
+                   "diff": rec["diff"], "scoped": rec["scoped"],
+                   "scoped_note": rec["scoped_note"], "then": rec["then"]}
         _out(compact,
              f"kept:   {compact['kept']}\n"
              f"digest: {compact['digest']} ({compact['bytes']} bytes)\n"
@@ -2219,7 +2272,10 @@ def cmd_take(args, cfg) -> int:
              f"{compact['round']} target {compact['sha']} as reviewer "
              f"{compact['reviewer']}\n\n{compact['brief']}\n\n"
              f"{render_checkout(compact['head'], compact['sha'])}"
-             f"diff:   {compact['diff']}\nthen:   {compact['then']}")
+             f"{render_take_decide(compact['decide'], decide_source)}"
+             f"diff:   {compact['diff']}\n"
+             f"{render_scoped(compact['scoped'], compact['scoped_note'])}"
+             f"then:   {compact['then']}")
         return EXIT_OK
     if args.full:
         rec["envelope"] = shown = verbatim
@@ -2233,7 +2289,10 @@ def cmd_take(args, cfg) -> int:
               f"{render_checkout(rec['head'], rec['sha'])}"
               f"references:\n{refs}\n"
               f"{render_tool_agreement(rec['tool'])}"
-              f"diff:   {rec['diff']}\nthen:   {rec['then']}")
+              f"{render_take_decide(rec['decide'], decide_source)}"
+              f"diff:   {rec['diff']}\n"
+              f"{render_scoped(rec['scoped'], rec['scoped_note'])}"
+              f"then:   {rec['then']}")
     return EXIT_OK
 
 
@@ -2904,21 +2963,64 @@ def _decide_text(entries: list, cfg) -> str:
              f"verbatim into {config.CONFIG_BASENAME}, under the section "
              f"named beside it.", ""]
     for entry in entries:
-        section = entry["key"].rpartition(".")[0]
-        lines.append(f"{entry['key']} — under [{section}]")
-        lines.append(f"  {entry['meaning']}")
-        # The values as the JSON prints them: this text is the same result
-        # read aloud, and `False`/`None` are a second spelling of a payload
-        # a reader may also be parsing.
-        lines.append(f"  applied: {json.dumps(entry['applied'])}")
-        lines.append(f"  set:     {entry['set'] or '(no line declares it)'}")
-        lines.append(f"  unset:   {entry['unset'] or '(this key has no off '
-                                                     'state)'}")
+        lines.extend(_decide_entry_lines(entry))
         lines.append("")
     lines.append(f"`{vocab.DECIDE_TRANSPORT}` reports what an emission from "
                  f"this environment would resolve now — the same resolution "
                  f"`handoff` makes — not a value anyone declared.")
     return "\n".join(lines)
+
+
+def _decide_entry_lines(entry: dict) -> list[str]:
+    """One `decide` entry read aloud — the one renderer `decide` and `take`
+    share, so a key reads the same wherever a person meets it."""
+    section = entry["key"].rpartition(".")[0]
+    # The values as the JSON prints them: this text is the same result read
+    # aloud, and `False`/`None` are a second spelling of a payload a reader
+    # may also be parsing.
+    return [f"{entry['key']} — under [{section}]",
+            f"  {entry['meaning']}",
+            f"  applied: {json.dumps(entry['applied'])}",
+            f"  set:     {entry['set'] or '(no line declares it)'}",
+            f"  unset:   {entry['unset'] or '(this key has no off state)'}"]
+
+
+def render_scoped(command, note: str | None) -> str:
+    """`take`'s `scoped:` line (public issue #10, 0.26.0): the request's
+    scoped diff rooted in this checkout, or why there is none. Printed in
+    every state, beside `diff:`, for the reason `render_checkout` gives."""
+    if command is not None:
+        return f"scoped: {command}\n"
+    return f"scoped: none — {note}\n"
+
+
+def render_take_decide(entries: list, source: str) -> str:
+    """`take`'s `decide` list for a person at a terminal (public issue #9,
+    0.26.0), in the default and the compact rendering alike.
+
+    The list is the TARGET commit's undeclared keys, computed by `take`
+    from the configuration that governed the request, and it exists only in
+    this result: the kept request stamps the value applied, never that the
+    key was undeclared. It rode in the JSON alone, so a person reading the
+    terminal — the one reader the adapter's ask-once rule cannot reach —
+    never saw what the target leaves open. `source` names that
+    configuration. An empty list prints too: a line that appears only when
+    something is open teaches nothing about what its absence means.
+    """
+    if not entries:
+        return (f"decide: none — the target's configuration ({source}) "
+                f"declares every optional key\n")
+    out = [f"decide: {len(entries)} key(s) the target's configuration "
+           f"({source}) never declared. Each `set`/`unset` line is written "
+           f"verbatim into {config.CONFIG_BASENAME}, under the section named "
+           f"beside it."]
+    for entry in entries:
+        out.extend(f"        {line}" for line in _decide_entry_lines(entry))
+    if any(e["key"] == vocab.DECIDE_TRANSPORT for e in entries):
+        out.append(f"        `{vocab.DECIDE_TRANSPORT}` applied is the "
+                   f"transport this take resolved for the round, not a value "
+                   f"anyone declared.")
+    return "\n".join(out) + "\n"
 
 
 def cmd_decide(args, cfg) -> int:

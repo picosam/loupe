@@ -862,8 +862,8 @@ class Ledger:
 
     def breakers(self, lineage: str, round_cap: int,
                  token_budget: int | None = None,
-                 blocking_severities: list[str] | None = None
-                 ) -> list[dict]:
+                 blocking_severities: list[str] | None = None,
+                 blocking_at=None) -> list[dict]:
         """Evaluate every breaker over every completed round (§5.3d).
 
         Any firing is an escalation to the user, naming the rule and the
@@ -880,6 +880,16 @@ class Ledger:
         that cannot be judged either way does not fire — a breaker that
         overstates is what makes the report untrustworthy where it is meant
         to drive a decision.
+
+        `blocking_at` (0.26.0, brief `unverifiable-breaker-target-authority`)
+        is the one authority for that join when given: `sha -> blocking list
+        | None`, asked for the commit the finding's round RULED ON — the
+        target whose configuration the précis and `close` judge that verdict
+        by — and it replaces `blocking_severities`, which is whatever list
+        the caller happened to hold (the checkout's, before). None from it
+        is unjudgeable, and unjudgeable does not fire. The product callers
+        pass it (`transport.target_blocking`); the list stays for a caller
+        with no repository to ask.
         """
         fired: list[dict] = []
         # Progress breakers read completed rounds only (F2); the budget
@@ -1008,7 +1018,8 @@ class Ledger:
             for x in runs:
                 if x.get("round") == r and x.get("status") == "cannot_execute" \
                         and self._run_is_blocking(x, all_findings,
-                                                  blocking_severities):
+                                                  blocking_severities,
+                                                  blocking_at, lineage):
                     fired.append({
                         "breaker": "unverifiable", "round": r, "fp": x["fp"],
                         "material": material_id("run", _uid(x)),
@@ -2167,17 +2178,20 @@ class Ledger:
                 for e in self.events() if e.get("event") == "waiver"]
 
     def _run_is_blocking(self, run: dict, findings: list[dict],
-                         blocking_severities: list[str] | None) -> bool:
+                         blocking_severities: list[str] | None,
+                         blocking_at=None, lineage: str | None = None
+                         ) -> bool:
         """Whether a falsification run belongs to a BLOCKING finding
         (sweep F12). The run's own `blocking` stamp first; else the latest
         finding event carrying the run's identity, at or before the run's
-        round, judged against the supplied blocking set by severity (the
-        run's existence already evidences a named test). Unjudgeable
-        is False: the breaker states a severity, so it may not fire on one
-        it cannot establish."""
+        round, judged by severity (the run's existence already evidences a
+        named test) against the blocking list of the commit that finding's
+        round ruled on when `blocking_at` is given (0.26.0), else against
+        the supplied set. Unjudgeable is False: the breaker states a
+        severity, so it may not fire on one it cannot establish."""
         if run.get("blocking") is not None:
             return bool(run["blocking"])
-        if blocking_severities is None:
+        if blocking_at is None and blocking_severities is None:
             return False
         ident = self.resolve(run.get("fp", ""))
         candidates = [f for f in findings
@@ -2186,6 +2200,14 @@ class Ledger:
         if not candidates:
             return False
         f = max(candidates, key=lambda e: e.get("round", 0))
+        if blocking_at is not None:
+            ruled = [e.get("sha") for e in self.current(lineage)
+                     if e.get("event") == "verdict"
+                     and e.get("round") == f.get("round")]
+            blocking_severities = (blocking_at(ruled[-1])
+                                   if ruled and ruled[-1] else None)
+            if blocking_severities is None:
+                return False
         # Severity alone here: a run event exists only because a test was
         # named and run (or could not be), so the "named test" half of the
         # validator's rule is already evidenced by the run itself.
@@ -2279,11 +2301,13 @@ class Ledger:
     def report(self, lineage: str, round_cap: int,
                gate_manifest: list[str] | None = None,
                token_budget: int | None = None,
-               blocking_severities: list[str] | None = None) -> dict:
+               blocking_severities: list[str] | None = None,
+               blocking_at=None) -> dict:
         waived = self.waivers()
         return {
             "breakers_fired": self.breakers(lineage, round_cap, token_budget,
-                                            blocking_severities),
+                                            blocking_severities,
+                                            blocking_at=blocking_at),
             "round_cap": round_cap,
             "gate_manifest": list(gate_manifest) if gate_manifest else [],
             "tokens": self.token_state(token_budget, lineage),

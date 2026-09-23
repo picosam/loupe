@@ -2760,6 +2760,11 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
         "CLAIM_OBJECT_REQUIRED": {"CLAIM_OBJECT_REQUIRED": lambda v: (
             {m: (*r, f"zz-{m}-required") for m, r in v.items()},
             [f"zz-{m}-required" for m in v])},
+        # 0.26.0: optional fields declared together, rendered beside the
+        # member's field table.
+        "CLAIM_OBJECT_TOGETHER": {"CLAIM_OBJECT_TOGETHER": lambda v: (
+            {m: ((f"zz-{m}-one", f"zz-{m}-two"),) for m in v},
+            [s for m in v for s in (f"zz-{m}-one", f"zz-{m}-two")])},
     }
 
     #: Vocabularies the advisory scan may flag in adapter text without a

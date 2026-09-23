@@ -973,17 +973,20 @@ class TestCachedHandoff(unittest.TestCase):
                     "claim_digest": transport.NO_CLAIM})
         # Paired control: the canonical LF copy is warm.
         self.assertIsNotNone(transport.cached_handoff(
-            cfg, ledger, 1, LINEAGE, git=git, claim_digest=transport.NO_CLAIM))
+            cfg, ledger, 1, LINEAGE, git=git, claim_digest=transport.NO_CLAIM,
+            base=SHA_A))
         for name, mutant in (("crlf", text.replace("\n", "\r\n")),
                              ("cr", text.replace("\n", "\r"))):
             Path(kept).write_bytes(mutant.encode("utf-8"))
             self.assertIsNone(
                 transport.cached_handoff(cfg, ledger, 1, LINEAGE, git=git,
-                                         claim_digest=transport.NO_CLAIM),
+                                         claim_digest=transport.NO_CLAIM,
+                                         base=SHA_A),
                 f"{name}: a byte-distinct kept copy served warm")
         Path(kept).write_bytes(b"\xff" + text.encode("utf-8"))
         self.assertIsNone(transport.cached_handoff(
-            cfg, ledger, 1, LINEAGE, git=git, claim_digest=transport.NO_CLAIM))
+            cfg, ledger, 1, LINEAGE, git=git, claim_digest=transport.NO_CLAIM,
+            base=SHA_A))
 
     def test_keep_bytes_restores_a_rewritten_copy_from_canonical_text(self):
         """keep_bytes OWNS the retained copy (ruled 2026-08-30): the
@@ -1039,16 +1042,19 @@ class TestCachedHandoff(unittest.TestCase):
 
         # Same claim, unchanged tip: warm, which is the rule's whole point.
         self.assertIsNotNone(transport.cached_handoff(
-            cfg, ledger, 1, LINEAGE, git=git, claim_digest="claim-one"))
+            cfg, ledger, 1, LINEAGE, git=git, claim_digest="claim-one",
+            base=SHA_A))
         # Edited claim, unchanged tip: cold.
         self.assertIsNone(transport.cached_handoff(
-            cfg, ledger, 1, LINEAGE, git=git, claim_digest="claim-two"))
+            cfg, ledger, 1, LINEAGE, git=git, claim_digest="claim-two",
+            base=SHA_A))
         # Round 4 F1: this assertion used to read the other way, with a
         # comment explaining why "not given" was not "given and different".
         # It was ratifying the bug. Dropping the claim IS a change to the
         # authored input, so it is cold like any other.
         self.assertIsNone(transport.cached_handoff(
-            cfg, ledger, 1, LINEAGE, git=git, claim_digest=transport.NO_CLAIM))
+            cfg, ledger, 1, LINEAGE, git=git, claim_digest=transport.NO_CLAIM,
+            base=SHA_A))
 
     def test_a_supplied_claim_against_an_unrecorded_one_is_cold(self):
         """Round 3 F3 (High), second half — and a reversal.
@@ -1078,7 +1084,8 @@ class TestCachedHandoff(unittest.TestCase):
                     "source_digest": transport._digest_text(text),
                     "bytes": len(text)})           # no claim_digest recorded
         self.assertIsNone(transport.cached_handoff(
-            cfg, ledger, 1, LINEAGE, git=git, claim_digest="claim-one"))
+            cfg, ledger, 1, LINEAGE, git=git, claim_digest="claim-one",
+            base=SHA_A))
         # Round 5 F1: this assertion used to read the other way, with a
         # comment saying the comparison "is not required". Two unknowns are
         # the one equality that can never be proved, and calling it warm was
@@ -1145,9 +1152,10 @@ class TestCachedHandoff(unittest.TestCase):
             # exactly that difference. Both forms are exercised.
             if current is OMITTED:
                 return transport.cached_handoff(
-                    cfg, ledger, 1, LINEAGE, git=git) is not None
+                    cfg, ledger, 1, LINEAGE, git=git, base=SHA_A) is not None
             return transport.cached_handoff(
-                cfg, ledger, 1, LINEAGE, git=git, claim_digest=current) is not None
+                cfg, ledger, 1, LINEAGE, git=git, claim_digest=current,
+                base=SHA_A) is not None
 
         for recorded, current, expected, why in (
                 ("claim-one", "claim-one", True, "same claim: the rule's point"),

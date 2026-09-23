@@ -324,9 +324,11 @@ class TestTakeEndToEnd(unittest.TestCase):
 
     # ------------------------------------------------ `--compact` (issue #4)
 
+    # `scoped` and `scoped_note` (0.26.0, public issue #10): the
+    # reviewer-local scoped diff sits beside the reviewer-local `diff`.
     COMPACT_KEYS = {"ok", "kept", "digest", "bytes", "lineage", "round",
                     "sha", "reviewer", "head", "brief", "decide", "diff",
-                    "then"}
+                    "scoped", "scoped_note", "then"}
 
     def test_compact_carries_pointers_only(self):
         """Public issue #4, the reviewer's request: a pointer-only `take`.
@@ -456,9 +458,11 @@ class TestCompactKeepsTheTargetsDecisions(unittest.TestCase):
     configuration; omit it when empty; carry only the keys.
     """
 
+    # `scoped` and `scoped_note` (0.26.0, public issue #10): the
+    # reviewer-local scoped diff sits beside the reviewer-local `diff`.
     COMPACT_KEYS = {"ok", "kept", "digest", "bytes", "lineage", "round",
                     "sha", "reviewer", "head", "brief", "decide", "diff",
-                    "then"}
+                    "scoped", "scoped_note", "then"}
     PROSE_AND_ATTESTATIONS = {"request_view", "envelope", "references",
                               "target", "tool", "transport"}
 

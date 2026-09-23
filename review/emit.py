@@ -689,10 +689,19 @@ def render_preflight_lines(reachability: dict) -> list[str]:
         elif env["bare_version"] == env["tool_version"]:
             bare = f"`{TOOL_NAME}` on PATH is {env['bare_version']}, this one"
         else:
+            # Public issue #8 (0.26.0): this used to go on to say that "a
+            # same-machine reviewer runs that one". That is an inference
+            # about ANOTHER process's PATH, and it is false exactly where a
+            # harness scopes its own reader into the reviewer's environment
+            # (a relay that prepends a staged build) — which is where the
+            # line was printed most. The hand-off observes this process;
+            # which reader the reviewer ran is a fact `take` observes and
+            # records (its tool agreement), so the line states the one and
+            # points at the other instead of guessing.
             bare = (f"`{TOOL_NAME}` on PATH is "
                     f"{env['bare_version'] or 'unreadable'}, NOT this "
-                    f"{env['tool_version']} — a same-machine reviewer runs "
-                    f"that one")
+                    f"{env['tool_version']} (this process's PATH; the "
+                    f"reviewer's `take` reports the reader it ran)")
         lines.append(f"Env:    {python}; {who}; {bare}")
     return lines
 
@@ -3418,10 +3427,13 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
     # through the ledger API a test calls directly. Round-4 F5: so does the
     # configured token budget, which is None when none is declared.
     effective_cap = ledger.effective_round_cap(cfg.round_cap, lineage)
+    from .transport import target_blocking
     report_md = render_report_md(ledger.report(
         lineage, effective_cap, gate_manifest=cfg.gate_ids,
         token_budget=cfg.token_budget,
-        blocking_severities=cfg.blocking_severities),
+        # 0.26.0: a run's blocking state, judged by the commit its finding
+        # was ruled on — not by this emission's target, a later commit.
+        blocking_at=target_blocking(cfg)),
         pending_round=round_no)
     # Ruling 1 of 2026-09-06: the cross-lineage notice, ON THE ENVELOPE'S
     # FACE. Empty when no standing identity of this lineage is also ruled in
@@ -3522,7 +3534,8 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
         *(["", in_scope_line] if (in_scope_line := _in_scope_line(
             shape, generated, claim.get("excluded_paths") or ())) else []),
         *(_objectives_block(claim["objectives"], shape, generated,
-                            claim.get("excluded_paths") or ())
+                            claim.get("excluded_paths") or (),
+                            read_authority=_authority_reader(repo, head))
           if claim.get("objectives") else []),
         *(_carried_block(record, repo, base, head)
           if claim.get("carried_findings") else []),
@@ -3879,6 +3892,7 @@ _OBJECT_FIELD_WANT = {
     "commits": "a 40-character lowercase commit id",
     "gate_id": f"a gate id ({vocab.GATE_ID_RE}, at most "
                f"{vocab.GATE_ID_MAX} characters)",
+    "path": "a repository path a reference manifest line can carry",
 }
 
 
@@ -3910,6 +3924,17 @@ def _check_object_field(path: Path, where: str, kind: str, value) -> None:
                         member=f"{where}[{i}]")
         return
     _check_string(path, where, value, nonempty=True)
+    if kind == "path":
+        # The reference grammar, not a second one: an objective's authority
+        # is read at the target exactly as a reference is, so it must be a
+        # path a manifest line can carry and `git show <sha>:<path>` reads.
+        why = refs.path_error(value)
+        if why is not None:
+            raise ClaimDefective(
+                path, f"{where} is {value!r}, which is not "
+                      f"{_OBJECT_FIELD_WANT[kind]}: {why}", defect="shape",
+                member=where)
+        return
     ok = {"string": lambda v: True,
           "fingerprint": lambda v: bool(_fingerprint_re().fullmatch(v)),
           "origin": lambda v: _origin_parts(v) is not None,
@@ -3959,6 +3984,18 @@ def _check_object_list(path: Path, member: str, item) -> None:
                     member=f"{where}.{field}")
         for field, value in element.items():
             _check_object_field(path, f"{where}.{field}", table[field], value)
+        for group in vocab.CLAIM_OBJECT_TOGETHER.get(member, ()):
+            stated = [f for f in group if f in element]
+            if stated and len(stated) != len(group):
+                absent = [f for f in group if f not in element]
+                raise ClaimDefective(
+                    path, f"{where} states {', '.join(repr(f) for f in stated)} "
+                          f"without {', '.join(repr(f) for f in absent)}; an "
+                          f"entry of {member!r} declares "
+                          f"{' and '.join(repr(f) for f in group)} together or "
+                          f"not at all, since either alone is compared with "
+                          f"nothing", defect="missing",
+                    member=f"{where}.{absent[0]}")
         # A carried fingerprint is the join key the attestation map resolves
         # against; carried twice, it names two outcomes for one finding.
         if member == "carried_findings":
@@ -4293,8 +4330,139 @@ def _notice_line(label: str, items: list[str]) -> str:
     return f"Notice — {label} ({len(items)}): " + ", ".join(items)
 
 
+#: The largest inventory an objective may name as its authority, in bytes.
+#: It is read whole, at emission, into the request's face; a larger file is
+#: reported as unreadable rather than read in part, because a partial list
+#: would compare as though its missing members did not exist.
+AUTHORITY_MAX_BYTES = 1_048_576
+
+#: How many member names one authority line or notice spells out before it
+#: counts the rest. The count is always the whole count.
+AUTHORITY_NAMES_SHOWN = 10
+
+
+def _authority_reader(repo: Path, head: str):
+    """`path -> (members, sha256, None)` or `(None, None, why)`: an
+    objective's authority as the TARGET carries it (brief
+    `take-objective-map` item 5, 0.26.0).
+
+    Read through the readers the reference manifest and the source anchor
+    already use — `refs.target_kind` for presence, then
+    `transport._anchored_blob`, which refuses a symlink, a submodule and an
+    ambiguous or substituted tree entry — with replacement objects off,
+    exactly as `_reference_block` hardens its runners. Never the working
+    tree: the request describes the commit the reviewer will fetch.
+
+    The format is the smallest one a repository's own tooling can write
+    from any inventory it keeps: UTF-8 text, one member per line, surrounding
+    whitespace stripped, blank lines and lines starting with `#` skipped,
+    repeats counted once."""
+    from .transport import _anchored_blob
+    run = lambda *a: _git(repo, *a, no_replace=True)          # noqa: E731
+    read = lambda *a: _git_bytes(repo, *a, no_replace=True)   # noqa: E731
+
+    def at_target(path: str):
+        kind = refs.target_kind(run, head, path)
+        if kind is None:
+            return None, None, f"`{path}` is not tracked at {head[:12]}"
+        if kind != "blob":
+            return None, None, (f"`{path}` at {head[:12]} is a {kind}, not "
+                                f"a file")
+        data, why = _anchored_blob(run, read, head, path)
+        if data is None:
+            return None, None, why
+        if len(data) > AUTHORITY_MAX_BYTES:
+            return None, None, (f"it is {len(data)} bytes, over the "
+                                f"{AUTHORITY_MAX_BYTES}-byte bound for an "
+                                f"authority")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, None, "its bytes are not UTF-8"
+        members = list(dict.fromkeys(
+            line.strip() for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")))
+        return members, hashlib.sha256(data).hexdigest(), None
+    return at_target
+
+
+def _names(items: list[str]) -> str:
+    """Up to AUTHORITY_NAMES_SHOWN names, then the count of the rest."""
+    shown = ", ".join(f"`{i}`" for i in items[:AUTHORITY_NAMES_SHOWN])
+    rest = len(items) - AUTHORITY_NAMES_SHOWN
+    return shown + (f", and {rest} more" if rest > 0 else "")
+
+
+def _counted_notice(label: str, items: list[str]) -> str:
+    """`_notice_line`'s shape with the list capped and the count whole."""
+    rest = len(items) - AUTHORITY_NAMES_SHOWN
+    return (f"Notice — {label} ({len(items)}): "
+            + ", ".join(items[:AUTHORITY_NAMES_SHOWN])
+            + (f", and {rest} more" if rest > 0 else ""))
+
+
+def _authority_block(objectives, read_authority) -> tuple[list[str],
+                                                          list[str]]:
+    """(the Authority lines, their notices) for the objectives that name an
+    authority — nothing at all when none does, so a claim without the two
+    fields renders exactly as before (brief `take-objective-map` item 5).
+
+    The comparison is exact strings, both ways: members the authority lists
+    and the objective does not cover contradict its claim to be complete;
+    members it covers that the authority does not list are claims the
+    authority does not back. It reports and never refuses — the inventory
+    is the repository's own file, and whether it is right is the reviewer's
+    call, which this puts in front of them before the relay."""
+    named = [o for o in objectives if o.get("authority")]
+    if not named:
+        return [], []
+    out = ["", "Authority — for each objective that names one, the members "
+                "it covers compared with that inventory, read at the target "
+                "(one member per line; blank and `#` lines skipped):", ""]
+    uncovered, unlisted, unreadable = [], [], []
+    for obj in named:
+        title, where = _squash(obj["title"]), obj["authority"]
+        members, digest, why = (read_authority(where) if read_authority
+                                else (None, None, "no target to read it from"))
+        if members is None:
+            out.append(f"- {title}: `{where}` — cannot be read at the "
+                       f"target: {why}")
+            unreadable.append(f"`{where}` ({title})")
+            continue
+        covers = list(dict.fromkeys(obj["covers"]))
+        listed, covered = set(members), set(covers)
+        missing = [m for m in members if m not in covered]
+        extra = [c for c in covers if c not in listed]
+        uncovered += [f"`{m}` ({title})" for m in missing]
+        unlisted += [f"`{c}` ({title})" for c in extra]
+        head = (f"- {title}: `{where}` (sha256:{digest[:16]}…, "
+                f"{len(members)} members) — covers {len(covers)}; ")
+        if not missing and not extra:
+            out.append(head + "every member it lists is covered, and every "
+                              "member covered is listed")
+        else:
+            out.append(head + "listed and not covered: "
+                       + (_names(missing) or "none")
+                       + "; covered and not listed: "
+                       + (_names(extra) or "none"))
+    notices = []
+    if uncovered:
+        notices.append(_counted_notice(
+            "objective authority member(s) the objective does not cover",
+            uncovered))
+    if unlisted:
+        notices.append(_counted_notice(
+            "objective member(s) covered that the named authority does not "
+            "list", unlisted))
+    if unreadable:
+        notices.append(_counted_notice(
+            "objective authority that cannot be read at the target",
+            unreadable))
+    return out, notices
+
+
 def _objectives_block(objectives, shape: dict, generated: set,
-                      excluded) -> list[str]:
+                      excluded, read_authority=None) -> list[str]:
     rows = _span_rows(shape)
     scoped = [r for r in rows if r["raw"] not in generated
               and not (excluded and in_scope(r["raw"], excluded))]
@@ -4323,7 +4491,10 @@ def _objectives_block(objectives, shape: dict, generated: set,
     if unmatched:
         notices.append(_notice_line(
             "objective path(s) that match no changed file", unmatched))
-    return out + ([""] + notices if notices else [])
+    authority_lines, authority_notices = _authority_block(objectives,
+                                                          read_authority)
+    notices += authority_notices
+    return out + authority_lines + ([""] + notices if notices else [])
 
 
 def _fix_in_span(repo: Path, sha: str, base: str, head: str) -> bool:

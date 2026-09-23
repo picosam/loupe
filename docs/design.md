@@ -1377,7 +1377,7 @@ than the gap it closes.
 
 ## 6. Packaging
 
-**A CLI core**, Python 3.14.x, standard library only, no network in its own
+**A CLI core**, Python 3.15.x, standard library only, no network in its own
 code, no model in any code path — the only shape every agent can shell out
 to, CI can run, and a human with no agent can use. Three install paths:
 `uvx --from git+<repo> loupe`, a vendored directory committed into a

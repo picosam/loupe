@@ -1617,7 +1617,7 @@ class TestTransportDeclarationClosedWorld(unittest.TestCase):
         # Control: with a valid declaration the same state is warm.
         self.assertIsNotNone(transport.cached_handoff(
             valid, w.ledger, 1, LINEAGE, git=w.git, claim_digest=w.claim_digest,
-            roles=("claude", "codex")))
+            roles=("claude", "codex"), base=SHA_A))
         with self.assertRaises(vocab.TransportDeclarationError):
             transport.cached_handoff(empty, w.ledger, 1, LINEAGE, git=w.git,
                                      claim_digest=w.claim_digest,

@@ -11,7 +11,7 @@ command per hand-off and stop where the procedure says stop.
 Built for AI coding agents reviewing each other's work — Claude Code, Codex,
 or any agent with a shell — the author agent runs the review step unasked
 once its work is done, and a human carries each leg between them.
-Python 3.14.x, standard library only, no native network client in the tool's
+Python 3.15.x, standard library only, no native network client in the tool's
 own code (Git subprocesses perform the networked steps: `handoff` pushes and
 observes the remote ref, `take` fetches). The argument for the design — what it solves, and what the rigidity costs —
 is [docs/overview.md](docs/overview.md); the specification is
@@ -142,8 +142,8 @@ reader is deciding on your behalf.
 
 ## Install
 
-**Requirements**, as they are, not as a wishlist: Python 3.14.x, pinned
-(`pyproject.toml` declares `requires-python = ">=3.14,<3.15"`); the
+**Requirements**, as they are, not as a wishlist: Python 3.15.x, pinned
+(`pyproject.toml` declares `requires-python = ">=3.15,<3.16"`); the
 standard library only, nothing else to resolve; and no network call in
 the tool's own code at any point (Git subprocesses do the two networked
 steps — `handoff` pushes and observes, `take` fetches). And one
@@ -328,7 +328,7 @@ name it at all, and the process keeps working with nothing installed.
 
 ## Status
 
-Version 0.25.0 — the version is bumped inside the reviewed round of any
+Version 0.26.0 — the version is bumped inside the reviewed round of any
 change that will be published, so `--version` discriminates publishes.
 Implemented and tested: the envelopes and validators, the gate manifest and
 attestation checks, roles and stamps, fingerprints with alias lineage, the

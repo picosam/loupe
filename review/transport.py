@@ -93,6 +93,70 @@ _AUTHORS_TO_FIX = (
     "belong to your tree rather than to the request")
 
 _BASE_LINE_RE = re.compile(r"^Base:\s+([0-9a-f]{40})\b", re.MULTILINE)
+# The request's `Scoped:` line (0.25.0), read back by `take` to re-render it
+# for the reviewer's checkout (public issue #10, 0.26.0). Searched in the
+# header only — the lines before the first section heading — because the
+# Claim below it is the author's prose, where a line may begin with anything.
+_SCOPED_LINE_RE = re.compile(r"^Scoped: (.*)$", re.MULTILINE)
+# The only pathspec forms the emitter's `Scoped:` command carries
+# (`emit._pathspecs`): every one literal, so no pattern reaches git.
+_SCOPED_SPEC_FORMS = (":(literal)", ":(exclude,literal)")
+
+
+def scoped_pathspecs(body: str, base: str | None, sha: str,
+                     render=None) -> tuple[list[str] | None, str | None]:
+    """(the pathspecs of the request's `Scoped:` command, None) — or
+    (None, why this reader gives no reviewer-local command).
+
+    Public issue #10 (0.26.0). The request's `Scoped:` line is a command for
+    the AUTHOR's checkout: `git -C <author root> … diff <base>...<target> --
+    <pathspecs>`. `take` already re-renders `Diff:` for the reviewer's; this
+    is the scoped half. The pathspecs are taken from the author's line, not
+    recomputed, because the set is the emitter's decision about which
+    changed paths the claim's `scope_paths` match (`emit._pathspecs`) and
+    the reviewer's command must select exactly that set — and they are
+    re-rendered only from a line in the exact form the emitter writes:
+    nothing but literal pathspecs, and `render(root, *pathspecs)` — the
+    caller's one diff renderer over THIS request's `Base:` and target —
+    reproducing the line byte for byte from the root and pathspecs parsed
+    out of it. So the range, the options and the quoting are all judged by
+    the renderer that wrote them, and no command word is restated here.
+    Anything else — no line, the emitter's own `none` or `withheld`, a
+    second `Scoped:` line, quoting that does not parse, a different range, a
+    pattern pathspec — gives no command and says why, because a line
+    re-rendered from bytes of another form would carry another selection
+    under this tool's name.
+    """
+    import shlex
+    header = body.split("\n## ", 1)[0]
+    lines = _SCOPED_LINE_RE.findall(header)
+    if not lines:
+        return None, ("the request carries no `Scoped:` line: its claim "
+                      "declares no `scope_paths`")
+    if len(lines) > 1:
+        return None, (f"the request carries {len(lines)} `Scoped:` lines, "
+                      f"and a reviewer command cannot choose between them")
+    text = lines[0].strip()
+    if text.startswith(("none — ", "withheld — ")):
+        return None, (f"the request's own `Scoped:` line gives no command "
+                      f"({text})")
+    if base is None:
+        return None, ("the request names no `Base:`, so there is no range "
+                      "to limit")
+    try:
+        argv = shlex.split(text)
+    except ValueError:
+        return None, ("the request's `Scoped:` line does not parse as one "
+                      "command line")
+    specs = argv[7:]
+    if (len(argv) < 8 or render is None
+            or not all(s.startswith(_SCOPED_SPEC_FORMS) for s in specs)
+            or str(render(argv[2], *specs)) != text):
+        return None, (f"the request's `Scoped:` line is not the form this "
+                      f"reader re-renders: the one diff command over this "
+                      f"request's range, {base[:12]}...{sha[:12]}, limited by "
+                      f"literal pathspecs only")
+    return specs, None
 # The closed reference grammar. Four forms, and `asserted` is one of them:
 # a line naming a path and its requirement marker but carrying no digest, so
 # the tool can say the author claimed it and nothing more. It had no syntax
@@ -2657,6 +2721,10 @@ def disposition_events(parsed: wire.Disposition,
             # (blocking severity AND a named test) — so the `unverifiable`
             # breaker fires on a blocking finding's unexecutable test and on
             # nothing else, without re-deriving severity at read time.
+            # 0.26.0: `cfg` is the TARGET's configuration (the commit the
+            # verdict rules on) at both recording doors — `respond --out`
+            # through `record_response`, and `ledger add` — so the stamp
+            # agrees with the précis and `close` by construction.
             event["blocking"] = validate.effective_blocking(
                 by_id[fid].severity, test, cfg)
         if str(record.get("note", "")).strip():
@@ -2666,11 +2734,22 @@ def disposition_events(parsed: wire.Disposition,
 
 
 def record_response(cfg: Config, ledger: Ledger, envelope: str,
-                    against: wire.Verdict, lineage: str, git=None) -> dict:
+                    against: wire.Verdict, lineage: str, git=None,
+                    governing: Config | None = None) -> dict:
     """`respond --out`: keep the disposition bytes and record the events, so
     the author's half of the round is in the ledger without a manual add.
     Only when a file was written: an envelope printed to stdout has no bytes
-    of record to bind to, and a re-run of the same JSON is idempotent."""
+    of record to bind to, and a re-run of the same JSON is idempotent.
+
+    `governing` is the configuration the run events' `blocking` stamp is
+    judged by: the TARGET's, the commit `against` rules on (0.26.0, brief
+    `unverifiable-breaker-target-authority`). It used to be `cfg`, the
+    checkout's, while the précis and `close` judged the same finding by the
+    target's. A caller that already resolved it hands it over, so one verb
+    asks once; one that did not gets it resolved here, and an unresolvable
+    target refuses rather than stamping by the checkout."""
+    if governing is None:
+        governing = governing_for(cfg, against.sha or "", git=git)
     parsed = wire.parse_disposition(envelope)
     round_no = int(parsed.data.get("round", 0))
     # The lineage the round the disposition ANSWERS belongs to, and the
@@ -2682,7 +2761,7 @@ def record_response(cfg: Config, ledger: Ledger, envelope: str,
         against.sha, prefer=lineage) or lineage
     kept = keep_bytes(cfg, round_no, "disposition", envelope,
                       lineage=carrier_lineage)
-    added = ledger.add_all(disposition_events(parsed, against, cfg),
+    added = ledger.add_all(disposition_events(parsed, against, governing),
                            lineage=lineage)
     # The disposition leg of a `git` round. The topology is the round's own,
     # read from THIS end's record of it (`recorded_transport`) rather than
@@ -2880,6 +2959,31 @@ def tool_agreement(parsed) -> dict:
                     "proceed knowing which one produced what"}
 
 
+def target_blocking(cfg: Config, git=None):
+    """`sha -> the blocking list of the configuration AT that commit`, or
+    None where it cannot be resolved here or declares no taxonomy.
+
+    The one authority for "is this finding blocking?" (0.26.0, brief
+    `unverifiable-breaker-target-authority`): the configuration of the
+    commit the finding's verdict ruled on — `governing_for`, the resolution
+    `close`, `validate --from-target` and the précis already use — never the
+    checkout's. Resolved lazily and once per commit, because the breakers
+    ask it only for a run that carries no `blocking` stamp."""
+    cache: dict[str, list[str] | None] = {}
+
+    def at(sha: str) -> list[str] | None:
+        if sha not in cache:
+            try:
+                governing = governing_for(cfg, sha, git=git)
+            except Refusal:
+                cache[sha] = None
+            else:
+                cache[sha] = (list(governing.blocking_severities)
+                              if governing.taxonomy_declared else None)
+        return cache[sha]
+    return at
+
+
 def unauthorized_breakers(cfg: Config, ledger: Ledger,
                           lineage: str) -> list[dict]:
     """The fired breakers no recorded decision covers (§5.3d, sweep F8):
@@ -2888,7 +2992,7 @@ def unauthorized_breakers(cfg: Config, ledger: Ledger,
                             ledger.effective_round_cap(cfg.round_cap,
                                                        lineage),
                             token_budget=cfg.token_budget,
-                            blocking_severities=cfg.blocking_severities)
+                            blocking_at=target_blocking(cfg))
     covered = {fid for o in ledger._by(BREAKER_OVERRIDE, lineage)
                for fid in o.get("covers", [])}
     return [f for f in fired if firing_id(f) not in covered]
@@ -3386,13 +3490,19 @@ def handoff_preflight(cfg: Config, ledger: Ledger, lineage: str,
             "")
 
 
+#: `cached_handoff`'s `base` when the caller states none — a value that
+#: equals no base, so an unstated base is cold (the round 5 F1 rule).
+_BASE_UNSTATED = object()
+
+
 def cached_handoff(cfg: Config, ledger: Ledger, round_no: int, lineage: str,
                    git=None, claim_digest: str = "",
                    roles: tuple[str, str] | None = None,
                    transport: str | None = None,
                    author_flag: str | None = None,
                    reviewer_flag: str | None = None,
-                   debug: bool = False) -> dict | None:
+                   debug: bool = False,
+                   base=_BASE_UNSTATED) -> dict | None:
     """§9bis.3 rule 5: re-running handoff on an unchanged tip with a warm
     request returns the same envelope without re-running gates or pushing.
 
@@ -3442,6 +3552,25 @@ def cached_handoff(cfg: Config, ledger: Ledger, round_no: int, lineage: str,
     a required argument because the reviewer's falsification calls this
     helper without it and requires a cold answer, not a TypeError: an API
     whose default is safe is stronger than one whose contract is documented.
+
+    Public issue #7 (0.26.0) found the review BASE outside the key: a second
+    `handoff --base Y` at an unchanged tip came back `cached: true` with
+    `Base:` still X, the author's second base silently dropped. KEYED, not
+    refused. A refusal would have no repair — at an unchanged tip the only
+    way to a request with the corrected base would be a new commit — while a
+    changed base is an authored input like a corrected claim, and a
+    corrected claim at an unchanged tip already goes cold and re-emits the
+    round. So `base` is the expression a cold emission from the same
+    arguments would use (`cli._review_base`), resolved here exactly as
+    `ensure_pushed` resolves it — `rev-parse --verify <base>^{commit}` —
+    which reads the same state the cold path would, because the tree is
+    clean and HEAD is the kept request's target, so the cold path would
+    commit nothing before resolving. Warm needs that commit to equal the
+    kept envelope's `Base:`. Unstated, None (no derivable base: the cold
+    path refuses "pass --base"), unresolvable, or a kept copy with no
+    `Base:` line: cold, and the cold path says what is wrong. A base that
+    IS the kept id is compared without running git, since it names that
+    commit by construction.
     """
     run = git or (lambda *a: _git(cfg.repo_root, *a,
                                   ceiling=git_ceiling(cfg)))
@@ -3561,6 +3690,21 @@ def cached_handoff(cfg: Config, ledger: Ledger, round_no: int, lineage: str,
     # "cannot be shown" is one re-emission.
     if attrs.get("tool", "") != tool_identity():
         return None
+    # Public issue #7: the review base, resolved as the cold path resolves
+    # it, must be the base the kept envelope names (docstring above). Last,
+    # so every boundary before it keeps its order: a defective declaration
+    # still refuses whatever base was asked for.
+    kept_base = (m.group(1) if (m := _BASE_LINE_RE.search(kept_request.body))
+                 else None)
+    if base is _BASE_UNSTATED or base is None or kept_base is None:
+        return None
+    if base != kept_base:
+        try:
+            resolved = run("rev-parse", "--verify", f"{base}^{{commit}}")
+        except RuntimeError:
+            return None
+        if resolved != kept_base:
+            return None
     return {"envelope": text, "sha": head, "round": round_no,
             "kept": str(path), "digest": request["source_digest"]}
 
@@ -4515,11 +4659,32 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
                     paths.Lit("git"), paths.Lit("-C"), cfg.repo_root,
                     paths.Lit("--no-replace-objects"),
                     paths.Lit("show"), sha))
+    # Public issue #10 (0.26.0): the scoped diff for THIS checkout, beside
+    # the whole one — the request's `Scoped:` pathspecs re-rendered through
+    # the one diff renderer, rooted here instead of at the author's clone.
+    specs, scoped_note = scoped_pathspecs(
+        parsed.body, base, sha,
+        render=lambda root, *given: paths.diff_command(root, base, sha,
+                                                       *given))
+    scoped_cmd = None
+    if specs:
+        from .emit import SCOPED_COMMAND_MAX
+        scoped_cmd = paths.diff_command(cfg.repo_root, base, sha, *specs)
+        size = len(str(scoped_cmd).encode("utf-8"))
+        if size > SCOPED_COMMAND_MAX:
+            # The emitter's bound, for the same reason: a longer line is
+            # withheld whole, never shortened into another selection.
+            scoped_cmd, scoped_note = None, (
+                f"rooted in this checkout the command is {size} bytes, over "
+                f"the {SCOPED_COMMAND_MAX}-byte bound for one command line, "
+                f"so it is withheld; the diff line is the whole span")
     return _runnable({"round": round_no, "sha": sha, "reviewer": me,
             "lineage": recorded_lineage,
             "target": target, "head": checkout,
             "references": refs, "kept": kept,
-            "digest": digest, "diff": diff_cmd, "envelope": envelope,
+            "digest": digest, "diff": diff_cmd,
+            "scoped": scoped_cmd, "scoped_note": scoped_note,
+            "envelope": envelope,
             "transport": effective, "tool": agreement,
             # F3: `decide` names what the TARGET's own committed
             # `review.toml` never declared — `governing` is that config,
@@ -4541,7 +4706,7 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
                     f"`{paths.command(*paths.lits(TOOL_NAME, 'validate'), paths.Ph('<verdict.md>'), paths.Lit('--from-target'))}`; "
                     f"then stop — do not start the next round (standing "
                     f"instructions)"},
-                     "diff")
+                     "diff", "scoped")
 
 
 # --------------------------------------------------------------------- close
