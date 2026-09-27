@@ -61,6 +61,7 @@ from pathlib import Path
 from unittest import mock
 
 from review import adapters, cli, config, emit, env_var, validate, wire
+from review.tests._transport_fixtures import copied_instance
 from review.tests.test_ci_attested_gates import STUB, STUB_DIR_ENV, run_row
 from review.tests.test_git_timeout import (Scratch, cli_env, git,
                                            sleeping_pre_push)
@@ -123,8 +124,13 @@ class _Gated(unittest.TestCase):
         # The remote's path is needed inside the gates, and the gates are
         # committed with the configuration — so the scratch is built once
         # to learn its root, then the manifest is written against it.
-        probe = Scratch(self, self.PREFIX, remote_dir=self.REMOTE_DIR,
-                        url_form=self.URL_FORM)
+        # The scratch itself (author, bare remote, two commits, hooks
+        # directory) is built once per process per remote shape and copied
+        # (`copied_instance`); the manifest below names this copy's own
+        # paths, so it is written and committed here, per scratch.
+        probe = copied_instance(Scratch, self, self.PREFIX,
+                                remote_dir=self.REMOTE_DIR,
+                                url_form=self.URL_FORM)
         self.scratch = probe
         self.ctl = probe.root / "ctl"
         self.ctl.mkdir()
@@ -186,6 +192,40 @@ class _Gated(unittest.TestCase):
                       "rule", payload["error"])
         self.assertEqual(self.remote_tip(), tip)
         self.assertEqual(self.requests(), [])
+
+
+class TestTheScratchIsACopyOfOneBuild(_Gated):
+    """`fresh()` copies one built `Scratch` per remote shape: each copy's
+    paths, remote URL and hooks directory are its own, its commits the
+    template's, and a push from one reaches no other copy's remote.
+
+    MUTATIONS: skip the path rebase in `copy_fixture` and the copy's
+    `core.hooksPath` and origin name the template's directories; leave
+    the attributes unmoved (`_moved` returning `attrs`) and `repo` is the
+    template's."""
+
+    def test_two_scratches_are_private_and_share_their_base(self):
+        a = self.scratch
+        b = self.fresh()
+        self.assertNotEqual(a.root, b.root)
+        self.assertEqual(a.base, b.base)
+        for s in (a, b):
+            for attr in ("repo", "remote", "state", "hooks", "claim"):
+                self.assertTrue(str(getattr(s, attr)).startswith(
+                    str(s.root) + os.sep), attr)
+            self.assertIs(s.case, self)
+            self.assertEqual(git(s.repo, "config", "core.hooksPath"),
+                             str(s.hooks))
+            self.assertEqual(git(s.repo, "remote", "get-url", "origin"),
+                             s.url)
+            self.assertIn(str(s.remote), s.url)
+            self.assertEqual(git(s.remote, "rev-parse", "main"), s.base)
+            # base <- change <- the manifest (this copy's own commit).
+            self.assertEqual(git(s.repo, "rev-parse", "HEAD~2"), s.base)
+            self.assertEqual(git(s.repo, "rev-parse", "HEAD"), s.head)
+        git(a.repo, "push", "-q", "origin", "main")
+        self.assertEqual(git(a.remote, "rev-parse", "main"), a.head)
+        self.assertEqual(git(b.remote, "rev-parse", "main"), b.base)
 
 
 class TestARedBlockingGateStopsThePush(_Gated):

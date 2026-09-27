@@ -60,6 +60,8 @@ import unittest.mock
 from pathlib import Path
 
 from review import config, emit, env_var, validate
+from review.tests._transport_fixtures import (
+    assert_private_copies, copy_fixture, git_out, write_identity)
 from review.tests.synth import evidence_with
 from review.tests.util import REPO_ROOT
 
@@ -143,6 +145,27 @@ def run_row(sha: str, *, status: str = "completed",
             "url": f"https://github.com/acme/widget/actions/runs/{run_id}"}
 
 
+def _build_probe_repo(repo):
+    """The probe repository every test resolves its coordinates from:
+    returns its one commit's id."""
+    def git(*args):
+        subprocess.run(["git", "-C", str(repo), *args], check=True,
+                       capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    write_identity(repo, (("user", "email", "suite@example.invalid"),
+                          ("user", "name", "suite")))
+    # A real remote, because the coordinates are resolved from git and a
+    # test that stubbed that resolution would prove nothing about it.
+    git("remote", "add", "origin", "https://github.com/acme/widget.git")
+    (repo / "probe.txt").write_text("probe\n", encoding="utf-8")
+    git("add", "probe.txt")
+    git("commit", "-q", "-m", "probe")
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
 class _CIGateHarness(unittest.TestCase):
     """A temp git repo with a github.com remote, and a stub `gh` on PATH."""
 
@@ -157,7 +180,6 @@ class _CIGateHarness(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         root = Path(self._tmp.name)
         self.repo = root / "repo"
-        self.repo.mkdir()
         self.state = root / "state"
         self.stub_dir = root / "stub"
         # PATH is REPLACED for every run, never prepended to, and holds
@@ -176,23 +198,10 @@ class _CIGateHarness(unittest.TestCase):
         gh = self.bin / "gh"
         gh.write_text(STUB, encoding="utf-8")
         gh.chmod(gh.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
-
-        def git(*args):
-            subprocess.run(["git", "-C", str(self.repo), *args], check=True,
-                           capture_output=True)
-
-        git("init", "-q", "-b", "main")
-        git("config", "user.email", "suite@example.invalid")
-        git("config", "user.name", "suite")
-        # A real remote, because the coordinates are resolved from git and a
-        # test that stubbed that resolution would prove nothing about it.
-        git("remote", "add", "origin", "https://github.com/acme/widget.git")
-        (self.repo / "probe.txt").write_text("probe\n", encoding="utf-8")
-        git("add", "probe.txt")
-        git("commit", "-q", "-m", "probe")
-        self.head = subprocess.run(
-            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
-            capture_output=True, text=True, check=True).stdout.strip()
+        # The repository is built once per process (`_build_probe_repo`)
+        # and copied here, so its one commit has the same id in every test.
+        self.head = copy_fixture("ci-attested-probe", _build_probe_repo,
+                                 self.repo)
         self._pages: list[list] = []
         self._ci_explicit = False
 
@@ -326,6 +335,26 @@ class _CIGateHarness(unittest.TestCase):
                                       clear=True):
             return emit.run_gates(cfg, self.head,
                                   ci_poll_interval=interval, **kwargs)
+
+
+class TestTheProbeRepositoryIsACopy(_CIGateHarness):
+    """The probe repository is built once per process and copied per test:
+    this test's copy is its own, at the commit the harness reports, with
+    the remote the coordinates are resolved from.
+
+    MUTATION: hand out the template (`copy_fixture` not copying) and
+    `assert_private_copies` fails on the paths."""
+
+    def test_the_copy_is_private_and_resolves_the_same_coordinates(self):
+        facts, _, other = assert_private_copies(self, "ci-attested-probe",
+                                                _build_probe_repo)
+        self.assertEqual(facts, self.head)
+        for repo in (self.repo, other):
+            self.assertEqual(git_out(repo, "rev-parse", "HEAD"), self.head)
+            self.assertEqual(git_out(repo, "remote", "get-url", "origin"),
+                             "https://github.com/acme/widget.git")
+            self.assertEqual(git_out(repo, "config", "user.email"),
+                             "suite@example.invalid")
 
 
 class TestTheGrammar(unittest.TestCase):

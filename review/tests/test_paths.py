@@ -18,6 +18,7 @@ import unittest
 from pathlib import Path
 
 from review import paths
+from review.tests._transport_fixtures import identity_of, write_identity
 
 METACHAR_DIRS = ("repo with space", "it's", 'q"uote', "semi;colon",
                  "uni-été", "da sh -n", "dollar$var", "back`tick")
@@ -57,9 +58,7 @@ class TestShellPath(unittest.TestCase):
 
         subprocess.run(["git", "init", "-q", "-b", "main", str(repo)],
                        check=True, capture_output=True, timeout=60)
-        for k, v in (("user.name", "t"), ("user.email", "t@example.invalid"),
-                     ("commit.gpgsign", "false")):
-            git("config", k, v)
+        write_identity(repo, identity_of("t", "t@example.invalid"))
         (repo / "f.txt").write_text("one\n", encoding="utf-8")
         git("add", ".")
         git("commit", "-q", "-m", "one")

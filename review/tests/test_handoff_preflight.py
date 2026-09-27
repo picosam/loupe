@@ -37,7 +37,9 @@ from pathlib import Path
 import review
 from review import emit, vocab
 from review.emit import _git
-from review.tests._transport_fixtures import run_cli, scratch_loop_repo, sh
+from review.tests._transport_fixtures import (
+    assert_private_copies, copy_fixture, run_cli, scratch_loop_repo, sh,
+    write_identity)
 from review.tests.util import REPO_ROOT, declared_interval, public_path
 
 
@@ -274,6 +276,22 @@ class TestTheSweepPreflight(unittest.TestCase):
         self.assertEqual(tripping, [])
 
 
+_CANDIDATE_IDENTITY = (("user", "name", "t"), ("user", "email", "t@invalid"),
+                       ("commit", "gpgsign", "false"))
+
+
+def _build_candidate_repo(repo):
+    """`TestTheCandidateDomain`'s repository: `f.txt` in one commit."""
+    def git(*args):
+        subprocess.run(["git", "-C", str(repo), *args], check=True,
+                       capture_output=True)
+    git("init", "-q", "-b", "main")
+    write_identity(repo, _CANDIDATE_IDENTITY)
+    (repo / "f.txt").write_text("one\n")
+    git("add", "f.txt")
+    git("commit", "-q", "-m", "init")
+
+
 class TestTheCandidateDomain(unittest.TestCase):
     """`CandidateCommit` against real git: every entry kind and index state
     W3 named, each with the bytes git will record. This is the domain the
@@ -284,19 +302,30 @@ class TestTheCandidateDomain(unittest.TestCase):
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp(prefix="candidate-"))
         self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
-        self.git("init", "-q", "-b", "main")
-        for k, v in (("user.name", "t"), ("user.email", "t@invalid"),
-                     ("commit.gpgsign", "false")):
-            self.git("config", k, v)
-        (self.repo / "f.txt").write_text("one\n")
-        self.git("add", "f.txt")
-        self.git("commit", "-q", "-m", "init")
+        # Built once per process (`_build_candidate_repo`) and copied in.
+        copy_fixture("candidate-domain", _build_candidate_repo, self.repo)
         self.marked = f"commit: not-a-sha\n# {emit.FIXTURE_MARKER}\n"
 
     def git(self, *args, env=None):
         return subprocess.run(["git", "-C", str(self.repo), *args],
                               check=True, capture_output=True,
                               env={**os.environ, **(env or {})}).stdout
+
+    def test_the_repository_is_a_private_copy_of_one_build(self):
+        """Built once per process and copied per test: this test's copy
+        is its own, carrying the one commit with the fixture's identity
+        in its own config: the fixture sets nothing in the environment,
+        which is what `TestTheEnvironmentLine` below reads.
+
+        MUTATION: hand out the template and `assert_private_copies`
+        fails on the paths."""
+        _, a, _ = assert_private_copies(self, "candidate-domain",
+                                        _build_candidate_repo)
+        self.assertEqual(self.git("log", "--format=%an <%ae> %s").decode(),
+                         "t <t@invalid> init\n")
+        self.assertEqual(self.git("config", "--local", "user.email"),
+                         b"t@invalid\n")
+        self.assertNotEqual(a.resolve(), self.repo.resolve())
 
     def changes(self):
         return {c["path"]: c for c in emit.CandidateCommit(self.repo).changes()}
@@ -401,10 +430,7 @@ class TestTheCandidateDomain(unittest.TestCase):
         self.addCleanup(shutil.rmtree, inner, ignore_errors=True)
         subprocess.run(["git", "init", "-q", "-b", "main", str(inner)],
                        check=True)
-        for k, v in (("user.name", "t"), ("user.email", "t@invalid"),
-                     ("commit.gpgsign", "false")):
-            subprocess.run(["git", "-C", str(inner), "config", k, v],
-                           check=True)
+        write_identity(inner, _CANDIDATE_IDENTITY)
         (inner / "x").write_text("x")
         subprocess.run(["git", "-C", str(inner), "add", "x"], check=True)
         subprocess.run(["git", "-C", str(inner), "commit", "-q", "-m", "x"],

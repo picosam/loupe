@@ -5,6 +5,36 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.27.0
+
+**For upgraders — read before crossing this version.** Nothing in the
+grammar moves: every envelope, refusal and exit code is the same as
+0.26.0's, and a 0.26.0 reader takes a 0.27.0 request. What moves is cost.
+
+**The shipped tests build each fixture repository once per process and copy
+it per test** (`shutil.copytree`, paths rebased in git's own files, commit
+ids identical in every copy; identities written into `.git/config` instead
+of three `git config` launches), with an isolation proof per fixture.
+
+**A git memo was built and withdrawn.** A transparent per-invocation cache
+of git reads, with a long-lived `cat-file --batch-command` reader behind it,
+was built for this version, reviewed and withdrawn in the same round.
+Shared refs, configuration and `.git/shallow` are written by linked
+worktrees, gates and hooks with no launch the invocation sees (review
+round 1), and a full object id fixes an object's content, not this
+repository's access to it, which alternates and object storage change
+(round 2). So every git read launches fresh, exactly as in 0.26.0, and
+`test_git_memo` guards it: each of those changes is made between two reads
+of one invocation, and the second read must answer what fresh git answers.
+
+**Measured** with the workbench's launch counter (two counters, a Python
+hook and a `git` shim on PATH, reconciled by process id) on one `tests` run
+of the tool's own repository: 41,764 git launches against 45,178 at
+0.26.0's tests (8% fewer), 826 CPU-seconds against 911 with both counters
+on, 2,196 tests. The saving is the fixtures'. The withdrawn cache had
+measured 35,542 launches in its wide form and 39,620 narrowed to object
+ids; that difference is the price of reading shared state fresh, paid.
+
 ## 0.26.0
 
 **For upgraders — read before crossing this version.** Two things move.

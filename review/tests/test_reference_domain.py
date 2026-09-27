@@ -35,6 +35,7 @@ import contextlib
 import dataclasses
 import io
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -44,12 +45,63 @@ from pathlib import Path
 
 from review import cli, emit, refs, transport
 from review.digest import sha256_file
+from review.tests._transport_fixtures import (
+    assert_private_copies, copy_fixture, git_out, write_identity)
 from review.tests.synth import CFG
 
 
 def _sh(*args, **kw):
     return subprocess.run(args, check=True, capture_output=True, text=True,
                           timeout=60, **kw).stdout.strip()
+
+
+def _build_object_modes(repo):
+    """`RepoFixture`'s repository: one instance of every object mode the
+    boundary rules on. Returns the commit's id."""
+    _sh("git", "init", "-q", "-b", "main", str(repo))
+    write_identity(repo, (("user", "name", "t"),
+                          ("user", "email", "t@example.invalid"),
+                          ("commit", "gpgsign", "false"),
+                          ("core", "quotePath", "true")))
+    (repo / ".gitignore").write_text("/private/\n", encoding="utf-8")
+    (repo / "private").mkdir()
+    (repo / "private" / "ignored.md").write_text(
+        "bytes no commit carries\n", encoding="utf-8")
+
+    # The valid controls, one per admitted class.
+    (repo / "ordinary.md").write_text("ordinary\n", encoding="utf-8")
+    (repo / "runnable.sh").write_text("#!/bin/sh\nexit 0\n",
+                                      encoding="utf-8")
+    (repo / "runnable.sh").chmod(0o755)
+    (repo / "docs").mkdir()
+    (repo / "docs" / "kept.md").write_text("kept\n", encoding="utf-8")
+    (repo / "docs" / "café.md").write_text("accented\n",
+                                           encoding="utf-8")
+    (repo / "docs" / "it's;fine$.md").write_text("shellish\n",
+                                                 encoding="utf-8")
+    # The refused classes, each really present in the tree.
+    (repo / "required file.md").write_text("spaced\n",
+                                           encoding="utf-8")
+    # The symlink domain (round 4 F5): one link per referent state, so
+    # the object mode is what decides, never what the link points at.
+    (repo / "linked.md").symlink_to("private/ignored.md")
+    (repo / "dangling.md").symlink_to("missing-target.md")
+    (repo / "outside.md").symlink_to("../outside-target.md")
+    (repo / "cyclic.md").symlink_to("cyclic.md")
+    (repo / "to-untracked.md").symlink_to("loose-untracked.md")
+    (repo / "to-tracked.md").symlink_to("ordinary.md")
+    (repo / "sub").mkdir()
+    _sh("git", "-C", str(repo), "add", "-A")
+    # Untracked on purpose, and created AFTER `git add -A` so it stays
+    # that way: the advisory tracking-state control.
+    (repo / "loose-untracked.md").write_text("untracked\n",
+                                             encoding="utf-8")
+    # A gitlink without a submodule checkout: the index entry is what the
+    # target tree carries, and it is the state the boundary must name.
+    _sh("git", "-C", str(repo), "update-index", "--add",
+        "--cacheinfo", f"160000,{'a' * 40},sub")
+    _sh("git", "-C", str(repo), "commit", "-q", "-m", "init")
+    return _sh("git", "-C", str(repo), "rev-parse", "HEAD")
 
 
 class RepoFixture(unittest.TestCase):
@@ -63,50 +115,11 @@ class RepoFixture(unittest.TestCase):
             self.skipTest(f"filesystem writes denied ({exc})")
         self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
         self.repo = self.tmp / "repo"
-        self.repo.mkdir()
-        _sh("git", "init", "-q", "-b", "main", str(self.repo))
-        for k, v in (("user.name", "t"), ("user.email", "t@example.invalid"),
-                     ("commit.gpgsign", "false"), ("core.quotePath", "true")):
-            _sh("git", "-C", str(self.repo), "config", k, v)
-        (self.repo / ".gitignore").write_text("/private/\n", encoding="utf-8")
-        (self.repo / "private").mkdir()
-        (self.repo / "private" / "ignored.md").write_text(
-            "bytes no commit carries\n", encoding="utf-8")
-
-        # The valid controls, one per admitted class.
-        (self.repo / "ordinary.md").write_text("ordinary\n", encoding="utf-8")
-        (self.repo / "runnable.sh").write_text("#!/bin/sh\nexit 0\n",
-                                               encoding="utf-8")
-        (self.repo / "runnable.sh").chmod(0o755)
-        (self.repo / "docs").mkdir()
-        (self.repo / "docs" / "kept.md").write_text("kept\n", encoding="utf-8")
-        (self.repo / "docs" / "café.md").write_text("accented\n",
-                                                    encoding="utf-8")
-        (self.repo / "docs" / "it's;fine$.md").write_text("shellish\n",
-                                                          encoding="utf-8")
-        # The refused classes, each really present in the tree.
-        (self.repo / "required file.md").write_text("spaced\n",
-                                                    encoding="utf-8")
-        # The symlink domain (round 4 F5): one link per referent state, so
-        # the object mode is what decides, never what the link points at.
-        (self.repo / "linked.md").symlink_to("private/ignored.md")
-        (self.repo / "dangling.md").symlink_to("missing-target.md")
-        (self.repo / "outside.md").symlink_to("../outside-target.md")
-        (self.repo / "cyclic.md").symlink_to("cyclic.md")
-        (self.repo / "to-untracked.md").symlink_to("loose-untracked.md")
-        (self.repo / "to-tracked.md").symlink_to("ordinary.md")
-        (self.repo / "sub").mkdir()
-        _sh("git", "-C", str(self.repo), "add", "-A")
-        # Untracked on purpose, and created AFTER `git add -A` so it stays
-        # that way: the advisory tracking-state control.
-        (self.repo / "loose-untracked.md").write_text("untracked\n",
-                                                      encoding="utf-8")
-        # A gitlink without a submodule checkout: the index entry is what the
-        # target tree carries, and it is the state the boundary must name.
-        _sh("git", "-C", str(self.repo), "update-index", "--add",
-            "--cacheinfo", f"160000,{'a' * 40},sub")
-        _sh("git", "-C", str(self.repo), "commit", "-q", "-m", "init")
-        self.head = _sh("git", "-C", str(self.repo), "rev-parse", "HEAD")
+        # Built once per process (`_build_object_modes`) and copied here:
+        # symlinks as links, modes kept, the untracked and ignored files
+        # included, the one commit under the same id in every test.
+        self.head = copy_fixture("reference-object-modes",
+                                 _build_object_modes, self.repo)
         self.cfg = dataclasses.replace(CFG, repo_root=self.repo)
 
     def check(self, path, required=True):
@@ -187,6 +200,32 @@ class TestPathGrammar(unittest.TestCase):
                 match = transport._REF_LINE_RE.match(line)
                 self.assertIsNotNone(match, f"{name}: {line!r}")
                 self.assertEqual(match.group("path"), path)
+
+
+class TestTheObjectModeRepositoryIsACopy(RepoFixture):
+    """The object-mode repository is built once per process and copied
+    per test: this test's copy is its own and carries every mode the
+    boundary rules on — links as links, the executable bit, the gitlink,
+    the untracked and the ignored file — under the reported commit.
+
+    MUTATION: copy with `symlinks=False` in `copy_tree` and the links
+    arrive as the files (or the errors) they point at; hand out the
+    template and `assert_private_copies` fails on the paths."""
+
+    def test_the_copy_is_private_and_keeps_every_mode(self):
+        facts, _, _ = assert_private_copies(self, "reference-object-modes",
+                                            _build_object_modes)
+        self.assertEqual(facts, self.head)
+        for link in ("linked.md", "dangling.md", "outside.md", "cyclic.md",
+                     "to-untracked.md", "to-tracked.md"):
+            self.assertTrue((self.repo / link).is_symlink(), link)
+        self.assertEqual(os.readlink(self.repo / "cyclic.md"), "cyclic.md")
+        self.assertTrue(os.access(self.repo / "runnable.sh", os.X_OK))
+        self.assertEqual(git_out(self.repo, "ls-tree", "HEAD", "sub"),
+                         f"160000 commit {'a' * 40}\tsub")
+        self.assertEqual(git_out(self.repo, "status", "--porcelain",
+                                 "--ignored"),
+                         "?? loose-untracked.md\n!! private/")
 
 
 class TestObjectMode(RepoFixture):

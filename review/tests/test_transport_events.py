@@ -22,7 +22,8 @@ from review.emit import _git
 from review.ledger import Ledger
 from review.tests.util import LINEAGE, REPO_ROOT
 from review.tests._transport_fixtures import (
-    CFG, SHA_A, SHA_B, SHA_C, request_text, verdict_text, _cli)
+    CFG, SHA_A, SHA_B, SHA_C, request_text, verdict_text, _cli,
+    assert_private_copies, copy_fixture, write_identity)
 
 #: "no argument given" told apart from "the argument None was given" — the
 #: manifest tests need both.
@@ -1729,23 +1730,14 @@ class _ImportLegacyCase(unittest.TestCase):
             raise unittest.SkipTest(f"filesystem writes denied ({exc})")
         cls.addClassCleanup(shutil.rmtree, cls.src, ignore_errors=True)
         cls.repo = cls.src / "work"
-        bare = cls.src / "origin.git"
-        subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
-        cls.repo.mkdir()
-        cls._git("init", "-q", "-b", "main")
-        cls._git("config", "user.email", "fixture@invalid")
-        cls._git("config", "user.name", "fixture")
-        cls._git("remote", "add", "origin", str(bare))
         cls.split_bytes = cls.source_text().encode("utf-8")
         cls.verdict_bytes = cls.VERDICT_TEXT.encode("utf-8")
-        (cls.repo / "sources").mkdir()
-        (cls.repo / cls.SPLIT_PATH).write_bytes(cls.split_bytes)
-        (cls.repo / cls.VERDICT_PATH).write_bytes(cls.verdict_bytes)
-        cls._git("add", cls.SPLIT_PATH, cls.VERDICT_PATH)
-        cls._git("commit", "-q", "-m", "the legacy corpus sources")
-        cls._git("push", "-q", "origin", "main")
-        cls._git("fetch", "-q", "origin")
-        cls.anchor = cls._git("rev-parse", "HEAD")
+        # Built once per process per distinct source (`_build_anchor_tree`)
+        # and copied into this class's own directory: every class still
+        # owns its repository, and its anchor has the same id as before.
+        key = ("legacy-anchor", cls.SPLIT_PATH, cls.VERDICT_PATH,
+               cls.split_bytes, cls.verdict_bytes)
+        cls.anchor = copy_fixture(key, cls._build_anchor_tree, cls.src)
         cls.SPLIT_DIGEST = hashlib.sha256(cls.split_bytes).hexdigest()
         cls.VERDICT_DIGEST = hashlib.sha256(cls.verdict_bytes).hexdigest()
         #: A commit a remote-tracking ref contains, so an envelope row has a
@@ -1759,6 +1751,33 @@ class _ImportLegacyCase(unittest.TestCase):
         if out.returncode != 0:                      # pragma: no cover
             raise AssertionError(f"git {args}: {out.stderr}")
         return out.stdout.strip()
+
+    @classmethod
+    def _build_anchor_tree(cls, root):
+        """The work repository and its bare origin under `root`, the two
+        sources committed, pushed and fetched. Returns the anchor's id."""
+        repo, bare = root / "work", root / "origin.git"
+
+        def git(*args):
+            out = subprocess.run(["git", "-C", str(repo), *args],
+                                 capture_output=True, text=True, timeout=60)
+            if out.returncode != 0:                  # pragma: no cover
+                raise AssertionError(f"git {args}: {out.stderr}")
+            return out.stdout.strip()
+        subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+        repo.mkdir()
+        git("init", "-q", "-b", "main")
+        write_identity(repo, (("user", "email", "fixture@invalid"),
+                              ("user", "name", "fixture")))
+        git("remote", "add", "origin", str(bare))
+        (repo / "sources").mkdir()
+        (repo / cls.SPLIT_PATH).write_bytes(cls.split_bytes)
+        (repo / cls.VERDICT_PATH).write_bytes(cls.verdict_bytes)
+        git("add", cls.SPLIT_PATH, cls.VERDICT_PATH)
+        git("commit", "-q", "-m", "the legacy corpus sources")
+        git("push", "-q", "origin", "main")
+        git("fetch", "-q", "origin")
+        return git("rev-parse", "HEAD")
 
     def local_only_commit(self, text: str) -> tuple[str, str]:
         """A commit made and NEVER pushed, plus the digest of the split file
@@ -1896,6 +1915,29 @@ class _ImportLegacyCase(unittest.TestCase):
         code, payload = self._import(ledger, events, **kw)
         self.assertEqual(code, 0, payload)
         return payload
+
+
+class TestTheLegacyAnchorIsACopy(_ImportLegacyCase):
+    """The class fixture's repository, proven once rather than in every
+    class that inherits it."""
+
+    def test_the_class_repository_is_a_private_copy_of_one_build(self):
+        """Built once per distinct source and copied per class: this
+        class's repository is its own, its `origin` its own bare copy, and
+        its anchor the template's commit, already on `origin/main`.
+
+        MUTATION: skip the path rebase in `copy_fixture` and `origin` is
+        the template's bare repository."""
+        key = ("legacy-anchor", self.SPLIT_PATH, self.VERDICT_PATH,
+               self.split_bytes, self.verdict_bytes)
+        facts, _, _ = assert_private_copies(self, key,
+                                            self._build_anchor_tree, "work")
+        self.assertEqual(facts, self.anchor)
+        self.assertEqual(self._git("remote", "get-url", "origin"),
+                         str(self.src / "origin.git"))
+        self.assertEqual(self._git("rev-parse", "origin/main"), self.anchor)
+        self.assertEqual((self.repo / self.SPLIT_PATH).read_bytes(),
+                         self.split_bytes)
 
 
 class TestTheSourcePathGrammarIsClosed(_ImportLegacyCase):

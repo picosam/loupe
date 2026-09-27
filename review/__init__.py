@@ -163,7 +163,7 @@ TOOL_NAME = "loupe"
 #   - the reviewer procedure gains the falsification-anchoring rule (D3):
 #     anchor in the reviewed tree wherever the defect admits it, and name
 #     an external mutable dependency in the finding when it does not.
-TOOL_VERSION = "0.26.0"
+TOOL_VERSION = "0.27.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never
@@ -321,6 +321,7 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_fingerprint.py": TESTS,
     "review/tests/test_gate_environment.py": TESTS,
     "review/tests/test_gate_before_push.py": TESTS,
+    "review/tests/test_git_memo.py": TESTS,
     "review/tests/test_git_timeout.py": TESTS,
     "review/tests/test_git_reads.py": TESTS,
     "review/tests/test_paths.py": TESTS,

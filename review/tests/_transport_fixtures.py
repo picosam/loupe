@@ -222,6 +222,276 @@ def ledgerless_cfg():
     return dataclasses.replace(CFG, ledger_dir=None)
 
 
+#: The committer every fixture repository records, written into the
+#: repository's own `.git/config` by `write_identity` — the bytes
+#: `git config user.name a` and its two siblings would write, without the
+#: three launches. It lives in the repository and not in the environment
+#: because loupe itself commits in these repositories (a hand-off commits
+#: outstanding work), and loupe's git calls read the repository's config.
+FIXTURE_IDENTITY = (("user", "name", "a"),
+                    ("user", "email", "a@example.invalid"),
+                    ("commit", "gpgsign", "false"))
+
+
+def identity_of(name, email):
+    """The three-key identity `write_identity` writes, for `name <email>`
+    with signing off — the loop `for k, v in (("user.name", ...), ...):
+    git config k v` many fixtures ran, as data."""
+    return (("user", "name", name), ("user", "email", email),
+            ("commit", "gpgsign", "false"))
+
+
+def write_identity(repo, identity=FIXTURE_IDENTITY):
+    """Append `identity` ((section, key, value), ...) to `repo`'s
+    `.git/config` — or to `repo/config` for a bare repository — in the
+    layout `git config` writes: one `[section]` header per run of keys."""
+    repo = Path(repo)
+    cfg = repo / ".git" / "config"
+    if not cfg.is_file():
+        cfg = repo / "config"
+    lines, section = [], None
+    for sec, key, value in identity:
+        if sec != section:
+            lines.append(f"[{sec}]")
+            section = sec
+        lines.append(f"\t{key} = {value}")
+    with cfg.open("a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+#: Process-wide memo of fixture trees: key -> (template root, facts).
+_TEMPLATES: dict = {}
+_TEMPLATE_PARENT: list = []
+
+
+def _template_parent():
+    """One directory per test process holding every template it built,
+    removed when the process exits."""
+    if not _TEMPLATE_PARENT:
+        import atexit
+        parent = Path(tempfile.mkdtemp(prefix="loupe-fixture-templates-"))
+        atexit.register(shutil.rmtree, parent, ignore_errors=True)
+        _TEMPLATE_PARENT.append(parent)
+    return _TEMPLATE_PARENT[0]
+
+
+#: Files inside a copied tree that may carry the template's absolute path:
+#: a remote URL in `config`, a fetched URL in `FETCH_HEAD`, the two halves
+#: of a linked worktree (`gitdir`, and a `.git` that is a file), a
+#: borrowed object store (`objects/info/alternates`, a `--shared` clone),
+#: and every reflog (`logs/...`: a clone's first entry names its source).
+_PATH_BEARING = frozenset({"config", "FETCH_HEAD", "gitdir", ".git",
+                           "alternates"})
+
+
+def copy_tree(src, dst):
+    """A private, writable copy of the directory `src` at `dst` (created,
+    or filled when it exists and is empty): `shutil.copytree`, no process
+    launched, on every platform.
+
+    Not `git clone`: a clone rewrites `remote.origin`, the reflog and the
+    object layout, all of which a test may read. Not `cp -c -R` (an APFS
+    clone): measured 2026-09-27 on this Mac at 6.8 ms and one launch per
+    copy of a 45-entry fixture repository, against 5.1 ms and none for
+    `copytree`; fixture trees are small enough that copy-on-write buys
+    nothing. A copy shares no file with `src` or any other copy, so a
+    write in one is invisible in every other."""
+    shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+
+
+def fixture_tree(key, build):
+    """The template for `key`, built by `build(root) -> facts` the first
+    time this process asks for it, returned as (root, facts). The template
+    is never handed to a test: `copy_fixture` copies it."""
+    if key not in _TEMPLATES:
+        root = Path(tempfile.mkdtemp(prefix="t-", dir=_template_parent()))
+        _TEMPLATES[key] = (root, build(root))
+    return _TEMPLATES[key]
+
+
+def copy_fixture(key, build, dst):
+    """Copy the fixture tree `key` (built once per process by `build`) into
+    `dst`, rebase every absolute path the template recorded onto `dst`, and
+    return the template's facts — commit ids included, which are therefore
+    the same in every copy (and within one second of each other before
+    this, when each test built its own: git's timestamps are seconds, so a
+    test could never rely on two builds' ids differing).
+
+    Building once is safe only for what a template is: a pure function of
+    `key`. A `build` that reads anything else (the clock aside) belongs in
+    the key."""
+    root, facts = fixture_tree(key, build)
+    dst = Path(dst)
+    copy_tree(root, dst)
+    rebase_paths(dst, root)
+    return facts
+
+
+def assert_private_copies(case, key, build, repo="."):
+    """The isolation proof every converted fixture carries: two copies of
+    template `key` are two directories, neither of them the template; the
+    git repository at `repo` inside each carries the template's HEAD with
+    the template's working-tree status (read without the optional index
+    refresh, so the proof never writes the template); and a commit made in
+    the first copy moves neither the second nor the template. Returns
+    (facts, first copy, second copy) for the fixture's own id assertions."""
+    root, facts = fixture_tree(key, build)
+    copies = []
+    for _ in range(2):
+        dst = scratch_tmp(case, "copy-proof-")
+        case.assertEqual(copy_fixture(key, build, dst), facts)
+        copies.append(dst)
+    case.assertEqual(len({c.resolve() for c in copies} | {root.resolve()}), 3,
+                     "a copy is the template or the other copy")
+    head = git_out(root / repo, "rev-parse", "HEAD")
+    status = _status(root / repo)
+    for c in copies:
+        case.assertEqual(git_out(c / repo, "rev-parse", "HEAD"), head)
+        case.assertEqual(_status(c / repo), status)
+    first = copies[0] / repo
+    (first / "copy-proof.txt").write_text("first copy only\n",
+                                          encoding="utf-8")
+    sh("git", "-C", str(first), "add", "copy-proof.txt")
+    sh("git", "-C", str(first), "-c", "user.name=p",
+       "-c", "user.email=p@example.invalid", "commit", "-q", "-m", "proof")
+    case.assertNotEqual(git_out(first, "rev-parse", "HEAD"), head)
+    for untouched in (copies[1] / repo, root / repo):
+        case.assertEqual(git_out(untouched, "rev-parse", "HEAD"), head)
+        case.assertFalse((untouched / "copy-proof.txt").exists())
+        case.assertEqual(_status(untouched), status)
+    return facts, copies[0], copies[1]
+
+
+def _status(repo):
+    """`git status --porcelain` that takes no optional lock, so reading a
+    template never rewrites its index."""
+    return git_out(repo, "--no-optional-locks", "status", "--porcelain")
+
+
+def rebase_paths(dst, root):
+    """Rewrite every absolute path to `root` that git metadata under `dst`
+    records (`_path_bearing`) into the same path under `dst`."""
+    dst = Path(dst)
+    # Each spelling of the template's root onto the same spelling of the
+    # copy's: git records a linked worktree by its resolved path and a
+    # remote by the path it was given, and on macOS the two differ
+    # (`/var/folders` is `/private/var/folders`). Longest first, so the
+    # resolved form is never half-matched by the plain one inside it.
+    pairs = sorted({(os.path.realpath(root), os.path.realpath(dst)),
+                    (str(root), str(dst))}, key=lambda p: -len(p[0]))
+    for path in _path_bearing(dst):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        new = text
+        for old, rebased in pairs:
+            new = new.replace(old, rebased)
+        if new != text:
+            path.write_text(new, encoding="utf-8")
+
+
+class _BuildCase:
+    """The one-shot test case a template's own constructor runs under: a
+    cleanup it registers is run when the build ends, a skip it asks for
+    is a skip of whoever asked for the template."""
+
+    def __init__(self):
+        self.cleanups = []
+
+    def addCleanup(self, fn, *args, **kw):
+        self.cleanups.append((fn, args, kw))
+
+    def skipTest(self, why):
+        raise unittest.SkipTest(why)
+
+
+def copied_instance(cls, case, prefix, root_attr="root", **kw):
+    """An instance of fixture class `cls` — whose constructor is
+    `cls(case, prefix, **kw)`, builds everything under a fresh directory
+    it keeps as `.<root_attr>`, and registers that directory's removal —
+    built ONCE per process per `kw` and copied for each caller.
+
+    The constructor runs unmodified, once, into a scratch directory; that
+    tree becomes the template. Each caller gets a fresh directory (named
+    by `prefix`, removed at its cleanup), a copy of the tree with its git
+    metadata rebased, and an instance whose attributes are the built
+    one's with every path under the built root moved under its own — so
+    what the fixture's own methods then do happens in the caller's copy
+    and nowhere else. Only for a constructor whose output depends on `kw`
+    alone (the clock aside): `prefix` names the directory, nothing more."""
+    key = ("instance", cls.__module__, cls.__qualname__,
+           tuple(sorted((k, repr(v)) for k, v in kw.items())))
+
+    def build(troot):
+        built_case = _BuildCase()
+        try:
+            obj = cls(built_case, "template-", **kw)
+            built = Path(getattr(obj, root_attr))
+            copy_tree(built, troot)
+            rebase_paths(troot, built)
+            # The build's own case is a stand-in: whatever attribute held
+            # it holds the CALLER's case in each copy.
+            attrs = {k: (_CALLER_CASE if v is built_case else v)
+                     for k, v in vars(obj).items()}
+            return _moved(attrs, built, Path(troot))
+        finally:
+            for fn, args, fkw in reversed(built_case.cleanups):
+                fn(*args, **fkw)
+
+    root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+    case.addCleanup(shutil.rmtree, root, True)
+    troot, _ = fixture_tree(key, build)
+    attrs = copy_fixture(key, build, root)
+    obj = cls.__new__(cls)
+    vars(obj).update({k: (case if v is _CALLER_CASE else v) for k, v in
+                      _moved(attrs, Path(troot), root).items()})
+    return obj
+
+
+#: Where a template's attributes held the case that built it.
+_CALLER_CASE = object()
+
+
+def _moved(attrs, old, new):
+    """`attrs` with each Path under `old`, and each string naming a path
+    under it (a URL, say), moved under `new`."""
+    spellings = sorted({str(old), os.path.realpath(old)}, key=len,
+                       reverse=True)
+    out = {}
+    for k, v in attrs.items():
+        if isinstance(v, Path):
+            for sp in spellings:
+                if str(v) == sp or str(v).startswith(sp + os.sep):
+                    v = Path(str(new) + str(v)[len(sp):])
+                    break
+        elif isinstance(v, str):
+            for sp in spellings:
+                v = v.replace(sp, str(new))
+        out[k] = v
+    return out
+
+
+def _path_bearing(top):
+    """The git-metadata files under `top` that may name an absolute path:
+    a `.git` file (a linked worktree's pointer), or one of `_PATH_BEARING`
+    inside a git directory (`.git`, or a bare `*.git`), or a reflog under
+    its `logs`. Of an object store
+    only `objects/info` is walked; working-tree files are never touched."""
+    top = Path(top)
+    for dirpath, dirnames, filenames in os.walk(top):
+        parts = Path(dirpath).relative_to(top).parts
+        in_git = any(p == ".git" or p.endswith(".git") for p in parts)
+        if in_git and parts[-1] == "objects":
+            dirnames[:] = [d for d in dirnames if d == "info"]
+        elif in_git:
+            dirnames[:] = [d for d in dirnames if d != "hooks"]
+        for name in filenames:
+            if name == ".git" or (in_git and (name in _PATH_BEARING
+                                              or "logs" in parts)):
+                yield Path(dirpath) / name
+
+
 def sh(*args):
     """Run one command to completion, raising on failure; output discarded."""
     subprocess.run(args, check=True, capture_output=True, text=True,
@@ -310,18 +580,10 @@ def warm_cache_fixture(case, text=None, *, prefix="warm-cache-",
     return WarmCache(cfg, ledger, git, text, kept, claim_digest)
 
 
-def scratch_loop_repo(case, prefix, name="repo", objective="loop test"):
-    """A real repository the real CLI can run a round against: this repo's
-    `review.toml` with its gates spliced out, `f.txt` committed twice so
-    there is a base and a head, and a claim file naming `review.toml` as
-    the required reference. The caller's cwd is restored at cleanup, since
-    `run_cli` changes it. Returns tmp, repo, base, claim and cwd."""
-    tmp = scratch_tmp(case, prefix)
-    repo = tmp / name
+def _build_scratch_loop(repo):
+    """`scratch_loop_repo`'s repository, built at `repo`: returns its base."""
     sh("git", "init", "-q", "-b", "main", str(repo))
-    for k, v in (("user.name", "a"), ("user.email", "a@example.invalid"),
-                 ("commit.gpgsign", "false")):
-        sh("git", "-C", str(repo), "config", k, v)
+    write_identity(repo)
     toml = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
     toml = toml[:toml.index("[[gates]]")] + toml[toml.index("[roles]"):]
     # This repository declares `transport = "path"` (asked once, 2026-09-03);
@@ -335,6 +597,34 @@ def scratch_loop_repo(case, prefix, name="repo", objective="loop test"):
     base = git_out(repo, "rev-parse", "HEAD")
     (repo / "f.txt").write_text("two\n", encoding="utf-8")
     sh("git", "-C", str(repo), "commit", "-qam", "change")
+    return base
+
+
+def scratch_loop_repo(case, prefix, name="repo", objective="loop test",
+                      tree=None):
+    """A real repository the real CLI can run a round against: this repo's
+    `review.toml` with its gates spliced out, `f.txt` committed twice so
+    there is a base and a head, and a claim file naming `review.toml` as
+    the required reference. The caller's cwd is restored at cleanup, since
+    `run_cli` changes it. Returns tmp, repo, base, claim and cwd.
+
+    The repository is built once per test process and copied into each
+    caller's own directory (`copy_fixture`): every test still gets a
+    repository of its own, with the same two commits under the same ids.
+
+    `tree=(key, build)` copies a larger template into the test's directory
+    instead — one whose `build(root)` put this repository at `root/name`
+    (`copy_fixture(..., root / name)` of this one) and whatever else a
+    module's fixture adds around it, returning facts with `base` among
+    them. The facts come back as `.facts`."""
+    tmp = scratch_tmp(case, prefix)
+    repo = tmp / name
+    if tree is None:
+        base = copy_fixture("scratch_loop_repo", _build_scratch_loop, repo)
+        facts = {"base": base}
+    else:
+        facts = copy_fixture(*tree, tmp)
+        base = facts["base"]
     claim = tmp / "claim.json"
     claim.write_text(json.dumps({
         "objective": objective,
@@ -343,7 +633,7 @@ def scratch_loop_repo(case, prefix, name="repo", objective="loop test"):
     cwd = os.getcwd()
     case.addCleanup(os.chdir, cwd)
     return SimpleNamespace(tmp=tmp, repo=repo, base=base, claim=claim,
-                           cwd=cwd)
+                           cwd=cwd, facts=facts)
 
 
 def run_cli(where, state, *argv, cwd, env=None):

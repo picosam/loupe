@@ -27,6 +27,7 @@ import unittest
 from pathlib import Path
 
 from review.tests.util import REPO_ROOT, public_path
+from review.tests._transport_fixtures import identity_of, write_identity
 
 
 def author_script():
@@ -61,10 +62,7 @@ class TestWalkthroughRunsAsPrinted(unittest.TestCase):
         self.repo = self.tmp / "repo"
         self._sh("git", "init", "-q", "--bare", "-b", "main", str(remote))
         self._sh("git", "init", "-q", "-b", "main", str(self.repo))
-        for k, v in (("user.name", "w"),
-                     ("user.email", "w@example.invalid"),
-                     ("commit.gpgsign", "false")):
-            self._sh("git", "-C", str(self.repo), "config", k, v)
+        write_identity(self.repo, identity_of("w", "w@example.invalid"))
         # The generic gate-free config shape the loop test proves: taxonomy
         # and roles from this tree's own root config, manifest dropped so
         # the scaffold attests no foreign commands.

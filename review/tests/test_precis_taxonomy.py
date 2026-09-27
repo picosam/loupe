@@ -51,6 +51,7 @@ from pathlib import Path
 
 from review import TOOL_NAME, env_var, vocab
 from review.tests.util import REPO_ROOT
+from review.tests._transport_fixtures import identity_of, write_identity
 
 SHIM = REPO_ROOT / "bin" / TOOL_NAME
 
@@ -124,9 +125,7 @@ class ScratchLoop:
         self.state = self.tmp / "state"
         self.remote = remote
         self._git_top("init", "-q", "-b", "main", str(self.repo))
-        for k, v in (("user.name", "t3"), ("user.email", "t3@example.invalid"),
-                     ("commit.gpgsign", "false")):
-            self.git("config", k, v)
+        write_identity(self.repo, identity_of("t3", "t3@example.invalid"))
         if remote:
             self._git_top("init", "-q", "--bare", str(self.tmp / "origin.git"))
             self.git("remote", "add", "origin", str(self.tmp / "origin.git"))

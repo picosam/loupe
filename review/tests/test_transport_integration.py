@@ -24,6 +24,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -35,8 +36,53 @@ from review.emit import _git
 from review.ledger import Ledger
 from review.tests import synth
 from review.tests._transport_fixtures import (
-    CFG, run_cli, scratch_loop_repo, sh, verdict_text)
+    CFG, _build_scratch_loop, copy_fixture, fixture_tree, git_out, run_cli,
+    scratch_loop_repo, sh, verdict_text, write_identity)
 from review.tests.util import LINEAGE
+
+def _publish(root):
+    """A bare `remote.git` beside `root/author`, main pushed to it, and a
+    `reviewer` clone of it: the two-machine topology over a path remote."""
+    author, remote = root / "author", root / "remote.git"
+    # The bare remote names its initial branch too. Without `-b`, HEAD
+    # takes git's built-in default (`master`); the author pushes `main`,
+    # so the remote's HEAD points at a branch that never exists and
+    # `git clone` below yields an EMPTY working tree — no review.toml,
+    # so `take` refuses with T-UNDECLARED. Invisible on a machine whose
+    # system gitconfig sets init.defaultBranch=main (Apple's git does);
+    # the first CI run of this suite (2026-08-17) found it.
+    sh("git", "init", "-q", "--bare", "-b", "main", str(remote))
+    sh("git", "-C", str(author), "remote", "add", "origin", str(remote))
+    sh("git", "-C", str(author), "push", "-q", "-u", "origin", "main")
+    sh("git", "clone", "-q", str(remote), str(root / "reviewer"))
+
+
+def _build_full_loop(root):
+    """`TestFullLoopIntegration`'s tree, once per process: returns base."""
+    base = copy_fixture("scratch_loop_repo", _build_scratch_loop,
+                        root / "author")
+    _publish(root)
+    return {"base": base}
+
+
+def _build_header_loop(root):
+    """`_HeaderLoop`'s tree, once per process: the full loop's, with the
+    fixture's own round cap committed before anything is published."""
+    base = copy_fixture("scratch_loop_repo", _build_scratch_loop,
+                        root / "author")
+    import re
+    toml_path = root / "author" / "review.toml"
+    toml, pinned = re.subn(r"^round_cap\s*=.*$", "round_cap = 3",
+                           toml_path.read_text(encoding="utf-8"),
+                           count=1, flags=re.M)
+    if pinned != 1:
+        raise AssertionError("the scratch config declares no round_cap")
+    toml_path.write_text(toml, encoding="utf-8")
+    sh("git", "-C", str(root / "author"), "commit", "-q", "--allow-empty",
+       "-am", "the fixture declares its own round cap")
+    _publish(root)
+    return {"base": base}
+
 
 class TestFullLoopIntegration(unittest.TestCase):
     """The first-real-execution instrument: two clones, a bare path remote,
@@ -45,26 +91,15 @@ class TestFullLoopIntegration(unittest.TestCase):
     → lineage close → round 1 again with the repo default cap."""
 
     def setUp(self):
+        # Author, bare path remote and reviewer clone: one template per
+        # process (`_build_full_loop`), copied into this test's directory.
         scratch = scratch_loop_repo(self, "loop-", name="author",
-                                    objective="loop test")
+                                    objective="loop test",
+                                    tree=("full-loop", _build_full_loop))
         self.tmp, self.author = scratch.tmp, scratch.repo
         self.base, self.claim, self.cwd = scratch.base, scratch.claim, scratch.cwd
         self.remote = self.tmp / "remote.git"
         self.reviewer = self.tmp / "reviewer"
-        # The bare remote names its initial branch too. Without `-b`, HEAD
-        # takes git's built-in default (`master`); the author pushes `main`,
-        # so the remote's HEAD points at a branch that never exists and
-        # `git clone` below yields an EMPTY working tree — no review.toml,
-        # so `take` refuses with T-UNDECLARED. Invisible on a machine whose
-        # system gitconfig sets init.defaultBranch=main (Apple's git does);
-        # the first CI run of this suite (2026-08-17) found it.
-        self._sh("git", "init", "-q", "--bare", "-b", "main",
-                 str(self.remote))
-        self._sh("git", "-C", str(self.author), "remote", "add", "origin",
-                 str(self.remote))
-        self._sh("git", "-C", str(self.author), "push", "-q", "-u", "origin",
-                 "main")
-        self._sh("git", "clone", "-q", str(self.remote), str(self.reviewer))
         self.author_state = self.tmp / "state-author"
         self.reviewer_state = self.tmp / "state-reviewer"
 
@@ -386,33 +421,25 @@ class _HeaderLoop(unittest.TestCase):
     PREFIX = "header-"
 
     def setUp(self):
-        scratch = scratch_loop_repo(self, self.PREFIX, name="author",
-                                    objective="header test")
-        self.tmp, self.author = scratch.tmp, scratch.repo
-        self.base, self.claim, self.cwd = (scratch.base, scratch.claim,
-                                           scratch.cwd)
         # The fixture DECLARES its cap; it does not inherit this
         # repository's. The scratch config is a copy of the workbench's
         # review.toml, so "round 4 of 3" restated a configured number and
         # `bin/config-perturbation` went red on it (cap 3 -> 34) the day
         # these classes landed. What they measure is a round past a cap of
-        # three, whatever this repository's cap is that day.
-        import re
-        toml_path = self.author / "review.toml"
-        toml, pinned = re.subn(r"^round_cap\s*=.*$", "round_cap = 3",
-                               toml_path.read_text(encoding="utf-8"),
-                               count=1, flags=re.M)
-        self.assertEqual(pinned, 1, "the scratch config declares no round_cap")
-        toml_path.write_text(toml, encoding="utf-8")
-        sh("git", "-C", str(self.author), "commit", "-q", "--allow-empty",
-           "-am", "the fixture declares its own round cap")
+        # three, whatever this repository's cap is that day. The cap is
+        # committed, published and cloned once per process
+        # (`_build_header_loop`, which refuses a config with no round_cap)
+        # and the tree copied into this test's directory.
+        scratch = scratch_loop_repo(self, self.PREFIX, name="author",
+                                    objective="header test",
+                                    tree=("header-loop", _build_header_loop))
+        self.tmp, self.author = scratch.tmp, scratch.repo
+        self.base, self.claim, self.cwd = (scratch.base, scratch.claim,
+                                           scratch.cwd)
+        self.assertIn("\nround_cap = 3\n",
+                      (self.author / "review.toml").read_text(encoding="utf-8"))
         self.remote = self.tmp / "remote.git"
         self.reviewer = self.tmp / "reviewer"
-        sh("git", "init", "-q", "--bare", "-b", "main", str(self.remote))
-        sh("git", "-C", str(self.author), "remote", "add", "origin",
-           str(self.remote))
-        sh("git", "-C", str(self.author), "push", "-q", "-u", "origin", "main")
-        sh("git", "clone", "-q", str(self.remote), str(self.reviewer))
         self.state = self.tmp / "state-author"
         self.reviewer_state = self.tmp / "state-reviewer"
 
@@ -1348,9 +1375,7 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
         # clone's `origin` is the repository beside it; the case is about
         # the object store, not the topology.
         sh("git", "-C", str(clone), "remote", "remove", "origin")
-        for k, v in (("user.name", "a"), ("user.email", "a@example.invalid"),
-                     ("commit.gpgsign", "false")):
-            sh("git", "-C", str(clone), "config", k, v)
+        write_identity(clone)
         self.assertTrue(
             (clone / ".git" / "objects" / "info" / "alternates").is_file(),
             "the fixture is not a shared clone, so it proves nothing")
@@ -2115,6 +2140,126 @@ class TestGateIdIsASafeFilenameComponent(unittest.TestCase):
                 self.assertEqual(out.parent, target.resolve())
 
     CONTAINMENT = ("tests", "lint-2", "a.b_c", "A", "z9")
+
+
+class TestScratchRepositoriesAreCopiesOfOne(unittest.TestCase):
+    """`scratch_loop_repo` builds its repository once per process and
+    copies it per caller (`copy_fixture`). What the tests that use it were
+    promised before still holds: a repository of their own, carrying the
+    same two commits, which nothing another test does can reach.
+
+    MUTATIONS: hand every caller the template itself (`copy_fixture`
+    returning without copying, `repo` pointing at the template root) and
+    the distinct-path and invisible-write assertions fail; drop
+    `write_identity` and the commit below fails for want of an identity on
+    a machine without a global one, and the config assertion fails on any.
+    """
+
+    def test_two_callers_get_two_private_repositories_with_the_same_commits(self):
+        a = scratch_loop_repo(self, "copy-a-")
+        b = scratch_loop_repo(self, "copy-b-", name="author")
+        root, facts = fixture_tree("scratch_loop_repo", _build_scratch_loop)
+        paths = {a.repo.resolve(), b.repo.resolve(), root.resolve()}
+        self.assertEqual(len(paths), 3, "a copy is the template or the other")
+        self.assertEqual(a.base, b.base)
+        self.assertEqual(a.base, facts)
+        head = git_out(root, "rev-parse", "HEAD")
+        for scratch in (a, b):
+            self.assertEqual(git_out(scratch.repo, "rev-parse", "HEAD"), head)
+            self.assertEqual(git_out(scratch.repo, "rev-parse", "HEAD~1"),
+                             scratch.base)
+            self.assertEqual(git_out(scratch.repo, "rev-list", "--count",
+                                     "HEAD"), "2")
+            self.assertEqual(git_out(scratch.repo, "status", "--porcelain"),
+                             "")
+            self.assertEqual(git_out(scratch.repo, "config", "user.email"),
+                             "a@example.invalid")
+        (a.repo / "f.txt").write_text("only in a\n", encoding="utf-8")
+        sh("git", "-C", str(a.repo), "commit", "-qam", "only in a")
+        self.assertNotEqual(git_out(a.repo, "rev-parse", "HEAD"), head)
+        for untouched in (b.repo, root):
+            self.assertEqual(git_out(untouched, "rev-parse", "HEAD"), head)
+            self.assertEqual((untouched / "f.txt").read_text(encoding="utf-8"),
+                             "two\n")
+            self.assertEqual(git_out(untouched, "--no-optional-locks",
+                                     "status", "--porcelain"), "")
+
+    def test_a_published_loop_copies_its_remote_and_its_clone(self):
+        """The full-loop and header-loop templates hold an author, a bare
+        path remote and a reviewer clone: each copy's author pushes to,
+        and each copy's reviewer fetches from, ITS OWN remote."""
+        for key, build in (("full-loop", _build_full_loop),
+                           ("header-loop", _build_header_loop)):
+            with self.subTest(key):
+                a, b = (scratch_loop_repo(self, f"{key}-{n}-", name="author",
+                                          tree=(key, build)) for n in "ab")
+                root, facts = fixture_tree(key, build)
+                self.assertEqual(a.facts, facts)
+                for c in (a, b):
+                    self.assertEqual(
+                        git_out(c.repo, "remote", "get-url", "origin"),
+                        str(c.tmp / "remote.git"))
+                    self.assertEqual(
+                        git_out(c.tmp / "reviewer", "remote", "get-url",
+                                "origin"), str(c.tmp / "remote.git"))
+                    self.assertEqual(
+                        git_out(c.tmp / "reviewer", "rev-parse", "HEAD"),
+                        git_out(root / "author", "rev-parse", "HEAD"))
+                (a.repo / "f.txt").write_text("pushed from a\n",
+                                              encoding="utf-8")
+                sh("git", "-C", str(a.repo), "commit", "-qam", "a only")
+                sh("git", "-C", str(a.repo), "push", "-q", "origin", "main")
+                sh("git", "-C", str(a.tmp / "reviewer"), "fetch", "-q")
+                moved = git_out(a.repo, "rev-parse", "HEAD")
+                self.assertEqual(git_out(a.tmp / "reviewer", "rev-parse",
+                                         "origin/main"), moved)
+                for untouched in (b.tmp, root):
+                    self.assertNotEqual(git_out(untouched / "remote.git",
+                                                "rev-parse", "main"), moved)
+
+    def test_no_copied_git_metadata_names_the_template(self):
+        """The rebase guard, over every path-bearing kind a template can
+        hold: a remote URL, a clone's origin, a `--shared` clone's
+        alternates, a linked worktree's two pointers. After the copy, no
+        file in any git directory of the copy names the template's root,
+        in either spelling, and each still works.
+
+        MUTATION: drop "alternates" from `_PATH_BEARING` and the shared
+        clone's store still borrows the template's objects — named here."""
+        def build(root):
+            copy_fixture("scratch_loop_repo", _build_scratch_loop,
+                         root / "author")
+            _publish(root)
+            sh("git", "clone", "-q", "--shared", str(root / "author"),
+               str(root / "shared"))
+            sh("git", "-C", str(root / "author"), "worktree", "add", "-q",
+               "-b", "side", str(root / "side"))
+            return None
+        key = ("proof-every-path-kind",)
+        root, _ = fixture_tree(key, build)
+        tmp = Path(tempfile.mkdtemp(prefix="path-kinds-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        copy_fixture(key, build, tmp)
+        spellings = {str(root), os.path.realpath(root)}
+        for path in tmp.rglob("*"):
+            if not path.is_file() or not any(
+                    p == ".git" or p.endswith(".git")
+                    for p in path.relative_to(tmp).parts):
+                continue
+            data = path.read_bytes()
+            for spelling in spellings:
+                self.assertNotIn(spelling.encode(), data,
+                                 f"{path.relative_to(tmp)} names the template")
+        alternates = (tmp / "shared" / ".git" / "objects" / "info"
+                      / "alternates").read_text(encoding="utf-8")
+        self.assertEqual(Path(alternates.strip()).resolve(),
+                         (tmp / "author" / ".git" / "objects").resolve())
+        self.assertEqual(git_out(tmp / "shared", "rev-parse", "HEAD"),
+                         git_out(tmp / "author", "rev-parse", "HEAD"))
+        common = git_out(tmp / "side", "rev-parse", "--path-format=absolute",
+                         "--git-common-dir")
+        self.assertEqual(Path(common).resolve(),
+                         (tmp / "author" / ".git").resolve())
 
 
 if __name__ == "__main__":

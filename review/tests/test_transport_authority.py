@@ -29,7 +29,7 @@ from review.ledger import Ledger
 from review.tests.util import REPO_ROOT
 from review.tests._transport_fixtures import (
     ledgerless_cfg, reviewer_clone_git, CFG, SHA_A, SHA_B, fake_git,
-    request_text)
+    request_text, assert_private_copies, copy_fixture)
 
 
 #: The finite liveness EFFECTS, and the whole of what an effect may be.
@@ -480,6 +480,24 @@ class TestGoverningAuthorityReachesTheVerdictLeg(unittest.TestCase):
         self.assertIn("--from-target", rec["then"])
 
 
+def _build_own_rules_base(repo):
+    """`TestTheReviewedCommitCarriesItsOwnRules`' repository: `keep.txt`
+    committed as `base` by the identity that class's `_git` passes on each
+    call (the repository itself declares none). Returns the base id."""
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)],
+                   check=True, capture_output=True, timeout=60)
+    (repo / "keep.txt").write_text("keep\n", encoding="utf-8")
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.email=t@example.invalid",
+             "-c", "user.name=t", *args], check=True, capture_output=True,
+            text=True, timeout=60).stdout.strip()
+    git("add", "-A")
+    git("commit", "--allow-empty", "-qm", "base")
+    return git("rev-parse", "HEAD")
+
+
 class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
     """Round 6 F1, end to end on real repositories.
 
@@ -506,11 +524,11 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(
             self.tmp, ignore_errors=True))
         self.repo = self.tmp / "repo"
-        subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)],
-                       check=True, capture_output=True, timeout=60)
         self.toml = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
-        (self.repo / "keep.txt").write_text("keep\n", encoding="utf-8")
-        self.base = self._commit("base")
+        # The base is built once per process (`_build_own_rules_base`, the
+        # same three git steps this class's `_commit` runs) and copied here.
+        self.base = copy_fixture("own-rules-base", _build_own_rules_base,
+                                 self.repo)
 
     def _git(self, *args, input_text=None):
         return subprocess.run(
@@ -553,6 +571,23 @@ class TestTheReviewedCommitCarriesItsOwnRules(unittest.TestCase):
             return code, json.loads(out.getvalue())
         finally:
             os.chdir(cwd)
+
+    def test_the_base_repository_is_a_private_copy(self):
+        """The base is built once per process and copied per test: this
+        test's copy is its own, at the reported base, with no identity of
+        its own (the class passes one per call).
+
+        MUTATION: hand out the template and `assert_private_copies` fails
+        on the paths."""
+        facts, _, _ = assert_private_copies(self, "own-rules-base",
+                                            _build_own_rules_base)
+        self.assertEqual(facts, self.base)
+        self.assertEqual(self._git("rev-parse", "HEAD"), self.base)
+        self.assertEqual(self._git("log", "--format=%an <%ae> %s"),
+                         "t <t@example.invalid> base")
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.repo), "config", "--local", "user.email"],
+            capture_output=True, text=True).stdout, "")
 
     def test_the_author_refuses_where_the_rules_do_not_travel(self):
         """The author's end — RVW-T17: after the commit, before the push.

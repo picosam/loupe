@@ -36,7 +36,8 @@ from review.tests._transport_fixtures import (CFG, SHA_A, SHA_B, fake_git,
                                               reviewer_clone_git, run_cli,
                                               scratch_loop_repo, sh,
                                               verdict_text,
-                                              warm_cache_fixture)
+                                              warm_cache_fixture,
+                                              identity_of, write_identity)
 from review.tests.util import LINEAGE, REPO_ROOT
 
 
@@ -734,9 +735,7 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
     def _reviewer_clone(self):
         clone = self.tmp / "reviewer"
         sh("git", "clone", "-q", str(self.bare), str(clone))
-        for k, v in (("user.name", "b"), ("user.email", "b@example.invalid"),
-                     ("commit.gpgsign", "false")):
-            sh("git", "-C", str(clone), "config", k, v)
+        write_identity(clone, identity_of("b", "b@example.invalid"))
         self.reviewer_state = self.tmp / "reviewer-state"
         return clone
 
@@ -1040,9 +1039,7 @@ class TestTheGitCarrierEndToEnd(unittest.TestCase):
 
         clone3 = self.tmp / "reviewer3"
         sh("git", "clone", "-q", str(self.bare), str(clone3))
-        for k, v in (("user.name", "c"), ("user.email", "c@example.invalid"),
-                     ("commit.gpgsign", "false")):
-            sh("git", "-C", str(clone3), "config", k, v)
+        write_identity(clone3, identity_of("c", "c@example.invalid"))
         state3 = self.tmp / "reviewer3-state"
         code, taken3 = run_cli(clone3, state3, "take", f"git:{three}/1",
                                "--as", "codex", cwd=self.cwd)

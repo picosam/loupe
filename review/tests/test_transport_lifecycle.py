@@ -25,7 +25,8 @@ from review.ledger import Ledger
 from review.tests.util import LINEAGE, REPO_ROOT, spec_path
 from review.tests._transport_fixtures import (
     ledgerless_cfg, reviewer_clone_git, CFG, SHA_A, SHA_B, SHA_C, fake_git, authority_calls, request_text, verdict_text, lineage_ledger, _cli,
-    warm_cache_fixture, REVIEWER_REMOTES)
+    warm_cache_fixture, REVIEWER_REMOTES, assert_private_copies, copy_fixture,
+    write_identity)
 
 class TestLineageScoping(unittest.TestCase):
     """FALSIFICATION: a cap override authorized for one lineage must not be
@@ -1808,28 +1809,17 @@ class TestTheAuthorDoorStampsTheCommittedRoles(unittest.TestCase):
             self.skipTest(f"filesystem writes denied ({exc})")
         self.addCleanup(lambda d=self.tmp: shutil.rmtree(d,
                                                          ignore_errors=True))
-        self.repo = self.tmp / "repo"
-        self.remote = self.tmp / "remote.git"
-        self._sh("git", "init", "-q", "-b", "main", str(self.repo))
-        for k, v in (("user.name", "a"), ("user.email", "a@example.invalid"),
-                     ("commit.gpgsign", "false")):
-            self._sh("git", "-C", str(self.repo), "config", k, v)
-        self._sh("git", "init", "-q", "--bare", str(self.remote))
         # The gate manifest is stripped: this class is about role
         # resolution, and the refusal rows assert that NO gate ran, which
         # a real manifest would make slow without making it truer.
         full = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
         self.head_toml = full[:full.index("[[gates]]")]
         self.roles_toml = full[full.index("[roles]"):]
-        self._write_config()
-        (self.repo / "f.txt").write_text("one\n", encoding="utf-8")
-        self._sh("git", "-C", str(self.repo), "add", ".")
-        self._sh("git", "-C", str(self.repo), "commit", "-q", "-m", "init")
-        self.base = self._git("rev-parse", "HEAD")
-        self._sh("git", "-C", str(self.repo), "remote", "add", "origin",
-                 str(self.remote))
-        self._sh("git", "-C", str(self.repo), "push", "-q", "-u", "origin",
-                 "main")
+        # Repository and bare remote are built once per process
+        # (`_build_into`) and copied into this directory.
+        self.base = copy_fixture("author-roles", self._build_into, self.tmp)
+        self.repo = self.tmp / "repo"
+        self.remote = self.tmp / "remote.git"
         self.claim = self.tmp / "claim.json"
         self.claim.write_text(json.dumps({
             "objective": "author role matrix",
@@ -1837,6 +1827,45 @@ class TestTheAuthorDoorStampsTheCommittedRoles(unittest.TestCase):
             encoding="utf-8")
         self.cwd = os.getcwd()
         self.addCleanup(os.chdir, self.cwd)
+
+    def _build_into(self, root):
+        """The repository (default roles committed, pushed) and its bare
+        remote, built under `root`. Returns the commit's id."""
+        self.repo = root / "repo"
+        self.remote = root / "remote.git"
+        self._sh("git", "init", "-q", "-b", "main", str(self.repo))
+        write_identity(self.repo)
+        self._sh("git", "init", "-q", "--bare", str(self.remote))
+        self._write_config()
+        (self.repo / "f.txt").write_text("one\n", encoding="utf-8")
+        self._sh("git", "-C", str(self.repo), "add", ".")
+        self._sh("git", "-C", str(self.repo), "commit", "-q", "-m", "init")
+        base = self._git("rev-parse", "HEAD")
+        self._sh("git", "-C", str(self.repo), "remote", "add", "origin",
+                 str(self.remote))
+        self._sh("git", "-C", str(self.repo), "push", "-q", "-u", "origin",
+                 "main")
+        return base
+
+    def test_the_fixture_is_a_private_copy_of_one_build(self):
+        """Built once per process, copied per `_build`: this test's copy
+        is its own, at the reported commit, pushing to its own remote.
+
+        MUTATION: skip the path rebase in `copy_fixture` and the copy's
+        origin is the template's remote."""
+        facts, a, _ = assert_private_copies(self, "author-roles",
+                                            self._build_into, "repo")
+        self.assertEqual(facts, self.base)
+        self.assertEqual(self._git("remote", "get-url", "origin"),
+                         str(self.remote))
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.remote), "rev-parse", "main"],
+            capture_output=True, text=True).stdout.strip(), self.base)
+        self.assertEqual(
+            subprocess.run(["git", "-C", str(a / "repo"), "remote",
+                            "get-url", "origin"], capture_output=True,
+                           text=True).stdout.strip(),
+            str(a / "remote.git"))
 
     def _sh(self, *argv):
         subprocess.run(list(argv), check=True, capture_output=True,

@@ -33,7 +33,8 @@ from pathlib import Path
 from review import (TOOL_NAME, brief, cli, config, env_var, transport, vocab,
                     wire)
 from review.emit import _git
-from review.tests._transport_fixtures import run_cli, scratch_loop_repo, sh
+from review.tests._transport_fixtures import (
+    identity_of, run_cli, scratch_loop_repo, sh, write_identity)
 from review.tests.util import REPO_ROOT
 
 SHA = "a" * 40
@@ -484,9 +485,7 @@ class TestCompactKeepsTheTargetsDecisions(unittest.TestCase):
         sh("git", "-C", str(s.repo), "remote", "add", "origin", str(remote))
         sh("git", "-C", str(s.repo), "push", "-q", "-u", "origin", "main")
         sh("git", "clone", "-q", str(remote), str(s.reviewer))
-        for k, v in (("user.name", "r"), ("user.email", "r@example.invalid"),
-                     ("commit.gpgsign", "false")):
-            sh("git", "-C", str(s.reviewer), "config", k, v)
+        write_identity(s.reviewer, identity_of("r", "r@example.invalid"))
         code, s.rec = run_cli(s.repo, s.tmp / "state-author", "handoff",
                               "--claim-file", str(s.claim), "--base", s.base,
                               cwd=s.cwd, env={"HOME": str(s.home)})

@@ -23,8 +23,77 @@ from pathlib import Path
 from unittest import mock
 
 from review import TOOL_NAME, brief, cli, config, wire
-from review.tests._transport_fixtures import git_out as _git, sh as _sh
-from review.tests.util import LINEAGE
+from review.tests._transport_fixtures import (
+    assert_private_copies, copy_fixture, git_out as _git, sh as _sh,
+    write_identity)
+from review.tests.util import LINEAGE, REPO_ROOT
+
+
+def _build_identity_checkout(main):
+    """`TestWorktreeIdentity`'s main checkout: one commit, no remote."""
+    _sh("git", "init", "-q", "-b", "main", str(main))
+    write_identity(main)
+    (main / "f.txt").write_text("one\n", encoding="utf-8")
+    _sh("git", "-C", str(main), "add", ".")
+    _sh("git", "-C", str(main), "commit", "-q", "-m", "init")
+
+
+def _build_base_and_head(repo):
+    """This repository's review.toml with its gates spliced out, `f.txt`
+    committed twice. Returns (base, head)."""
+    _sh("git", "init", "-q", "-b", "main", str(repo))
+    write_identity(repo)
+    toml = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
+    toml = toml[:toml.index("[[gates]]")] + toml[toml.index("[roles]"):]
+    (repo / "review.toml").write_text(toml, encoding="utf-8")
+    (repo / "f.txt").write_text("one\n", encoding="utf-8")
+    _sh("git", "-C", str(repo), "add", ".")
+    _sh("git", "-C", str(repo), "commit", "-q", "-m", "init")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "f.txt").write_text("two\n", encoding="utf-8")
+    _sh("git", "-C", str(repo), "commit", "-qam", "change")
+    return base, _git(repo, "rev-parse", "HEAD")
+
+
+def _build_endings_tree(root):
+    """`TestPhysicalLineEndingsAtTheCLI`'s tree: the base-and-head
+    repository at `root/repo` pushed to a bare `root/origin.git`. A
+    declared paste round may not bind a SHA the other side cannot fetch,
+    so the fixture carries the bare remote the rule requires."""
+    repo, bare = root / "repo", root / "origin.git"
+    base, head = copy_fixture("base-and-head", _build_base_and_head, repo)
+    _sh("git", "init", "-q", "--bare", str(bare))
+    _sh("git", "-C", str(repo), "remote", "add", "origin", str(bare))
+    _sh("git", "-C", str(repo), "push", "-q", "-u", "origin", "main")
+    return base, head
+
+
+class TestTheFixtureRepositoriesAreCopies(unittest.TestCase):
+    """The three repositories this module's classes start from are each
+    built once per process and copied per test: every copy is private,
+    carries the template's commits under the reported ids, and the
+    endings tree's repository pushes to ITS OWN bare origin.
+
+    MUTATION: skip the path rebase in `copy_fixture` and the endings
+    copy's origin is the template's; hand out the template and
+    `assert_private_copies` fails on the paths."""
+
+    def test_each_template_is_copied_privately(self):
+        assert_private_copies(self, "identity-checkout",
+                              _build_identity_checkout)
+        (base, head), _, b = assert_private_copies(
+            self, "base-and-head", _build_base_and_head)
+        self.assertEqual(_git(b, "rev-parse", "HEAD", "HEAD~1"),
+                         f"{head}\n{base}")
+        facts, a, b = assert_private_copies(self, "endings-tree",
+                                            _build_endings_tree, "repo")
+        self.assertEqual(facts, (base, head))
+        for c in (a, b):
+            self.assertEqual(_git(c / "repo", "remote", "get-url", "origin"),
+                             str(c / "origin.git"))
+        _sh("git", "-C", str(a / "repo"), "push", "-q", "origin", "main")
+        self.assertNotEqual(_git(a / "origin.git", "rev-parse", "main"), head)
+        self.assertEqual(_git(b / "origin.git", "rev-parse", "main"), head)
 
 
 class TestWorktreeIdentity(unittest.TestCase):
@@ -38,13 +107,7 @@ class TestWorktreeIdentity(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(
             self.tmp, ignore_errors=True))
         self.main = self.tmp / "main-checkout"
-        _sh("git", "init", "-q", "-b", "main", str(self.main))
-        for k, v in (("user.name", "a"), ("user.email", "a@example.invalid"),
-                     ("commit.gpgsign", "false")):
-            _sh("git", "-C", str(self.main), "config", k, v)
-        (self.main / "f.txt").write_text("one\n", encoding="utf-8")
-        _sh("git", "-C", str(self.main), "add", ".")
-        _sh("git", "-C", str(self.main), "commit", "-q", "-m", "init")
+        copy_fixture("identity-checkout", _build_identity_checkout, self.main)
 
     def _worktree(self, name="linked"):
         path = self.tmp / name
@@ -953,27 +1016,10 @@ class TestPhysicalLineEndingsAtTheCLI(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(
             self.tmp, ignore_errors=True))
         self.repo = self.tmp / "repo"
-        _sh("git", "init", "-q", "-b", "main", str(self.repo))
-        for k, v in (("user.name", "a"), ("user.email", "a@example.invalid"),
-                     ("commit.gpgsign", "false")):
-            _sh("git", "-C", str(self.repo), "config", k, v)
-        from review.tests.util import REPO_ROOT
-        toml = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
-        toml = toml[:toml.index("[[gates]]")] + toml[toml.index("[roles]"):]
-        (self.repo / "review.toml").write_text(toml, encoding="utf-8")
-        (self.repo / "f.txt").write_text("one\n", encoding="utf-8")
-        _sh("git", "-C", str(self.repo), "add", ".")
-        _sh("git", "-C", str(self.repo), "commit", "-q", "-m", "init")
-        self.base = _git(self.repo, "rev-parse", "HEAD")
-        (self.repo / "f.txt").write_text("two\n", encoding="utf-8")
-        _sh("git", "-C", str(self.repo), "commit", "-qam", "change")
-        # A declared paste round may not bind a SHA the other side cannot
-        # fetch, so the fixture carries the bare remote the rule requires.
-        bare = self.tmp / "origin.git"
-        _sh("git", "init", "-q", "--bare", str(bare))
-        _sh("git", "-C", str(self.repo), "remote", "add", "origin", str(bare))
-        _sh("git", "-C", str(self.repo), "push", "-q", "-u", "origin", "main")
-        self.head = _git(self.repo, "rev-parse", "HEAD")
+        # Repository and bare origin, built once per process
+        # (`_build_endings_tree`) and copied into this test's directory.
+        self.base, self.head = copy_fixture("endings-tree",
+                                            _build_endings_tree, self.tmp)
         self.state = self.tmp / "state"
         self.claim = self.tmp / "claim.json"
         self.claim.write_text(json.dumps({
@@ -1281,20 +1327,8 @@ class TestHandoffAlwaysCarriesTheBrief(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(
             self.tmp, ignore_errors=True))
         self.repo = self.tmp / "repo"
-        _sh("git", "init", "-q", "-b", "main", str(self.repo))
-        for k, v in (("user.name", "a"), ("user.email", "a@example.invalid"),
-                     ("commit.gpgsign", "false")):
-            _sh("git", "-C", str(self.repo), "config", k, v)
-        from review.tests.util import REPO_ROOT
-        toml = (REPO_ROOT / "review.toml").read_text(encoding="utf-8")
-        toml = toml[:toml.index("[[gates]]")] + toml[toml.index("[roles]"):]
-        (self.repo / "review.toml").write_text(toml, encoding="utf-8")
-        (self.repo / "f.txt").write_text("one\n", encoding="utf-8")
-        _sh("git", "-C", str(self.repo), "add", ".")
-        _sh("git", "-C", str(self.repo), "commit", "-q", "-m", "init")
-        self.base = _git(self.repo, "rev-parse", "HEAD")
-        (self.repo / "f.txt").write_text("two\n", encoding="utf-8")
-        _sh("git", "-C", str(self.repo), "commit", "-qam", "change")
+        self.base, _head = copy_fixture("base-and-head",
+                                        _build_base_and_head, self.repo)
         self.state = self.tmp / "state"
         self.claim = self.tmp / "claim.json"
         self.claim.write_text(json.dumps({

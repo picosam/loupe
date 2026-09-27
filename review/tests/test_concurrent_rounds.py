@@ -165,7 +165,8 @@ from unittest import mock
 from review import env_var, transport, vocab, wire
 from review.ledger import AmbiguousLineage, Ledger, render_cross_lineage_md
 from review.tests._transport_fixtures import (
-    CFG, git_out, run_cli, scratch_loop_repo, sh, verdict_text)
+    CFG, _build_scratch_loop, copy_fixture, fixture_tree, git_out, run_cli,
+    scratch_loop_repo, sh, verdict_text)
 from review.tests.util import REPO_ROOT
 from review.validate import validate_request
 
@@ -237,6 +238,55 @@ def wait_for(path: Path, what: str, timeout: float = 60.0) -> None:
                          f"({path})")
 
 
+def _layer_other(root, facts):
+    """The second branch checkout, one commit ahead of main."""
+    other = root / "other"
+    sh("git", "-C", str(root / "repo"), "worktree", "add", "-q", "-b",
+       "other", str(other))
+    (other / "f.txt").write_text("three\n", encoding="utf-8")
+    sh("git", "-C", str(other), "commit", "-qam", "the other branch")
+
+
+def _layer_origin(root, facts):
+    """A bare `origin` with main pushed: the `git` carrier's remote."""
+    bare = root / "origin.git"
+    sh("git", "init", "-q", "--bare", "-b", "main", str(bare))
+    sh("git", "-C", str(root / "repo"), "remote", "add", "origin", str(bare))
+    sh("git", "-C", str(root / "repo"), "push", "-q", "-u", "origin", "main")
+
+
+def _layer_push_other(root, facts):
+    """The second branch pushed too: the reviewer can fetch both targets."""
+    sh("git", "-C", str(root / "other"), "push", "-q", "-u", "origin",
+       "other")
+
+
+def _layer_same(root, facts):
+    """A second branch AT main's head: one commit under two checkouts."""
+    repo = root / "repo"
+    sh("git", "-C", str(repo), "worktree", "add", "-q", "-b", "same",
+       str(root / "same"), "HEAD")
+    facts["shared"] = git_out(repo, "rev-parse", "HEAD")
+
+
+_LAYERS = {"other": _layer_other, "origin": _layer_origin,
+           "push-other": _layer_push_other, "same": _layer_same}
+
+
+def _worktree_tree(layers):
+    """The template (key, build) for `_TwoWorktrees` with `layers` applied
+    over the scratch repository, in order — built once per process and
+    copied per test by `scratch_loop_repo(tree=...)`."""
+    def build(root):
+        facts = {"base": copy_fixture("scratch_loop_repo",
+                                      _build_scratch_loop, root / "repo")}
+        (root / "gates").mkdir()
+        for name in layers:
+            _LAYERS[name](root, facts)
+        return facts
+    return ("concurrent-worktrees", layers), build
+
+
 class _TwoWorktrees(unittest.TestCase):
     """One repository, two branch checkouts, ONE ledger.
 
@@ -252,22 +302,35 @@ class _TwoWorktrees(unittest.TestCase):
     #: default: the sequential classes want no gate at all, and the gate is
     #: committed BEFORE the second worktree branches so both carry it.
     PAUSING_GATE = False
+    #: What the fixture builds over the scratch repository, in order (see
+    #: `_LAYERS`): the second worktree always, then what a class adds —
+    #: a bare origin, the second branch pushed, a third checkout at main.
+    #: Without a pausing gate the whole tree is a template copied per test;
+    #: the pausing gate's committed script names this test's own gate
+    #: directory, so a class that declares it builds its tree per test,
+    #: through the same layers.
+    LAYERS = ("other",)
 
     def setUp(self):
-        scratch = scratch_loop_repo(self, self.PREFIX, objective="collision")
+        tree = None if self.PAUSING_GATE else _worktree_tree(self.LAYERS)
+        scratch = scratch_loop_repo(self, self.PREFIX, objective="collision",
+                                    tree=tree)
         self.tmp, self.repo = scratch.tmp, scratch.repo
         self.base, self.claim = scratch.base, scratch.claim
         self.cwd = scratch.cwd
         self.state = self.tmp / "state"
         self.gates = self.tmp / "gates"
-        self.gates.mkdir()
         if self.PAUSING_GATE:
+            self.gates.mkdir()
             self._declare_pausing_gate()
+            for name in self.LAYERS:
+                _LAYERS[name](self.tmp, scratch.facts)
         self.other = self.tmp / "other"
-        sh("git", "-C", str(self.repo), "worktree", "add", "-q", "-b",
-           "other", str(self.other))
-        (self.other / "f.txt").write_text("three\n", encoding="utf-8")
-        sh("git", "-C", str(self.other), "commit", "-qam", "the other branch")
+        if "origin" in self.LAYERS:
+            self.bare = self.tmp / "origin.git"
+        if "same" in self.LAYERS:
+            self.same = self.tmp / "same"
+            self.shared = scratch.facts["shared"]
 
     def _declare_pausing_gate(self):
         """Append the gate to review.toml and COMMIT it — the manifest that
@@ -532,14 +595,7 @@ class TestTheGitCarrierKeepsBothEnvelopes(_TwoWorktrees):
     """
 
     PREFIX = "keyed-git-"
-
-    def setUp(self):
-        super().setUp()
-        self.bare = self.tmp / "origin.git"
-        sh("git", "init", "-q", "--bare", "-b", "main", str(self.bare))
-        sh("git", "-C", str(self.repo), "remote", "add", "origin",
-           str(self.bare))
-        sh("git", "-C", str(self.repo), "push", "-q", "-u", "origin", "main")
+    LAYERS = ("other", "origin")
 
     def _envelope_refs(self):
         return git_out(self.repo, "ls-remote", "origin", "refs/loupe/*")
@@ -605,14 +661,7 @@ class TestTheReservationExcludesOneLineageAndNotTheOther(_TwoWorktrees):
 
     PREFIX = "keyed-overlap-"
     PAUSING_GATE = True
-
-    def setUp(self):
-        super().setUp()
-        self.bare = self.tmp / "origin.git"
-        sh("git", "init", "-q", "--bare", "-b", "main", str(self.bare))
-        sh("git", "-C", str(self.repo), "remote", "add", "origin",
-           str(self.bare))
-        sh("git", "-C", str(self.repo), "push", "-q", "-u", "origin", "main")
+    LAYERS = ("other", "origin")
 
     def test_two_overlapping_handoffs_of_one_lineage_are_refused(self):
         """Same worktree, same lineage: the second is refused before it
@@ -1055,12 +1104,7 @@ class _SameCommitWorktrees(_TwoWorktrees):
     itself, name either.
     """
 
-    def setUp(self):
-        super().setUp()
-        self.same = self.tmp / "same"
-        sh("git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "same",
-           str(self.same), "HEAD")
-        self.shared = git_out(self.repo, "rev-parse", "HEAD")
+    LAYERS = ("other", "same")
 
     def _in_same(self, *argv):
         return run_cli(self.same, self.state, *argv, cwd=self.cwd)
@@ -1571,10 +1615,10 @@ class TestAFreshReviewerTakesBothReviewsOfOneCommit(_SameCommitWorktrees):
     legitimate take is refused as "already taken".
     """
     PREFIX = "fresh-reviewer-"
+    LAYERS = ("other", "same", "origin")
 
     def setUp(self):
         super().setUp()
-        self._origin()
         self.reviewer = self.tmp / "reviewer-state"
 
     def _take(self, *argv):
@@ -1811,14 +1855,10 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
 
     PREFIX = "reviewer-ingress-"
 
+    LAYERS = ("other", "origin", "push-other")
+
     def setUp(self):
         super().setUp()
-        self.bare = self.tmp / "origin.git"
-        sh("git", "init", "-q", "--bare", "-b", "main", str(self.bare))
-        sh("git", "-C", str(self.repo), "remote", "add", "origin",
-           str(self.bare))
-        sh("git", "-C", str(self.repo), "push", "-q", "-u", "origin", "main")
-        sh("git", "-C", str(self.other), "push", "-q", "-u", "origin", "other")
         #: THE REVIEWER'S OWN LEDGER — a different machine's state.
         self.reviewer = self.tmp / "reviewer-state"
 
@@ -2055,6 +2095,57 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
             self._legacy(self._bytes(again), drop_branch=True), "u2.md")
         self.assertEqual(code, 0, two)
         self.assertEqual(two["lineage"], one["lineage"])
+
+class TestTheWorktreeTemplateIsCopiedWhole(unittest.TestCase):
+    """`_TwoWorktrees` copies one template per layer set: a main checkout,
+    linked worktrees and a bare origin, all of which record absolute
+    paths. Each copy must be a tree of its own — its worktrees linked to
+    ITS main checkout, its remote ITS bare repository — with the
+    template's commit ids, and nothing written in one copy visible in
+    another or in the template.
+
+    MUTATION: skip the path rebase in `copy_fixture` and the pointers
+    below name the template, and the push lands in the template's origin.
+    """
+
+    def test_each_copy_links_its_own_worktrees_and_its_own_origin(self):
+        key, build = _worktree_tree(("other", "same", "origin"))
+        copies = [scratch_loop_repo(self, f"wt-copy-{n}-", tree=(key, build))
+                  for n in "ab"]
+        a, b = copies
+        root, facts = fixture_tree(key, build)
+        self.assertEqual(len({a.tmp.resolve(), b.tmp.resolve(),
+                              root.resolve()}), 3)
+        for c in copies:
+            self.assertEqual(c.facts, facts)
+            self.assertEqual(git_out(c.repo, "rev-parse", "HEAD"),
+                             facts["shared"])
+            self.assertEqual(git_out(c.repo, "remote", "get-url", "origin"),
+                             str(c.tmp / "origin.git"))
+            for wt in ("other", "same"):
+                common = git_out(c.tmp / wt, "rev-parse",
+                                 "--path-format=absolute",
+                                 "--git-common-dir")
+                self.assertEqual(Path(common).resolve(),
+                                 (c.repo / ".git").resolve(), wt)
+            listed = git_out(c.repo, "worktree", "list", "--porcelain")
+            self.assertNotIn(str(root.resolve()), listed)
+            self.assertNotIn(str(root), listed)
+        (a.tmp / "other" / "f.txt").write_text("four\n", encoding="utf-8")
+        sh("git", "-C", str(a.tmp / "other"), "commit", "-qam", "only in a")
+        sh("git", "-C", str(a.tmp / "other"), "push", "-q", "origin", "other")
+        moved = git_out(a.tmp / "other", "rev-parse", "HEAD")
+        self.assertEqual(git_out(a.tmp / "origin.git", "rev-parse", "other"),
+                         moved)
+        for untouched in (b.tmp, root):
+            self.assertNotEqual(git_out(untouched / "other", "rev-parse",
+                                        "HEAD"), moved)
+            self.assertNotEqual(
+                subprocess.run(["git", "-C", str(untouched / "origin.git"),
+                                "rev-parse", "--verify", "-q", "other"],
+                               capture_output=True, text=True).stdout.strip(),
+                moved)
+
 
 if __name__ == "__main__":
     unittest.main()
