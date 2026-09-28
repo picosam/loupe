@@ -171,6 +171,9 @@ PROSE_KEYS = (
     # brief ci-attested-gates (2026-09-07): the gate row's attester, the run
     # it names, and the limit the poll runs under.
     "attested_by", "ci_run", "ci_timeout",
+    # 0.28.0: why a hand-off left a schedule-attested gate unrun — a reason
+    # the reviewer reads, never a command.
+    "deferred",
     # 0.25.0: `[limits] git_timeout`, the ceiling on a git subprocess —
     # there because `commit` and `push` run the REPOSITORY's hooks and a
     # repository may take longer at them than the built-in allows. Read,

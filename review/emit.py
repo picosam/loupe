@@ -1547,10 +1547,28 @@ _caller_env = caller_env
 # minutes are now on the critical path of every round. Local CPU drops,
 # which is what was asked for.
 
-#: The one admitted value of a gate's `attested_by`. A gate is executed by
-#: this process or attested by CI; there is no third executor, and the
-#: config layer refuses anything else BY NAME rather than defaulting it.
+#: The CI value of a gate's `attested_by`. A gate is executed by this
+#: process, attested by CI, or (below) deferred to the schedule at a
+#: hand-off; the config layer refuses anything else BY NAME rather than
+#: defaulting it.
 CI_ATTESTER = "ci"
+
+#: A gate attested by a scheduled full-manifest run and before publication
+#: (0.28.0). A HAND-OFF does not run it: it records it deferred, with the
+#: reason below and no field only a run could produce, and the validator
+#: accepts that record only for a gate the manifest itself declares so —
+#: a record cannot defer itself. Every other runner (`run_gates` called
+#: without `defer_scheduled`, CI, a full local run) executes it as it
+#: executes any gate. Nothing here can verify that the schedule ran or
+#: passed; the record says as much, and the reviewer reads it.
+SCHEDULE_ATTESTER = "schedule"
+
+#: The reason a deferred record carries, verbatim.
+SCHEDULE_DEFERRED = (
+    'not run at hand-off: the manifest declares attested_by = "schedule", '
+    "so this gate is attested by a scheduled full-manifest run and before "
+    "publication, not by the hand-off; nothing at the hand-off checks that "
+    "run")
 
 #: GitHub Actions sets this in every step. INSIDE CI the runner is the
 #: executor — somebody has to actually run the command, and it is this
@@ -2093,16 +2111,19 @@ class LocalGates:
 
 
 def run_local_gates(cfg: Config, target_sha: str, base: str | None = None,
-                    execute_ci_gates: bool = False) -> LocalGates:
+                    execute_ci_gates: bool = False,
+                    defer_scheduled: bool = True) -> LocalGates:
     """The half of `run_gates` that needs nothing from a remote: every gate
     not attested by CI (all of them inside CI or under `execute_ci_gates`,
     the split `run_gates` makes). Executed at the commit, before the push;
     `run_gates(..., prior=...)` later adds the CI-attested half without
-    executing these again."""
+    executing these again. This is the hand-off's half, so a gate declaring
+    `attested_by = "schedule"` is recorded deferred here, not executed
+    (0.28.0), unless the caller passes `defer_scheduled=False`."""
     token = run_token()
     records = run_gates(cfg, target_sha, base=base,
                         execute_ci_gates=execute_ci_gates, local_only=True,
-                        token=token)
+                        token=token, defer_scheduled=defer_scheduled)
     return LocalGates(target_sha, token, tuple(records), base)
 
 
@@ -2196,7 +2217,8 @@ def run_gates(cfg: Config, target_sha: str,
               base: str | None = None, execute_ci_gates: bool = False,
               ci_poll_interval: float = CI_POLL_INTERVAL_S, *,
               local_only: bool = False, prior: LocalGates | None = None,
-              token: str | None = None) -> list[dict]:
+              token: str | None = None,
+              defer_scheduled: bool = False) -> list[dict]:
     """Execute the declared gate manifest and return attestations (§5.1).
 
     `base` is the review range's other end (audit of 2026-09-05, finding
@@ -2240,6 +2262,11 @@ def run_gates(cfg: Config, target_sha: str,
     order WITHOUT executing the local half again. `token` is the shared
     retention token. Called with neither, this is the whole manifest in one
     call, as `bin/loupe-gates` and every direct caller always had it.
+
+    `defer_scheduled` (0.28.0) is the hand-off's: a gate declaring
+    `attested_by = "schedule"` is then not executed and gets a deferred
+    record (`SCHEDULE_DEFERRED`). Without it such a gate executes like any
+    other, which is what a scheduled or pre-publication full run needs.
     """
     # Which gates this process executes, and which it waits for. INSIDE CI
     # everything executes: the attestation has to be produced by somebody,
@@ -2251,6 +2278,11 @@ def run_gates(cfg: Config, target_sha: str,
                       if g.get("attested_by") == CI_ATTESTER])
     ci_ids = {g["id"] for g in ci_gates}
     local_gates = [g for g in cfg.gates if g["id"] not in ci_ids]
+    # Deferred gates stay in the local half, so the half recorded before the
+    # push still names every local gate; they are recorded, never executed.
+    deferred_ids = ({g["id"] for g in local_gates
+                     if g.get("attested_by") == SCHEDULE_ATTESTER}
+                    if defer_scheduled else set())
     if prior is not None:
         # The pre-run half must be THIS commit's and THIS manifest's local
         # half, or the envelope would carry evidence about something else.
@@ -2406,14 +2438,22 @@ def run_gates(cfg: Config, target_sha: str,
         return _await_ci(cfg, wait, target_sha, run,
                          interval=ci_poll_interval, timeout=ci_timeout)
 
-    workers = max(1, min(workers, len(local_gates) or 1))
-    if workers == 1 or not local_gates:
+    for gate in local_gates:
+        if gate["id"] in deferred_ids:
+            records[gate["id"]] = {"id": gate["id"],
+                                   "blocking": gate.get("blocking", False),
+                                   "attested_by": SCHEDULE_ATTESTER,
+                                   "deferred": SCHEDULE_DEFERRED}
+    executed = [g for g in local_gates if g["id"] not in deferred_ids]
+
+    workers = max(1, min(workers, len(executed) or 1))
+    if workers == 1 or not executed:
         # The sequential path waits for CI FIRST: a poll that spends its
         # timeout is the long pole either way, and doing it up front keeps
         # the two halves in one obvious order for whoever is debugging.
         if wait:
             records.update(wait_for_ci())
-        for gate in local_gates:
+        for gate in executed:
             records[gate["id"]] = run_one(gate)
     else:
         # The CI wait rides in the pool beside the local gates rather than
@@ -2425,7 +2465,7 @@ def run_gates(cfg: Config, target_sha: str,
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=workers + (1 if wait else 0)) as pool:
             waiting = pool.submit(wait_for_ci) if wait else None
-            for rec in pool.map(run_one, local_gates):
+            for rec in pool.map(run_one, executed):
                 records[rec["id"]] = rec
             if waiting is not None:
                 records.update(waiting.result())
@@ -3458,7 +3498,8 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
         changed = "  (none — every changed path is generated by declaration)"
     # `local_gates`: the half the hand-off ran before its push (0.25.0) —
     # carried, never re-run; only the CI-attested half is awaited here.
-    attestations = run_gates(cfg, head, base=base, prior=local_gates)
+    attestations = run_gates(cfg, head, base=base, prior=local_gates,
+                             defer_scheduled=True)
     ev_cap = _attestation_block(cfg.wrapper_tag, attestations)
     ev_not = "\n".join(f"  - {x}" for x in claim.get("evidence_not_captured", []))
     stops = "\n".join(f"  - {x}" for x in claim.get("stop_conditions", []))

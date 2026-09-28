@@ -681,11 +681,16 @@ def _check_value(section: str, key: str, value, errors: list) -> None:
 GATE_KEYS = ("id", "command", "blocking", "attested_by")
 
 #: The admitted executors of a declared gate. The tool runs it, or CI is
-#: asked what it concluded — and nothing else, BY NAME. A value outside this
-#: set is refused rather than treated as "not ci, so run it locally": that
-#: fallback would turn a typo into a silently stronger local loop, which is
-#: the shape of defect this repository refuses everywhere else.
-GATE_ATTESTERS = ("ci",)
+#: asked what it concluded, or (0.28.0) the gate is attested by a scheduled
+#: full-manifest run and before publication, and a hand-off records it
+#: deferred instead of running it — and nothing else, BY NAME. A value
+#: outside this set is refused rather than treated as "not ci, so run it
+#: locally": that fallback would turn a typo into a silently stronger local
+#: loop, which is the shape of defect this repository refuses everywhere
+#: else. `schedule` is a declaration a hand-off cannot verify: the deferred
+#: record says so to the reviewer, and every runner other than a hand-off
+#: still executes the gate.
+GATE_ATTESTERS = ("ci", "schedule")
 
 
 def _check_gates(rows, errors: list) -> bool:
@@ -738,7 +743,7 @@ def _check_gates(rows, errors: list) -> bool:
             if not isinstance(attester, str) or attester not in GATE_ATTESTERS:
                 errors.append(
                     f"{at} `attested_by` is {attester!r}, which names no "
-                    f"admitted attester: the only value is "
+                    f"admitted attester: the admitted values are "
                     f"{' or '.join(repr(a) for a in GATE_ATTESTERS)}, and "
                     f"absent means this tool executes the gate itself")
     # Round 5 F2: the rows were judged one at a time, so the SHAPE was closed

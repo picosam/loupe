@@ -139,6 +139,15 @@ attest:
   prove the review base — so a range-sensitive gate (`git diff --check
   "$LOUPE_GATE_BASE" "$LOUPE_GATE_HEAD"` is one) should not be
   CI-attested.
+- **A gate too heavy for every hand-off can be attested by the schedule.**
+  `attested_by = "schedule"` (0.28.0) tells the hand-off not to run the
+  gate: its record says "deferred" with the reason, the reviewer sees it
+  on its own line, and it neither passes nor fails the round. Every other
+  runner still executes it, so the declaration is only true if something
+  runs the whole manifest on a schedule and before each publication. The
+  hand-off does not check that it did. Keep this for gates that re-prove
+  what the hand-off's own gates already cover from another angle (a
+  second run of the suite in an extracted copy, under perturbed limits).
 - **A guard over prose is advisory drift evidence by construction.** No
   lexical check holds a semantic guarantee, so a check over prose reports
   drift and the claims around it narrow to what the check actually owns —

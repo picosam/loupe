@@ -16,6 +16,21 @@ sharing one state directory, which no in-memory fixture reproduces. The one
 exception is stated where it is made and is about pausing, not about the
 lock. Self-skips where filesystem writes are denied.
 
+**Start states, built once and copied.** Most tests here begin AFTER one or
+two handoffs — two reviews open, of two commits or of one, on one carrier or
+another — and those handoffs are where most of this module's process
+launches went, because every test ran its own. A test now names the state
+it starts from (`starts_from`): the layered repository, then a recipe of
+steps (`_STEPS`) — a handoff or any other verb through the same in-process
+CLI entry a test body uses, or a plain git edit. Each state is built once
+per test process and COPIED into every test that starts from it; no test
+ever writes to the state itself. A step
+records what it did and asserts nothing: the tests that start from a state
+assert every exit and record they rely on, so a mutation that breaks a
+setup handoff fails those tests by name. What still runs inside a test is
+the verb under test — and every handoff whose interleaving IS the subject
+(the overlaps, the reservation hooks, an amend, a re-emission).
+
 THE DOMAIN THIS MODULE CLOSES
 =============================
 
@@ -152,11 +167,15 @@ second source read, is falsified in `test_transport_topology` and
 `test_worktree_and_brief`, where the stdin carriers live.
 """
 
+import atexit
+import copy
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -165,8 +184,8 @@ from unittest import mock
 from review import env_var, transport, vocab, wire
 from review.ledger import AmbiguousLineage, Ledger, render_cross_lineage_md
 from review.tests._transport_fixtures import (
-    CFG, _build_scratch_loop, copy_fixture, fixture_tree, git_out, run_cli,
-    scratch_loop_repo, sh, verdict_text)
+    CFG, _build_scratch_loop, copy_fixture, copy_tree, fixture_tree, git_out,
+    run_cli, scratch_loop_repo, scratch_tmp, sh, verdict_text)
 from review.tests.util import REPO_ROOT
 from review.validate import validate_request
 
@@ -287,6 +306,263 @@ def _worktree_tree(layers):
     return ("concurrent-worktrees", layers), build
 
 
+# ----------------------------------------------------------- start states
+#
+# ONE FIXED PATH PER PROCESS. A handoff writes absolute paths into what it
+# keeps: the request's Diff, Push and Verify lines name the checkout and the
+# bare origin, its ledger line names the state directory, and `take` fetches
+# from the Push line's URL. Rebasing those would change kept bytes under the
+# digest that names them, and leaving them would point every copy at the
+# state it was copied from. So every start state is BUILT at `_live()`,
+# moved aside as a template, and each test's private copy is put back at
+# that same path. unittest runs one test at a time in a process; each test
+# removes its copy at cleanup, and the next copy replaces whatever is left.
+
+#: Process-wide memo: (pausing, layers, steps) -> (template dir, facts).
+_STARTS: dict = {}
+_STARTS_PARENT: list = []
+
+
+def _starts_parent(case) -> Path:
+    """One directory per test process for the templates and the live copy,
+    removed when the process exits — or a skip where writes are denied."""
+    if not _STARTS_PARENT:
+        try:
+            parent = Path(tempfile.mkdtemp(prefix="concurrent-starts-"))
+        except OSError as exc:
+            case.skipTest(f"filesystem writes denied ({exc})")
+        atexit.register(shutil.rmtree, parent, ignore_errors=True)
+        _STARTS_PARENT.append(parent)
+    return _STARTS_PARENT[0]
+
+
+def _live(case) -> Path:
+    """The one path every start state is built at and every copy lives at."""
+    return _starts_parent(case) / "live"
+
+
+def _declare_pausing_gate(repo: Path, gates: Path) -> None:
+    """Append the gate to review.toml and COMMIT it — the manifest that runs
+    is the target commit's, never this checkout's working copy."""
+    toml = repo / "review.toml"
+    toml.write_text(
+        toml.read_text(encoding="utf-8")
+        + _GATE_BLOCK.format(script=_GATE_SCRIPT.format(gate_dir=gates)),
+        encoding="utf-8")
+    sh("git", "-C", str(repo), "commit", "-qam", "the controllable gate")
+
+
+def _base_tree(live: Path, layers, pausing: bool) -> dict:
+    """The layered repository at `live`, plus the claim every handoff files.
+
+    Without a pausing gate it is `_worktree_tree(layers)`, copied and
+    rebased. With one, the gate is committed BEFORE the layers run, so the
+    second worktree branches from a commit that carries it; its script names
+    `live/gates`, which is every copy's gate directory."""
+    if pausing:
+        facts = {"base": copy_fixture("scratch_loop_repo",
+                                      _build_scratch_loop, live / "repo")}
+        (live / "gates").mkdir()
+        _declare_pausing_gate(live / "repo", live / "gates")
+        for name in layers:
+            _LAYERS[name](live, facts)
+    else:
+        facts = dict(copy_fixture(*_worktree_tree(layers), live))
+    (live / "claim.json").write_text(json.dumps({
+        "objective": "collision",
+        "references": [{"path": "review.toml", "required": True}]}),
+        encoding="utf-8")
+    return facts
+
+
+def _cli_at(live: Path, where: str, *argv, scrub_gate_run=False):
+    """One in-process CLI call from checkout `where` on the start's ledger.
+
+    `scrub_gate_run` is `_TwoWorktrees._handoff`'s scrub, for the same
+    reason: the suite may itself run inside a gate, and a handoff inheriting
+    the marker would have its gates marked "not run" and be refused."""
+    with mock.patch.dict(os.environ):
+        if scrub_gate_run:
+            os.environ.pop(env_var("IN_GATE_RUN"), None)
+        return run_cli(live / where, live / "state", *argv, cwd=os.getcwd())
+
+
+def _step_handoff(live, facts, name, where, *extra):
+    """`handoff` from `where`; its (exit, record) is `facts[name]`."""
+    facts[name] = _cli_at(live, where, "handoff", "--claim-file",
+                          str(live / "claim.json"), "--base", facts["base"],
+                          *extra, scrub_gate_run=True)
+
+
+def _step_cli(live, facts, name, where, *argv):
+    """Any other verb from `where`; its (exit, payload) is `facts[name]`."""
+    facts[name] = _cli_at(live, where, *argv)
+
+
+def _step_layer(live, facts, name):
+    """A `_LAYERS` entry applied after handoffs, e.g. a bare origin."""
+    _LAYERS[name](live, facts)
+
+
+def _step_commit(live, facts, where, text, message, push=None):
+    """Rewrite `f.txt` in `where` and commit it, pushing `push` if named."""
+    (live / where / "f.txt").write_text(text, encoding="utf-8")
+    sh("git", "-C", str(live / where), "commit", "-qam", message)
+    if push:
+        sh("git", "-C", str(live / where), "push", "-q", "origin", push)
+
+
+def _step_cap_of_one(live, facts):
+    """Commit `round_cap = 1` into the manifest the reviews are judged by,
+    so round 2 is past the cap and the notice is observable.
+
+    The commit moves `main`; the fixture's whole point is ONE commit under
+    two reviews, so the second branch follows it and the shared SHA is
+    re-read rather than remembered."""
+    repo = live / "repo"
+    toml = repo / "review.toml"
+    text = toml.read_text(encoding="utf-8")
+    if re.search(r"^round_cap\s*=.*$", text, re.M):
+        text = re.sub(r"^round_cap\s*=.*$", "round_cap = 1", text,
+                      count=1, flags=re.M)
+    elif "[limits]" in text:
+        text = text.replace("[limits]", "[limits]\nround_cap = 1", 1)
+    else:
+        text += "\n[limits]\nround_cap = 1\n"
+    toml.write_text(text, encoding="utf-8")
+    sh("git", "-C", str(repo), "commit", "-qam", "a cap of one")
+    sh("git", "-C", str(live / "same"), "reset", "-q", "--hard", "main")
+    facts["shared"] = git_out(repo, "rev-parse", "HEAD")
+    facts["base"] = git_out(repo, "rev-parse", "HEAD~1")
+
+
+def _step_answer(live, facts, where, name):
+    """A verdict recorded and answered in the ONE review `facts[name]`
+    opened, so that review may open a round 2: `facts[name + ":close"]` and
+    `facts[name + ":respond"]` are the two (exit, record) pairs."""
+    record = facts[name][1]
+    lineage = record.get("lineage") if isinstance(record, dict) else None
+    verdict = live / f"v-{lineage}.md"
+    verdict.write_text(verdict_text(sha=facts["shared"]), encoding="utf-8")
+    facts[f"{name}:close"] = _cli_at(live, where, "close", "--verdict",
+                                     str(verdict))
+    dispositions = live / f"d-{lineage}.json"
+    dispositions.write_text(json.dumps({
+        "head": facts["shared"],
+        "dispositions": [{
+            "finding_id": "F1", "disposition": "accepted",
+            "payload": {"change": "fixed", "verification": "the test",
+                        "falsification": {"status": "pass",
+                                          "mutation": "fails_without_fix"}}}]}),
+        encoding="utf-8")
+    facts[f"{name}:respond"] = _cli_at(
+        live, where, "respond", "--verdict", str(verdict), "--from-json",
+        str(dispositions), "--out", str(live / f"disposition-{lineage}.md"))
+
+
+def _step_round_two(live, facts):
+    """One new commit that both `same` and `main` point at."""
+    _step_commit(live, facts, "same", "round two\n", "round two")
+    sh("git", "-C", str(live / "repo"), "merge", "-q", "--ff-only", "same")
+    facts["shared"] = git_out(live / "repo", "rev-parse", "HEAD")
+
+
+_STEPS = {"handoff": _step_handoff, "cli": _step_cli, "layer": _step_layer,
+          "commit": _step_commit, "cap-of-one": _step_cap_of_one,
+          "answer": _step_answer, "round-two": _step_round_two}
+
+
+def _start(case, pausing: bool, layers, steps):
+    """The template for this start state, built at `_live()` the first time
+    this process asks for it — from the template of its own prefix, so
+    states that share leading steps share their build — and returned as
+    (template dir, facts). The template is never handed to a test."""
+    key = (bool(pausing), tuple(layers), tuple(steps))
+    if key not in _STARTS:
+        prefix = _start(case, pausing, layers, steps[:-1]) if steps else None
+        live = _live(case)
+        shutil.rmtree(live, ignore_errors=True)
+        live.mkdir()
+        if prefix is None:
+            facts = _base_tree(live, layers, pausing)
+        else:
+            copy_tree(prefix[0], live)
+            facts = copy.deepcopy(prefix[1])
+            name, *args = steps[-1]
+            _STEPS[name](live, facts, *args)
+        template = _starts_parent(case) / f"start-{len(_STARTS)}"
+        live.rename(template)
+        _STARTS[key] = (template, facts)
+    return _STARTS[key]
+
+
+def starts_from(steps):
+    """Mark one test with the start state it begins from, overriding its
+    class's `START`. `None` is no repository at all: a state directory."""
+    def mark(test):
+        test.start = steps
+        return test
+    return mark
+
+
+LOCAL = ("--local-only",)
+GIT = ("--transport", "git")
+PASTE = ("--transport", "paste")
+
+#: One review, opened from `main`.
+MAIN_OPENED = (("handoff", "first", "repo", *LOCAL),)
+#: ...and a second from the other branch, at its own commit.
+TWO_BRANCHES = MAIN_OPENED + (("handoff", "second", "other", *LOCAL),)
+#: ...or a second from `same`, at main's commit: one commit, two reviews.
+ONE_COMMIT = MAIN_OPENED + (("handoff", "second", "same", *LOCAL),)
+#: The same two reviews of one commit, `same` arriving first.
+ONE_COMMIT_REVERSED = (("handoff", "first", "same", *LOCAL),
+                       ("handoff", "second", "repo", *LOCAL))
+#: Two reviews of one commit on the `git` carrier, and on `paste`: a bare
+#: remote first, because a declared cross-machine round may not bind an
+#: unfetchable SHA.
+ONE_COMMIT_GIT = (("layer", "origin"), ("handoff", "first", "repo", *GIT),
+                  ("handoff", "second", "same", *GIT))
+ONE_COMMIT_PASTE = (("layer", "origin"),
+                    ("handoff", "first", "repo", *PASTE),
+                    ("handoff", "second", "same", *PASTE))
+#: Two branches' reviews on the `git` carrier (layers other, origin).
+TWO_BRANCHES_GIT = (("handoff", "first", "repo", *GIT),
+                    ("handoff", "second", "other", *GIT))
+#: Round 1 answered in BOTH reviews of one commit under a committed cap of
+#: one, one new commit both branches point at, a round-2 request emitted in
+#: each, and the cap raised for `same`'s review only.
+ROUND_TWO_CAPPED = (
+    (("cap-of-one",),) + ONE_COMMIT
+    + (("answer", "repo", "first"), ("answer", "same", "second"),
+       ("round-two",),
+       ("handoff", "b_two", "same", *LOCAL),
+       ("handoff", "a_two", "repo", *LOCAL),
+       ("cli", "raised", "same", "ledger", "authorize-cap", "--to", "2",
+        "--reason", "the falsification's own scenario", "--by", "a person")))
+#: Two branches' reviews on the default carrier, both branches pushed
+#: (layers other, origin, push-other) — and the same on `paste` and `git`.
+INGRESS = (("handoff", "first", "repo"), ("handoff", "second", "other"))
+INGRESS_PASTE = (("handoff", "first", "repo", *PASTE),
+                 ("handoff", "second", "other", *PASTE))
+INGRESS_GIT = (("handoff", "first", "repo", *GIT),
+               ("handoff", "second", "other", *GIT))
+#: ...then a second emission of `main`'s review at a new, pushed tip.
+INGRESS_AGAIN = INGRESS + (("commit", "repo", "four\n", "more", "main"),
+                           ("handoff", "again", "repo"))
+#: ...or `main`'s review closed on the AUTHOR's side and a second review
+#: opened from `main`, two rounds of it at two new pushed tips (`third`,
+#: `fourth`). A reviewer who takes `first` and `third` and never learns of
+#: the close holds two open reviews recorded on one author branch.
+INGRESS_REOPENED = INGRESS + (
+    ("cli", "closed", "repo", "close", "--lineage", "--reason",
+     "superseded by a new review of main", "--by", "a person"),
+    ("commit", "repo", "four\n", "more", "main"),
+    ("handoff", "third", "repo"),
+    ("commit", "repo", "five\n", "again", "main"),
+    ("handoff", "fourth", "repo"))
+
+
 class _TwoWorktrees(unittest.TestCase):
     """One repository, two branch checkouts, ONE ledger.
 
@@ -295,54 +571,62 @@ class _TwoWorktrees(unittest.TestCase):
     back to the main checkout, so both resolve to the same id and the same
     ledger file. `--ledger-dir` makes that literal here rather than relying
     on the machine's real state directory.
+
+    Each test gets a private copy of its START STATE (see the module
+    docstring and `_start`): the layers, then the steps it names.
     """
 
     PREFIX = "concurrent-"
     #: Declare the controllable gate in the committed manifest. Off by
     #: default: the sequential classes want no gate at all, and the gate is
-    #: committed BEFORE the second worktree branches so both carry it.
+    #: committed BEFORE the second worktree branches so both carry it. Its
+    #: script names `<live>/gates`, which is every copy's gate directory, so
+    #: a pausing tree is a start state like any other.
     PAUSING_GATE = False
     #: What the fixture builds over the scratch repository, in order (see
     #: `_LAYERS`): the second worktree always, then what a class adds —
     #: a bare origin, the second branch pushed, a third checkout at main.
-    #: Without a pausing gate the whole tree is a template copied per test;
-    #: the pausing gate's committed script names this test's own gate
-    #: directory, so a class that declares it builds its tree per test,
-    #: through the same layers.
     LAYERS = ("other",)
+    #: The steps a test starts from after the layers (`_STEPS`); a test
+    #: overrides it with `starts_from`. `None`: no repository, a state
+    #: directory only — for the tests that read and write a ledger directly.
+    START = ()
 
     def setUp(self):
-        tree = None if self.PAUSING_GATE else _worktree_tree(self.LAYERS)
-        scratch = scratch_loop_repo(self, self.PREFIX, objective="collision",
-                                    tree=tree)
-        self.tmp, self.repo = scratch.tmp, scratch.repo
-        self.base, self.claim = scratch.base, scratch.claim
-        self.cwd = scratch.cwd
-        self.state = self.tmp / "state"
-        self.gates = self.tmp / "gates"
-        if self.PAUSING_GATE:
-            self.gates.mkdir()
-            self._declare_pausing_gate()
-            for name in self.LAYERS:
-                _LAYERS[name](self.tmp, scratch.facts)
-        self.other = self.tmp / "other"
-        if "origin" in self.LAYERS:
-            self.bare = self.tmp / "origin.git"
+        start = getattr(getattr(self, self._testMethodName), "start",
+                        self.START)
+        if start is None:
+            self.tmp = scratch_tmp(self, self.PREFIX)
+            self.state = self.tmp / "state"
+            return
+        template, facts = _start(self, self.PAUSING_GATE, self.LAYERS, start)
+        live = _live(self)
+        shutil.rmtree(live, ignore_errors=True)
+        copy_tree(template, live)
+        self.addCleanup(lambda: shutil.rmtree(live, ignore_errors=True))
+        self.cwd = os.getcwd()
+        self.addCleanup(os.chdir, self.cwd)
+        #: This test's own copy of what the start recorded.
+        self.facts = copy.deepcopy(facts)
+        self.tmp, self.repo = live, live / "repo"
+        self.base, self.claim = self.facts["base"], live / "claim.json"
+        self.state = live / "state"
+        self.gates = live / "gates"
+        self.other = live / "other"
         if "same" in self.LAYERS:
-            self.same = self.tmp / "same"
-            self.shared = scratch.facts["shared"]
+            self.same = live / "same"
+            self.shared = self.facts["shared"]
 
-    def _declare_pausing_gate(self):
-        """Append the gate to review.toml and COMMIT it — the manifest that
-        runs is the target commit's, never this checkout's working copy."""
-        toml = self.repo / "review.toml"
-        toml.write_text(
-            toml.read_text(encoding="utf-8")
-            + _GATE_BLOCK.format(
-                script=_GATE_SCRIPT.format(gate_dir=self.gates)),
-            encoding="utf-8")
-        sh("git", "-C", str(self.repo), "commit", "-qam",
-           "the controllable gate")
+    def _started(self, *names):
+        """The records of the start's handoffs (or other steps) `names`,
+        each asserted to have exited 0 — the assertion every test made on
+        the handoffs it used to run itself."""
+        records = []
+        for name in names:
+            code, record = self.facts[name]
+            self.assertEqual(code, 0, record)
+            records.append(record)
+        return records[0] if len(records) == 1 else records
 
     # Both checkouts, one state directory: that is the whole fixture.
     def _in_main(self, *argv):
@@ -453,15 +737,16 @@ class TestTwoWorktreesOpenTwoLineages(_TwoWorktrees):
     swallowed the other's request, and a `brief` that returned the other
     worktree's round. All three are now the ordinary, correct outcome of two
     reviews running beside each other.
+
+    Every test starts from both handoffs made (`TWO_BRANCHES`), except the
+    two that are about one review.
     """
 
     PREFIX = "keyed-emit-"
+    START = TWO_BRANCHES
 
     def test_both_handoffs_succeed_with_distinct_lineage_ids(self):
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_other, "--local-only")
-        self.assertEqual(code, 0, second)
+        first, second = self._started("first", "second")
         # Two reviews, each at its own round 1 — and two IDS, not one
         # position in a file.
         self.assertEqual(first["round"], 1)
@@ -481,10 +766,7 @@ class TestTwoWorktreesOpenTwoLineages(_TwoWorktrees):
         """Destruction 2, inverted. A clean verdict closes ITS lineage; the
         other worktree's request is untouched, unruled by nobody, and still
         the round its own `brief` reports."""
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_other, "--local-only")
-        self.assertEqual(code, 0, second)
+        first, second = self._started("first", "second")
         code, closed = self._in_main(
             "close", "--verdict",
             self._verdict_file(first["sha"], name="clean.md",
@@ -513,10 +795,7 @@ class TestTwoWorktreesOpenTwoLineages(_TwoWorktrees):
         It now returns A's, and NAMES B's — id, branch, round and state — so
         a reader is not left believing theirs is the only review live.
         """
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_other, "--local-only")
-        self.assertEqual(code, 0, second)
+        first, second = self._started("first", "second")
         for where, mine, theirs, branch in (
                 (self._in_main, first, second, "other"),
                 (self._in_other, second, first, "main")):
@@ -531,19 +810,19 @@ class TestTwoWorktreesOpenTwoLineages(_TwoWorktrees):
             self.assertEqual(other["round"], 1)
             self.assertEqual(other["state"], "awaiting a verdict")
 
+    @starts_from(MAIN_OPENED)
     def test_one_open_lineage_names_no_other(self):
         """The paired control: with one review live, nothing is named."""
-        code, only = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, only)
+        self._started("first")
         code, briefed = self._in_main("brief")
         self.assertEqual(code, 0, briefed)
         self.assertEqual(briefed["open_lineages"], [])
 
+    @starts_from(MAIN_OPENED)
     def test_amend_and_re_emit_still_supersedes_within_one_lineage(self):
         """The flow that makes SHA useless as an axis, unchanged: it stays
         in ITS lineage rather than opening a second one."""
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
+        first = self._started("first")
         sh("git", "-C", str(self.repo), "commit", "--amend", "-q", "-m",
            "change, amended")
         amended = git_out(self.repo, "rev-parse", "HEAD")
@@ -561,10 +840,7 @@ class TestTwoWorktreesOpenTwoLineages(_TwoWorktrees):
 
     def test_the_report_aggregate_lists_both_open_lineages(self):
         """The repository aggregate ruled 2026-09-06: a FACT, no breaker."""
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_other, "--local-only")
-        self.assertEqual(code, 0, second)
+        first, second = self._started("first", "second")
         report = json.loads(
             subprocess.run(
                 [sys.executable, "-m", "review", "--ledger-dir",
@@ -596,15 +872,13 @@ class TestTheGitCarrierKeepsBothEnvelopes(_TwoWorktrees):
 
     PREFIX = "keyed-git-"
     LAYERS = ("other", "origin")
+    START = TWO_BRANCHES_GIT
 
     def _envelope_refs(self):
         return git_out(self.repo, "ls-remote", "origin", "refs/loupe/*")
 
     def test_both_envelopes_survive_on_distinct_refs(self):
-        code, first = self._handoff(self._in_main, "--transport", "git")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_other, "--transport", "git")
-        self.assertEqual(code, 0, second)
+        first, second = self._started("first", "second")
         self.assertNotEqual(first["carrier"]["ref"], second["carrier"]["ref"])
         for rec in (first, second):
             self.assertEqual(
@@ -618,10 +892,7 @@ class TestTheGitCarrierKeepsBothEnvelopes(_TwoWorktrees):
             self.assertIn(f'sha="{rec["sha"]}"', fetched)
 
     def test_closing_one_lineage_leaves_the_others_ref_readable(self):
-        code, first = self._handoff(self._in_main, "--transport", "git")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_other, "--transport", "git")
-        self.assertEqual(code, 0, second)
+        first, second = self._started("first", "second")
         code, closed = self._in_main(
             "close", "--verdict",
             self._verdict_file(first["sha"], name="clean.md",
@@ -632,6 +903,7 @@ class TestTheGitCarrierKeepsBothEnvelopes(_TwoWorktrees):
                                            "request")
         self.assertIn(f'sha="{second["sha"]}"', fetched)
 
+    @starts_from(None)
     def test_the_round_reference_carries_the_id(self):
         """One word a person carries, and the id is what makes it unique."""
         self.assertEqual(transport.round_reference("L0a1b2c3d4e", 3),
@@ -656,7 +928,9 @@ class TestTheReservationExcludesOneLineageAndNotTheOther(_TwoWorktrees):
     share no ref, no round number and no terminal marker.
 
     Two SEPARATE CLI processes, because that is what the defect is made of,
-    and a gate the test controls, because the gates are the interval.
+    and a gate the test controls, because the gates are the interval. The
+    rows about the locks themselves (their names, and `fcntl`'s absence)
+    need no repository and start from a state directory alone.
     """
 
     PREFIX = "keyed-overlap-"
@@ -743,6 +1017,7 @@ class TestTheReservationExcludesOneLineageAndNotTheOther(_TwoWorktrees):
         self.assertEqual([c["lineage"] for c in closures],
                          [theirs["lineage"]])
 
+    @starts_from(None)
     def test_without_flock_admission_is_refused_rather_than_unguarded(self):
         """The platform guard, unchanged: where `fcntl` is absent the
         reservation cannot be taken and the tool refuses admission naming
@@ -756,6 +1031,7 @@ class TestTheReservationExcludesOneLineageAndNotTheOther(_TwoWorktrees):
         self.assertIn("fcntl", str(caught.exception))
         self.assertTrue(caught.exception.remedy)
 
+    @starts_from(None)
     def test_the_lock_files_are_named_by_lineage(self):
         """Two names, which is what makes the exclusion per review."""
         led = Ledger(self.state)
@@ -766,6 +1042,7 @@ class TestTheReservationExcludesOneLineageAndNotTheOther(_TwoWorktrees):
         self.assertNotEqual(one.path, two.path)
         self.assertEqual(one.path.name, "lineage-L0a1b2c3d4e.lock")
 
+    @starts_from(None)
     def test_the_opening_lock_is_named_by_branch(self):
         """The lineage that has no id yet is reserved by BRANCH: a slug a
         person can read, and a digest so two branch names never collapse
@@ -780,6 +1057,7 @@ class TestTheReservationExcludesOneLineageAndNotTheOther(_TwoWorktrees):
             transport.NewLineageReservation(led, branch="HEAD").path.name,
             "lineage-new.lock")
 
+    @starts_from(None)
     def test_two_openers_on_one_branch_cannot_mint_two_lineages(self):
         """An id that does not exist yet cannot be locked by id, so the
         assignment and the admission after it are one critical section —
@@ -798,6 +1076,7 @@ class TestTheReservationExcludesOneLineageAndNotTheOther(_TwoWorktrees):
         first.release()
         second.acquire().release()          # free again: no stale state
 
+    @starts_from(None)
     def test_two_openers_on_two_branches_exclude_nothing(self):
         """The counterpart, and the reason the opening lock is not
         repository-wide: two branches opening two reviews share no id, no
@@ -817,10 +1096,11 @@ class TestALegacyLedgerReadsAsItDidBeforeKeying(_TwoWorktrees):
 
     In-process over a real ledger file: these are reads, and the events are
     written the way a pre-0.20.0 installation wrote them — with no `lineage`
-    field at all.
+    field at all. No repository: a state directory is the whole fixture.
     """
 
     PREFIX = "keyed-legacy-"
+    START = None
 
     def _legacy(self, closures=2):
         """A ledger with `closures` closed lineages and one open, none of
@@ -940,10 +1220,12 @@ class TestTheCrossLineageNotice(_TwoWorktrees):
     the notice adds is that a reader is told the other review exists, with
     its id, round and disposition. Paired controls throughout: the notice
     appears when the identity is live elsewhere and disappears when it is
-    not, when the other lineage is closed, and when there is no other.
+    not, when the other lineage is closed, and when there is no other. No
+    repository: a ledger file in a state directory is the whole fixture.
     """
 
     PREFIX = "keyed-notice-"
+    START = None
 
     FP = "fp2:" + "a" * 16
 
@@ -1048,13 +1330,13 @@ class TestBriefNamesTheDiscardedRound(_TwoWorktrees):
     """
 
     PREFIX = "keyed-discarded-"
+    START = MAIN_OPENED
 
     def _discarded(self):
         """The pre-keying state, built the only way it can now be reached:
         two rounds in ONE lineage, and a close that rules one of them with
         the unruled-request guard disabled."""
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
+        first = self._started("first")
         sh("git", "-C", str(self.repo), "commit", "--amend", "-q", "-m",
            "a second emission at a second sha")
         code, second = self._handoff(self._in_main, "--local-only")
@@ -1079,8 +1361,7 @@ class TestBriefNamesTheDiscardedRound(_TwoWorktrees):
 
     def test_an_ordinary_closed_lineage_still_reads_as_it_did(self):
         """The control: nothing was discarded, so nothing is claimed."""
-        code, opened = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, opened)
+        opened = self._started("first")
         code, closed = self._in_main(
             "close", "--verdict",
             self._verdict_file(opened["sha"], name="clean.md",
@@ -1102,27 +1383,21 @@ class _SameCommitWorktrees(_TwoWorktrees):
     branch and a feature branch at one tip, a re-review of an unchanged tip
     under a different claim. The SHA then names two reviews and cannot, by
     itself, name either.
+
+    A test starts from both reviews of the one commit opened, `main` first
+    (`ONE_COMMIT`), unless it names another start state.
     """
 
     LAYERS = ("other", "same")
+    START = ONE_COMMIT
 
     def _in_same(self, *argv):
         return run_cli(self.same, self.state, *argv, cwd=self.cwd)
 
-    def _origin(self):
-        """A bare remote: the `git` carrier pushes envelopes to it, and a
-        declared cross-machine round may not bind an unfetchable SHA."""
-        bare = self.tmp / "origin.git"
-        sh("git", "init", "-q", "--bare", "-b", "main", str(bare))
-        sh("git", "-C", str(self.repo), "remote", "add", "origin", str(bare))
-        sh("git", "-C", str(self.repo), "push", "-q", "-u", "origin", "main")
-
-    def _two_reviews(self, first_where, second_where):
-        """Two handoffs of the SAME commit, in the given arrival order."""
-        code, first = self._handoff(first_where, "--local-only")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(second_where, "--local-only")
-        self.assertEqual(code, 0, second)
+    def _two_reviews(self):
+        """The start's two handoffs of the SAME commit, in its arrival
+        order: both admitted, one SHA, two lineages."""
+        first, second = self._started("first", "second")
         self.assertEqual(first["sha"], second["sha"])
         self.assertNotEqual(first["lineage"], second["lineage"])
         return first, second
@@ -1159,19 +1434,18 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
                          {first["lineage"], second["lineage"]})
 
     def test_main_first_opens_two_reviews_of_one_commit(self):
-        self._two_requests_of_one_commit(
-            *self._two_reviews(self._in_main, self._in_same))
+        self._two_requests_of_one_commit(*self._two_reviews())
 
+    @starts_from(ONE_COMMIT_REVERSED)
     def test_the_other_arrival_order_opens_two_reviews_as_well(self):
         """Insertion order reversed: the second review recorded is not the
         one an event-order resolver would pick for either verb."""
-        self._two_requests_of_one_commit(
-            *self._two_reviews(self._in_same, self._in_main))
+        self._two_requests_of_one_commit(*self._two_reviews())
 
     def test_a_close_appends_its_closure_to_its_own_review(self):
         """The exact incident: a clean close from `main` landed in the other
         branch's lineage."""
-        first, second = self._two_reviews(self._in_main, self._in_same)
+        first, second = self._two_reviews()
         code, closed = self._in_main(
             "close", "--verdict",
             self._verdict_file(self.shared, name="clean.md",
@@ -1190,7 +1464,7 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
     def test_the_other_branch_closes_its_own_review_afterwards(self):
         """Reversed insertion order for the CLOSE: whichever rules first,
         the second still has a review to close."""
-        first, second = self._two_reviews(self._in_main, self._in_same)
+        first, second = self._two_reviews()
         code, closed = self._in_same(
             "close", "--verdict",
             self._verdict_file(self.shared, name="clean-same.md",
@@ -1210,7 +1484,7 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
     def test_brief_without_a_source_finds_its_own_retained_bytes(self):
         """"round 1 is open but its bytes were not kept" — about a file that
         was there, in the other review's directory."""
-        first, second = self._two_reviews(self._in_main, self._in_same)
+        first, second = self._two_reviews()
         for where, mine in ((self._in_main, first), (self._in_same, second)):
             code, briefed = where("brief")
             self.assertEqual(code, 0, briefed)
@@ -1219,22 +1493,19 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
             self.assertIn(f"lineage-{mine['lineage']}", mine["kept"])
 
     def test_brief_with_a_source_stays_in_the_review_it_was_run_from(self):
-        first, second = self._two_reviews(self._in_main, self._in_same)
+        first, second = self._two_reviews()
         for where, mine in ((self._in_main, first), (self._in_same, second)):
             code, briefed = where("brief", mine["kept"])
             self.assertEqual(code, 0, briefed)
             self.assertEqual(briefed["lineage"], mine["lineage"])
 
+    @starts_from(ONE_COMMIT_GIT)
     def test_validate_publishes_the_verdict_to_its_own_reviews_ref(self):
         """The verdict PUBLICATION boundary: `validate --from-target` is the
         one place a ruling is pushed, and the ref it goes to is keyed on the
         lineage. Choosing by event order put both branches' verdicts on one
         review's ref."""
-        self._origin()
-        code, first = self._handoff(self._in_main, "--transport", "git")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_same, "--transport", "git")
-        self.assertEqual(code, 0, second)
+        first, second = self._started("first", "second")
         self.assertNotEqual(first["lineage"], second["lineage"])
         for where, mine in ((self._in_main, first), (self._in_same, second)):
             code, validated = where(
@@ -1248,7 +1519,7 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
             self.assertIn(f"refs/loupe/{mine['lineage']}/1/verdict", refs)
 
     def test_respond_answers_the_verdict_of_its_own_review(self):
-        first, second = self._two_reviews(self._in_main, self._in_same)
+        first, second = self._two_reviews()
         verdict = self._verdict_file(self.shared, name="v.md")
         code, closed = self._in_same("close", "--verdict", verdict)
         self.assertEqual(code, 0, closed)
@@ -1274,21 +1545,22 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
         return str(path)
 
     def test_brief_of_the_other_reviews_request_names_that_review(self):
-        first, second = self._two_reviews(self._in_main, self._in_same)
+        first, second = self._two_reviews()
         code, briefed = self._in_main("brief", second["kept"])
         self.assertEqual(code, 0, briefed)
         self.assertEqual(briefed["lineage"], second["lineage"])
         self.assertIn(second["kept"], briefed["relay"])
         self.assertNotIn(first["kept"], briefed["relay"])
 
+    @starts_from(ONE_COMMIT_REVERSED)
     def test_the_other_arrival_order_briefs_the_stamped_review_too(self):
-        first, second = self._two_reviews(self._in_same, self._in_main)
+        first, second = self._two_reviews()
         code, briefed = self._in_same("brief", second["kept"])
         self.assertEqual(code, 0, briefed)
         self.assertEqual(briefed["lineage"], second["lineage"])
 
     def test_brief_on_stdin_carries_the_stamp_as_a_path_does(self):
-        first, second = self._two_reviews(self._in_main, self._in_same)
+        first, second = self._two_reviews()
         proc = subprocess.Popen(
             [sys.executable, "-m", "review", "--ledger-dir", str(self.state),
              "brief", "-"],
@@ -1301,7 +1573,7 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
         self.assertEqual(json.loads(out)["lineage"], second["lineage"])
 
     def test_ledger_add_of_the_other_reviews_request_records_only_it(self):
-        first, second = self._two_reviews(self._in_main, self._in_same)
+        first, second = self._two_reviews()
         before = len(self._events())
         code, added = self._in_main("ledger", "add", second["kept"])
         if code == 0:
@@ -1313,7 +1585,7 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
             self.assertEqual(len(self._events()), before, added)
 
     def test_a_stamp_naming_no_review_here_refuses_without_writes(self):
-        first, second = self._two_reviews(self._in_main, self._in_same)
+        first, second = self._two_reviews()
         foreign = self._rewrite_stamp(second["kept"], "Lffffffffff")
         before = len(self._events())
         # A READ renders what it is handed and substitutes nothing: the
@@ -1333,14 +1605,11 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
         else:
             self.assertEqual(new, [], added)
 
+    @starts_from(ONE_COMMIT_GIT)
     def test_respond_with_the_other_reviews_reference_answers_it(self):
         """`respond --verdict git:B/1` from A's checkout answers B (round-3
         F1: the test that used to carry this name never invoked respond)."""
-        self._origin()
-        code, first = self._handoff(self._in_main, "--transport", "git")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_same, "--transport", "git")
-        self.assertEqual(code, 0, second)
+        first, second = self._started("first", "second")
         verdict = self._verdict_file(self.shared, name="v-second.md")
         code, validated = self._in_same("validate", verdict, "--from-target")
         self.assertEqual(code, 0, validated)
@@ -1365,71 +1634,27 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
         self.assertEqual({e.get("lineage") for e in recorded},
                          {second["lineage"]})
 
-    def _cap_of_one(self):
-        """Commit `round_cap = 1` into the manifest the reviews are judged
-        by, so round 2 is past the cap and the notice is observable."""
-        toml = self.repo / "review.toml"
-        text = toml.read_text(encoding="utf-8")
-        if re.search(r"^round_cap\s*=.*$", text, re.M):
-            text = re.sub(r"^round_cap\s*=.*$", "round_cap = 1", text,
-                          count=1, flags=re.M)
-        elif "[limits]" in text:
-            text = text.replace("[limits]", "[limits]\nround_cap = 1", 1)
-        else:
-            text += "\n[limits]\nround_cap = 1\n"
-        toml.write_text(text, encoding="utf-8")
-        sh("git", "-C", str(self.repo), "commit", "-qam", "a cap of one")
-        # The commit moved `main`; the fixture's whole point is ONE commit
-        # under two reviews, so the second branch follows it and the shared
-        # SHA is re-read rather than remembered from setUp.
-        sh("git", "-C", str(self.same), "reset", "-q", "--hard", "main")
-        self.shared = git_out(self.repo, "rev-parse", "HEAD")
-        self.base = git_out(self.repo, "rev-parse", "HEAD~1")
-
     def _both_reviews_at_round_two(self):
-        """Round 1 answered in BOTH reviews, then one new commit that both
-        branches point at, and a round-2 request emitted in each.
+        """The start's `ROUND_TWO_CAPPED`: round 1 answered in BOTH reviews
+        (under a committed cap of one), then one new commit that both
+        branches point at, and a round-2 request emitted in each — every
+        exit asserted, as when the test ran them itself.
 
         The SHA must be under both reviews or the finding is unreachable:
         with a commit only one review has recorded, `recorded_lineage_for_sha`
         answers correctly from the SHA alone and nothing the invocation
         carries is ever consulted.
         """
-        first, second = self._two_reviews(self._in_main, self._in_same)
-        self._answer_round_one(self._in_main, first["lineage"])
-        self._answer_round_one(self._in_same, second["lineage"])
-        (self.same / "f.txt").write_text("round two\n", encoding="utf-8")
-        sh("git", "-C", str(self.same), "commit", "-qam", "round two")
-        sh("git", "-C", str(self.repo), "merge", "-q", "--ff-only", "same")
-        self.shared = git_out(self.repo, "rev-parse", "HEAD")
-        code, b_two = self._handoff(self._in_same, "--local-only")
-        self.assertEqual(code, 0, b_two)
-        code, a_two = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, a_two)
+        first, second = self._two_reviews()
+        self._started("first:close", "first:respond",
+                      "second:close", "second:respond")
+        b_two, a_two = self._started("b_two", "a_two")
         self.assertEqual(a_two["round"], 2, a_two)
         self.assertEqual(b_two["round"], 2, b_two)
+        self.assertEqual(a_two["sha"], self.shared, a_two)
         return first, second, a_two, b_two
 
-    def _answer_round_one(self, where, lineage):
-        """A verdict recorded and answered in ONE review, so that review may
-        open a round 2."""
-        verdict = self._verdict_file(self.shared, name=f"v-{lineage}.md")
-        code, closed = where("close", "--verdict", verdict)
-        self.assertEqual(code, 0, closed)
-        dispositions = self.tmp / f"d-{lineage}.json"
-        dispositions.write_text(json.dumps({
-            "head": self.shared,
-            "dispositions": [{
-                "finding_id": "F1", "disposition": "accepted",
-                "payload": {"change": "fixed", "verification": "the test",
-                            "falsification": {"status": "pass",
-                                              "mutation": "fails_without_fix"}}}]}),
-            encoding="utf-8")
-        code, responded = where(
-            "respond", "--verdict", verdict, "--from-json", str(dispositions),
-            "--out", str(self.tmp / f"disposition-{lineage}.md"))
-        self.assertEqual(code, 0, responded)
-
+    @starts_from(ROUND_TWO_CAPPED)
     def test_validate_judges_a_stamped_request_under_the_review_it_names(self):
         """FALSIFICATION for round-3 F2.
 
@@ -1445,14 +1670,10 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
         B's envelope is judged under A's cap from A's checkout and the
         notice reappears, which is the state it was found in.
         """
-        self._cap_of_one()
         first, second, _a_two, b_two = self._both_reviews_at_round_two()
-        # The human raises the cap for THIS lineage only: B may reach two,
-        # A keeps the cap of one.
-        code, raised = self._in_same(
-            "ledger", "authorize-cap", "--to", "2",
-            "--reason", "the falsification's own scenario", "--by", "a person")
-        self.assertEqual(code, 0, raised)
+        # The human raised the cap for THIS lineage only (the start's last
+        # step, from `same`): B may reach two, A keeps the cap of one.
+        self._started("raised")
 
         code, judged = self._in_main("validate", b_two["kept"])
         self.assertEqual(code, 0, judged)
@@ -1462,25 +1683,22 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
             "B's request was judged against A's cap: the review an envelope "
             "stamps is the one whose limits apply to it")
 
+    @starts_from(ROUND_TWO_CAPPED)
     def test_the_cap_notice_still_reaches_the_review_that_did_not_raise_it(self):
         """The control the falsification needs: R-BUDGET is reachable, and
         reaches an envelope of the review whose cap was NOT raised — same
         checkout, same commit, same round, different stamped review. A fix
         that silenced the notice everywhere would pass the test above and
         fail this one."""
-        self._cap_of_one()
         first, second, a_two, _b_two = self._both_reviews_at_round_two()
-        code, raised = self._in_same(
-            "ledger", "authorize-cap", "--to", "2",
-            "--reason", "the falsification's own scenario", "--by", "a person")
-        self.assertEqual(code, 0, raised)
+        self._started("raised")
         code, judged = self._in_main("validate", a_two["kept"])
         self.assertEqual(code, 0, judged)
         codes = {i["code"] for i in judged.get("items", [])}
         self.assertIn("R-BUDGET", codes, judged)
 
     def test_ledger_add_records_into_the_review_it_was_run_from(self):
-        first, second = self._two_reviews(self._in_main, self._in_same)
+        first, second = self._two_reviews()
         verdict = self._verdict_file(self.shared, name="v.md")
         code, added = self._in_same("ledger", "add", verdict)
         self.assertEqual(code, 0, added)
@@ -1492,7 +1710,7 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
         """A THIRD checkout, on a branch holding no review: nothing there
         says which of the two reviews of this commit is meant, so the verb
         refuses instead of choosing by the order they were recorded in."""
-        first, second = self._two_reviews(self._in_main, self._in_same)
+        first, second = self._two_reviews()
         third = self.tmp / "third"
         sh("git", "-C", str(self.repo), "worktree", "add", "-q", "-b",
            "third", str(third), "HEAD")
@@ -1508,14 +1726,11 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
         self.assertEqual(len(self._events()), before,
                          "an ambiguity refusal wrote to the ledger")
 
+    @starts_from(ONE_COMMIT_GIT)
     def test_a_carried_git_reference_stays_authoritative(self):
         """The one carrier that names its review in the argument itself: the
         reference decides, from any checkout."""
-        self._origin()
-        code, first = self._handoff(self._in_main, "--transport", "git")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_same, "--transport", "git")
-        self.assertEqual(code, 0, second)
+        first, second = self._started("first", "second")
         self.assertNotEqual(first["lineage"], second["lineage"])
         for mine in (first, second):
             code, briefed = self._in_main(
@@ -1524,12 +1739,9 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
             self.assertEqual(briefed["lineage"], mine["lineage"])
             self.assertEqual(briefed["sha"], self.shared)
 
+    @starts_from(ONE_COMMIT_PASTE)
     def test_a_paste_round_of_a_shared_commit_keeps_its_review(self):
-        self._origin()
-        code, first = self._handoff(self._in_main, "--transport", "paste")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_same, "--transport", "paste")
-        self.assertEqual(code, 0, second)
+        first, second = self._started("first", "second")
         self.assertNotEqual(first["lineage"], second["lineage"])
         for where, mine in ((self._in_main, first), (self._in_same, second)):
             code, briefed = where("brief")
@@ -1538,13 +1750,11 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
 
     # ------------------------------------------------------------- controls
 
+    @starts_from(TWO_BRANCHES)
     def test_two_distinct_commits_resolve_as_they_always_did(self):
         """The valid control: two reviews of two commits need no
         disambiguation, and every resolver answers exactly as before."""
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_other, "--local-only")
-        self.assertEqual(code, 0, second)
+        first, second = self._started("first", "second")
         self.assertNotEqual(first["sha"], second["sha"])
         # Resolved from ANY checkout, because one SHA names one review.
         for mine in (first, second):
@@ -1552,19 +1762,19 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
             self.assertEqual(code, 0, briefed)
             self.assertEqual(briefed["lineage"], mine["lineage"])
 
+    @starts_from(MAIN_OPENED)
     def test_one_review_of_a_commit_needs_nothing_carried(self):
         """The single-match control, from a checkout that names no review."""
-        code, only = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, only)
+        only = self._started("first")
         code, briefed = self._in_same("brief", only["kept"])
         self.assertEqual(code, 0, briefed)
         self.assertEqual(briefed["lineage"], only["lineage"])
 
+    @starts_from(MAIN_OPENED)
     def test_a_repeated_sha_in_a_closed_and_an_open_review(self):
         """One commit, one branch, TWO reviews in sequence: the first closed
         and historical, the second open. The branch names the open one."""
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
+        first = self._started("first")
         code, closed = self._in_main(
             "close", "--verdict",
             self._verdict_file(self.shared, name="clean.md",
@@ -1585,7 +1795,7 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
 
     def test_the_resolvers_answer_the_set_rather_than_the_newest(self):
         """The unit statement of the rule, under the CLI's own state."""
-        first, second = self._two_reviews(self._in_main, self._in_same)
+        first, second = self._two_reviews()
         led = Ledger(self.state)
         self.assertEqual(sorted(led.lineages_for_sha(self.shared)),
                          sorted([first["lineage"], second["lineage"]]))
@@ -1615,7 +1825,7 @@ class TestAFreshReviewerTakesBothReviewsOfOneCommit(_SameCommitWorktrees):
     legitimate take is refused as "already taken".
     """
     PREFIX = "fresh-reviewer-"
-    LAYERS = ("other", "same", "origin")
+    START = ONE_COMMIT_GIT
 
     def setUp(self):
         super().setUp()
@@ -1631,11 +1841,10 @@ class TestAFreshReviewerTakesBothReviewsOfOneCommit(_SameCommitWorktrees):
                 if e.get("event") == "take"]
 
     def _two_git_reviews(self):
-        code, first = self._handoff(self._in_main, "--transport", "git")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_same, "--transport", "git")
-        self.assertEqual(code, 0, second)
-        return first, second
+        """The start's two `git`-carried reviews of one commit (a bare
+        origin added after the `same` checkout, as the `origin` layer
+        does)."""
+        return self._started("first", "second")
 
     def test_both_reviews_of_one_commit_enter_a_fresh_reviewer_ledger(self):
         first, second = self._two_git_reviews()
@@ -1701,6 +1910,7 @@ class TestTheSnapshotIsTakenUnderTheReservation(_TwoWorktrees):
     """
 
     PREFIX = "snapshot-"
+    START = MAIN_OPENED
 
     def _hook(self, target, competitor):
         """Patch `target.acquire` so `competitor()` runs to completion the
@@ -1722,8 +1932,7 @@ class TestTheSnapshotIsTakenUnderTheReservation(_TwoWorktrees):
             self._verdict_file(sha, name=name, verdict="clean to advance"))
 
     def test_a_close_completing_before_acquisition_stops_the_handoff(self):
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
+        first = self._started("first")
         patch, state = self._hook(
             transport.LineageReservation,
             self._clean_close_subprocess(first["sha"], "clean.md"))
@@ -1744,6 +1953,7 @@ class TestTheSnapshotIsTakenUnderTheReservation(_TwoWorktrees):
         code, briefed = self._in_main("brief")
         self.assertNotEqual(code, 0, briefed)
 
+    @starts_from(())
     def test_an_opener_that_finished_in_the_interval_is_continued(self):
         """The opening-to-existing transition. The branch's opening lock is
         held while a second opener finishes, and the re-read under it must
@@ -1767,8 +1977,7 @@ class TestTheSnapshotIsTakenUnderTheReservation(_TwoWorktrees):
         """The terminal-marker writer, with `--lineage`: two closures for one
         review is exactly the state the marker is supposed to make
         impossible."""
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
+        self._started("first")
         patch, state = self._hook(
             transport.LineageReservation,
             lambda: self._run(self.repo, "close", "--lineage", "--reason",
@@ -1784,8 +1993,7 @@ class TestTheSnapshotIsTakenUnderTheReservation(_TwoWorktrees):
 
     def test_a_close_completing_before_acquisition_stops_an_advance(self):
         """The third terminal-marker writer."""
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
+        self._started("first")
         patch, state = self._hook(
             transport.LineageReservation,
             lambda: self._run(self.repo, "close", "--lineage", "--reason",
@@ -1803,20 +2011,17 @@ class TestTheSnapshotIsTakenUnderTheReservation(_TwoWorktrees):
     def test_an_uncontended_handoff_is_unaffected(self):
         """The valid control: nothing competes, and the re-read under the
         reservation changes nothing about an ordinary round."""
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
+        first = self._started("first")
         code, again = self._handoff(self._in_main, "--local-only")
         self.assertEqual(code, 0, again)
         self.assertEqual(again["lineage"], first["lineage"])
 
+    @starts_from(TWO_BRANCHES)
     def test_a_close_of_another_branchs_review_does_not_stop_this_one(self):
         """The different-branch overlap control: two reviews, and the close
         of one completing mid-admission of the other is no reason to refuse
         — that refusal is what keying retired."""
-        code, first = self._handoff(self._in_main, "--local-only")
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_other, "--local-only")
-        self.assertEqual(code, 0, second)
+        first, second = self._started("first", "second")
         patch, state = self._hook(
             transport.LineageReservation,
             self._clean_close_subprocess(second["sha"], "clean-other.md"))
@@ -1847,6 +2052,14 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
     the pasted takes, which are subprocesses so the bytes ride real standard
     input.
 
+    The AUTHOR's side is the start state: both reviews emitted (`INGRESS`,
+    or its `paste` and `git` twins), and for the continuation rows a second
+    emission of `main`'s review at a new pushed tip (`INGRESS_AGAIN`). The
+    author's second emission therefore precedes the reviewer's first take
+    in those rows; the two ledgers are separate, the reviewer's sees the
+    same takes in the same order, and the first round's commit stays in
+    the reviewer's clone, so nothing a take reads differs.
+
     MUTATION: restore adoption by the sole open lineage — make
     `take_lineage` return `ledger.open_lineages()[0]` whenever exactly one
     is open, before the stamp is consulted — and both independent reviews
@@ -1856,6 +2069,7 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
     PREFIX = "reviewer-ingress-"
 
     LAYERS = ("other", "origin", "push-other")
+    START = INGRESS
 
     def setUp(self):
         super().setUp()
@@ -1886,11 +2100,10 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
         return [e for e in led.events()
                 if kind is None or e.get("event") == kind]
 
-    def _two_handoffs(self, *extra):
-        code, first = self._handoff(self._in_main, *extra)
-        self.assertEqual(code, 0, first)
-        code, second = self._handoff(self._in_other, *extra)
-        self.assertEqual(code, 0, second)
+    def _two_handoffs(self):
+        """The start's two reviews, `main`'s and the other branch's, on the
+        carrier its recipe names."""
+        first, second = self._started("first", "second")
         self.assertNotEqual(first["lineage"], second["lineage"])
         return first, second
 
@@ -1957,9 +2170,10 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
             {e["lineage"] for e in self._reviewer_events("request")},
             {first["lineage"], second["lineage"]})
 
+    @starts_from(INGRESS_PASTE)
     def test_two_pasted_reviews_stay_two(self):
         """The other carrier that names no reference: the bytes themselves."""
-        first, second = self._two_handoffs("--transport", "paste")
+        first, second = self._two_handoffs()
         for mine in (first, second):
             code, taken = self._take_pasted(self._bytes(mine))
             self.assertEqual(code, 0, taken)
@@ -1968,6 +2182,7 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
             {e["lineage"] for e in self._reviewer_events("request")},
             {first["lineage"], second["lineage"]})
 
+    @starts_from(INGRESS_AGAIN)
     def test_each_review_is_continued_and_closed_independently(self):
         """Both reviews live on the reviewer's ledger at once: a second
         round of one lands in ITS lineage, and closing one leaves the other
@@ -1976,13 +2191,10 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
         for mine in (first, second):
             self.assertEqual(self._take(mine["kept"])[1]["lineage"],
                              mine["lineage"])
-        # A second emission of `main`'s review at a new tip: same review,
-        # same id, and the reviewer's take must land in the same lineage.
-        (self.repo / "f.txt").write_text("four\n", encoding="utf-8")
-        sh("git", "-C", str(self.repo), "commit", "-qam", "more")
-        sh("git", "-C", str(self.repo), "push", "-q", "origin", "main")
-        code, again = self._handoff(self._in_main)
-        self.assertEqual(code, 0, again)
+        # A second emission of `main`'s review at a new tip (the start's
+        # `again`): same review, same id, and the reviewer's take must land
+        # in the same lineage.
+        again = self._started("again")
         self.assertEqual(again["lineage"], first["lineage"])
         code, taken = self._take(again["kept"])
         self.assertEqual(code, 0, taken)
@@ -2009,11 +2221,12 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
         self.assertEqual(len(self._reviewer_events("take")), 1,
                          "a retake recorded a second take event")
 
+    @starts_from(INGRESS_GIT)
     def test_an_explicit_git_reference_still_decides(self):
         """The control the finding leaves untouched: where the argument
         names the review, it is authoritative and nothing else is
         consulted."""
-        first, second = self._two_handoffs("--transport", "git")
+        first, second = self._two_handoffs()
         for mine in (second, first):
             code, taken = self._take(
                 transport.round_reference(mine["lineage"], 1))
@@ -2022,6 +2235,7 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
 
     # ------------------------------------------- the legacy (unstamped) path
 
+    @starts_from(INGRESS_AGAIN)
     def test_a_legacy_envelope_continues_the_review_on_its_branch(self):
         """Sequential continuation, preserved: an envelope with no id lands
         where the review from the same author branch already is."""
@@ -2030,11 +2244,7 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
                                        "legacy-1.md")
         self.assertEqual(code, 0, taken)
         opened = taken["lineage"]
-        (self.repo / "f.txt").write_text("five\n", encoding="utf-8")
-        sh("git", "-C", str(self.repo), "commit", "-qam", "again")
-        sh("git", "-C", str(self.repo), "push", "-q", "origin", "main")
-        code, again = self._handoff(self._in_main)
-        self.assertEqual(code, 0, again)
+        again = self._started("again")
         code, taken = self._take_bytes(self._legacy(self._bytes(again)),
                                        "legacy-2.md")
         self.assertEqual(code, 0, taken)
@@ -2057,6 +2267,7 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
              for e in self._reviewer_events("request")},
             {"main": one["lineage"], "other": two["lineage"]})
 
+    @starts_from(INGRESS_AGAIN)
     def test_an_unresolvable_legacy_envelope_refuses_rather_than_adopting(self):
         """Neither an id nor a branch, and two reviews open here: there is
         nothing to bind by, so nothing is recorded."""
@@ -2066,11 +2277,7 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
                                            name)
             self.assertEqual(code, 0, taken)
         before = len(self._reviewer_events())
-        (self.repo / "f.txt").write_text("six\n", encoding="utf-8")
-        sh("git", "-C", str(self.repo), "commit", "-qam", "yet again")
-        sh("git", "-C", str(self.repo), "push", "-q", "origin", "main")
-        code, again = self._handoff(self._in_main)
-        self.assertEqual(code, 0, again)
+        again = self._started("again")
         code, refused = self._take_bytes(
             self._legacy(self._bytes(again), drop_branch=True), "l3.md")
         self.assertNotEqual(code, 0, refused)
@@ -2078,6 +2285,7 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
         self.assertEqual(len(self._reviewer_events()), before,
                          "a refused take wrote to the reviewer's ledger")
 
+    @starts_from(INGRESS_AGAIN)
     def test_one_open_review_still_adopts_an_unbranded_legacy_envelope(self):
         """The paired control: with a single open review and nothing to
         distinguish, sequential continuation is exactly what a legacy
@@ -2086,20 +2294,66 @@ class TestPathAndPasteIngressKeepReviewsApart(_TwoWorktrees):
         code, one = self._take_bytes(
             self._legacy(self._bytes(first), drop_branch=True), "u1.md")
         self.assertEqual(code, 0, one)
-        (self.repo / "f.txt").write_text("seven\n", encoding="utf-8")
-        sh("git", "-C", str(self.repo), "commit", "-qam", "once more")
-        sh("git", "-C", str(self.repo), "push", "-q", "origin", "main")
-        code, again = self._handoff(self._in_main)
-        self.assertEqual(code, 0, again)
+        again = self._started("again")
         code, two = self._take_bytes(
             self._legacy(self._bytes(again), drop_branch=True), "u2.md")
         self.assertEqual(code, 0, two)
         self.assertEqual(two["lineage"], one["lineage"])
 
+    def _reviewer_files(self) -> dict:
+        """Every file of the reviewer's state, by relative path, as bytes:
+        what a refused take must leave exactly as it found it."""
+        return {str(p.relative_to(self.reviewer)): p.read_bytes()
+                for p in sorted(self.reviewer.rglob("*")) if p.is_file()}
+
+    @starts_from(INGRESS_REOPENED)
+    def test_a_legacy_envelope_refuses_when_its_branch_has_two_open_reviews(self):
+        """Two reviews open on this ledger record the envelope's own author
+        branch, and the envelope carries no id: which one it continues
+        cannot be derived, so the take refuses and records nothing.
+
+        MUTATION: make `take_lineage` return `mine[0]` however many open
+        reviews name the branch, and this row goes red (the take adopts the
+        first); its paired control below stays green."""
+        first, third, fourth = self._started("first", "third", "fourth")
+        self.assertNotEqual(third["lineage"], first["lineage"],
+                            "the author's close did not open a new review")
+        self.assertEqual(fourth["lineage"], third["lineage"])
+        for mine in (first, third):
+            code, taken = self._take(mine["kept"])
+            self.assertEqual(code, 0, taken)
+            self.assertEqual(taken["lineage"], mine["lineage"], taken)
+        self.assertEqual(
+            sorted(e["branch"] for e in self._reviewer_events("request")),
+            ["main", "main"])
+        before = self._reviewer_files()
+        code, refused = self._take_bytes(self._legacy(self._bytes(fourth)),
+                                         "reopened.md")
+        self.assertNotEqual(code, 0, refused)
+        self.assertIn("2 open reviews on this ledger record branch main",
+                      refused["error"])
+        self.assertEqual(self._reviewer_files(), before,
+                         "a refused take changed the reviewer's state")
+
+    @starts_from(INGRESS_REOPENED)
+    def test_one_open_review_on_the_branch_adopts_beside_another_branchs(self):
+        """The paired control: the same envelope, and two reviews open here
+        as above, but only one of them on the envelope's branch — the legacy
+        continuation lands in it."""
+        first, second, fourth = self._started("first", "second", "fourth")
+        for mine in (first, second):
+            code, taken = self._take(mine["kept"])
+            self.assertEqual(code, 0, taken)
+            self.assertEqual(taken["lineage"], mine["lineage"], taken)
+        code, taken = self._take_bytes(self._legacy(self._bytes(fourth)),
+                                       "one-on-main.md")
+        self.assertEqual(code, 0, taken)
+        self.assertEqual(taken["lineage"], first["lineage"], taken)
+
 class TestTheWorktreeTemplateIsCopiedWhole(unittest.TestCase):
-    """`_TwoWorktrees` copies one template per layer set: a main checkout,
-    linked worktrees and a bare origin, all of which record absolute
-    paths. Each copy must be a tree of its own — its worktrees linked to
+    """Every `_TwoWorktrees` start state is built over one template per
+    layer set: a main checkout, linked worktrees and a bare origin, all of
+    which record absolute paths. Each copy must be a tree of its own — its worktrees linked to
     ITS main checkout, its remote ITS bare repository — with the
     template's commit ids, and nothing written in one copy visible in
     another or in the template.

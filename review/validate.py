@@ -603,6 +603,17 @@ _ATTESTATION_FIELDS = (
 # is the same closed set met at the record rather than at the manifest).
 CI_ATTESTER = "ci"
 
+#: 0.28.0: the attester a hand-off defers instead of running
+#: (`emit.SCHEDULE_ATTESTER`, spelled here as `CI_ATTESTER` is).
+SCHEDULE_ATTESTER = "schedule"
+
+#: The whole shape of a deferred record, and nothing else is admitted: a
+#: deferral records that nothing ran, so any further field (an exit code, a
+#: binding, a tree, an executed or target SHA, a tool version, a CI run)
+#: claims an execution or an attestation the deferral denies (lineage
+#: Lb8575b3a9a round 1 F1). `emit.run_gates` writes exactly these four.
+DEFERRED_SHAPE = ("id", "blocking", "attested_by", "deferred")
+
 
 def _nonempty(value) -> bool:
     return isinstance(value, str) and bool(value.strip())
@@ -864,6 +875,9 @@ def validate_attestations(evidence: str, cfg: Config,
     # nothing, and a record contradicting the manifest is its own defect.
     manifest_blocking = {g["id"]: bool(g.get("blocking", False))
                          for g in cfg.gates}
+    # 0.28.0: which gates the MANIFEST lets a hand-off leave unrun. A deferred
+    # record is judged against this, never against its own claim.
+    manifest_attester = {g["id"]: g.get("attested_by") for g in cfg.gates}
     attested = set()
     for i, rec in enumerate(records):
         if not isinstance(rec, dict):
@@ -892,6 +906,47 @@ def validate_attestations(evidence: str, cfg: Config,
                 f"absent means this tool executed the gate itself) — an "
                 f"unknown executor is an unjudged one, and unjudged is not "
                 f"clean"))
+        if "deferred" in rec:
+            # 0.28.0: a gate the manifest attests by the schedule, which a
+            # hand-off records instead of running. It is not a pass and not
+            # a failure: a notice the reviewer reads. Two ways it could lie,
+            # each its own code: a record that defers a gate the manifest
+            # does not declare `attested_by = "schedule"` (a record cannot
+            # excuse itself from a blocking gate), and a record whose shape
+            # is not exactly DEFERRED_SHAPE (any other field claims a run or
+            # an attestation, and a could-not-run `error` is a different
+            # state).
+            problems = []
+            if not (isinstance(rec.get("id"), str) and rec["id"].strip()):
+                problems.append("no gate id")
+            if not isinstance(rec.get("blocking"), bool):
+                problems.append("no boolean 'blocking'")
+            if not (isinstance(rec.get("deferred"), str)
+                    and rec["deferred"].strip()):
+                problems.append("no reason in 'deferred'")
+            if rec.get("attested_by") != SCHEDULE_ATTESTER:
+                problems.append(f"attested_by={rec.get('attested_by')!r}, "
+                                f"and only a gate attested by "
+                                f"{SCHEDULE_ATTESTER!r} is deferred")
+            outside = sorted(k for k in rec if k not in DEFERRED_SHAPE)
+            if outside:
+                problems.append(f"carries {outside}, outside the deferred "
+                                f"shape {list(DEFERRED_SHAPE)}: they claim a "
+                                f"run or an attestation, which contradicts "
+                                f"'deferred, not run'")
+            for problem in problems:
+                items.append(_err("A-DEFERRED-SHAPE",
+                                  f"{gate_id}: deferred record: {problem}"))
+            if manifest_attester.get(rec.get("id")) != SCHEDULE_ATTESTER:
+                items.append(_err(
+                    "A-DEFERRED-UNDECLARED",
+                    f"{gate_id}: the record says the gate was deferred, but "
+                    f"the manifest does not declare it attested_by = "
+                    f"{SCHEDULE_ATTESTER!r}; only the manifest decides "
+                    f"which gates a hand-off may leave unrun"))
+            items.append(_notice("A-DEFERRED",
+                                 f"{gate_id}: {rec.get('deferred')}"))
+            continue
         if "error" in rec:
             # A gate that could not run is a recorded state, not a pass —
             # and RVW-T2(c): the one path that means "no evidence" meets its

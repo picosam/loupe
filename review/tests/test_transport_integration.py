@@ -16,9 +16,29 @@ the lineage's recorded history and the state that made it wrong is a round
 the loop has to actually run to: round 1 of a fresh lineage, round 1 of a
 lineage opened after a closed one, a round past the cap, a cap moved by a
 recorded override. `_HeaderLoop` drives the real CLI to each of them.
+
+WHAT RUNS HOW (consolidated 2026-09-27, when this module cost 6,706
+process launches a run and a hand-off runs it about 2.3 times). The CLI
+was already called in process (`run_cli`); the cost was git, launched by
+the tool once per step of every round each test drove from scratch. So:
+
+  * A round the loop has to RUN TO is still run to by the real CLI, but
+    once per process: each state of the header loop (`_STATES`) is a
+    template built by driving the previous state one step further, and a
+    test that only reads what a round rendered reads the text its build
+    recorded, while a test that goes on from a state goes on in a private
+    COPY of it (`copy_fixture`). No test mutates a template; a test's
+    copy is its own.
+  * A partition whose rows are decided by one function is walked against
+    that function in process — `emit.generated_at_target`, on a real
+    repository, real git, the caller's environment patched — and keeps a
+    few rows through the real emitter: one per outcome class, so the
+    wiring from the decision to the rendered span stays proven. Each class
+    says which rows are which.
 """
 
 import contextlib
+import copy
 import dataclasses
 import json
 import math
@@ -37,7 +57,7 @@ from review.ledger import Ledger
 from review.tests import synth
 from review.tests._transport_fixtures import (
     CFG, _build_scratch_loop, copy_fixture, fixture_tree, git_out, run_cli,
-    scratch_loop_repo, sh, verdict_text, write_identity)
+    scratch_loop_repo, scratch_tmp, sh, verdict_text, write_identity)
 from review.tests.util import LINEAGE
 
 def _publish(root):
@@ -82,6 +102,180 @@ def _build_header_loop(root):
        "-am", "the fixture declares its own round cap")
     _publish(root)
     return {"base": base}
+
+
+def _write_claim(root, objective):
+    """The claim `scratch_loop_repo` writes beside a copy, byte for byte —
+    so a template that hands off with it and the copy that hands off after
+    it present one claim, not two."""
+    (Path(root) / "claim.json").write_text(json.dumps({
+        "objective": objective,
+        "references": [{"path": "review.toml", "required": True}]}),
+        encoding="utf-8")
+
+
+def _relocate(rec, root, into):
+    """`rec` with its `kept` path, if any, made relative to `root` when it
+    is absolute, then placed under `into` when `into` is given. A template
+    records paths relative to itself, so a fact read by a copy names the
+    copy's file and never the template's."""
+    rec = dict(rec)
+    kept = rec.get("kept")
+    if isinstance(kept, str):
+        if root is not None and os.path.isabs(kept):
+            kept = os.path.relpath(os.path.realpath(kept),
+                                   os.path.realpath(root))
+        if into is not None and not os.path.isabs(kept):
+            kept = str(Path(into) / kept)
+        rec["kept"] = kept
+    return rec
+
+
+class _Loop:
+    """The real CLI, in process, against a loop tree at `root`: the author
+    checkout `author/`, its ledger `state_name/`, the claim `claim.json`,
+    and the reviewer clone `reviewer/` with its ledger beside it.
+
+    Used both to BUILD a state template — no test case in hand, so a step
+    that exits nonzero raises AssertionError, which fails whichever test
+    asked for the template — and to drive a test's own copy on from that
+    state. Every step writes under `root` and nowhere else."""
+
+    def __init__(self, root, cwd=None, state_name="state-author"):
+        self.root = Path(root)
+        self.author = self.root / "author"
+        self.state = self.root / state_name
+        self.reviewer = self.root / "reviewer"
+        self.reviewer_state = self.root / "state-reviewer"
+        self.claim = self.root / "claim.json"
+        self.cwd = cwd or os.getcwd()
+
+    def run(self, *argv, where=None, state=None):
+        return run_cli(where or self.author, state or self.state, *argv,
+                       cwd=self.cwd)
+
+    def ok(self, *argv, **kw):
+        code, rec = self.run(*argv, **kw)
+        if code != 0:
+            raise AssertionError(f"`{' '.join(argv[:2])}` exited {code}: "
+                                 f"{rec}")
+        return rec
+
+    def handoff(self, *extra):
+        rec = self.ok("handoff", "--claim-file", str(self.claim), *extra)
+        rec["text"] = Path(rec["kept"]).read_text(encoding="utf-8")
+        return rec
+
+    def verdict_file(self, sha, round_no):
+        """Every finding carries id `F1` with a title naming its round, so
+        each round's ruling is a DISTINCT fingerprint (`_HeaderLoop`)."""
+        path = self.root / f"v{round_no}.md"
+        path.write_text(
+            f'<loupe-review-verdict sha="{sha}">\nVERDICT: changes '
+            f'requested\n\n## findings\n\n'
+            + synth.finding(1, title=f"the round {round_no} finding",
+                            evidence="f.txt:1")
+            + "## evidence checked\n\nf.txt\n</loupe-review-verdict>\n",
+            encoding="utf-8")
+        return path
+
+    def answer(self, round_no, sha):
+        """Close round `round_no` with a verdict and record its answer, so
+        the next hand-off may open a round at all."""
+        verdict = self.verdict_file(sha, round_no)
+        closed = self.ok("close", "--verdict", str(verdict))
+        dispositions = self.root / f"d{round_no}.json"
+        dispositions.write_text(json.dumps({
+            "head": sha, "author": "claude",
+            "dispositions": [{
+                "finding_id": "F1", "disposition": "accepted",
+                "payload": {"change": "fixed", "verification": "observed",
+                            "falsification": {
+                                "status": "pass",
+                                "mutation": "fails_without_fix"}}}]}),
+            encoding="utf-8")
+        self.ok("respond", "--verdict", str(verdict), "--from-json",
+                str(dispositions), "--out",
+                str(self.root / f"d{round_no}.md"))
+        return closed
+
+
+#: The objective every header-loop claim states (`_write_claim`).
+_HEADER_OBJECTIVE = "header test"
+
+
+def _state(parent, step):
+    """A header-loop state: the template of `parent`, copied, driven one
+    `step(loop, facts)` further by the real CLI. Facts are JSON-shaped and
+    carry every recorded path RELATIVE to the template (`_relocate`)."""
+    def build(root):
+        facts = copy.deepcopy(copy_fixture(parent, _STATES[parent], root))
+        _write_claim(root, _HEADER_OBJECTIVE)
+        step(_Loop(root), facts)
+        for key in ("records", "closed"):
+            facts[key] = [_relocate(r, root, None)
+                          for r in facts.get(key, [])]
+        for key in ("ended", "second"):
+            if key in facts:
+                facts[key] = _relocate(facts[key], root, None)
+        return facts
+    return build
+
+
+def _open_round_one(loop, facts):
+    facts["records"] = [loop.handoff("--base", facts["base"])]
+
+
+def _answer_last(loop, facts):
+    last = facts["records"][-1]
+    facts.setdefault("closed", []).append(loop.answer(last["round"],
+                                                      last["sha"]))
+
+
+def _hand_off(loop, facts):
+    facts["records"].append(loop.handoff())
+
+
+def _answer_and_hand_off(loop, facts):
+    _answer_last(loop, facts)
+    _hand_off(loop, facts)
+
+
+def _close_the_lineage(loop, facts):
+    """The lineage closed by decision after round 1's answer, and one more
+    commit on the author branch — the tip a NEW lineage opens on."""
+    facts["ended"] = loop.ok("close", "--lineage", "--reason", "done",
+                             "--by", "user")
+    (loop.author / "f.txt").write_text("three\n", encoding="utf-8")
+    sh("git", "-C", str(loop.author), "commit", "-qam", "more")
+
+
+def _open_second_lineage(loop, facts):
+    """Round 1 of the second lineage, based on the commit round 1 of the
+    first one ruled on."""
+    facts["second"] = loop.handoff("--base", facts["records"][0]["sha"])
+
+
+#: The header loop's states, parent first: name -> build. `header-loop` is
+#: the published tree with the fixture's own cap committed; each other state
+#: is its parent driven one step further, built ONCE per process
+#: (`fixture_tree`) and copied into each test that goes on from it.
+_STATES = {"header-loop": _build_header_loop}
+_STATES.update({
+    # Round 1 of a fresh lineage, based on the fixture's base.
+    "header-r1": _state("header-loop", _open_round_one),
+    # ...its verdict closed and its answer recorded.
+    "header-r1-answered": _state("header-r1", _answer_last),
+    # Rounds 2, 3 and 4 of that lineage (cap 3), each after the previous
+    # round's answer.
+    "header-r2": _state("header-r1-answered", _hand_off),
+    "header-r3": _state("header-r2", _answer_and_hand_off),
+    "header-r4": _state("header-r3", _answer_and_hand_off),
+    # The first lineage closed after round 1's answer, one commit on.
+    "header-closed": _state("header-r1-answered", _close_the_lineage),
+    # Round 1 of the second lineage, on the first one's ruled commit.
+    "header-second": _state("header-closed", _open_second_lineage),
+})
 
 
 class TestFullLoopIntegration(unittest.TestCase):
@@ -416,76 +610,70 @@ class _HeaderLoop(unittest.TestCase):
     a passing falsification trips the `stale` breaker, and the next
     hand-off would refuse for a reason that has nothing to do with what
     these tests measure.
+
+    The rounds are driven once per process, not once per test: each state
+    in `_STATES` is a template the real CLI built by driving its parent one
+    step further. `_facts(state)` reads what that build recorded — the
+    rendered envelopes among it — for a test that only reads; `_copy(state)`
+    gives a test that goes on its own copy of the tree, ledger included,
+    and every step it takes from there is its own. A request a reviewer
+    TAKES is always emitted in the taking test's own copy: its reachability
+    stamp names the remote of the tree that emitted it, and a copy's
+    reviewer clone must fetch from the copy's remote, never a template's.
     """
 
     PREFIX = "header-"
 
-    def setUp(self):
-        # The fixture DECLARES its cap; it does not inherit this
-        # repository's. The scratch config is a copy of the workbench's
-        # review.toml, so "round 4 of 3" restated a configured number and
-        # `bin/config-perturbation` went red on it (cap 3 -> 34) the day
-        # these classes landed. What they measure is a round past a cap of
-        # three, whatever this repository's cap is that day. The cap is
-        # committed, published and cloned once per process
-        # (`_build_header_loop`, which refuses a config with no round_cap)
-        # and the tree copied into this test's directory.
+    def _facts(self, state):
+        """What state `state`'s build recorded, as a private deep copy: the
+        template's facts are shared by every test in the process and are
+        never handed out to be edited. Recorded paths are relative to the
+        template, which no test reads or writes."""
+        return copy.deepcopy(fixture_tree(state, _STATES[state])[1])
+
+    def _copy(self, state="header-loop"):
+        """A private copy of state `state` for this test to drive on from;
+        returns its facts with every recorded path under the copy.
+
+        The fixture DECLARES its cap; it does not inherit this
+        repository's. The scratch config is a copy of the workbench's
+        review.toml, so "round 4 of 3" restated a configured number and
+        `bin/config-perturbation` went red on it (cap 3 -> 34) the day
+        these classes landed. What they measure is a round past a cap of
+        three, whatever this repository's cap is that day. The cap is
+        committed, published and cloned once per process
+        (`_build_header_loop`, which refuses a config with no round_cap)
+        and every state is built on top of it."""
         scratch = scratch_loop_repo(self, self.PREFIX, name="author",
-                                    objective="header test",
-                                    tree=("header-loop", _build_header_loop))
+                                    objective=_HEADER_OBJECTIVE,
+                                    tree=(state, _STATES[state]))
         self.tmp, self.author = scratch.tmp, scratch.repo
         self.base, self.claim, self.cwd = (scratch.base, scratch.claim,
                                            scratch.cwd)
         self.assertIn("\nround_cap = 3\n",
                       (self.author / "review.toml").read_text(encoding="utf-8"))
+        self.loop = _Loop(self.tmp, self.cwd)
         self.remote = self.tmp / "remote.git"
-        self.reviewer = self.tmp / "reviewer"
-        self.state = self.tmp / "state-author"
-        self.reviewer_state = self.tmp / "state-reviewer"
+        self.reviewer = self.loop.reviewer
+        self.state = self.loop.state
+        self.reviewer_state = self.loop.reviewer_state
+        facts = copy.deepcopy(scratch.facts)
+        for key in ("records", "closed"):
+            facts[key] = [_relocate(r, None, self.tmp)
+                          for r in facts.get(key, [])]
+        for key in ("ended", "second"):
+            if key in facts:
+                facts[key] = _relocate(facts[key], None, self.tmp)
+        return facts
 
     def _run(self, *argv, where=None, state=None):
-        return run_cli(where or self.author, state or self.state, *argv,
-                       cwd=self.cwd)
+        return self.loop.run(*argv, where=where, state=state)
 
     def _handoff(self, *extra):
-        code, rec = self._run("handoff", "--claim-file", str(self.claim),
-                              *extra)
-        self.assertEqual(code, 0, rec)
-        rec["text"] = Path(rec["kept"]).read_text(encoding="utf-8")
-        return rec
-
-    def _verdict_file(self, sha, round_no):
-        path = self.tmp / f"v{round_no}.md"
-        path.write_text(
-            f'<loupe-review-verdict sha="{sha}">\nVERDICT: changes '
-            f'requested\n\n## findings\n\n'
-            + synth.finding(1, title=f"the round {round_no} finding",
-                            evidence="f.txt:1")
-            + "## evidence checked\n\nf.txt\n</loupe-review-verdict>\n",
-            encoding="utf-8")
-        return path
+        return self.loop.handoff(*extra)
 
     def _answer(self, round_no, sha):
-        """Close round `round_no` with a verdict and record its answer, so
-        the next hand-off may open a round at all."""
-        verdict = self._verdict_file(sha, round_no)
-        code, closed = self._run("close", "--verdict", str(verdict))
-        self.assertEqual(code, 0, closed)
-        dispositions = self.tmp / f"d{round_no}.json"
-        dispositions.write_text(json.dumps({
-            "head": sha, "author": "claude",
-            "dispositions": [{
-                "finding_id": "F1", "disposition": "accepted",
-                "payload": {"change": "fixed", "verification": "observed",
-                            "falsification": {
-                                "status": "pass",
-                                "mutation": "fails_without_fix"}}}]}),
-            encoding="utf-8")
-        code, resp = self._run("respond", "--verdict", str(verdict),
-                               "--from-json", str(dispositions), "--out",
-                               str(self.tmp / f"d{round_no}.md"))
-        self.assertEqual(code, 0, resp)
-        return closed
+        return self.loop.answer(round_no, sha)
 
     def _next_round(self, previous, *extra):
         """Answer `previous` and emit the round after it."""
@@ -534,6 +722,10 @@ class TestTheRoundLineReportsTheRoundsOwnState(_HeaderLoop):
     round within the cap · an override the round is still past — because
     either axis alone is what the defect was.
 
+    Rounds 1 to 4 are the `header-r4` state, driven once per process; the
+    override rows go on from a copy of it, and the take row emits round 4
+    in its own copy of `header-r3`.
+
     MUTATION: restore the cap-override-only ternary in `emit._round_line`
     and round 1, round 3 of 3 and round 4 of 3 render one parenthetical
     again; `test_the_parenthetical_is_not_a_constant` fails first.
@@ -541,16 +733,14 @@ class TestTheRoundLineReportsTheRoundsOwnState(_HeaderLoop):
 
     PREFIX = "roundline-"
 
-    def _drive_to_round_four(self):
+    def _four_rounds(self):
         """Rounds 1..4 against the fixture's declared cap of 3."""
-        records = [self._handoff("--base", self.base)]
-        while records[-1]["round"] < 4:
-            records.append(self._next_round(records[-1]))
+        records = self._facts("header-r4")["records"]
         self.assertEqual([r["round"] for r in records], [1, 2, 3, 4])
         return records
 
     def test_the_parenthetical_is_not_a_constant(self):
-        r1, r2, r3, r4 = self._drive_to_round_four()
+        r1, r2, r3, r4 = self._four_rounds()
         within = [self._round_line(r) for r in (r1, r2, r3)]
         past = self._round_line(r4)
         # The falsifier, stated as the brief states it.
@@ -570,7 +760,7 @@ class TestTheRoundLineReportsTheRoundsOwnState(_HeaderLoop):
                           "it)"})
 
     def test_the_past_cap_text_says_what_the_tool_actually_does(self):
-        r4 = self._drive_to_round_four()[3]
+        r4 = self._four_rounds()[3]
         line = self._round_line(r4)
         self.assertEqual(
             line,
@@ -583,14 +773,15 @@ class TestTheRoundLineReportsTheRoundsOwnState(_HeaderLoop):
         self.assertIn("Convergence", r4["text"])
 
     def test_no_round_line_reads_as_an_event(self):
-        records = self._drive_to_round_four()
+        records = self._four_rounds()
         for rec in records:
             line = self._round_line(rec)
             for word in ("fires", "breaker", "fired"):
                 self.assertNotIn(word, line, line)
 
     def test_an_override_keeps_its_half_and_still_reports_the_round(self):
-        records = self._drive_to_round_four()
+        records = self._copy("header-r4")["records"]
+        self.assertEqual([r["round"] for r in records], [1, 2, 3, 4])
         # An override that puts the round WITHIN the cap.
         code, raised = self._run("ledger", "authorize-cap", "--to", "6",
                                  "--reason", "the loop is converging",
@@ -619,8 +810,12 @@ class TestTheRoundLineReportsTheRoundsOwnState(_HeaderLoop):
 
     def test_every_round_still_validates_and_takes(self):
         """The header is envelope text other readers parse; a round past the
-        cap must still be a valid request a reviewer can take."""
-        records = self._drive_to_round_four()
+        cap must still be a valid request a reviewer can take. Round 4 is
+        emitted in this test's own copy, so the request taken carries this
+        copy's reachability stamp."""
+        records = self._copy("header-r3")["records"]
+        records.append(self._next_round(records[-1]))
+        self.assertEqual([r["round"] for r in records], [1, 2, 3, 4])
         for rec in records:
             code, out = self._run("validate", rec["kept"])
             self.assertEqual(code, 0, out)
@@ -646,18 +841,17 @@ class TestTheBaseLineNamesWhatTheBaseActuallyIs(_HeaderLoop):
     PREFIX = "baseline-"
 
     def test_round_one_of_a_fresh_lineage_names_the_author_declared_base(self):
-        r1 = self._handoff("--base", self.base)
-        line = self._base_line(r1)
+        facts = self._facts("header-r1")
+        line = self._base_line(facts["records"][0])
         self.assertNotIn("round 0", line)
         self.assertEqual(
             line,
-            f"Base:   {self.base}   (round 1 opens this lineage: the base "
+            f"Base:   {facts['base']}   (round 1 opens this lineage: the base "
             f"is the one the author declared, ruled on by no round of this "
             f"lineage; no verdict in this ledger rules on it)")
 
     def test_a_later_round_keeps_the_meaning_it_had(self):
-        r1 = self._handoff("--base", self.base)
-        r2 = self._next_round(r1)
+        r1, r2 = self._facts("header-r2")["records"]
         self.assertEqual(self._base_line(r2),
                          f"Base:   {r1['sha']}   (the SHA ruled on in "
                          f"round 1)")
@@ -666,15 +860,10 @@ class TestTheBaseLineNamesWhatTheBaseActuallyIs(_HeaderLoop):
         """The common shape: a lineage opens on the tip the previous one
         closed on, so a verdict DID rule on that commit — in another
         lineage. The line says which, and still refuses to call it this
-        lineage's."""
-        r1 = self._handoff("--base", self.base)
-        self._answer(1, r1["sha"])
-        code, closed = self._run("close", "--lineage", "--reason", "done",
-                                 "--by", "user")
-        self.assertEqual(code, 0, closed)
-        (self.author / "f.txt").write_text("three\n", encoding="utf-8")
-        sh("git", "-C", str(self.author), "commit", "-qam", "more")
-        second = self._handoff("--base", r1["sha"])
+        lineage's. (`header-second`: round 1, answered, the lineage closed,
+        one commit more, and a new lineage based on round 1's commit.)"""
+        facts = self._facts("header-second")
+        second, closed = facts["second"], facts["ended"]
         self.assertEqual(second["round"], 1)
         line = self._base_line(second)
         self.assertIn("round 1 opens this lineage", line)
@@ -685,13 +874,7 @@ class TestTheBaseLineNamesWhatTheBaseActuallyIs(_HeaderLoop):
     def test_the_absence_is_derived_from_the_record_not_assumed(self):
         """Paired control for the clause above: the SAME new lineage, based
         on a commit no verdict ever ruled on, reports the absence."""
-        r1 = self._handoff("--base", self.base)
-        self._answer(1, r1["sha"])
-        code, closed = self._run("close", "--lineage", "--reason", "done",
-                                 "--by", "user")
-        self.assertEqual(code, 0, closed)
-        (self.author / "f.txt").write_text("three\n", encoding="utf-8")
-        sh("git", "-C", str(self.author), "commit", "-qam", "more")
+        self._copy("header-closed")
         second = self._handoff("--base", self.base)
         self.assertIn("no verdict in this ledger rules on it",
                       self._base_line(second))
@@ -717,14 +900,16 @@ class TestTheDispositionLedgerNamesTheRulingItAnswers(_HeaderLoop):
     PREFIX = "pointer-"
 
     def test_round_one_says_there_is_no_ruling_to_answer(self):
-        r1 = self._handoff("--base", self.base)
+        r1 = self._facts("header-r1")["records"][0]
         self.assertEqual(self._pointer(r1),
                          "Round 1 opens this lineage: there is no previous "
                          "verdict for these to answer.")
 
     def test_the_pointer_is_the_recorded_digest_and_its_retained_copy(self):
-        r1 = self._handoff("--base", self.base)
-        closed = self._answer(1, r1["sha"])
+        """Round 2 is emitted in this test's own copy of round 1 answered,
+        so the ledger and the retained copy the pointer names are both
+        this test's to read."""
+        [closed] = self._copy("header-r1-answered")["closed"]
         r2 = self._handoff()
         recorded = [e for e in Ledger(self.state).events()
                     if e.get("event") == "verdict" and e.get("round") == 1]
@@ -752,15 +937,10 @@ class TestTheDispositionLedgerNamesTheRulingItAnswers(_HeaderLoop):
         so `round-1-verdict-*.md` still matches something; a reader that
         lists rather than composes would print THAT file as the ruling
         lineage B's dispositions answer, which is the lineage-25 round-1 F4
-        defect in a second place."""
-        first = self._handoff("--base", self.base)
-        first_closed = self._answer(1, first["sha"])
-        code, ended = self._run("close", "--lineage", "--reason", "done",
-                                "--by", "user")
-        self.assertEqual(code, 0, ended)
-        (self.author / "f.txt").write_text("three\n", encoding="utf-8")
-        sh("git", "-C", str(self.author), "commit", "-qam", "more")
-        second = self._handoff("--base", first["sha"])
+        defect in a second place. (A copy of `header-second`: lineage A's
+        round 1 answered and closed, lineage B's round 1 emitted.)"""
+        facts = self._copy("header-second")
+        [first_closed], second = facts["closed"], facts["second"]
         self.assertEqual(second["round"], 1)
         self.assertNotEqual(second["lineage"], first_closed["lineage"])
         closed = self._answer(1, second["sha"])
@@ -780,6 +960,7 @@ class TestTheDispositionLedgerNamesTheRulingItAnswers(_HeaderLoop):
         self.assertNotIn(first_closed["digest"], r2["text"])
 
     def _transport_round_two(self, carrier):
+        self._copy()
         r1 = self._handoff("--base", self.base, "--transport", carrier)
         self._answer(1, r1["sha"])
         return self._pointer(self._handoff("--transport", carrier))
@@ -834,7 +1015,7 @@ class TestTheDispositionLedgerNamesNoRoundZero(_HeaderLoop):
     PREFIX = "dispzero-"
 
     def test_round_one_heads_the_section_with_a_round_that_exists(self):
-        r1 = self._handoff("--base", self.base)
+        r1 = self._facts("header-r1")["records"][0]
         self.assertEqual(
             self._ledger_heading(r1),
             "## Disposition ledger — round 1 opens this lineage, emitted by "
@@ -842,7 +1023,7 @@ class TestTheDispositionLedgerNamesNoRoundZero(_HeaderLoop):
         self.assertNotIn("round 0", r1["text"])
 
     def test_round_one_says_there_is_nothing_to_carry(self):
-        r1 = self._handoff("--base", self.base)
+        r1 = self._facts("header-r1")["records"][0]
         self.assertEqual(
             self._ledger_body(r1),
             "(round 1 opens this lineage: no earlier round ruled, so there "
@@ -852,8 +1033,7 @@ class TestTheDispositionLedgerNamesNoRoundZero(_HeaderLoop):
     def test_a_later_round_keeps_the_heading_it_had(self):
         """THE PAIRED CONTROL. Round 2 names round 1, which exists and did
         rule; nothing about that sentence was wrong and nothing moves."""
-        r1 = self._handoff("--base", self.base)
-        r2 = self._next_round(r1)
+        r2 = self._facts("header-r2")["records"][1]
         self.assertEqual(
             self._ledger_heading(r2),
             "## Disposition ledger — round 1, emitted by the tool")
@@ -861,9 +1041,7 @@ class TestTheDispositionLedgerNamesNoRoundZero(_HeaderLoop):
     def test_the_headings_identity_is_unchanged_on_every_round(self):
         """What any reader could match on: the leading word. Both rounds
         reduce to `disposition`, as every request before this did."""
-        r1 = self._handoff("--base", self.base)
-        r2 = self._next_round(r1)
-        for rec in (r1, r2):
+        for rec in self._facts("header-r2")["records"]:
             heading = self._ledger_heading(rec).removeprefix("## ")
             self.assertEqual(wire.section_key(heading), "disposition")
             self.assertNotIn(
@@ -876,7 +1054,7 @@ class TestTheDispositionLedgerNamesNoRoundZero(_HeaderLoop):
         """The block's own domain, below the loop: round 0 (what a round-1
         request asks for), and rounds 1 and 2, which are real rounds whose
         emptiness is an ordinary absence."""
-        ledger = Ledger(self.tmp / "empty-state")
+        ledger = Ledger(scratch_tmp(self, self.PREFIX) / "empty-state")
         self.assertEqual(
             emit._dispositions_block(ledger, 0, "L0"),
             "(round 1 opens this lineage: no earlier round ruled, so there "
@@ -886,6 +1064,9 @@ class TestTheDispositionLedgerNamesNoRoundZero(_HeaderLoop):
                              f"(no round-{n} dispositions in the ledger)")
 
     def test_round_one_still_validates_and_takes(self):
+        """End to end on its own copy: round 1 emitted here, validated, and
+        taken by this copy's reviewer clone."""
+        self._copy()
         r1 = self._handoff("--base", self.base)
         code, out = self._run("validate", r1["kept"])
         self.assertEqual(code, 0, out)
@@ -909,18 +1090,33 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
     rejected for the mirror-image reason: that table reaches no other
     installation.
 
-    THE DOMAIN, every case through the real emitter in its own scratch
-    repository, because the classification is a git read and a fake one
-    would only pin the fake: the attribute bare · absent · explicitly unset
-    · `=true` · `=false` · by pattern · by exact path · in a nested
-    `.gitattributes` · in the WORKING TREE only (must not count) · in the
-    TARGET only (must count) · on a renamed, a deleted and an added path ·
-    on a path with a space and non-ASCII bytes · and a repository with no
-    `.gitattributes`, which must render the span byte for byte as every
-    round before this one did.
+    THE DOMAIN, every case in its own scratch repository with real git,
+    because the classification is a git read and a fake one would only pin
+    the fake: the attribute bare · absent · explicitly unset · `=true` ·
+    `=false` · by pattern · by exact path · in a nested `.gitattributes` ·
+    in the WORKING TREE only (must not count) · in the TARGET only (must
+    count) · on a renamed, a deleted and an added path · on a path with a
+    space and non-ASCII bytes · and a repository with no `.gitattributes`,
+    which must render the span byte for byte as every round before this one
+    did.
+
+    WHICH ROWS RUN HOW. The classification is one function,
+    `emit.generated_at_target`, and the span renders whatever it answers;
+    so the attribute's forms and the machine-local partition are decided
+    by that function in process, on the real repository, and each keeps
+    rows through the real emitter (`_span`, the `emit-request` verb): a
+    form the reader marks and one it must not; the partition's two
+    references and one cell per intent. The shapes of a diff, the odd
+    spelling, the nested file, the two renderings and the object-store
+    topologies' references stay end to end whole, because what they
+    measure is the span itself.
 
     MUTATIONS, each red: read the attributes from the working tree (drop
-    `--source=<sha>`) and the working-tree-only case counts one;
+    `--source=<sha>` and run `check-attr` in the checkout rather than the
+    isolated directory) and the working-tree-only case counts one; drop
+    `--source=<sha>` alone and the isolated directory, which has no tree,
+    marks nothing, so every case that expects a mark fails (measured
+    2026-09-27: the working-tree-only case stays green under that one);
     merge the sub-list back into the main listing and the two-list
     assertions fail; drop the suffix and the header stops carrying the
     second total.
@@ -1001,11 +1197,31 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
         "unrecognised value": ("gen.json linguist-generated=maybe\n", False),
     }
 
+    #: The forms that also go through the real emitter: one the reader
+    #: marks, and one it must not — a value it does not recognise, which is
+    #: not consent. The bare form's whole rendering is
+    #: `test_the_marked_span_states_both_totals_and_both_lists`.
+    FORMS_END_TO_END = ("=true", "unrecognised value")
+
     def test_every_form_of_the_attribute_is_read_as_git_reads_it(self):
+        """Every form decided by `generated_at_target` on its own real
+        repository — over the span's whole path list, `.gitattributes`
+        included — and `FORMS_END_TO_END` also through the emitter, where a
+        path belongs to exactly one of the two lists."""
+        self.assertLessEqual(set(self.FORMS_END_TO_END), set(self.FORMS),
+                             "an end-to-end form names no form in FORMS")
         for label, (attributes, expected) in self.FORMS.items():
             with self.subTest(form=label):
-                _, rows, marked = self._lists(
-                    self._span(self._repo(attributes)))
+                scratch = self._repo(attributes)
+                head = _git(scratch.repo, "rev-parse", "HEAD")
+                self.assertEqual(
+                    emit.generated_at_target(
+                        scratch.repo, head,
+                        [".gitattributes", self.GEN, self.HAND]),
+                    {self.GEN} if expected else set())
+                if label not in self.FORMS_END_TO_END:
+                    continue
+                _, rows, marked = self._lists(self._span(scratch))
                 self.assertEqual(marked,
                                  ["gen.json   (+1 -0)"] if expected else [])
                 self.assertIn(self.HAND, rows)
@@ -1172,41 +1388,44 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
     # the tree), `core.attributesFile` wherever configured, its default
     # user file, and the system file.
     #
-    # THE PARTITION, every cell through the real emitter on a real
-    # repository: tracked declaration kind × local source × local intent.
-    # The target never moves inside a cell, so the two renderings are
-    # comparable byte for byte — both lists and both totals, since the
-    # suffix carries the non-generated totals and the sub-list carries the
-    # generated ones.
+    # THE PARTITION, every cell on a real repository: tracked declaration
+    # kind × local source × local intent. The target never moves inside a
+    # cell, so the two answers are comparable exactly. Every cell is
+    # decided by `generated_at_target` in process — the span renders
+    # nothing but its answer — and the `END_TO_END` cells also through the
+    # real emitter, where the two renderings are compared byte for byte:
+    # both lists and both totals, since the suffix carries the
+    # non-generated totals and the sub-list carries the generated ones.
 
     ODD = "café x.json"
     DEEP = "sub/deep.json"
 
-    #: Tracked declaration kind -> (the files HEAD adds, whether the
-    #: target declares anything). The FILE SET never varies, so a cell
-    #: differs from its reference only in where the declaration lives.
+    #: Tracked declaration kind -> (the files HEAD adds, the paths the
+    #: target declares generated, raw spelling). The FILE SET never
+    #: varies, so a cell differs from its reference only in where the
+    #: declaration lives.
     TRACKED = {
         "root rule": (
             {"hand.py": "one\n", "gen.json": "[]\n", "sub/deep.json": "[]\n",
              "café x.json": "[]\n",
              ".gitattributes": ("gen.json linguist-generated\n"
                                 "caf* linguist-generated\n")},
-            True),
+            {"gen.json", "café x.json"}),
         "nested .gitattributes": (
             {"hand.py": "one\n", "gen.json": "[]\n", "sub/deep.json": "[]\n",
              "café x.json": "[]\n",
              "sub/.gitattributes": "deep.json linguist-generated\n"},
-            True),
+            {"sub/deep.json"}),
         "macro": (
             {"hand.py": "one\n", "gen.json": "[]\n", "sub/deep.json": "[]\n",
              "café x.json": "[]\n",
              ".gitattributes": ("[attr]robot linguist-generated\n"
                                 "gen.json robot\n")},
-            True),
+            {"gen.json"}),
         "no declaration": (
             {"hand.py": "one\n", "gen.json": "[]\n", "sub/deep.json": "[]\n",
              "café x.json": "[]\n"},
-            False),
+            set()),
     }
 
     #: What a local source TRIES to do. Suppression names every path any
@@ -1294,33 +1513,79 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
                 "$XDG_CONFIG_HOME/git/attributes": xdg_default,
                 "~/.config/git/attributes": home_default}
 
-    def test_no_machine_local_attribute_source_reaches_the_answer(self):
-        """THE PARTITION. At an unchanged target the whole span is
-        identical with each local source present and absent.
+    #: The cells that also run through the real emitter, one per outcome a
+    #: local source could force, each a cell that goes red under a
+    #: mutation below: on the kind whose marks a suppression could remove,
+    #: a suppression (only `info/attributes` outranks a tracked file, so
+    #: only it can) and a promotion from the same file; a promotion from a
+    #: configured `core.attributesFile`; and on the kind that declares
+    #: nothing, the promotion that would put a heading into a span that
+    #: has none. Every other cell is decided in process only.
+    END_TO_END = frozenset({
+        ("root rule", "$GIT_DIR/info/attributes", "suppress with -"),
+        ("root rule", "$GIT_DIR/info/attributes", "promote an unmarked path"),
+        ("root rule", "core.attributesFile, global config",
+         "promote an unmarked path"),
+        ("no declaration", "$XDG_CONFIG_HOME/git/attributes",
+         "promote an unmarked path"),
+    })
 
-        MUTATION: restore the unrestricted `check-attr` — every cell of
-        the info and `core.attributesFile` rows fails, in both intents.
+    #: How `--numstat` spells a path the span lists: C-quoted when it
+    #: carries a non-ASCII byte (`test_a_path_with_a_space_and_non_ascii_
+    #: bytes`), as written otherwise.
+    SHOWN = {"café x.json": '"caf\\303\\251 x.json"'}
+
+    def test_no_machine_local_attribute_source_reaches_the_answer(self):
+        """THE PARTITION. At an unchanged target the classification — and,
+        on the end-to-end cells, the whole span — is identical with each
+        local source present and absent.
+
+        MUTATIONS, measured 2026-09-27 cell by cell. Restore the
+        unrestricted `check-attr` and 26 of the 60 cells fail — every
+        promotion, from every source, and every `$GIT_DIR/info/attributes`
+        cell in all three intents — with every end-to-end cell among them.
+        A suppression from `core.attributesFile` or a default user file
+        passes even then: git reads those BELOW the target's tracked
+        `.gitattributes`, so they cannot unmark what it declares. Drop the
+        isolated directory's `attributesFile` pin and the promotions from
+        the global config and both default user files fail (12 cells).
         """
-        cell = 0
-        for kind, (files, declares) in self.TRACKED.items():
+        cell, spanned = 0, set()
+        for kind, (files, declared) in self.TRACKED.items():
             scratch = self._repo(None, files=files, prefix="genspan-local-")
             home, xdg = scratch.tmp / "home", scratch.tmp / "xdg"
             home.mkdir()
             xdg.mkdir()
             head = _git(scratch.repo, "rev-parse", "HEAD")
+            # The span's own path list: every path the head commit adds.
+            paths = sorted(files)
             with self._environment(HOME=str(home), XDG_CONFIG_HOME=str(xdg)):
-                reference = self._span(scratch, state="reference")
-            _, rows, marked = self._lists(reference)
-            # PAIRED CONTROL on the reference itself: a kind that declares
-            # nothing must mark nothing, and one that declares must mark —
-            # otherwise every cell below would agree with a vacant answer.
-            self.assertEqual(bool(marked), declares, kind)
-            self.assertIn(self.HAND, " ".join(rows),
-                          "the handwritten path is ordinary at the target")
-            for label, install in self._sources(
-                    scratch.repo, scratch.tmp, home, xdg).items():
+                reference = emit.generated_at_target(scratch.repo, head,
+                                                     paths)
+            # PAIRED CONTROL on the reference itself: each kind marks
+            # exactly what it declares, and a kind that declares nothing
+            # marks nothing — otherwise every cell below would agree with
+            # a vacant answer.
+            self.assertEqual(reference, declared, kind)
+            self.assertNotIn(self.HAND, reference,
+                             "the handwritten path is ordinary at the target")
+            rendered = None
+            if any(k == kind for k, _s, _i in self.END_TO_END):
+                with self._environment(HOME=str(home),
+                                       XDG_CONFIG_HOME=str(xdg)):
+                    rendered = self._span(scratch, state="reference")
+                _, rows, marked = self._lists(rendered)
+                # The rendering carries the decision, and nothing else.
+                self.assertEqual(sorted(marked), sorted(
+                    f"{self.SHOWN.get(p, p)}   (+1 -0)" for p in declared))
+                self.assertIn(self.HAND, " ".join(rows))
+            sources = self._sources(scratch.repo, scratch.tmp, home, xdg)
+            for label, install in sources.items():
                 for intent, rules in self.INTENTS.items():
                     cell += 1
+                    end_to_end = (kind, label, intent) in self.END_TO_END
+                    if end_to_end:
+                        spanned.add((kind, label, intent))
                     with self.subTest(declared=kind, source=label,
                                       intent=intent):
                         overrides, undo = install(rules)
@@ -1328,20 +1593,41 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
                             with self._environment(HOME=str(home),
                                                    XDG_CONFIG_HOME=str(xdg),
                                                    also=overrides):
-                                got = self._span(scratch, state=f"s{cell}")
+                                got = emit.generated_at_target(
+                                    scratch.repo, head, paths)
+                                span = (self._span(scratch, state=f"s{cell}")
+                                        if end_to_end else None)
                         finally:
                             undo()
-                        self.assertEqual(
-                            _git(scratch.repo, "rev-parse", "HEAD"), head,
-                            "the target moved, so the two spans are not "
-                            "comparable")
+                        if end_to_end:
+                            # The emitter sweeps and may commit; the
+                            # in-process reader never writes a ref.
+                            self.assertEqual(
+                                _git(scratch.repo, "rev-parse", "HEAD"),
+                                head, "the target moved, so the two spans "
+                                "are not comparable")
+                            self.assertEqual(span, rendered)
                         self.assertEqual(got, reference)
+            self.assertEqual(_git(scratch.repo, "rev-parse", "HEAD"), head,
+                             "the target moved, so the answers are not "
+                             "comparable")
+        self.assertEqual(cell, len(self.TRACKED) * len(sources)
+                         * len(self.INTENTS))
+        self.assertEqual(spanned, self.END_TO_END,
+                         "an end-to-end cell names no cell of the partition")
+
+    #: The paths `_repo` adds with an attributes file: the span's list.
+    SPAN_PATHS = [".gitattributes", "gen.json", "hand.py"]
 
     def test_a_local_source_cannot_reach_it_from_a_linked_worktree(self):
         """`info/attributes` lives in the COMMON directory, so a linked
         worktree inherits its parent's machine-local source — and the
         object store it must borrow is `--git-path objects`, not an
-        assumed `<repo>/.git/objects`."""
+        assumed `<repo>/.git/objects`.
+
+        The reference runs end to end from the linked worktree; the hostile
+        row is decided in process, from the same checkout, and must give
+        the answer the reference rendered."""
         scratch = self._repo("gen.json linguist-generated\n",
                              prefix="genspan-worktree-")
         home, xdg = scratch.tmp / "home", scratch.tmp / "xdg"
@@ -1350,6 +1636,7 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
         linked = scratch.tmp / "linked"
         sh("git", "-C", str(scratch.repo), "worktree", "add", "-q", "-b",
            "linked", str(linked), "HEAD")
+        head = _git(linked, "rev-parse", "HEAD")
         with self._environment(HOME=str(home), XDG_CONFIG_HOME=str(xdg)):
             reference = self._span(scratch, where=linked, state="wt-ref")
         _, _, marked = self._lists(reference)
@@ -1358,12 +1645,15 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
                     self.INTENTS["promote an unmarked path"]
                     + self.INTENTS["suppress with -"])
         with self._environment(HOME=str(home), XDG_CONFIG_HOME=str(xdg)):
-            self.assertEqual(self._span(scratch, where=linked, state="wt"),
-                             reference)
+            self.assertEqual(
+                emit.generated_at_target(linked, head, self.SPAN_PATHS),
+                {self.GEN})
 
     def test_an_object_store_that_has_its_own_alternates(self):
         """A `--shared` clone: the store this reader borrows borrows one
-        of its own, and the target's tree has to resolve through both."""
+        of its own, and the target's tree has to resolve through both.
+        The reference end to end from the clone, the hostile row in
+        process from it, as for the linked worktree."""
         scratch = self._repo("gen.json linguist-generated\n",
                              prefix="genspan-shared-")
         home, xdg = scratch.tmp / "home", scratch.tmp / "xdg"
@@ -1379,6 +1669,7 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
         self.assertTrue(
             (clone / ".git" / "objects" / "info" / "alternates").is_file(),
             "the fixture is not a shared clone, so it proves nothing")
+        head = _git(clone, "rev-parse", "HEAD")
         with self._environment(HOME=str(home), XDG_CONFIG_HOME=str(xdg)):
             reference = self._span(scratch, where=clone, state="alt-ref")
         _, _, marked = self._lists(reference)
@@ -1387,8 +1678,9 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
                     self.INTENTS["promote an unmarked path"]
                     + self.INTENTS["suppress with -"])
         with self._environment(HOME=str(home), XDG_CONFIG_HOME=str(xdg)):
-            self.assertEqual(self._span(scratch, where=clone, state="alt"),
-                             reference)
+            self.assertEqual(
+                emit.generated_at_target(clone, head, self.SPAN_PATHS),
+                {self.GEN})
 
     def _check_attr_calls(self, call):
         """(argv, env) for every `check-attr` the production reader
@@ -1511,11 +1803,11 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
                 "  hand.py\n")
 
     def test_every_emitted_request_still_validates(self):
+        """Both renderings, each emitted once to a file and validated: the
+        span with no generated path, and the span with the sub-list."""
         for attributes in (None, "gen.json linguist-generated\n"):
             with self.subTest(attributes=attributes):
                 scratch = self._repo(attributes)
-                out = self._span(scratch)
-                self.assertIn("What changed", out)
                 envelope = scratch.tmp / "request.md"
                 code, text = run_cli(
                     scratch.repo, scratch.tmp / "state-v", "emit-request",
@@ -1523,6 +1815,10 @@ class TestTheSpanListsGeneratedPathsSeparately(unittest.TestCase):
                     scratch.base, "--local-only", "--transport", "path",
                     "--out", str(envelope), cwd=scratch.cwd)
                 self.assertEqual(code, 0, text)
+                body = envelope.read_text(encoding="utf-8")
+                self.assertIn("What changed", body)
+                self.assertEqual("\nGenerated by declaration — " in body,
+                                 attributes is not None)
                 code, items = run_cli(scratch.repo, scratch.tmp / "state-v",
                                       "validate", str(envelope),
                                       cwd=scratch.cwd)
@@ -1581,6 +1877,24 @@ class TestTheScopeReportReachesTheAuthor(unittest.TestCase):
                          "here — the field exists to carry a disagreement")
 
 
+def _build_respond_author(root):
+    """`TestRespondRefusesAMismatchedAuthor`'s tree, once per process: the
+    scratch repository handed off `--local-only` (the request records this
+    repository's configured author) and round 1's verdict closed — the
+    state every test there answers, each in its own copy."""
+    base = copy_fixture("scratch_loop_repo", _build_scratch_loop,
+                        Path(root) / "author")
+    _write_claim(root, "respond author test")
+    loop = _Loop(root, state_name="state")
+    head = git_out(loop.author, "rev-parse", "HEAD")
+    loop.ok("handoff", "--claim-file", str(loop.claim), "--base", base,
+            "--local-only")
+    v1 = Path(root) / "v1.md"
+    v1.write_text(verdict_text(sha=head), encoding="utf-8")
+    loop.ok("close", "--verdict", str(v1))
+    return {"base": base, "head": head}
+
+
 class TestRespondRefusesAMismatchedAuthor(unittest.TestCase):
     """Round-3 F2's real-verb falsification.
 
@@ -1599,11 +1913,18 @@ class TestRespondRefusesAMismatchedAuthor(unittest.TestCase):
     """
 
     def setUp(self):
+        # Every test here answers the same round: the scratch repository
+        # handed off `--local-only` and round 1's verdict closed against
+        # it. That much is built once per process (`_build_respond_author`)
+        # and copied, so each test answers it in a ledger of its own.
         scratch = scratch_loop_repo(self, "respond-author-", name="author",
-                                    objective="respond author test")
+                                    objective="respond author test",
+                                    tree=("respond-author",
+                                          _build_respond_author))
         self.tmp, self.repo = scratch.tmp, scratch.repo
         self.base, self.claim, self.cwd = scratch.base, scratch.claim, scratch.cwd
         self.state = self.tmp / "state"
+        self.head, self.v1 = scratch.facts["head"], self.tmp / "v1.md"
 
     def _run(self, *argv):
         return run_cli(self.repo, self.state, *argv, cwd=self.cwd)
@@ -1620,21 +1941,13 @@ class TestRespondRefusesAMismatchedAuthor(unittest.TestCase):
                                           }}]})
 
     def test_a_mismatched_author_refuses_before_any_write(self):
-        head = _git(self.repo, "rev-parse", "HEAD")
-        code, rec = self._run("handoff", "--claim-file", str(self.claim),
-                              "--base", self.base, "--local-only")
-        self.assertEqual(code, 0, rec)
-        # The request `handoff` just recorded stamps this repo's configured
-        # author, "claude" — confirmed here rather than assumed, since the
-        # whole test rests on it.
+        head, v1 = self.head, self.v1
+        # The request the fixture's `handoff` recorded stamps this repo's
+        # configured author, "claude" — confirmed here rather than assumed,
+        # since the whole test rests on it.
         req = next(e for e in Ledger(self.state).events()
                   if e.get("event") == "request" and e.get("round") == 1)
         self.assertEqual(req.get("author"), "claude")
-
-        v1 = self.tmp / "v1.md"
-        v1.write_text(verdict_text(sha=head), encoding="utf-8")
-        code, closed = self._run("close", "--verdict", str(v1))
-        self.assertEqual(code, 0, closed)
 
         d_json = self.tmp / "d.json"
         d_json.write_text(self._disposition_json(head, "codex"),
@@ -1673,14 +1986,7 @@ class TestRespondRefusesAMismatchedAuthor(unittest.TestCase):
         is silence, and the recorded request's author fills it, exactly as
         `cfg.roles["author"]` did before this fix existed for a round with
         no derivable request."""
-        head = _git(self.repo, "rev-parse", "HEAD")
-        code, rec = self._run("handoff", "--claim-file", str(self.claim),
-                              "--base", self.base, "--local-only")
-        self.assertEqual(code, 0, rec)
-        v1 = self.tmp / "v1.md"
-        v1.write_text(verdict_text(sha=head), encoding="utf-8")
-        code, closed = self._run("close", "--verdict", str(v1))
-        self.assertEqual(code, 0, closed)
+        head, v1 = self.head, self.v1
         d_json = self.tmp / "d.json"
         data = json.loads(self._disposition_json(head, "codex"))
         del data["author"]
@@ -1712,17 +2018,10 @@ class TestRespondRefusesAMismatchedAuthor(unittest.TestCase):
         runs, and the mismatched case below prints the `author="codex"`
         envelope with exit 0 — this test's refusal assertions fail.
         """
-        head = _git(self.repo, "rev-parse", "HEAD")
-        code, rec = self._run("handoff", "--claim-file", str(self.claim),
-                              "--base", self.base, "--local-only")
-        self.assertEqual(code, 0, rec)
+        head, v1 = self.head, self.v1
         req = next(e for e in Ledger(self.state).events()
                   if e.get("event") == "request" and e.get("round") == 1)
         self.assertEqual(req.get("author"), "claude")
-        v1 = self.tmp / "v1.md"
-        v1.write_text(verdict_text(sha=head), encoding="utf-8")
-        code, closed = self._run("close", "--verdict", str(v1))
-        self.assertEqual(code, 0, closed)
 
         d_json = self.tmp / "d.json"
         d_json.write_text(self._disposition_json(head, "codex"),
@@ -1765,17 +2064,10 @@ class TestRespondRefusesAMismatchedAuthor(unittest.TestCase):
         `ledger add` below exit 0 and append an `author: "codex"`
         disposition event — this test's refusal assertions fail.
         """
-        head = _git(self.repo, "rev-parse", "HEAD")
-        code, rec = self._run("handoff", "--claim-file", str(self.claim),
-                              "--base", self.base, "--local-only")
-        self.assertEqual(code, 0, rec)
+        head, v1 = self.head, self.v1
         req = next(e for e in Ledger(self.state).events()
                   if e.get("event") == "request" and e.get("round") == 1)
         self.assertEqual(req.get("author"), "claude")
-        v1 = self.tmp / "v1.md"
-        v1.write_text(verdict_text(sha=head), encoding="utf-8")
-        code, closed = self._run("close", "--verdict", str(v1))
-        self.assertEqual(code, 0, closed)
 
         scratch_cfg = config.load(self.repo)
         dispositions = [{"finding_id": "F1", "disposition": "accepted",
@@ -1856,17 +2148,10 @@ class TestRespondRefusesAMismatchedAuthor(unittest.TestCase):
         that carries its answer forward — makes this envelope append
         `author: null` again and this test's assertion fails.
         """
-        head = _git(self.repo, "rev-parse", "HEAD")
-        code, rec = self._run("handoff", "--claim-file", str(self.claim),
-                              "--base", self.base, "--local-only")
-        self.assertEqual(code, 0, rec)
+        head, v1 = self.head, self.v1
         req = next(e for e in Ledger(self.state).events()
                   if e.get("event") == "request" and e.get("round") == 1)
         self.assertEqual(req.get("author"), "claude")
-        v1 = self.tmp / "v1.md"
-        v1.write_text(verdict_text(sha=head), encoding="utf-8")
-        code, closed = self._run("close", "--verdict", str(v1))
-        self.assertEqual(code, 0, closed)
 
         scratch_cfg = config.load(self.repo)
         dispositions = [{"finding_id": "F1", "disposition": "accepted",
@@ -1907,14 +2192,7 @@ class TestRespondRefusesAMismatchedAuthor(unittest.TestCase):
         author, makes this legacy ledger addition raise or record a
         fabricated author instead of the documented null.
         """
-        head = _git(self.repo, "rev-parse", "HEAD")
-        code, rec = self._run("handoff", "--claim-file", str(self.claim),
-                              "--base", self.base, "--local-only")
-        self.assertEqual(code, 0, rec)
-        v1 = self.tmp / "v1.md"
-        v1.write_text(verdict_text(sha=head), encoding="utf-8")
-        code, closed = self._run("close", "--verdict", str(v1))
-        self.assertEqual(code, 0, closed)
+        head, v1 = self.head, self.v1
 
         # Simulate a ledger whose round-1 request predates the `author`
         # field: strip it from the recorded request event directly, the
@@ -1966,14 +2244,7 @@ class TestRespondRefusesAMismatchedAuthor(unittest.TestCase):
         produce. Either stamp alone is enough to supply the author `ledger
         add` compares against the recorded request.
         """
-        head = _git(self.repo, "rev-parse", "HEAD")
-        code, rec = self._run("handoff", "--claim-file", str(self.claim),
-                              "--base", self.base, "--local-only")
-        self.assertEqual(code, 0, rec)
-        v1 = self.tmp / "v1.md"
-        v1.write_text(verdict_text(sha=head), encoding="utf-8")
-        code, closed = self._run("close", "--verdict", str(v1))
-        self.assertEqual(code, 0, closed)
+        head, v1 = self.head, self.v1
         scratch_cfg = config.load(self.repo)
         dispositions = [{"finding_id": "F1", "disposition": "accepted",
                          "payload": {"change": "fixed",
@@ -2027,14 +2298,7 @@ class TestRespondRefusesAMismatchedAuthor(unittest.TestCase):
         record the wrapper's `claude`, even though the body secretly
         claims `codex` — this test's refusal assertions fail.
         """
-        head = _git(self.repo, "rev-parse", "HEAD")
-        code, rec = self._run("handoff", "--claim-file", str(self.claim),
-                              "--base", self.base, "--local-only")
-        self.assertEqual(code, 0, rec)
-        v1 = self.tmp / "v1.md"
-        v1.write_text(verdict_text(sha=head), encoding="utf-8")
-        code, closed = self._run("close", "--verdict", str(v1))
-        self.assertEqual(code, 0, closed)
+        head, v1 = self.head, self.v1
         scratch_cfg = config.load(self.repo)
         dispositions = [{"finding_id": "F1", "disposition": "accepted",
                          "payload": {"change": "fixed",
@@ -2083,16 +2347,24 @@ class TestGateIdIsASafeFilenameComponent(unittest.TestCase):
         return "".join(f'[[gates]]\nid = "{i}"\ncommand = ["true"]\n'
                        for i in ids)
 
+    def _load_door(self):
+        """This test's own repository for the `load` door: initialised once
+        per test, its `review.toml` rewritten by each row before `load`
+        reads it — a row's refusal is judged on the bytes it wrote."""
+        if getattr(self, "_door_repo", None) is None:
+            tmp = Path(tempfile.mkdtemp(prefix="gate-id-"))
+            self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+            subprocess.run(["git", "init", "-q", str(tmp)], check=True,
+                           capture_output=True, timeout=60)
+            self._door_repo = tmp
+        return self._door_repo
+
     def _refused(self, body, door):
         with self.assertRaises(config.ConfigError) as ctx:
             if door == "from_text":
                 config.from_text(body, self._cfg(), source="t")
             else:
-                tmp = Path(tempfile.mkdtemp(prefix="gate-id-"))
-                self.addCleanup(lambda: __import__("shutil").rmtree(
-                    tmp, ignore_errors=True))
-                subprocess.run(["git", "init", "-q", str(tmp)], check=True,
-                               capture_output=True, timeout=60)
+                tmp = self._load_door()
                 (tmp / "review.toml").write_text(body, encoding="utf-8")
                 config.load(tmp)
         return str(ctx.exception)
@@ -2187,9 +2459,12 @@ class TestScratchRepositoriesAreCopiesOfOne(unittest.TestCase):
     def test_a_published_loop_copies_its_remote_and_its_clone(self):
         """The full-loop and header-loop templates hold an author, a bare
         path remote and a reviewer clone: each copy's author pushes to,
-        and each copy's reviewer fetches from, ITS OWN remote."""
+        and each copy's reviewer fetches from, ITS OWN remote. So does the
+        deepest header-loop state, a template copied from a template four
+        rounds down (`_STATES`), whose tree also carries a ledger."""
         for key, build in (("full-loop", _build_full_loop),
-                           ("header-loop", _build_header_loop)):
+                           ("header-loop", _build_header_loop),
+                           ("header-r4", _STATES["header-r4"])):
             with self.subTest(key):
                 a, b = (scratch_loop_repo(self, f"{key}-{n}-", name="author",
                                           tree=(key, build)) for n in "ab")
@@ -2216,6 +2491,16 @@ class TestScratchRepositoriesAreCopiesOfOne(unittest.TestCase):
                 for untouched in (b.tmp, root):
                     self.assertNotEqual(git_out(untouched / "remote.git",
                                                 "rev-parse", "main"), moved)
+                # A state's ledger is the copy's too: a write to one is in
+                # neither the other copy nor the template.
+                ledger = Path("state-author") / "ledger.jsonl"
+                if (root / ledger).is_file():
+                    before = (root / ledger).read_bytes()
+                    with (a.tmp / ledger).open("ab") as fh:
+                        fh.write(b"{}\n")
+                    for untouched in (b.tmp, root):
+                        self.assertEqual((untouched / ledger).read_bytes(),
+                                         before)
 
     def test_no_copied_git_metadata_names_the_template(self):
         """The rebase guard, over every path-bearing kind a template can

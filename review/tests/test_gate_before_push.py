@@ -25,13 +25,29 @@ so the predicate is the validator's own (`validate.validate_attestations`,
 through `emit.local_gate_failures`), never a second one — `not run: nested`
 records included.
 
-Everything runs through `python3 -m review` as a separate process, in a
-scratch repository with a bare remote and its own state directory. Each
-gate is a real command that APPENDS one line per execution to a counter
-outside the repository — the gate id, and the tip the remote carried when
-it ran — so "ran once" and "ran before the push" are counted, not assumed.
-A gate's exit code is read from a control file, so red and green are
-flipped without a commit.
+Every row runs in a scratch repository with a bare remote and its own
+state directory, at one of two levels. END TO END, through
+`python3 -m review` as a separate process, as a caller runs it: each guard
+keeps its accept row and one row per refusal kind there, through both
+author verbs wherever the verb is a dimension, so the wiring is proven
+where a caller meets it. IN PROCESS, the rest of each partition, against
+the functions that decide it, composed as `cli._emit` composes them:
+`emit.ensure_pushed` (the one resolution of the base, its refusals, the
+commit and the push) with, as its `before_push`, `emit.gate_before_push`
+(the local gates at the commit, refused before the push), under the
+environment `Scratch.run` gives its CLI child (`child_environment`), so a
+row run inside a gate execution is judged as that child would be.
+`emit.local_gate_failures` and `emit.run_gates`' carried half are judged
+directly. Each class that splits its rows says which run where, and why.
+
+The scratch — author repository, bare remote, the committed manifest —
+is built once per manifest and remote shape and copied per test
+(`GatedScratch`); a row that commits, pushes or runs a gate does so in
+its own copy. Each gate is a real command that APPENDS one line per
+execution to a counter outside the repository — the gate id, and the tip
+the remote carried when it ran — so "ran once" and "ran before the push"
+are counted, not assumed. A gate's exit code is read from a control file,
+so red and green are flipped without a commit.
 
 The one-base section holds the review BASE to one id (0.25.0 review
 round 1 F1): resolved once, before the hand-off's own commit, and that id
@@ -44,7 +60,9 @@ guarantee names that limit.
 
 MUTATIONS, each applied alone with bytecode off and measured red, recorded
 in the track reports of 2026-09-21 (loupe 0.25.0, track T1; round 2, track
-R2a for the base; round 3, track R3b for its scope).
+R2a for the base; round 3, track R3b for its scope), and measured red
+again against the rows as they now run, before and after the split
+between the two levels (track report of 2026-09-27).
 """
 from __future__ import annotations
 
@@ -60,20 +78,35 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from review import adapters, cli, config, emit, env_var, validate, wire
+from review import (TOOL_NAME, adapters, cli, config, emit, env_var,
+                    validate, wire)
 from review.tests._transport_fixtures import copied_instance
 from review.tests.test_ci_attested_gates import STUB, STUB_DIR_ENV, run_row
 from review.tests.test_git_timeout import (Scratch, cli_env, git,
                                            sleeping_pre_push)
 from review.tests.util import REPO_ROOT, public_path
 
+GATE_BASE, GATE_HEAD = env_var("GATE_BASE"), env_var("GATE_HEAD")
+
+#: What this process's environment may not leak into a runner it starts —
+#: nor into an in-process row, which stands where that runner's child was.
+RUNNER_NAMES = tuple(env_var(n) for n in (
+    "IN_GATE_RUN", "GATE_HEAD", "GATE_BASE", "STATE_DIR", "CONFIG",
+    "GATE_WORKERS", "SHIM", "CALLER_PYTHONSAFEPATH", "CALLER_PYTHONPATH"))
+
 #: A gate: one line to the counter per execution — its id, the remote's tip
 #: at that moment, and the review range the runner told it (base and head)
-#: — then the exit code its control file holds (0 when there is none).
+#: — then the exit code its control file holds (0 when there is none). The
+#: scratch is found from the gate's working directory, the scratch
+#: repository (`<root>/author`) every runner starts a gate in, so the
+#: manifest names no path of its own and is committed once, into the
+#: template every copy is made from (`GatedScratch`).
 GATE_SCRIPT = """\
 import json, os, pathlib, subprocess, sys
-ctl = pathlib.Path({ctl!r})
-tip = subprocess.run(["git", "ls-remote", {remote!r}, "refs/heads/main"],
+root = pathlib.Path.cwd().parent
+ctl = root / "ctl"
+tip = subprocess.run(["git", "ls-remote", str(root / {remote_dir!r}),
+                      "refs/heads/main"],
                      capture_output=True, text=True).stdout.split("\\t")[0]
 with (ctl / "runs.jsonl").open("a", encoding="utf-8") as log:
     log.write(json.dumps({{"gate": {gid!r}, "remote_tip": tip,
@@ -84,16 +117,45 @@ sys.exit(int(code.read_text()) if code.exists() else 0)
 """
 
 
-def gate_block(gid: str, ctl: Path, remote: Path, *, blocking: bool,
+def gate_block(gid: str, remote_dir: str, *, blocking: bool,
                ci: bool = False) -> str:
     command = [sys.executable, "-c",
-               GATE_SCRIPT.format(ctl=str(ctl), remote=str(remote), gid=gid,
-                                  base_name=env_var("GATE_BASE"),
-                                  head_name=env_var("GATE_HEAD"))]
+               GATE_SCRIPT.format(remote_dir=remote_dir, gid=gid,
+                                  base_name=GATE_BASE, head_name=GATE_HEAD)]
     return (f"\n[[gates]]\nid = {json.dumps(gid)}\n"
             f"command = {json.dumps(command)}\n"
             f"blocking = {'true' if blocking else 'false'}\n"
             + ('attested_by = "ci"\n' if ci else ""))
+
+
+class GatedScratch(Scratch):
+    """`Scratch` (base <- change) with a committed gate manifest on top
+    (<- the manifest) and the gates' control directory. `copied_instance`
+    builds it once per process per manifest and remote shape and copies
+    it: the manifest names no path (`GATE_SCRIPT`), so the template's
+    commit is every copy's, id included."""
+
+    def __init__(self, case, prefix, *, manifest: str, git_timeout=None,
+                 **kw):
+        super().__init__(case, prefix, **kw)
+        self.ctl = self.root / "ctl"
+        self.ctl.mkdir()
+        self.write_config(git_timeout=git_timeout, gates=manifest)
+        git(self.repo, "commit", "-qam", "the manifest")
+        self.head = git(self.repo, "rev-parse", "HEAD")
+
+
+def child_environment(state: Path, extra: dict | None = None):
+    """THIS process's environment made the one `Scratch.run` gives its CLI
+    child — `cli_env`'s, less every name a gate runner exports (the suite
+    may itself run inside a gate, `IN_GATE_RUN` set), with `extra` on top —
+    for the duration of an in-process row. `run_gates` reads the nesting
+    marker and `gh`'s stub directory from here, and every git door and gate
+    inherits it."""
+    env = {k: v for k, v in cli_env(state).items() if k not in RUNNER_NAMES}
+    env[env_var("STATE_DIR")] = str(state)
+    env.update(extra or {})
+    return mock.patch.dict(os.environ, env, clear=True)
 
 
 #: The range-sensitive gate round 1 F1 of 0.25.0's review names, verbatim:
@@ -120,28 +182,20 @@ class _Gated(unittest.TestCase):
 
     def fresh(self) -> Scratch:
         """A new scratch, made `self.scratch` — for a test whose rows each
-        need their own repository, remote and ledger."""
-        # The remote's path is needed inside the gates, and the gates are
-        # committed with the configuration — so the scratch is built once
-        # to learn its root, then the manifest is written against it.
-        # The scratch itself (author, bare remote, two commits, hooks
-        # directory) is built once per process per remote shape and copied
-        # (`copied_instance`); the manifest below names this copy's own
-        # paths, so it is written and committed here, per scratch.
-        probe = copied_instance(Scratch, self, self.PREFIX,
-                                remote_dir=self.REMOTE_DIR,
-                                url_form=self.URL_FORM)
-        self.scratch = probe
-        self.ctl = probe.root / "ctl"
-        self.ctl.mkdir()
-        gates = "".join(gate_block(gid, self.ctl, probe.remote,
-                                   blocking=blocking, ci=ci)
-                        for gid, blocking, ci in self.GATES)
-        probe.write_config(git_timeout=self.LIMITS,
-                           gates=gates + self.EXTRA_GATES)
-        git(probe.repo, "commit", "-qam", "the manifest")
-        probe.head = git(probe.repo, "rev-parse", "HEAD")
-        return probe
+        need their own repository, remote and ledger. A copy of the one
+        `GatedScratch` built for this manifest and remote shape: author,
+        bare remote, base <- change <- the manifest, hooks directory and
+        the gates' control directory."""
+        manifest = "".join(gate_block(gid, self.REMOTE_DIR,
+                                      blocking=blocking, ci=ci)
+                           for gid, blocking, ci in self.GATES)
+        s = copied_instance(GatedScratch, self, self.PREFIX,
+                            manifest=manifest + self.EXTRA_GATES,
+                            git_timeout=self.LIMITS,
+                            remote_dir=self.REMOTE_DIR,
+                            url_form=self.URL_FORM)
+        self.scratch, self.ctl = s, s.ctl
+        return s
 
     # ------------------------------------------------------------ control
 
@@ -171,6 +225,38 @@ class _Gated(unittest.TestCase):
         self.assertIsNone(err)
         return records
 
+    # --------------------------------------------------------- in process
+
+    def in_process(self, base: str, *, gates: bool = False,
+                   verb: str = "handoff", env: dict | None = None,
+                   seen: list | None = None) -> tuple[dict, list, object]:
+        """The hand-off up to its emission, IN THIS PROCESS: the two
+        functions `cli._emit` composes, called as it calls them for
+        `<verb> --base <base>`, under `child_environment`. `emit.ensure_pushed`
+        resolves the base, commits, reaches its `before_push` and pushes;
+        the callback records what it was handed and the remote's tip at
+        that moment into `seen` and — with `gates` — runs
+        `emit.gate_before_push` exactly as the CLI's callback does (the
+        governing manifest, the resolved base, the verb). Returns
+        (record, seen, the local gates or None); raises what the two raise,
+        `seen` then holding what the callback saw."""
+        s = self.scratch
+        seen = [] if seen is None else seen
+        local = []
+
+        def before_push(record: dict) -> None:
+            seen.append((dict(record), self.remote_tip()))
+            if gates:
+                local.append(emit.gate_before_push(
+                    record["governing"], record, base=record["base"],
+                    verb=verb))
+
+        with child_environment(s.state, env):
+            cfg = config.load(s.repo, ledger_dir=str(s.state))
+            record = emit.ensure_pushed(cfg, base=base,
+                                        before_push=before_push)
+        return record, seen, (local[0] if local else None)
+
     def assert_refused_before_push(self, code, payload, stderr, *,
                                    failed: list[str], tip: str,
                                    ran: bool = True):
@@ -195,9 +281,11 @@ class _Gated(unittest.TestCase):
 
 
 class TestTheScratchIsACopyOfOneBuild(_Gated):
-    """`fresh()` copies one built `Scratch` per remote shape: each copy's
-    paths, remote URL and hooks directory are its own, its commits the
-    template's, and a push from one reaches no other copy's remote.
+    """`fresh()` copies one built `GatedScratch` per manifest and remote
+    shape: each copy's paths, remote URL, hooks and control directories are
+    its own, its commits — the manifest's included — the template's, and a
+    push from one reaches no other copy's remote, nor a gate's record
+    another copy's counter.
 
     MUTATIONS: skip the path rebase in `copy_fixture` and the copy's
     `core.hooksPath` and origin name the template's directories; leave
@@ -208,9 +296,9 @@ class TestTheScratchIsACopyOfOneBuild(_Gated):
         a = self.scratch
         b = self.fresh()
         self.assertNotEqual(a.root, b.root)
-        self.assertEqual(a.base, b.base)
+        self.assertEqual((a.base, a.head), (b.base, b.head))
         for s in (a, b):
-            for attr in ("repo", "remote", "state", "hooks", "claim"):
+            for attr in ("repo", "remote", "state", "hooks", "claim", "ctl"):
                 self.assertTrue(str(getattr(s, attr)).startswith(
                     str(s.root) + os.sep), attr)
             self.assertIs(s.case, self)
@@ -220,12 +308,24 @@ class TestTheScratchIsACopyOfOneBuild(_Gated):
                              s.url)
             self.assertIn(str(s.remote), s.url)
             self.assertEqual(git(s.remote, "rev-parse", "main"), s.base)
-            # base <- change <- the manifest (this copy's own commit).
+            # base <- change <- the manifest (the template's commit).
             self.assertEqual(git(s.repo, "rev-parse", "HEAD~2"), s.base)
             self.assertEqual(git(s.repo, "rev-parse", "HEAD"), s.head)
+            self.assertEqual(git(s.repo, "status", "--porcelain"), "")
         git(a.repo, "push", "-q", "origin", "main")
         self.assertEqual(git(a.remote, "rev-parse", "main"), a.head)
         self.assertEqual(git(b.remote, "rev-parse", "main"), b.base)
+        # A gate, run as a runner runs it — from the copy's repository —
+        # records into that copy's counter and reads that copy's remote.
+        [block] = [g for g in config.load(
+            a.repo, ledger_dir=str(a.state)).gates if g["id"] == "block"]
+        subprocess.run(block["command"], cwd=str(a.repo), check=True,
+                       capture_output=True, timeout=60,
+                       stdin=subprocess.DEVNULL)
+        self.scratch, self.ctl = a, a.ctl
+        self.assertEqual([(r["gate"], r["remote_tip"]) for r in self.runs()],
+                         [("block", a.head)])
+        self.assertFalse((b.ctl / "runs.jsonl").exists())
 
 
 class TestARedBlockingGateStopsThePush(_Gated):
@@ -354,6 +454,12 @@ class TestAnUnknownMapGateStopsBeforeAnyGate(_Gated):
 
 
 class TestWhatDoesNotStopThePush(_Gated):
+    """End to end, one hand-off per outcome: a red advisory gate pushes and
+    emits; no derivable base refuses; and all green — one cold hand-off
+    that carries three rows (every gate once, before the push, bound, in
+    manifest order; the gates told the resolved id, not the spelling; then
+    the same hand-off warm, served from the cache with no gate run and
+    nothing pushed)."""
 
     def test_a_red_advisory_gate_pushes_and_emits_as_before(self):
         s = self.scratch
@@ -370,29 +476,39 @@ class TestWhatDoesNotStopThePush(_Gated):
         self.assertEqual({r["remote_tip"] for r in self.runs()}, {tip})
 
     def test_all_green_every_gate_runs_once_and_before_the_push(self):
+        """All green, cold: every gate runs once, before the push, and is
+        told the id the emission binds, not the spelling the author typed
+        (`--base <abbreviated>`): the base is resolved before the commit,
+        and the gates now run before the push. Then the same hand-off
+        again, warm: served from the cache — the same digest — with no gate
+        run and nothing pushed (a `pre-push` counter)."""
         s = self.scratch
         tip = self.remote_tip()
-        code, rec, stderr = s.handoff()
-        self.assertEqual(code, 0, (rec, stderr))
+        counter = s.root / "pre-push.count"
+        s.hook("pre-push", sleeping_pre_push(0, counter=counter))
+        argv = ("handoff", "--claim-file", str(s.claim),
+                "--base", s.base[:10])
+        code, first, stderr = s.run(*argv)
+        self.assertEqual(code, 0, (first, stderr))
         runs = self.runs()
         self.assertEqual(sorted(r["gate"] for r in runs), ["advise", "block"])
         self.assertEqual({r["remote_tip"] for r in runs}, {tip})
+        self.assertEqual({r["base"] for r in runs}, {s.base})
         self.assertEqual(self.remote_tip(), s.head)
-        envelope = Path(rec["kept"]).read_text(encoding="utf-8")
+        envelope = Path(first["kept"]).read_text(encoding="utf-8")
         self.assertEqual([r["id"] for r in self.attestations(envelope)],
                          ["block", "advise"])
         for record in self.attestations(envelope):
             self.assertEqual(record["binding"], "bound")
-
-    def test_the_gates_are_told_the_resolved_base(self):
-        """The base is resolved before the commit, and the gates — which
-        now run before the push — are told the id the emission binds, not
-        the spelling the author typed."""
-        s = self.scratch
-        code, rec, stderr = s.run("handoff", "--claim-file", str(s.claim),
-                                  "--base", s.base[:10])
-        self.assertEqual(code, 0, (rec, stderr))
-        self.assertEqual({r["base"] for r in self.runs()}, {s.base})
+        pushes = counter.read_text().count("run")
+        code, warm, stderr = s.run(*argv)
+        self.assertEqual(code, 0, (warm, stderr))
+        self.assertTrue(warm["cached"])
+        self.assertEqual(warm["digest"], first["digest"])
+        self.assertEqual(len(self.runs()), len(runs),
+                         "a gate ran on a warm serve")
+        self.assertEqual(counter.read_text().count("run"), pushes,
+                         "the warm serve pushed")
 
     def test_no_derivable_base_refuses_before_any_gate_or_push(self):
         s = self.scratch
@@ -406,21 +522,6 @@ class TestWhatDoesNotStopThePush(_Gated):
         self.assertEqual(self.runs(), [])
         self.assertEqual(self.remote_tip(), tip)
         self.assertEqual(self.requests(), [])
-
-    def test_the_warm_cache_runs_no_gate_and_pushes_nothing(self):
-        s = self.scratch
-        counter = s.root / "pre-push.count"
-        s.hook("pre-push", sleeping_pre_push(0, counter=counter))
-        code, first, stderr = s.handoff()
-        self.assertEqual(code, 0, (first, stderr))
-        runs, pushes = len(self.runs()), counter.read_text().count("run")
-        code, warm, stderr = s.handoff()
-        self.assertEqual(code, 0, (warm, stderr))
-        self.assertTrue(warm["cached"])
-        self.assertEqual(warm["digest"], first["digest"])
-        self.assertEqual(len(self.runs()), runs, "a gate ran on a warm serve")
-        self.assertEqual(counter.read_text().count("run"), pushes,
-                         "the warm serve pushed")
 
 
 class TestLocalOnly(_Gated):
@@ -764,22 +865,48 @@ class _Ranged(_Gated):
 class TestEveryBaseFormBindsOneRange(_Ranged):
     """THE PARTITION: immutable (full, abbreviated), symbolic (the branch,
     its remote-tracking ref, a lightweight and an annotated tag), relative
-    (`HEAD`, `HEAD~1`) — with and without outstanding tracked work — through
-    BOTH author verbs. Every row: the request names the base its expression
-    named before the run, every gate was told exactly that range, and the
-    range gate re-run over the emitted range agrees with its attestation.
+    (`HEAD`, `HEAD~1`) — with and without outstanding tracked work. Every
+    row: the base is the commit its expression named before the run, and
+    that id is what the callback that runs the gates is handed, before the
+    push.
 
     The rows that exercise a MOVE assert that they do: after the run their
     expression names another commit, so a second resolution would have
     found it. `origin/main` moves with the PUSH even when nothing was
-    committed. Mutation (the finding's): forward the unresolved expression
-    to the emission again, and every moving row fails."""
+    committed.
+
+    WHERE THE ROWS RUN. The form decides one thing — which commit the
+    expression names — and one function decides it: `emit.ensure_pushed`,
+    which resolves the base once, before its own commit and push, and hands
+    the id to the callback where the hand-off runs its gates. So the whole
+    partition runs IN PROCESS against it (`in_process`: the real commit and
+    the real push, a recording callback in the gates' place). What the id
+    then reaches — every gate told it, `Base:`, the range gate's
+    attestation, the shape, the validation — does not depend on the form,
+    and is proven END TO END through the real CLI on the two kinds of move,
+    one author verb each: `handoff` with the branch and outstanding work
+    (it moves with the commit), `emit-request` with the remote-tracking ref
+    and none (it moves with the push alone). `HEAD~1` with outstanding work
+    runs end to end through both verbs in `TestTheWhitespaceReproduction`
+    and in the control of
+    `TestABaseThatNamesNoOneCommitRefusesBeforeTheCommit`.
+
+    MUTATIONS. The finding's — forward the unresolved expression to the
+    emission again — fails the end-to-end rows (it acts after the
+    resolution the in-process rows stop at). Resolve the base after the
+    hand-off's own commit rather than before it, and every in-process row
+    that moves with the commit fails; drop the `^{commit}` peel, and the
+    annotated tag's rows fail."""
 
     FORMS = ("full", "abbreviated", "branch", "remote-tracking",
              "lightweight tag", "annotated tag", "HEAD", "HEAD~1")
     #: Which forms name another commit after the run, by outstanding work.
     MOVES = {True: {"branch", "remote-tracking", "HEAD", "HEAD~1"},
              False: {"remote-tracking"}}
+    #: End to end: (verb, form, outstanding work) — one move of each kind,
+    #: one verb each.
+    THROUGH_THE_CLI = (("handoff", "branch", True),
+                       ("emit-request", "remote-tracking", False))
 
     def spelled(self, form: str) -> str:
         s = self.scratch
@@ -791,29 +918,56 @@ class TestEveryBaseFormBindsOneRange(_Ranged):
                 "lightweight tag": "light", "annotated tag": "ann",
                 "HEAD": "HEAD", "HEAD~1": "HEAD~1"}[form]
 
-    def test_the_partition_through_both_verbs(self):
-        for verb in self.VERBS:
-            for outstanding in (True, False):
-                for form in self.FORMS:
-                    with self.subTest(verb=verb, outstanding=outstanding,
-                                      form=form):
-                        s = self.fresh()
-                        spelled = self.spelled(form)
-                        expected = git(s.repo, "rev-parse", "--verify",
-                                       f"{spelled}^{{commit}}")
-                        if outstanding:
-                            (s.repo / "f.txt").write_text(
-                                "three\nfour\n", encoding="utf-8")
-                        code, payload, stderr, envelope = self.verb(
-                            verb, spelled)
-                        self.assert_one_range(verb, code, payload, stderr,
-                                              envelope, expected=expected)
-                        after = git(s.repo, "rev-parse", "--verify",
-                                    f"{spelled}^{{commit}}")
-                        self.assertEqual(
-                            after != expected,
-                            form in self.MOVES[outstanding],
-                            "the row does not exercise what it names")
+    def assert_moves(self, form: str, outstanding: bool, spelled: str,
+                     expected: str) -> None:
+        after = git(self.scratch.repo, "rev-parse", "--verify",
+                    f"{spelled}^{{commit}}")
+        self.assertEqual(after != expected, form in self.MOVES[outstanding],
+                         "the row does not exercise what it names")
+
+    def test_the_partition_at_the_one_resolution(self):
+        for outstanding in (True, False):
+            for form in self.FORMS:
+                with self.subTest(outstanding=outstanding, form=form):
+                    s = self.fresh()
+                    spelled = self.spelled(form)
+                    expected = git(s.repo, "rev-parse", "--verify",
+                                   f"{spelled}^{{commit}}")
+                    tip = self.remote_tip()
+                    if outstanding:
+                        (s.repo / "f.txt").write_text(
+                            "three\nfour\n", encoding="utf-8")
+                    record, seen, _local = self.in_process(spelled)
+                    target = git(s.repo, "rev-parse", "HEAD")
+                    self.assertEqual(
+                        (record["state"], record["sha"], record["committed"]),
+                        ("pushed", target, outstanding))
+                    self.assertEqual(record["base"], expected,
+                                     "the base is what the expression named "
+                                     "before the hand-off's own commit and "
+                                     "push")
+                    self.assertEqual(
+                        [(handed["base"], handed["sha"], at)
+                         for handed, at in seen], [(expected, target, tip)],
+                        "the callback that runs the gates was not handed "
+                        "that id, once, before the push")
+                    self.assertEqual(self.remote_tip(), target)
+                    self.assert_moves(form, outstanding, spelled, expected)
+
+    def test_the_moves_through_the_real_cli(self):
+        for verb, form, outstanding in self.THROUGH_THE_CLI:
+            with self.subTest(verb=verb, form=form, outstanding=outstanding):
+                s = self.fresh()
+                spelled = self.spelled(form)
+                expected = git(s.repo, "rev-parse", "--verify",
+                               f"{spelled}^{{commit}}")
+                if outstanding:
+                    (s.repo / "f.txt").write_text("three\nfour\n",
+                                                  encoding="utf-8")
+                code, payload, stderr, envelope = self.verb(verb, spelled)
+                self.assert_one_range(verb, code, payload, stderr, envelope,
+                                      expected=expected)
+                self.assert_moves(form, outstanding, spelled, expected)
 
 
 class TestTheWhitespaceReproduction(_Ranged):
@@ -828,7 +982,19 @@ class TestTheWhitespaceReproduction(_Ranged):
 
     The paired control is the immutable B, and `--base HEAD` — B when
     typed — names the same range: the blocking gate is red over B..C, so
-    the hand-off refuses before the push and emits nothing."""
+    the hand-off refuses before the push and emits nothing.
+
+    WHERE THE ROWS RUN. `HEAD~1` end to end through both author verbs: it
+    is the reproduction. Of the four refusal rows (two spellings, two
+    verbs), two run end to end — `handoff --base HEAD`, `emit-request
+    --base B`, one spelling per verb — and the other two in process, where
+    the refusal is decided (`in_process` with the gates: GatesRefused
+    before the push, the verb's own command in its remedy)."""
+
+    #: The refusal, end to end: (verb, spelling), each verb and each
+    #: spelling once. The other pairing runs in process.
+    REFUSED_THROUGH_THE_CLI = (("handoff", "HEAD"), ("emit-request", "B"))
+    REFUSED_IN_PROCESS = (("handoff", "B"), ("emit-request", "HEAD"))
 
     def abc(self) -> tuple[str, str]:
         s = self.fresh()
@@ -854,30 +1020,55 @@ class TestTheWhitespaceReproduction(_Ranged):
                 # gate over B..C is red.
                 self.assertNotEqual(self.rerun(b, target), 0)
 
+    def assert_judged_b_to_c(self, a: str, b: str, tip: str) -> None:
+        """Refused before the push, over B..C: the remote untouched, C the
+        commit the hand-off left on B, every gate told B..C, and the gate
+        over that range red where A..C is clean."""
+        s = self.scratch
+        self.assertEqual(self.remote_tip(), tip)
+        committed = git(s.repo, "rev-parse", "HEAD")
+        self.assertEqual(git(s.repo, "rev-parse", "HEAD~1"), b)
+        self.assertEqual({(r["base"], r["head"]) for r in self.runs()},
+                         {(b, committed)})
+        # The refusal agrees with the gate over the range it judged — and
+        # that range is B..C, not A..C.
+        self.assertNotEqual(self.rerun(b, committed), 0)
+        self.assertEqual(self.rerun(a, committed), 0)
+
     def test_the_immutable_control_and_head_refuse_before_the_push(self):
-        for verb in self.VERBS:
-            for spelling in ("B", "HEAD"):
-                with self.subTest(verb=verb, base=spelling):
-                    a, b = self.abc()
-                    s = self.scratch
-                    tip = self.remote_tip()
-                    code, payload, stderr, envelope = self.verb(
-                        verb, b if spelling == "B" else "HEAD")
-                    self.assert_refused_nothing_emitted(
-                        verb, code, payload, stderr, envelope)
-                    self.assertEqual(code, 1, payload)
-                    self.assertEqual(payload["next_kind"], "blocked")
-                    self.assertIn("whitespace", payload["error"])
-                    self.assertEqual(self.remote_tip(), tip)
-                    committed = git(s.repo, "rev-parse", "HEAD")
-                    self.assertEqual(git(s.repo, "rev-parse", "HEAD~1"), b)
-                    self.assertEqual(
-                        {(r["base"], r["head"]) for r in self.runs()},
-                        {(b, committed)})
-                    # The refusal agrees with the gate over the range it
-                    # judged — and that range is B..C, not A..C.
-                    self.assertNotEqual(self.rerun(b, committed), 0)
-                    self.assertEqual(self.rerun(a, committed), 0)
+        for verb, spelling in self.REFUSED_THROUGH_THE_CLI:
+            with self.subTest(verb=verb, base=spelling):
+                a, b = self.abc()
+                tip = self.remote_tip()
+                code, payload, stderr, envelope = self.verb(
+                    verb, b if spelling == "B" else "HEAD")
+                self.assert_refused_nothing_emitted(
+                    verb, code, payload, stderr, envelope)
+                self.assertEqual(code, 1, payload)
+                self.assertEqual(payload["next_kind"], "blocked")
+                self.assertIn("whitespace", payload["error"])
+                self.assertIn(f"`{TOOL_NAME} {verb}`", payload["remedy"])
+                self.assert_judged_b_to_c(a, b, tip)
+
+    def test_the_other_pairing_refuses_in_process(self):
+        for verb, spelling in self.REFUSED_IN_PROCESS:
+            with self.subTest(verb=verb, base=spelling):
+                a, b = self.abc()
+                tip = self.remote_tip()
+                seen = []
+                with self.assertRaises(emit.GatesRefused) as caught:
+                    self.in_process(b if spelling == "B" else "HEAD",
+                                    gates=True, verb=verb, seen=seen)
+                refusal = caught.exception
+                self.assertIn("whitespace", str(refusal))
+                self.assertIn("Nothing was pushed, emitted or recorded",
+                              str(refusal))
+                self.assertIn(f"`{TOOL_NAME} {verb}`", refusal.remedy)
+                self.assertEqual([handed["base"] for handed, _at in seen],
+                                 [b])
+                self.assertEqual(refusal.sha,
+                                 git(self.scratch.repo, "rev-parse", "HEAD"))
+                self.assert_judged_b_to_c(a, b, tip)
 
 
 class TestABaseThatNamesNoOneCommitRefusesBeforeTheCommit(_Ranged):
@@ -887,32 +1078,72 @@ class TestABaseThatNamesNoOneCommitRefusesBeforeTheCommit(_Ranged):
     status and files byte-identical. Before the fix a range or an
     option-shaped value resolved to SEVERAL lines, and a tree to a tree:
     each was committed and gated, and the tree was pushed. Mutations: drop
-    `--verify`, or the `^{commit}` peel, and those rows go red."""
+    `--verify`, or the `^{commit}` peel, and those rows go red.
+
+    WHERE THE ROWS RUN. The refusal is `emit.ensure_pushed`'s, before its
+    commit, and the spelling is all that varies, so every spelling runs IN
+    PROCESS against it (`in_process`, gates on): the refusal, the
+    repository byte-identical, the remote untouched, the gate callback
+    never reached — beside the paired control, the same scratch with a
+    resolvable base, which reaches it and gates. END TO END each author
+    verb keeps one row, spelled as argparse must hand over as a VALUE
+    rather than parse — `handoff --base=--all` (option-shaped),
+    `emit-request --base=` (empty) — with the exit code and the blocked
+    payload, and the control through both verbs."""
 
     BASES = ("nosuch", "HEAD~50", "HEAD~1..HEAD", "--all", "",
              "HEAD^{tree}")
+    #: End to end: (verb, spelling), one per verb.
+    THROUGH_THE_CLI = (("handoff", "--all"), ("emit-request", ""))
 
-    def test_every_verb_every_unresolvable_spelling(self):
-        for verb in self.VERBS:
-            for base in self.BASES:
-                with self.subTest(verb=verb, base=base):
-                    s = self.fresh()
-                    (s.repo / "f.txt").write_text("outstanding\n",
-                                                  encoding="utf-8")
-                    Scratch.settle(s.repo)
-                    before = Scratch.snapshot(s.repo)
-                    tip = self.remote_tip()
-                    code, payload, stderr, envelope = self.verb(verb, base)
-                    self.assert_refused_nothing_emitted(
-                        verb, code, payload, stderr, envelope)
-                    self.assertEqual(code, 2, payload)
-                    self.assertIn("does not name one commit",
-                                  payload["error"])
-                    self.assertIn("nothing has been committed",
-                                  payload["error"])
-                    self.assertEqual(Scratch.snapshot(s.repo), before)
-                    self.assertEqual(self.runs(), [])
-                    self.assertEqual(self.remote_tip(), tip)
+    def outstanding(self) -> tuple[Scratch, dict, str]:
+        """A fresh scratch with outstanding tracked work, settled: (the
+        scratch, its snapshot, the remote's tip)."""
+        s = self.fresh()
+        (s.repo / "f.txt").write_text("outstanding\n", encoding="utf-8")
+        Scratch.settle(s.repo)
+        return s, Scratch.snapshot(s.repo), self.remote_tip()
+
+    def assert_untouched(self, before: dict, tip: str) -> None:
+        self.assertEqual(Scratch.snapshot(self.scratch.repo), before)
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(self.remote_tip(), tip)
+
+    def test_every_unresolvable_spelling_in_process(self):
+        for base in self.BASES:
+            with self.subTest(base=base):
+                _s, before, tip = self.outstanding()
+                seen = []
+                with self.assertRaises(RuntimeError) as caught:
+                    self.in_process(base, gates=True, seen=seen)
+                self.assertNotIsInstance(caught.exception, emit.GatesRefused)
+                self.assertIn("does not name one commit",
+                              str(caught.exception))
+                self.assertIn("nothing has been committed",
+                              str(caught.exception))
+                self.assertEqual(seen, [], "the gate callback was reached")
+                self.assert_untouched(before, tip)
+        with self.subTest(control="HEAD~1"):
+            s, _before, _tip = self.outstanding()
+            record, seen, local = self.in_process("HEAD~1", gates=True)
+            self.assertEqual(record["base"],
+                             git(s.repo, "rev-parse", "HEAD~2"))
+            self.assertEqual(len(seen), 1)
+            self.assertEqual([r["id"] for r in local.records],
+                             ["block", "whitespace"])
+            self.assertEqual(self.remote_tip(), record["sha"])
+
+    def test_one_spelling_per_verb_through_the_real_cli(self):
+        for verb, base in self.THROUGH_THE_CLI:
+            with self.subTest(verb=verb, base=base):
+                _s, before, tip = self.outstanding()
+                code, payload, stderr, envelope = self.verb(verb, base)
+                self.assert_refused_nothing_emitted(
+                    verb, code, payload, stderr, envelope)
+                self.assertEqual(code, 2, payload)
+                self.assertIn("does not name one commit", payload["error"])
+                self.assertIn("nothing has been committed", payload["error"])
+                self.assert_untouched(before, tip)
 
     def test_control_the_same_scratch_with_a_resolvable_base(self):
         for verb in self.VERBS:
@@ -960,18 +1191,11 @@ class TestANonAncestorBaseEmitsNothing(_Ranged):
 # range-sensitive gate must run locally to receive it, and every statement
 # of it says so.
 
-GATE_BASE, GATE_HEAD = env_var("GATE_BASE"), env_var("GATE_HEAD")
-
 #: The reviewer's range gate, verbatim: told no base, it falls back to the
 #: last commit — which is exactly the range CI, told no base, checks.
 FALLBACK_RANGE_GATE = ["sh", "-c",
                        f'git diff --check "${{{GATE_BASE}:-HEAD~1}}" '
                        f'"${GATE_HEAD}"']
-
-#: What this process's environment may not leak into a runner it starts.
-RUNNER_NAMES = tuple(env_var(n) for n in (
-    "IN_GATE_RUN", "GATE_HEAD", "GATE_BASE", "STATE_DIR", "CONFIG",
-    "GATE_WORKERS", "SHIM", "CALLER_PYTHONSAFEPATH", "CALLER_PYTHONPATH"))
 
 
 class _CIRange(_Gated):
@@ -1037,14 +1261,15 @@ class _CIRange(_Gated):
         return [{k: v for k, v in r.items() if k != "duration_s"}
                 for r in receipt["gates"]]
 
-    def ci_receipt(self, head: str) -> dict:
+    def ci_receipt(self, head: str, *, through_the_runner: bool = False
+                   ) -> dict:
         """CI's receipt for `head`, made the way CI makes it: the runner
         inside CI (`GITHUB_ACTIONS`), with NO review base — the workflow
-        passes none — then one row per declared gate. Where the workbench's
-        own entry point exists it runs too, from inside the scratch
-        repository as CI runs it from inside the checkout, with
-        `--receipt`; its rows must be the in-process ones, and its receipt
-        is the one served."""
+        passes none — then one row per declared gate. `through_the_runner`:
+        where the workbench's own entry point exists it runs too, from
+        inside the scratch repository as CI runs it from inside the
+        checkout, with `--receipt`; its rows must be the in-process ones,
+        and its receipt is the one served."""
         s = self.scratch
         ambient = {k: v for k, v in os.environ.items()
                    if k not in RUNNER_NAMES + ("PYTHONSAFEPATH",
@@ -1055,7 +1280,7 @@ class _CIRange(_Gated):
             records = emit.run_gates(cfg, head)
         receipt = emit.gate_receipt(head, cfg.gates,
                                     {r["id"]: r for r in records})
-        if not self.RUNNER.is_file():
+        if not through_the_runner or not self.RUNNER.is_file():
             return receipt
         # The runner's root is its grandparent, so it sits where CI's does:
         # `bin/loupe-gates` inside the checkout it gates — ignored, so the
@@ -1140,47 +1365,92 @@ class TestACIAttestedRangeGateBindsTheCommitNotTheBase(_CIRange):
     that attestation, bound and green; the same gate over the EMITTED
     range exits 2. The recorder, a local gate, was told A. Row base=B: CI's
     fallback range IS the emitted range, and the two agree — the
-    disagreement is the base, not the mechanism."""
+    disagreement is the base, not the mechanism.
+
+    WHERE THE ROWS RUN. Both bases IN PROCESS, through the hand-off's own
+    composition up to the envelope: `in_process` with the gates (the local
+    half at the commit, told the base, then the push), then
+    `emit.run_gates` carrying that half and awaiting CI's receipt from the
+    fake `gh`, as `emit_request` calls it — the attestation the envelope
+    would carry. END TO END, one row per author verb, one base each
+    (`handoff --base A`, `emit-request --base B`), the envelope read back.
+    CI's receipt is made in process on every row; the workbench's CI entry
+    point runs once, on the `handoff --base A` row, and must produce the
+    same receipt."""
+
+    #: End to end: (verb, base); the runner runs on the first.
+    THROUGH_THE_CLI = (("handoff", "A"), ("emit-request", "B"))
+
+    def base_less_receipt(self, c: str, *, through_the_runner=False) -> dict:
+        receipt = self.ci_receipt(c, through_the_runner=through_the_runner)
+        keys = set(receipt) | {k for r in receipt["gates"] for k in r}
+        self.assertEqual([k for k in keys if "base" in k], [],
+                         "a CI receipt carries no review base")
+        [row] = [r for r in receipt["gates"] if r["id"] == "whitespace"]
+        self.assertEqual((row["exit_code"], row["not_run"]), (0, None))
+        return receipt
+
+    def assert_the_limit(self, name: str, a: str, b: str, c: str,
+                         ws: dict) -> None:
+        """The attestation CI's evidence gives the range gate, against the
+        gate itself over each range."""
+        self.assertEqual((ws["attested_by"], ws["binding"], ws["exit_code"]),
+                         ("ci", "bound", 0))
+        # What CI's evidence is about: its own base-less range.
+        self.assertEqual(self.rerun(None, c), 0)
+        self.assertEqual(self.rerun(b, c), 0)
+        # What the request names: A..C for row A, where the same gate is
+        # red — the limit, in one line.
+        self.assertEqual(self.rerun({"A": a, "B": b}[name], c),
+                         2 if name == "A" else 0)
+        self.assertEqual(self.rerun(a, c), 2)
 
     def test_the_reviewers_abc_ci_attested(self):
-        for verb in self.VERBS:
-            for name in ("A", "B"):
-                with self.subTest(verb=verb, base=name):
-                    a, b, c = self.abc(ci=True)
-                    base = {"A": a, "B": b}[name]
-                    receipt = self.ci_receipt(c)
-                    keys = set(receipt) | {k for r in receipt["gates"]
-                                           for k in r}
-                    self.assertEqual([k for k in keys if "base" in k], [],
-                                     "a CI receipt carries no review base")
-                    [row] = [r for r in receipt["gates"]
-                             if r["id"] == "whitespace"]
-                    self.assertEqual((row["exit_code"], row["not_run"]),
-                                     (0, None))
-                    self.serve(c, receipt)
-                    since = len(self.runs())
-                    code, payload, stderr, envelope = self.verb(verb, base)
-                    self.assertNotIn("Traceback", stderr)
-                    self.assertEqual(code, 0, (payload, stderr))
-                    self.assertEqual(self.emitted(verb), 1)
-                    self.assertEqual(self.remote_tip(), c)
-                    self.assertEqual(wire.parse_request(envelope).sha, c)
-                    self.assertEqual(BASE_LINE.findall(envelope), [base])
-                    # The one base reached the gate the hand-off ran.
-                    self.assertEqual(self.told(since), [("block", base, c)])
-                    by_id = {r["id"]: r for r in self.attestations(envelope)}
-                    ws = by_id["whitespace"]
-                    self.assertEqual(
-                        (ws["attested_by"], ws["binding"], ws["exit_code"]),
-                        ("ci", "bound", 0))
-                    # What CI's evidence is about: its own base-less range.
-                    self.assertEqual(self.rerun(None, c), 0)
-                    self.assertEqual(self.rerun(b, c), 0)
-                    # What the request names: A..C for row A, where the
-                    # same gate is red — the limit, in one line.
-                    self.assertEqual(self.rerun(base, c),
-                                     2 if name == "A" else 0)
-                    self.assertEqual(self.rerun(a, c), 2)
+        for row, (verb, name) in enumerate(self.THROUGH_THE_CLI):
+            with self.subTest(verb=verb, base=name):
+                a, b, c = self.abc(ci=True)
+                base = {"A": a, "B": b}[name]
+                self.serve(c, self.base_less_receipt(
+                    c, through_the_runner=row == 0))
+                since = len(self.runs())
+                code, payload, stderr, envelope = self.verb(verb, base)
+                self.assertNotIn("Traceback", stderr)
+                self.assertEqual(code, 0, (payload, stderr))
+                self.assertEqual(self.emitted(verb), 1)
+                self.assertEqual(self.remote_tip(), c)
+                self.assertEqual(wire.parse_request(envelope).sha, c)
+                self.assertEqual(BASE_LINE.findall(envelope), [base])
+                # The one base reached the gate the hand-off ran.
+                self.assertEqual(self.told(since), [("block", base, c)])
+                by_id = {r["id"]: r for r in self.attestations(envelope)}
+                self.assert_the_limit(name, a, b, c, by_id["whitespace"])
+
+    def test_both_bases_in_process(self):
+        for name in ("A", "B"):
+            with self.subTest(base=name):
+                a, b, c = self.abc(ci=True)
+                base = {"A": a, "B": b}[name]
+                self.serve(c, self.base_less_receipt(c))
+                since, tip = len(self.runs()), self.remote_tip()
+                record, seen, local = self.in_process(base, gates=True,
+                                                      env=self.env)
+                self.assertEqual((record["state"], record["sha"],
+                                  record["base"]), ("pushed", c, base))
+                self.assertEqual(self.remote_tip(), c)
+                self.assertEqual([at for _handed, at in seen], [tip],
+                                 "the local half ran after the push")
+                # The one base reached the gate the hand-off ran.
+                self.assertEqual(self.told(since), [("block", base, c)])
+                with child_environment(self.scratch.state, self.env):
+                    records = emit.run_gates(record["governing"], c,
+                                             base=record["base"],
+                                             prior=local)
+                self.assertEqual([r["id"] for r in records],
+                                 ["block", "whitespace"])
+                self.assertEqual(self.told(since), [("block", base, c)],
+                                 "the local half ran twice")
+                by_id = {r["id"]: r for r in records}
+                self.assert_the_limit(name, a, b, c, by_id["whitespace"])
 
 
 class TestTheSameGateRunLocallyRefusesTheEmittedRange(_CIRange):
@@ -1190,55 +1460,103 @@ class TestTheSameGateRunLocallyRefusesTheEmittedRange(_CIRange):
     push: the remote's refs, the repository (refs, index, status, files)
     and the ledger byte-identical, nothing emitted. With `--base B` it
     checks B..C, is green, and the hand-off emits — the gate is live, not
-    red by construction."""
+    red by construction.
+
+    WHERE THE ROWS RUN. Each outcome end to end through one author verb —
+    the refusal through `handoff`, the control through `emit-request` —
+    and the other verb's row of each IN PROCESS (`in_process` with the
+    gates): the refusal as GatesRefused before the push, naming the range
+    gate and the verb's own command; the control as the local half the
+    envelope would carry, pushed."""
+
+    def refused_state(self) -> tuple:
+        """(repository snapshot, remote snapshot, ledger bytes or None,
+        the remote's tip, the recorder's count) before a refused run."""
+        s = self.scratch
+        Scratch.settle(s.repo)
+        ledger = s.state / "ledger.jsonl"
+        return (Scratch.snapshot(s.repo), Scratch.snapshot(s.remote,
+                                                           bare=True),
+                ledger.read_bytes() if ledger.is_file() else None,
+                self.remote_tip(), len(self.runs()))
+
+    def assert_nothing_moved(self, before: tuple, a: str, b: str,
+                             c: str) -> None:
+        s = self.scratch
+        repo, remote, recorded, _tip, since = before
+        ledger = s.state / "ledger.jsonl"
+        self.assertEqual(Scratch.snapshot(s.repo), repo)
+        self.assertEqual(Scratch.snapshot(s.remote, bare=True), remote)
+        self.assertEqual(ledger.read_bytes() if ledger.is_file() else None,
+                         recorded)
+        self.assertEqual(self.told(since), [("block", a, c)])
+        self.assertEqual(self.rerun(a, c), 2)
+        self.assertEqual(self.rerun(b, c), 0)
 
     def test_the_bad_emitted_range_refuses_before_the_push(self):
-        for verb in self.VERBS:
-            with self.subTest(verb=verb):
-                a, b, c = self.abc(ci=False)
-                s = self.scratch
-                Scratch.settle(s.repo)
-                repo = Scratch.snapshot(s.repo)
-                remote = Scratch.snapshot(s.remote, bare=True)
-                ledger = s.state / "ledger.jsonl"
-                recorded = (ledger.read_bytes() if ledger.is_file()
-                            else None)
-                tip = self.remote_tip()
-                since = len(self.runs())
-                code, payload, stderr, envelope = self.verb(verb, a)
-                self.assert_refused_before_push(
-                    code, payload, stderr, failed=["whitespace"], tip=tip)
-                self.assertIsNone(envelope)
-                self.assertEqual(self.emitted(verb), 0)
-                self.assertIn(f"no commit was made (HEAD is {c})",
-                              payload["error"])
-                self.assertEqual(Scratch.snapshot(s.repo), repo)
-                self.assertEqual(Scratch.snapshot(s.remote, bare=True),
-                                 remote)
-                self.assertEqual(ledger.read_bytes() if ledger.is_file()
-                                 else None, recorded)
-                self.assertEqual(self.told(since), [("block", a, c)])
-                self.assertIn("trailing whitespace", Path(
-                    payload["gate_output"]["whitespace"]).read_text(
-                        encoding="utf-8"))
-                self.assertEqual(self.rerun(a, c), 2)
-                self.assertEqual(self.rerun(b, c), 0)
+        verb = "handoff"
+        with self.subTest(verb=verb):
+            a, b, c = self.abc(ci=False)
+            before = self.refused_state()
+            code, payload, stderr, envelope = self.verb(verb, a)
+            self.assert_refused_before_push(
+                code, payload, stderr, failed=["whitespace"], tip=before[3])
+            self.assertIsNone(envelope)
+            self.assertEqual(self.emitted(verb), 0)
+            self.assertIn(f"no commit was made (HEAD is {c})",
+                          payload["error"])
+            self.assertIn("trailing whitespace", Path(
+                payload["gate_output"]["whitespace"]).read_text(
+                    encoding="utf-8"))
+            self.assert_nothing_moved(before, a, b, c)
 
     def test_control_the_range_that_is_clean_emits(self):
-        for verb in self.VERBS:
-            with self.subTest(verb=verb):
-                a, b, c = self.abc(ci=False)
-                code, payload, stderr, envelope = self.verb(verb, b)
-                self.assertNotIn("Traceback", stderr)
-                self.assertEqual(code, 0, (payload, stderr))
-                self.assertEqual(self.emitted(verb), 1)
-                self.assertEqual(self.remote_tip(), c)
-                self.assertEqual(BASE_LINE.findall(envelope), [b])
-                ws = {r["id"]: r for r in
-                      self.attestations(envelope)}["whitespace"]
-                self.assertNotIn("attested_by", ws)
-                self.assertEqual((ws["binding"], ws["exit_code"]),
-                                 ("bound", 0))
+        verb = "emit-request"
+        with self.subTest(verb=verb):
+            a, b, c = self.abc(ci=False)
+            code, payload, stderr, envelope = self.verb(verb, b)
+            self.assertNotIn("Traceback", stderr)
+            self.assertEqual(code, 0, (payload, stderr))
+            self.assertEqual(self.emitted(verb), 1)
+            self.assertEqual(self.remote_tip(), c)
+            self.assertEqual(BASE_LINE.findall(envelope), [b])
+            ws = {r["id"]: r for r in
+                  self.attestations(envelope)}["whitespace"]
+            self.assertNotIn("attested_by", ws)
+            self.assertEqual((ws["binding"], ws["exit_code"]), ("bound", 0))
+
+    def test_the_other_verb_of_each_in_process(self):
+        with self.subTest(verb="emit-request", base="A"):
+            a, b, c = self.abc(ci=False)
+            before = self.refused_state()
+            seen = []
+            with self.assertRaises(emit.GatesRefused) as caught:
+                self.in_process(a, gates=True, verb="emit-request",
+                                env=self.env, seen=seen)
+            refusal = caught.exception
+            self.assertEqual({i.code for i in refusal.items}, {"A-FAILED"})
+            self.assertEqual(set(refusal.outputs), {"whitespace"})
+            self.assertIn("whitespace", str(refusal))
+            self.assertIn("Nothing was pushed, emitted or recorded",
+                          str(refusal))
+            self.assertIn(f"no commit was made (HEAD is {c})", str(refusal))
+            self.assertIn(f"`{TOOL_NAME} emit-request`", refusal.remedy)
+            self.assertIn("trailing whitespace", Path(
+                refusal.outputs["whitespace"]).read_text(encoding="utf-8"))
+            self.assertEqual([(handed["base"], at) for handed, at in seen],
+                             [(a, before[3])])
+            self.assertEqual(self.remote_tip(), before[3])
+            self.assert_nothing_moved(before, a, b, c)
+        with self.subTest(verb="handoff", base="B"):
+            a, b, c = self.abc(ci=False)
+            record, _seen, local = self.in_process(b, gates=True,
+                                                   env=self.env)
+            self.assertEqual((record["state"], record["base"]),
+                             ("pushed", b))
+            self.assertEqual(self.remote_tip(), c)
+            ws = {r["id"]: r for r in local.records}["whitespace"]
+            self.assertNotIn("attested_by", ws)
+            self.assertEqual((ws["binding"], ws["exit_code"]), ("bound", 0))
 
 
 # ------------------------------------ every statement names its limit

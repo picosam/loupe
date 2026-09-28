@@ -453,11 +453,27 @@ def _gate_banners(records: list) -> list[str]:
     def advisory(r):
         return isinstance(r, dict) and r.get("blocking") is False
 
+    def deferred(r):
+        # 0.28.0: not run at the hand-off by the manifest's declaration. It
+        # is neither the target's failure nor unbound evidence, and it is
+        # never silent: it gets its own line. Whether the manifest really
+        # declares it is the validator's question, not the précis's.
+        return isinstance(r, dict) and "deferred" in r
+
+    later = [r for r in records if deferred(r)]
+    records = [r for r in records if not deferred(r)]
     hard = [r for r in records if not passed(r) and not advisory(r)]
     soft = [r for r in records if not passed(r) and advisory(r)]
     unbound = [r for r in records
                if not isinstance(r, dict) or r.get("binding") != "bound"]
     out = []
+    if later:
+        out.append(f"- **Gates deferred to the schedule — {len(later)}: "
+                   + ", ".join(row_id(r) for r in later)
+                   + "** — not run at this hand-off; the manifest declares "
+                     "them attested by a scheduled full-manifest run and "
+                     "before publication, and nothing at the hand-off "
+                     "checks that run")
     if hard or unbound:
         parts = []
         if hard:
@@ -489,6 +505,8 @@ def _attestation_row(rec, request_sha: str | None) -> str:
 
     if "error" in rec:
         result = f"NOT RUN: {rec.get('error')}"
+    elif "deferred" in rec:
+        result = "DEFERRED to the schedule"
     else:
         result = f"exit {rec.get('exit_code')}" if "exit_code" in rec else None
     executed = rec.get("executed_sha")
@@ -500,9 +518,13 @@ def _attestation_row(rec, request_sha: str | None) -> str:
         ran_at = (f"executed {cell(executed)[:_SHORT]} / claims "
                   f"{cell(target)[:_SHORT]}")
     run = rec.get("ci_run") if isinstance(rec.get("ci_run"), dict) else {}
-    by = (f"{rec.get('attested_by')} run {run.get('id', '-')} "
-          f"({run.get('conclusion', '-')})" if rec.get("attested_by")
-          else "this tool")
+    if "deferred" in rec:
+        by = "the schedule, declared (not checked at hand-off)"
+    elif rec.get("attested_by"):
+        by = (f"{rec.get('attested_by')} run {run.get('id', '-')} "
+              f"({run.get('conclusion', '-')})")
+    else:
+        by = "this tool"
     output = rec.get("output") if isinstance(rec.get("output"), dict) else {}
     digest = output.get("sha256")
     return "| " + " | ".join(cell(c) for c in (

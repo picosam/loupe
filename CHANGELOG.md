@@ -5,6 +5,46 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.28.0
+
+**For upgraders — read before crossing this version.** One value joins the
+grammar: a gate row may declare `attested_by = "schedule"`. A reader older
+than 0.28.0 refuses a configuration that uses it, naming the version skew,
+so raise `[tool] requires` to 0.28.0 in the same change that declares it,
+and only once both sides of your loop run 0.28.0. A configuration that does
+not use the value needs no new floor, and every 0.27.0 envelope, refusal and
+exit code is unchanged.
+
+**A gate may be attested by the schedule.** `loupe handoff` does not run a
+gate declaring `attested_by = "schedule"`: it records it deferred, as
+`{"id", "blocking", "attested_by": "schedule", "deferred": <reason>}`, with
+no field only a run could produce. The validator reads that record as a
+notice (`A-DEFERRED`), never a failure, and only for a gate the manifest
+itself declares so: a record that defers a gate the manifest does not is
+`A-DEFERRED-UNDECLARED`, and one that is not exactly those four fields
+(any field claiming a run or a CI attestation, a could-not-run `error`, or
+no boolean `blocking`) is `A-DEFERRED-SHAPE`. A schedule-attested gate that
+did run is judged as a run. `loupe brief` names deferred gates on their own
+line and never counts them as the target's failure or as unbound. Every
+runner other than a hand-off (`run_gates` called directly, CI, a full local
+run) executes the gate, so the declaration is only true if something runs
+the whole manifest on a schedule and before each publication; the hand-off
+does not check that it did, and the recorded reason says so. It is for
+gates that re-prove from another angle what the hand-off's own gates cover:
+this workbench declares it for the suite re-run in the extracted candidate
+and the suite re-run under perturbed limits, which between 2026-08-17 and
+2026-09-27 caught 5 and 2 defects no other gate caught, all of them tests
+coupled to the workbench rather than defects in the tool.
+
+**The heaviest shipped test modules run far fewer processes.** Each guard's
+partition runs through the function that decides it, with one end-to-end
+row per outcome class through the real CLI; setup states are built once per
+process and copied. Measured module by module on a shared machine, git
+launches: `test_transport_integration` 6,557 -> 2,607,
+`test_concurrent_rounds` 5,665 -> 2,271, `test_gate_before_push`
+3,657 -> 2,246, `test_claim_members` 5,101 -> 954. Every mutation that reddened a module before
+reddens it after.
+
 ## 0.27.0
 
 **For upgraders — read before crossing this version.** Nothing in the

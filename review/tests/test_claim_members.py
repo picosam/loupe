@@ -7,16 +7,31 @@ kind, and `excluded_paths` in the `scope_paths` grammar. Everything they
 render is ADDITIVE: no wrapper attribute, no required section moved, the
 attestation fence untouched.
 
-THE PARTITION, all through the real CLI in scratch repositories with their
-own configuration and state directory:
+WHERE A ROW RUNS. This module's cost was process launches — a `bin/loupe`
+child per row and the git it runs — not Python. So each guard's partition
+runs IN-PROCESS against the function that decides it, and a few rows per
+guard stay END-TO-END through the real CLI (a subprocess, real argv, a
+scratch repository with its own configuration and state directory): one
+accept, and one per refusal kind. Each end-to-end row is also compared with
+the in-process answer to the same input, so the in-process rows are proven
+to be what the CLI runs. A fixture is built once per class and only read;
+an end-to-end row that could move it works on a copy (`copy_loop`).
+
+THE PARTITION:
 
   TestGrammarPartition — per member: absent (control), empty list, a
     non-list, a non-object element, an unknown field, each required field
     missing, each field of each wrong type and grammar, a duplicated
-    carried fingerprint; each refusal names its member path and leaves the
-    repository's refs, index and worktree byte-identical (a DIRTY tree, so
-    a commit would show). The cases are DERIVED from the field tables, so
-    a field added there joins the partition.
+    carried fingerprint; each refusal names its member path. The cases are
+    DERIVED from the field tables, so a field added there joins the
+    partition. In-process: every row, through the claim boundary both
+    emitting verbs call first (`cli._capture_claim`) and the blocked exit
+    both print (`cli._claim_defect_exit`). End-to-end: one row per refusal
+    kind the partition produces (type, empty, unknown, missing, shape,
+    duplicate) and `excluded_paths` through `handoff`, and one through
+    `emit-request`; each on its own copy of a DIRTY repository (so a commit
+    would show) that it leaves byte-identical — refs, index, worktree and
+    ledger — printing exactly the in-process payload.
   TestRecordBound — the ledger-bound checks: a carried fingerprint absent
     from an origin verdict this ledger holds (refused, before anything is
     committed) against one this ledger does not hold (stated, emitted);
@@ -25,18 +40,33 @@ own configuration and state directory:
     row resolving to the previous round's standing disposition, to a
     carried entry, to neither (refused), and naming a gate the governing
     manifest lacks (refused at emission, before any gate runs).
+    In-process, against `emit.check_claim_record` and the block it renders:
+    the origin not held, the kept `required`, the typed one that differs,
+    the map row a carried entry answers. End-to-end: the fix-commit span
+    and the previous-round map row (the accepts, the second carrying the
+    gate's own attestation columns), and every refusal.
   TestSpanRendering — objectives mapped against the span, the unmapped
     changed files and the objective paths matching nothing; excluded paths
     as a prefix, a glob and an exact path; generated paths subtracted from
     the in-scope counts; the scoped diff stamp RUN, printing only scoped
     paths; observations rendered outside the attestation block; and the
-    request précis carrying the in-scope counts and the notices.
+    request précis carrying the in-scope counts and the notices. End to
+    end over one shared emission, which no row moves; a claim with no
+    `scope_paths` is an emission of its own, and the scope report is
+    `validate.scope_gaps` read in-process.
   TestScopedMatchesInScope — round-2 F3: the `Scoped:` command selects
     EXACTLY the changed paths `emit.in_scope` selects over the same span.
-    Each row runs the real `emit-request`, EXECUTES the emitted command
-    through `/bin/sh` and compares every path its `diff --git` headers name
-    (both sides) with `in_scope` over `git diff --name-only -z` of the
-    span. Rows: exact entries (a file, a file in a directory, a name that
+    Each row renders the line `emit_request` renders — in-process,
+    `emit._scoped_stamp` over the span's `emit.diff_shape` with the call
+    site's renderer — EXECUTES the command through `/bin/sh` and compares
+    every path its `diff --git` headers name (both sides) with `in_scope`
+    over `git diff --name-only -z` of the span. Seven rows also run through
+    the real `emit-request` — the partition's `mixed` command and its
+    `none` line, the `[^a].txt` reproduction, the withheld line over 1,400
+    paths, the rename prefix that is not compressed, the reviewer's
+    diverged rename and both copy prefixes — and each prints exactly the
+    line the in-process row judged. Rows: exact
+    entries (a file, a file in a directory, a name that
     is only a directory, a file that became a directory and the reverse),
     `dir/` prefixes (nested, over a file that became a directory, one
     matching nothing), globs with `*` (crossing `/`), `?`, sets, ranges,
@@ -66,15 +96,22 @@ own configuration and state directory:
 """
 from __future__ import annotations
 
-import concurrent.futures
+import contextlib
+import copy
+import io
 import json
 import re
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
+import types
 import unittest
 from pathlib import Path
 
-from review import emit, vocab
+from review import cli, config, emit, paths, vocab
+from review.ledger import Ledger
 from review.tests.test_precis_taxonomy import (SHIM, ScratchLoop, cli_env,
                                                finding, taxonomy_toml,
                                                verdict)
@@ -101,9 +138,40 @@ def claim(**members) -> dict:
     return {"objective": "t3 members", "references": REFS, **members}
 
 
+def copy_loop(case, loop: ScratchLoop) -> ScratchLoop:
+    """A private copy of `loop` — its repository, its state directory and
+    the files beside them — for ONE test that could move what it is handed.
+    The fixture is built once; copying it launches nothing, and a row that
+    failed to refuse moves only its own copy."""
+    try:
+        tmp = Path(tempfile.mkdtemp(prefix="t3c-"))
+    except OSError as exc:
+        case.skipTest(f"filesystem writes denied ({exc})")
+    case.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+    shutil.copytree(loop.tmp, tmp, symlinks=True, dirs_exist_ok=True)
+    twin = copy.copy(loop)
+    twin.tmp, twin.repo, twin.state = tmp, tmp / "repo", tmp / "state"
+    # A copied file is a new inode, so the copied index's stat data is
+    # stale and the CLI's first `git status` would rewrite it — a moved
+    # index the snapshot would blame on the row. Refreshed once, here, the
+    # copy's index is as current as the original's.
+    twin.git("update-index", "-q", "--refresh")
+    return twin
+
+
 class _Loop(unittest.TestCase):
-    """Shared helpers: a refusal is judged on its payload AND on the
-    repository it must not have touched."""
+    """Shared helpers: a refusal is judged on its payload AND, end to end,
+    on the repository it must not have touched."""
+
+    def scratch(self) -> Path:
+        """A directory of this test's own, outside every repository."""
+        if getattr(self, "_scratch", None) is None:
+            try:
+                self._scratch = Path(tempfile.mkdtemp(prefix="t3s-"))
+            except OSError as exc:
+                self.skipTest(f"filesystem writes denied ({exc})")
+            self.addCleanup(shutil.rmtree, self._scratch, ignore_errors=True)
+        return self._scratch
 
     def state_bytes(self, loop):
         return {str(p.relative_to(loop.state)): p.read_bytes()
@@ -111,10 +179,35 @@ class _Loop(unittest.TestCase):
                 if p.is_file() and p.suffix != ".lock"} \
             if loop.state.exists() else {}
 
+    def refused_in_process(self, body, member_path, case="", path=None):
+        """IN-PROCESS: the claim boundary both emitting verbs call before
+        anything else (`cli._capture_claim`) refuses `body`, and the exit
+        both print for it (`cli._claim_defect_exit`) is blocked and names
+        `member_path`. Returns (the defect, the payload)."""
+        if path is None:
+            path = self.scratch() / "refused.json"
+            path.write_text(json.dumps(body), encoding="utf-8")
+        try:
+            cli._capture_claim(types.SimpleNamespace(claim_file=str(path)))
+        except emit.ClaimDefective as exc:
+            defect = exc
+        else:
+            self.fail(f"{case}: the claim boundary admitted it")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli._claim_defect_exit(defect)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, 1, f"{case}: {payload}")
+        self.assertEqual(payload.get("next_kind"), "blocked", case)
+        self.assertIn(f"(at {member_path})", payload.get("remedy", ""),
+                      f"{case}: {payload}")
+        return defect, payload
+
     def assert_refused_untouched(self, loop, verb, body, member_path,
                                  case=""):
-        """`verb` refuses `body` naming `member_path`; refs, index,
-        worktree and the ledger are byte-identical afterwards."""
+        """END TO END: `verb` refuses `body` naming `member_path`; refs,
+        index, worktree and the ledger are byte-identical afterwards.
+        Returns (the payload, the claim file it was handed)."""
         before, ledger_before = loop.snapshot(), self.state_bytes(loop)
         path = loop.claim(body, name="refused.json")
         argv = [verb, "--claim-file", path, "--base", loop.base]
@@ -130,7 +223,7 @@ class _Loop(unittest.TestCase):
         self.assertEqual(self.state_bytes(loop), ledger_before,
                          f"{case}: the ledger moved")
         self.assertFalse((loop.tmp / "never.md").exists(), case)
-        return payload
+        return payload, path
 
 
 class TestGrammarPartition(_Loop):
@@ -161,14 +254,99 @@ class TestGrammarPartition(_Loop):
         "path": [3, [], "", "  ", "a b", "-x", "dir/", "/abs", "../x",
                  "a/./b", "a//b"],
     }
+    #: The rows that ALSO run through the real CLI: (verb, case, body,
+    #: member path) — one per refusal kind the partition produces, the
+    #: top-level list member, and the other emitting verb.
+    END_TO_END = (
+        ("handoff", "type: a member that is not a list",
+         claim(objectives="x"), "objectives"),
+        ("handoff", "empty: a member that is an empty list",
+         claim(observations=[]), "observations"),
+        ("handoff", "unknown: a field no table declares",
+         claim(carried_findings=[{**VALID["carried_findings"],
+                                  "zz_typo": "x"}]),
+         "carried_findings[0].zz_typo"),
+        ("handoff", "missing: a required field",
+         claim(attestation_map=[{"fingerprint": FP}]),
+         "attestation_map[0].gate"),
+        ("handoff", "shape: a value outside its field's grammar",
+         claim(carried_findings=[{**VALID["carried_findings"],
+                                  "origin": "L1/0"}]),
+         "carried_findings[0].origin"),
+        ("handoff", "duplicate: one fingerprint carried twice",
+         claim(carried_findings=[VALID["carried_findings"],
+                                 {**VALID["carried_findings"],
+                                  "outcome": "deferred"}]),
+         "carried_findings[1].fingerprint"),
+        ("handoff", "excluded_paths: an element that is not a string",
+         claim(excluded_paths=[1]), "excluded_paths[0]"),
+        ("emit-request", "emit-request refuses at the same boundary",
+         claim(objectives=[{"title": "t"}]), "objectives[0].paths"),
+    )
 
     @classmethod
     def setUpClass(cls):
+        # The end-to-end rows' fixture, built once and copied per row.
         cls.loop = ScratchLoop(_ClassCase(cls),
                                taxonomy_toml(("High", "Low"), ("High",),
                                              gates=GATE))
         # A DIRTY tree: a refusal that reached the sweep would commit it.
         cls.loop.write("g.txt", "outstanding\n")
+
+    def rows(self, group=None):
+        """Every in-process row as (group, case, body, member path),
+        derived from the field tables."""
+        tables = vocab.CLAIM_OBJECT_LIST_FIELDS
+        out = []
+        for member in tables:
+            for wrong in ("x", {}, 3, None, True):
+                out.append(("member", f"{member} = {wrong!r}",
+                            claim(**{member: wrong}), member))
+            out.append(("member", f"{member} empty", claim(**{member: []}),
+                        member))
+            for element in (1, "x", [], None):
+                out.append(("member", f"{member}[0] = {element!r}",
+                            claim(**{member: [element]}), f"{member}[0]"))
+            # A bad SECOND entry is located as the second.
+            out.append(("member", f"{member}[1]",
+                        claim(**{member: [self.VALID[member], 7]}),
+                        f"{member}[1]"))
+        for member in tables:
+            out.append(("fields", f"{member} unknown field",
+                        claim(**{member: [{**self.VALID[member],
+                                           "zz_typo": "x"}]}),
+                        f"{member}[0].zz_typo"))
+            for field in vocab.CLAIM_OBJECT_REQUIRED[member]:
+                entry = {k: v for k, v in self.VALID[member].items()
+                         if k != field}
+                out.append(("fields", f"{member} missing {field}",
+                            claim(**{member: [entry]}),
+                            f"{member}[0].{field}"))
+        for member, table in tables.items():
+            for field, kind in table.items():
+                for wrong in self.WRONG[kind]:
+                    where = f"{member}[0].{field}"
+                    if isinstance(wrong, list) and wrong:
+                        where += "[0]"
+                    out.append(("values", f"{where} = {wrong!r}",
+                                claim(**{member: [{**self.VALID[member],
+                                                   field: wrong}]}),
+                                where))
+        entry = self.VALID["carried_findings"]
+        out.append(("duplicate", "duplicate", claim(carried_findings=[
+            entry, {**entry, "outcome": "deferred"}]),
+            "carried_findings[1].fingerprint"))
+        for wrong, where in (("x", "excluded_paths"), ({}, "excluded_paths"),
+                             ([1], "excluded_paths[0]"),
+                             ([None], "excluded_paths[0]")):
+            out.append(("excluded", f"excluded_paths = {wrong!r}",
+                        claim(excluded_paths=wrong), where))
+        return [r for r in out if group is None or r[0] == group]
+
+    def refuse_group(self, group):
+        for _group, case, body, where in self.rows(group):
+            with self.subTest(row=case):
+                self.refused_in_process(body, where, case)
 
     def test_the_tables_cover_every_member_and_kind(self):
         self.assertEqual(set(self.VALID), set(vocab.CLAIM_OBJECT_LIST_FIELDS))
@@ -181,74 +359,55 @@ class TestGrammarPartition(_Loop):
                                  set(table), member)
 
     def test_the_member_itself(self):
-        for member in vocab.CLAIM_OBJECT_LIST_FIELDS:
-            for wrong in ("x", {}, 3, None, True):
-                self.assert_refused_untouched(
-                    self.loop, "handoff", claim(**{member: wrong}), member,
-                    f"{member} = {wrong!r}")
-            self.assert_refused_untouched(
-                self.loop, "handoff", claim(**{member: []}), member,
-                f"{member} empty")
-            for element in (1, "x", [], None):
-                self.assert_refused_untouched(
-                    self.loop, "handoff", claim(**{member: [element]}),
-                    f"{member}[0]", f"{member}[0] = {element!r}")
-            # A bad SECOND entry is located as the second.
-            self.assert_refused_untouched(
-                self.loop, "handoff",
-                claim(**{member: [self.VALID[member], 7]}), f"{member}[1]",
-                f"{member}[1]")
+        self.refuse_group("member")
 
     def test_unknown_and_missing_fields(self):
-        for member, table in vocab.CLAIM_OBJECT_LIST_FIELDS.items():
-            entry = {**self.VALID[member], "zz_typo": "x"}
-            self.assert_refused_untouched(
-                self.loop, "handoff", claim(**{member: [entry]}),
-                f"{member}[0].zz_typo", f"{member} unknown field")
-            for field in vocab.CLAIM_OBJECT_REQUIRED[member]:
-                entry = {k: v for k, v in self.VALID[member].items()
-                         if k != field}
-                self.assert_refused_untouched(
-                    self.loop, "handoff", claim(**{member: [entry]}),
-                    f"{member}[0].{field}", f"{member} missing {field}")
+        self.refuse_group("fields")
 
     def test_every_field_refuses_every_wrong_value(self):
-        seen = set()
-        for member, table in vocab.CLAIM_OBJECT_LIST_FIELDS.items():
-            for field, kind in table.items():
-                for wrong in self.WRONG[kind]:
-                    entry = {**self.VALID[member], field: wrong}
-                    where = f"{member}[0].{field}"
-                    if isinstance(wrong, list) and wrong:
-                        where += "[0]"
-                    self.assert_refused_untouched(
-                        self.loop, "handoff", claim(**{member: [entry]}),
-                        where, f"{where} = {wrong!r}")
-                seen.add((member, field))
-        self.assertEqual(seen, {(m, f) for m, t in
-                                vocab.CLAIM_OBJECT_LIST_FIELDS.items()
-                                for f in t})
+        self.refuse_group("values")
+        located = {w for _g, _c, _b, w in self.rows("values")}
+        pairs = {(m, f) for m, t in vocab.CLAIM_OBJECT_LIST_FIELDS.items()
+                 for f in t}
+        self.assertEqual({(m, f) for m, f in pairs
+                          if {f"{m}[0].{f}", f"{m}[0].{f}[0]"} & located},
+                         pairs)
 
     def test_a_carried_fingerprint_is_carried_once(self):
-        entry = self.VALID["carried_findings"]
-        self.assert_refused_untouched(
-            self.loop, "handoff",
-            claim(carried_findings=[entry, {**entry, "outcome": "deferred"}]),
-            "carried_findings[1].fingerprint", "duplicate")
+        self.refuse_group("duplicate")
 
     def test_excluded_paths_is_a_list_of_strings(self):
-        for wrong, where in (("x", "excluded_paths"), ({}, "excluded_paths"),
-                             ([1], "excluded_paths[0]"),
-                             ([None], "excluded_paths[0]")):
-            self.assert_refused_untouched(
-                self.loop, "handoff", claim(excluded_paths=wrong), where,
-                f"excluded_paths = {wrong!r}")
+        self.refuse_group("excluded")
+
+    def test_the_end_to_end_rows_cover_every_refusal_kind(self):
+        """The partition's own bookkeeping: every refusal kind an
+        in-process row produces has an end-to-end row."""
+        def kinds(rows):
+            return {self.refused_in_process(body, where, case)[0].defect
+                    for case, body, where in rows}
+        partition = kinds((c, b, w) for _g, c, b, w in self.rows())
+        self.assertEqual(partition, {"type", "empty", "unknown", "missing",
+                                     "shape", "duplicate"})
+        self.assertLessEqual(partition, kinds(
+            (c, b, w) for _v, c, b, w in self.END_TO_END))
+
+    def test_end_to_end_one_row_per_refusal_kind(self):
+        """Through the real CLI, each on its own copy of the dirty fixture:
+        refused, nothing moved, and the payload the in-process row
+        prints for the same file."""
+        for verb, case, body, where in self.END_TO_END:
+            with self.subTest(row=case, verb=verb):
+                payload, path = self.assert_refused_untouched(
+                    copy_loop(self, self.loop), verb, body, where, case)
+                self.assertEqual(payload, self.refused_in_process(
+                    body, where, case, path=path)[1])
 
     def test_emit_request_refuses_at_the_same_boundary(self):
-        self.assert_refused_untouched(
-            self.loop, "emit-request",
-            claim(objectives=[{"title": "t"}]), "objectives[0].paths",
-            "emit-request")
+        """`emit-request`'s row, in-process; end to end it is the last row
+        of `END_TO_END`, which prints the same payload `handoff`'s do."""
+        verb, case, body, where = self.END_TO_END[-1]
+        self.assertEqual(verb, "emit-request")
+        self.refused_in_process(body, where, case)
 
 
 class TestControls(_Loop):
@@ -286,7 +445,11 @@ class TestControls(_Loop):
 class TestRecordBound(_Loop):
     """Round 1 handed off, ruled and answered on `main`; round 2's target a
     new commit that fixes it. The carried and mapped fingerprints are then
-    judged against this ledger."""
+    judged against this ledger.
+
+    The fixture is built once and never moved: an in-process row reads it
+    — configuration, ledger and lineage loaded fresh for each row — and an
+    end-to-end row runs the real CLI on its own copy."""
 
     @classmethod
     def setUpClass(cls):
@@ -330,53 +493,78 @@ class TestRecordBound(_Loop):
             raise AssertionError(f"fixture step failed: {payload}")
         return payload
 
-    def emit(self, body, name):
-        out = self.loop.tmp / name
-        code, payload = self.loop.loupe(
+    # ------------------------------------------------------ end to end
+
+    def emit(self, loop, body, name):
+        out = loop.tmp / name
+        code, payload = loop.loupe(
             "emit-request", "--claim-file",
-            self.loop.claim(body, name=name + ".json"),
+            loop.claim(body, name=name + ".json"),
             "--base", self.round1, "--out", out, "--local-only")
         self.assertEqual(code, 0, payload)
         return out.read_text(encoding="utf-8")
 
-    def refused(self, body, member_path, case, dirty=True):
-        if dirty:
-            self.loop.write("g.txt", "outstanding\n")
-        try:
-            return self.assert_refused_untouched(
-                self.loop, "emit-request", body, member_path, case)
-        finally:
-            if dirty:
-                self.loop.git("checkout", "-q", "--", "g.txt")
+    def refused(self, body, member_path, case, verb="emit-request"):
+        """`verb` refuses `body` on a copy of the fixture made DIRTY, so a
+        commit would show."""
+        loop = copy_loop(self, self.loop)
+        loop.write("g.txt", "outstanding\n")
+        return self.assert_refused_untouched(loop, verb, body, member_path,
+                                             case)[0]
+
+    # ------------------------------------------------------- in-process
+
+    def record(self, body):
+        """(configuration, record) IN-PROCESS: `body` through the claim
+        boundary, then `emit.check_claim_record` — the one function the
+        hand-off calls before its commit and `emit_request` calls to render
+        — over this fixture's configuration, ledger and lineage, each read
+        fresh."""
+        path = self.scratch() / "claim.json"
+        path.write_text(json.dumps(body), encoding="utf-8")
+        captured = cli._capture_claim(
+            types.SimpleNamespace(claim_file=str(path)))
+        cfg = config.load(repo_root=self.loop.repo,
+                          ledger_dir=str(self.loop.state))
+        ledger = Ledger(cfg.ledger_dir)
+        lineage = cli._read_lineage(ledger, cfg, "emit-request")
+        self.assertEqual(lineage, self.lineage)
+        return cfg, emit.check_claim_record(captured.claim, ledger, lineage,
+                                            cfg, path=path)
+
+    def carried(self, body) -> str:
+        """The Carried findings block `emit_request` renders for `body`
+        over this span (`--base` round 1, the fix as the target)."""
+        cfg, record = self.record(body)
+        return "\n".join(emit._carried_block(record, cfg.repo_root,
+                                             self.round1, self.fix))
 
     # ---------------------------------------------------- carried findings
 
     def test_a_fingerprint_its_ledger_origin_never_ruled_is_refused(self):
-        payload = self.refused(
-            claim(carried_findings=[{"fingerprint": FP,
-                                     "origin": f"{self.lineage}/1",
-                                     "outcome": "fixed"}]),
-            "carried_findings[0].fingerprint", "absent from origin")
+        body = claim(carried_findings=[{"fingerprint": FP,
+                                        "origin": f"{self.lineage}/1",
+                                        "outcome": "fixed"}])
+        payload = self.refused(body, "carried_findings[0].fingerprint",
+                               "absent from origin")
         self.assertIn("recorded in this ledger without that finding",
                       payload["error"])
         # And through `handoff`, the verb that commits: a dirty tree stays
         # dirty, uncommitted, and no round is recorded.
-        self.loop.write("g.txt", "outstanding\n")
-        try:
-            self.assert_refused_untouched(
-                self.loop, "handoff",
-                claim(carried_findings=[{"fingerprint": FP,
-                                         "origin": f"{self.lineage}/1",
-                                         "outcome": "fixed"}]),
-                "carried_findings[0].fingerprint", "handoff")
-        finally:
-            self.loop.git("checkout", "-q", "--", "g.txt")
+        self.refused(body, "carried_findings[0].fingerprint", "handoff",
+                     verb="handoff")
+        # In-process, the same refusal from the function both call.
+        with self.assertRaises(emit.ClaimDefective) as ctx:
+            self.record(body)
+        self.assertEqual(ctx.exception.member,
+                         "carried_findings[0].fingerprint")
+        self.assertEqual(payload["error"],
+                         f"the claim file {ctx.exception.detail}")
 
     def test_an_origin_this_ledger_does_not_hold_is_stated(self):
-        text = self.emit(claim(carried_findings=[
+        text = self.carried(claim(carried_findings=[
             {"fingerprint": FP, "origin": "Lnothere000/3",
-             "outcome": "deferred", "required": "typed by hand"}]),
-            "elsewhere.md")
+             "outcome": "deferred", "required": "typed by hand"}]))
         self.assertIn(f"- `{FP}` · origin Lnothere000/3 · **deferred**", text)
         self.assertIn("origin verdict not in this ledger — not verifiable "
                       "here", text)
@@ -385,9 +573,9 @@ class TestRecordBound(_Loop):
                       "not in this ledger, so not verifiable here (1)", text)
 
     def test_required_comes_from_the_kept_origin_verdict(self):
-        text = self.emit(claim(carried_findings=[
+        text = self.carried(claim(carried_findings=[
             {"fingerprint": self.x, "origin": f"{self.lineage}/1",
-             "outcome": "fixed", "fix": [self.fix]}]), "kept.md")
+             "outcome": "fixed", "fix": [self.fix]}]))
         self.assertIn("required (the origin verdict, kept on this machine): "
                       "make f.txt say three", text)
         self.assertIn(f"fix: `{self.fix[:12]}`\n", text)
@@ -395,10 +583,9 @@ class TestRecordBound(_Loop):
         self.assertNotIn("Notice — fix commit", text)
 
     def test_a_typed_required_that_differs_is_a_notice(self):
-        text = self.emit(claim(carried_findings=[
+        text = self.carried(claim(carried_findings=[
             {"fingerprint": self.x, "origin": f"{self.lineage}/1",
-             "outcome": "fixed", "required": "something else"}]),
-            "differs.md")
+             "outcome": "fixed", "required": "something else"}]))
         self.assertIn("make f.txt say three", text)
         self.assertNotIn("something else", text)
         self.assertIn("the claim's `required` differs from the origin "
@@ -407,20 +594,27 @@ class TestRecordBound(_Loop):
                       "from the origin verdict's (1)", text)
 
     def test_fix_commits_inside_and_outside_the_span(self):
-        text = self.emit(claim(carried_findings=[
+        """End to end, the carried block's accept row: its span is the
+        one the CLI resolves from `--base`, and it renders exactly the
+        in-process block."""
+        body = claim(carried_findings=[
             {"fingerprint": self.x, "origin": f"{self.lineage}/1",
              "outcome": "fixed",
-             "fix": [self.fix, self.loop.base, "f" * 40]}]), "span.md")
+             "fix": [self.fix, self.loop.base, "f" * 40]}])
+        text = self.emit(copy_loop(self, self.loop), body, "span.md")
         self.assertIn(f"`{self.fix[:12]}`, `{self.loop.base[:12]}` (NOT in "
                       f"this review's span), `{'f' * 12}` (NOT in this "
                       f"review's span)", text)
         self.assertIn("Notice — fix commit(s) outside this review's span "
                       "(2)", text)
+        self.assertIn(self.carried(body), text)
 
     # ----------------------------------------------------- attestation map
 
     def test_a_row_resolves_to_the_previous_rounds_disposition(self):
-        text = self.emit(claim(attestation_map=[
+        """End to end, the map's accept row: the command, result and
+        binding columns are joined from this request's own attestation."""
+        text = self.emit(copy_loop(self, self.loop), claim(attestation_map=[
             {"fingerprint": self.x, "gate": "unit", "test": "t_one"}]),
             "map.md")
         self.assertRegex(text, re.escape(
@@ -431,14 +625,19 @@ class TestRecordBound(_Loop):
                       f"row covers — rerun these (1): `{self.z}`", text)
 
     def test_a_row_resolves_to_a_carried_entry(self):
-        text = self.emit(claim(
+        """In-process: what the row answers is decided by
+        `check_claim_record`; the gate columns it joins are the
+        previous-disposition row's, end to end."""
+        _cfg, record = self.record(claim(
             carried_findings=[{"fingerprint": FP,
                                "origin": "Lnothere000/3",
                                "outcome": "fixed"}],
-            attestation_map=[{"fingerprint": FP, "gate": "unit"}]),
-            "carried-map.md")
-        self.assertIn(f"| `{FP}` | carried from Lnothere000/3 | unit | - | "
-                      f"true | exit 0 | bound |", text)
+            attestation_map=[{"fingerprint": FP, "gate": "unit"}]))
+        self.assertEqual([r["answers"] for r in record["mapped"]],
+                         ["carried from Lnothere000/3"])
+        text = "\n".join(emit._attestation_map_block(record, []))
+        self.assertIn(f"| `{FP}` | carried from Lnothere000/3 | unit | - |",
+                      text)
 
     def test_a_row_about_no_answered_finding_is_refused(self):
         payload = self.refused(
@@ -451,11 +650,12 @@ class TestRecordBound(_Loop):
         """Judged at emission — the governing manifest is the target's —
         and before any gate runs. A clean tree, so nothing is committed or
         pushed on the way there, and the refusal leaves it as it was."""
-        before = self.loop.snapshot()
-        out = self.loop.tmp / "never-gate.md"
-        code, payload = self.loop.loupe(
+        loop = copy_loop(self, self.loop)
+        before = loop.snapshot()
+        out = loop.tmp / "never-gate.md"
+        code, payload = loop.loupe(
             "emit-request", "--claim-file",
-            self.loop.claim(claim(attestation_map=[
+            loop.claim(claim(attestation_map=[
                 {"fingerprint": self.x, "gate": "nope"}]),
                 name="gate.json"),
             "--base", self.round1, "--out", out, "--local-only")
@@ -463,7 +663,7 @@ class TestRecordBound(_Loop):
         self.assertEqual(payload["next_kind"], "blocked")
         self.assertIn("nope", payload["error"])
         self.assertIn("does not declare", payload["error"])
-        self.assertEqual(self.loop.snapshot(), before)
+        self.assertEqual(loop.snapshot(), before)
         self.assertFalse(out.exists())
 
 
@@ -544,7 +744,6 @@ class TestSpanRendering(_Loop):
         line = next(ln for ln in self.text.splitlines()
                     if ln.startswith("Scoped:"))
         command = line.split(":", 1)[1].strip()
-        from review import paths
         self.assertTrue(command.startswith(paths.diff_command(
             self.loop.repo.resolve(), self.base,
             self.loop.git("rev-parse", "HEAD"))
@@ -668,19 +867,51 @@ def scoped_line(text: str) -> str:
                 if ln.startswith("Scoped:")).split(":", 1)[1].strip()
 
 
-def executed_paths(command: str) -> set[str]:
-    """EXECUTE a `Scoped:` command as printed and return every path its
-    `diff --git` headers name, on either side."""
+def run_line(command: str) -> str:
+    """EXECUTE a `Scoped:` command as printed; its output."""
     run = subprocess.run(["/bin/sh", "-c", command], cwd="/",
                          capture_output=True, timeout=120,
                          stdin=subprocess.DEVNULL)
     if run.returncode != 0:
         raise AssertionError(run.stderr.decode("utf-8", "replace"))
+    return run.stdout.decode("utf-8")
+
+
+def header_paths(output: str) -> set[str]:
+    """Every path the `diff --git` headers of `output` name, either side."""
     shown: set[str] = set()
-    for line in run.stdout.decode("utf-8").split("\n"):
+    for line in output.split("\n"):
         if line.startswith("diff --git "):
             shown.update(_header_sides(line[len("diff --git "):]))
     return shown
+
+
+class Span:
+    """One span the `Scoped:` line is judged over, IN-PROCESS: the shape
+    `emit_request` computes for it (`emit.diff_shape`, whose second read
+    carries each rename's source) and the line `emit._scoped_stamp`
+    renders from that shape with the call site's renderer. Built once per
+    span and only read."""
+
+    def __init__(self, loop, base):
+        self.base = base
+        self.repo = config.find_repo_root(loop.repo)
+        self.head = loop.git("rev-parse", "HEAD")
+        self.shape = emit.diff_shape(self.repo, base, self.head)
+
+    def line(self, scope) -> str:
+        """The `Scoped:` value `emit_request` renders for `scope`."""
+        stamp = emit._scoped_stamp(
+            lambda *specs: paths.diff_command(self.repo, self.base,
+                                              self.head, *specs),
+            scope, self.shape)
+        return stamp.split(":", 1)[1].strip()
+
+    def table(self, objectives) -> str:
+        """The Objectives block `emit_request` renders for `objectives`
+        over this span (no path of these spans is generated)."""
+        return "\n".join(emit._objectives_block(objectives, self.shape,
+                                                set(), ()))
 
 
 class TestScopedMatchesInScope(_Loop):
@@ -731,6 +962,10 @@ class TestScopedMatchesInScope(_Loop):
         ("empty match", ["nothing/"]),                          # none
         ("mixed", ["src/", "*.md", "d", "[^a].txt"]),
     )
+    #: The partition rows ALSO run through the real `emit-request`: a
+    #: command that holds a caret, an exact file that became a directory
+    #: (with its exclusions), a prefix and a glob — and the `none` line.
+    END_TO_END_ROWS = ("mixed", "empty match")
 
     #: The reviewer's reproductions, each in a span of its own.
     REPRODUCED = (
@@ -740,6 +975,8 @@ class TestScopedMatchesInScope(_Loop):
         ("exact src diverged", ("src/x.txt",), ["src"]),
         ("src/ agreed", ("src/x.txt",), ["src/"]),
     )
+    #: The reproduction ALSO run through the real `emit-request`.
+    END_TO_END_REPRODUCED = "[^a].txt diverged"
 
     @classmethod
     def setUpClass(cls):
@@ -763,6 +1000,7 @@ class TestScopedMatchesInScope(_Loop):
                                 for p in cls.ADDED + ("d/x", "d/y", "e")))
         loop.git("commit", "-q", "-m", "span")
         cls.span = cls.changed(loop, cls.base)
+        cls.view = Span(loop, cls.base)
         # The partition is only as good as its span: the rename is a
         # rename, and both transitions changed both of their paths.
         status = loop.git("diff", "--name-status", f"{cls.base}...HEAD")
@@ -783,9 +1021,9 @@ class TestScopedMatchesInScope(_Loop):
 
     @staticmethod
     def run_emit(loop, base, scope, name, **members):
-        """(exit, payload, the `Scoped:` value, the request) of one real
-        `emit-request`, in a state directory of its own so rows can run
-        side by side."""
+        """END TO END: (exit, payload, the `Scoped:` value, the request)
+        of one real `emit-request`, in a state directory of its own, so it
+        shares the span and nothing else."""
         out = loop.tmp / f"{name}.md"
         argv = ["emit-request", "--claim-file",
                 loop.claim(claim(scope_paths=scope, **members),
@@ -808,20 +1046,27 @@ class TestScopedMatchesInScope(_Loop):
         self.assertEqual(code, 0, payload)
         return line
 
-    def assert_agrees(self, loop, base, span, scope, name,
-                      line=None) -> str:
+    def assert_end_to_end(self, loop, base, scope, name, view, **members):
+        """The real `emit-request` prints the line the in-process row
+        judged. Returns the request."""
+        code, payload, line, text = self.run_emit(loop, base, scope, name,
+                                                  **members)
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(line, view.line(scope))
+        return text
+
+    def assert_agrees(self, span, scope, line) -> tuple[str, str | None]:
         """The row's whole assertion, in two named checks. `set`: the paths
         the line SELECTS — every path the executed command's headers name,
         none for a line that is not a command — are exactly `in_scope`'s.
         `form`: a non-empty set is a command handing git only `:(literal)`
-        pathspecs; an empty one is the `none` line, never a command."""
-        import shlex
+        pathspecs; an empty one is the `none` line, never a command.
+        Returns (the line, the executed command's output or None)."""
         want = {p for p in span if emit.in_scope(p, scope)}
-        if line is None:
-            line = self.emit(loop, base, scope, name)
         command = line.startswith("git ")
+        output = run_line(line) if command else None
         with self.subTest(check="set"):
-            self.assertEqual(executed_paths(line) if command else set(),
+            self.assertEqual(header_paths(output) if command else set(),
                              want, line[:300])
         with self.subTest(check="form"):
             if want:
@@ -830,24 +1075,19 @@ class TestScopedMatchesInScope(_Loop):
                     self.assertRegex(spec, r"^:\((exclude,)?literal\)")
             else:
                 self.assertTrue(line.startswith("none — "), line)
-        return line
+        return line, output
 
     def test_the_partition(self):
         """Each row's selected set equals `in_scope`'s, and no pattern
         reaches git: every pathspec it hands over is literal."""
-        # Four emissions at a time, each with its own state directory: the
-        # rows share a span and nothing else.
-        with concurrent.futures.ThreadPoolExecutor(4) as pool:
-            emitted = list(pool.map(
-                lambda ir: self.run_emit(self.loop, self.base, ir[1][1],
-                                         f"row{ir[0]}"),
-                enumerate(self.ROWS)))
-        for (row, scope), (code, payload, line, _t) in zip(self.ROWS,
-                                                           emitted):
+        for row, scope in self.ROWS:
             with self.subTest(row=row):
-                self.assertEqual(code, 0, payload)
-                self.assert_agrees(self.loop, self.base, self.span, scope,
-                                   row, line=line)
+                self.assert_agrees(self.span, scope, self.view.line(scope))
+        rows = dict(self.ROWS)
+        for i, row in enumerate(self.END_TO_END_ROWS):
+            with self.subTest(row=row, path="end-to-end"):
+                self.assert_end_to_end(self.loop, self.base, rows[row],
+                                       f"row{i}", self.view)
 
     def test_the_rows_hold_the_sets_they_claim(self):
         """The partition's own bookkeeping, so a row cannot pass by testing
@@ -864,17 +1104,29 @@ class TestScopedMatchesInScope(_Loop):
         for scope in (["src"], ["up.txt"], ["old/r.txt"], ["old/"],
                       ["nothing/"]):
             self.assertEqual(matched(scope), set(), scope)
+        self.assertLessEqual(set(self.END_TO_END_ROWS), set(dict(self.ROWS)))
 
     def test_the_command_is_literal_and_says_how(self):
         """Every pathspec is `:(literal)`; a prefix stays one word; a path
         git would also select below a matched FILE is excluded by name."""
-        line = self.assert_agrees(self.loop, self.base, self.span,
-                                  ["src/", "d"], "shape")
-        import shlex
+        line, _out = self.assert_agrees(self.span, ["src/", "d"],
+                                        self.view.line(["src/", "d"]))
         specs = shlex.split(line.split(" -- ", 1)[1])
         self.assertEqual(specs, [":(literal)src/", ":(literal)d",
                                  ":(exclude,literal)d/x",
                                  ":(exclude,literal)d/y"])
+
+    def assert_reproduced(self, span, scope, line, table) -> None:
+        """A reproduction's row: the line agrees with `in_scope`, and the
+        objective table the reviewer read maps exactly what the command
+        they ran selects."""
+        selected, output = self.assert_agrees(span, scope, line)
+        row_md = re.search(r"^\| the scope \| [^|]+ \| ([^|]+) \|", table,
+                           re.M)
+        mapped = set(row_md[1].strip().split(", ")) - {"(none)"}
+        with self.subTest(check="table"):
+            self.assertEqual(mapped, header_paths(output)
+                             if selected.startswith("git ") else set())
 
     def test_the_reviewers_reproductions_are_paired_controls(self):
         spans: dict = {}
@@ -887,24 +1139,24 @@ class TestScopedMatchesInScope(_Loop):
                         loop.write(rel, f"{rel}\n")
                     loop.git("add", "--", *files)
                     loop.git("commit", "-q", "-m", "span")
-                    spans[files] = (loop, self.changed(loop, loop.base))
-                loop, span = spans[files]
+                    spans[files] = (loop, self.changed(loop, loop.base),
+                                    Span(loop, loop.base))
+                loop, span, view = spans[files]
                 # As reproduced: the same patterns as scope_paths AND as an
                 # objective's paths, so the table the reviewer read and the
                 # command they ran are compared on one request.
-                code, payload, line, text = self.run_emit(
-                    loop, loop.base, scope, f"rep{i}",
-                    objectives=[{"title": "the scope", "paths": scope}])
-                self.assertEqual(code, 0, payload)
-                selected = self.assert_agrees(loop, loop.base, span, scope,
-                                              row, line=line)
-                row_md = re.search(r"^\| the scope \| [^|]+ \| ([^|]+) \|",
-                                   text, re.M)
-                mapped = set(row_md[1].strip().split(", ")) - {"(none)"}
-                with self.subTest(check="table"):
-                    self.assertEqual(
-                        mapped, executed_paths(selected)
-                        if selected.startswith("git ") else set())
+                objectives = [{"title": "the scope", "paths": scope}]
+                self.assert_reproduced(span, scope, view.line(scope),
+                                       view.table(objectives))
+                if row == self.END_TO_END_REPRODUCED:
+                    with self.subTest(path="end-to-end"):
+                        text = self.assert_end_to_end(
+                            loop, loop.base, scope, f"rep{i}", view,
+                            objectives=objectives)
+                        self.assert_reproduced(span, scope,
+                                               scoped_line(text), text)
+        self.assertIn(self.END_TO_END_REPRODUCED,
+                      [r for r, _f, _s in self.REPRODUCED])
 
     def test_size_a_prefix_is_one_word_and_a_long_list_is_withheld(self):
         loop = ScratchLoop(self, taxonomy_toml(("High",), ("High",)))
@@ -914,25 +1166,33 @@ class TestScopedMatchesInScope(_Loop):
         loop.git("add", "big")
         loop.git("commit", "-q", "-m", "a large span")
         span = self.changed(loop, loop.base)
+        view = Span(loop, loop.base)
         # A prefix over every one of them: one pathspec, and it runs.
-        line = self.assert_agrees(loop, loop.base, span, ["big/"], "prefix")
+        line, _out = self.assert_agrees(span, ["big/"], view.line(["big/"]))
         self.assertEqual(line.split(" -- ", 1)[1], "':(literal)big/'")
         # A glob over 100 of them names each, and still runs.
-        self.assert_agrees(loop, loop.base, span, ["big/entry-00*"],
-                           "hundred")
+        self.assert_agrees(span, ["big/entry-00*"],
+                           view.line(["big/entry-00*"]))
         # 900 of them: ~58 KB, under the bound, and `/bin/sh -c` still
         # runs it (1,000 measured 64,244 bytes with a long TMPDIR — too
         # close to the bound to be a stable row).
-        line = self.assert_agrees(loop, loop.base, span,
-                                  ["big/entry-0[0-8]*"], "nine-hundred")
+        line, _out = self.assert_agrees(span, ["big/entry-0[0-8]*"],
+                                        view.line(["big/entry-0[0-8]*"]))
         self.assertGreater(len(line.encode("utf-8")), 50_000)
         # A glob over all 1,400: over the bound, withheld — never a
-        # shortened list, and never the whole span.
-        line = self.emit(loop, loop.base, ["big/*.dat"], "all")
-        self.assertTrue(line.startswith("withheld — the claim's scope_paths "
-                                        "match 1400 changed paths"), line)
-        self.assertIn(f"over the {emit.SCOPED_COMMAND_MAX}-byte bound", line)
-        self.assertNotIn("git ", line)
+        # shortened list, and never the whole span. In-process, and
+        # through the real `emit-request`, which prints the same line.
+        for how, line in (("in-process", view.line(["big/*.dat"])),
+                          ("end-to-end", self.emit(loop, loop.base,
+                                                   ["big/*.dat"], "all"))):
+            with self.subTest(path=how):
+                self.assertTrue(line.startswith(
+                    "withheld — the claim's scope_paths match 1400 changed "
+                    "paths"), line)
+                self.assertIn(f"over the {emit.SCOPED_COMMAND_MAX}-byte "
+                              f"bound", line)
+                self.assertNotIn("git ", line)
+                self.assertEqual(line, view.line(["big/*.dat"]))
 
     def test_unreadable_raw_paths_are_withheld(self):
         """`_numstat_entries` returns no rows when its two reads disagree;
@@ -1022,6 +1282,9 @@ class TestScopedMatchesInScope(_Loop):
          {"old/keep.txt", "new/r.txt"}),
         ("every changed path, by glob", ["*"], None),
     )
+    #: The rename row ALSO run through the real `emit-request`: the prefix
+    #: that is named path by path, not compressed.
+    END_TO_END_RENAME = "outgoing, the source became a directory"
 
     #: The exact pathspecs of the rows whose form carries the fix.
     RENAME_FORMS = (
@@ -1102,20 +1365,16 @@ class TestScopedMatchesInScope(_Loop):
             del tokens[:width]
         return rows
 
-    def assert_rename_treatment(self, line: str, want: set) -> None:
+    def assert_rename_treatment(self, output: str | None, want: set) -> None:
         """The treatment the comparison states, read off the EXECUTED
         output: an in-scope rename target is never paired with its own
         source; unpaired, it is a whole-file addition, and paired, it is
         paired with another in-scope path, as git's own rename detection
         does among the paths it was given."""
-        if not line.startswith("git "):
+        if output is None:
             return
-        run = subprocess.run(["/bin/sh", "-c", line], cwd="/",
-                             capture_output=True, timeout=120,
-                             stdin=subprocess.DEVNULL, check=True)
         source_of = {new: old for old, new in self.RENAMES}
-        out = run.stdout.decode("utf-8")
-        for block in re.split(r"^(?=diff --git )", out, flags=re.M):
+        for block in re.split(r"^(?=diff --git )", output, flags=re.M):
             if not block.startswith("diff --git "):
                 continue
             a, b = _header_sides(block.split("\n", 1)[0][len("diff --git "):])
@@ -1131,30 +1390,29 @@ class TestScopedMatchesInScope(_Loop):
         """Every row's selected set equals `in_scope`'s over the rename
         span, the command it runs shows no rename source, and the rows
         that carry the fix have the exact form it gives them."""
-        import shlex
         loop, base, span = self.rename_span()
-        with concurrent.futures.ThreadPoolExecutor(4) as pool:
-            emitted = list(pool.map(
-                lambda ir: self.run_emit(loop, base, ir[1][1],
-                                         f"rename{ir[0]}"),
-                enumerate(self.RENAME_ROWS)))
+        view = Span(loop, base)
         lines = {}
-        for (row, scope, held), (code, payload, line, _t) in zip(
-                self.RENAME_ROWS, emitted):
+        for row, scope, held in self.RENAME_ROWS:
             with self.subTest(row=row):
-                self.assertEqual(code, 0, payload)
                 want = {p for p in span if emit.in_scope(p, scope)}
                 with self.subTest(check="held"):
                     self.assertEqual(want, set(span) if held is None
                                      else held)
-                self.assert_agrees(loop, base, span, scope, row, line=line)
+                line, output = self.assert_agrees(span, scope,
+                                                  view.line(scope))
                 with self.subTest(check="treatment"):
-                    self.assert_rename_treatment(line, want)
+                    self.assert_rename_treatment(output, want)
                 lines[row] = line
         for row, specs in self.RENAME_FORMS:
             with self.subTest(row=row, check="specs"):
                 self.assertEqual(
                     shlex.split(lines[row].split(" -- ", 1)[1]), specs)
+        row = self.END_TO_END_RENAME
+        with self.subTest(row=row, path="end-to-end"):
+            self.assert_end_to_end(loop, base, dict(
+                (r, s) for r, s, _h in self.RENAME_ROWS)[row], "rename",
+                view)
 
     def test_the_reviewers_rename_reproduction_and_its_controls(self):
         """Round-3 F1 as reproduced: `old/r.txt → new/r.txt` beside an edit
@@ -1162,8 +1420,8 @@ class TestScopedMatchesInScope(_Loop):
         `old/r.txt` too; now it selects only `old/keep.txt`. The exact-file
         and destination-prefix controls agreed before the fix and still
         do, and both prefixes together select the edit and the target —
-        never the source."""
-        import shlex
+        never the source. The diverged row also runs through the real
+        `emit-request`."""
         loop = ScratchLoop(self, taxonomy_toml(("High",), ("High",)))
         loop.write("old/r.txt", "".join(f"line {i}\n" for i in range(40)))
         loop.write("old/keep.txt", "before\n")
@@ -1177,6 +1435,7 @@ class TestScopedMatchesInScope(_Loop):
         loop.git("commit", "-q", "-m", "head")
         span = self.changed(loop, base)
         self.assertEqual(span, ["new/r.txt", "old/keep.txt"])
+        view = Span(loop, base)
         rows = (
             ("outgoing prefix (diverged)", ["old/"], {"old/keep.txt"},
              [":(literal)old/", ":(exclude,literal)old/r.txt"]),
@@ -1188,16 +1447,19 @@ class TestScopedMatchesInScope(_Loop):
              [":(literal)old/", ":(literal)new/",
               ":(exclude,literal)old/r.txt"]),
         )
-        for i, (row, scope, held, specs) in enumerate(rows):
+        for row, scope, held, specs in rows:
             with self.subTest(row=row):
                 with self.subTest(check="held"):
                     self.assertEqual(
                         {p for p in span if emit.in_scope(p, scope)}, held)
-                line = self.assert_agrees(loop, base, span, scope,
-                                          f"reproduced{i}")
+                line, _out = self.assert_agrees(span, scope,
+                                                view.line(scope))
                 with self.subTest(check="specs"):
                     self.assertEqual(shlex.split(line.split(" -- ", 1)[1]),
                                      specs)
+        row, scope = rows[0][:2]
+        with self.subTest(row=row, path="end-to-end"):
+            self.assert_end_to_end(loop, base, scope, "reproduced", view)
 
     def test_a_copy_adds_no_path_the_command_could_select(self):
         """With `diff.renames = copies` the span also lists copies, and a
@@ -1206,7 +1468,8 @@ class TestScopedMatchesInScope(_Loop):
         its own name — so a copy's two ends are both judged, or the source
         is not in the walk at all. Every row agrees; the copy target of an
         unchanged source is an addition, since plain copy detection reads
-        only changed sources."""
+        only changed sources. Both prefixes together also run through the
+        real `emit-request`, whose span reads the same configuration."""
         loop = ScratchLoop(self, taxonomy_toml(("High",), ("High",)))
         loop.git("config", "diff.renames", "copies")
         source = "".join(f"cp/src.txt line {i}\n" for i in range(40))
@@ -1227,18 +1490,22 @@ class TestScopedMatchesInScope(_Loop):
         self.assertIn(("C100", "cp/src.txt", "cp2/copy.txt"), status)
         self.assertIn(("A", "cp2/still-copy.txt"), status)
         span = self.changed(loop, base)
+        view = Span(loop, base)
         both = {"cp/keep.txt", "cp/src.txt"}
         copies = {"cp2/copy.txt", "cp2/still-copy.txt"}
-        for i, (scope, held) in enumerate((
+        for scope, held in (
                 (["cp/"], both), (["cp2/"], copies), (["cp/", "cp2/"],
                                                       both | copies),
                 (["cp2/*"], copies), (["cp/src.txt"], {"cp/src.txt"}),
-                (["cp/still.txt"], set()))):
+                (["cp/still.txt"], set())):
             with self.subTest(scope=scope):
                 with self.subTest(check="held"):
                     self.assertEqual(
                         {p for p in span if emit.in_scope(p, scope)}, held)
-                self.assert_agrees(loop, base, span, scope, f"copy{i}")
+                self.assert_agrees(span, scope, view.line(scope))
+        with self.subTest(scope=["cp/", "cp2/"], path="end-to-end"):
+            self.assert_end_to_end(loop, base, ["cp/", "cp2/"], "copies",
+                                   view)
 
 
 if __name__ == "__main__":
