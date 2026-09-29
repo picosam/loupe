@@ -472,22 +472,18 @@ more:
    the agents will actually read it;
 4. work happens on the agreed branch in logical-unit commits; nothing
    is pushed except through the tool's own verbs (`handoff` commits
-   and pushes the reviewed branch) or on the owner's explicit request;
-5. **speak to the user in plain language.** Project-specific keys, enum
-   values, identifiers and status codes are how this project's artifacts
-   talk to each other and keep their exact form there. When one reaches
-   the user in prose, give its plain meaning beside it on first use in
-   that reply, and never make the user decode a token to follow a
-   sentence or take a decision. Prose only: no licence to rename,
-   translate or soften identifiers inside artifacts.
+   and pushes the reviewed branch) or on the owner's explicit request.
 
-Item 5 is injected into EVERY topology, the repository-present one
-included: a deterministic project makes its agents set and read keys and
-values nobody outside it knows, and the only surface reaching every agent
-working here is the repository's own file. Beyond that the floor is
-deliberately not a style guide: no house style, no role assignments
-between named agents, no delegation policy — those are the owner's to add
-or not.
+**One statement per rule, whichever tool wrote it.** Another tool's
+onboarding may have written the file first. Where it already names
+generated files, add each artifact to that list rather than starting a
+second one; where it already states a branch and push rule, make that
+rule true — it must admit `handoff`'s push — rather than adding item 4
+beside it. The same holds in the repository-present topology.
+
+The floor is deliberately not a style guide: no language rules, no house
+style, no role assignments between named agents, no delegation policy —
+those are the owner's to add or not.
 
 **The relay is a choice, not a default, and it is the operator's:**
 either the repository states that review rounds are relayed by a person
@@ -513,7 +509,7 @@ never delete on your own authority:
 
 | check | passes when | on failure |
 |---|---|---|
-| conformity | the file names the review tool, points at `review.toml` for roles, and carries floor items 1–5; where it embeds the generated instruction block, `loupe render-adapters --check-embedded <file>` exits 0; on each machine whose agents load the skills, `loupe render-adapters --check-install` (no `--dir`) exits 0 | add what is missing; `--write-embedded <file>` regenerates a stale block, `--install` a stale skill |
+| conformity | the file names the review tool, points at `review.toml` for roles, and carries floor items 1–4, each stated once; where it embeds the generated instruction block, `loupe render-adapters --check-embedded <file>` exits 0; on each machine whose agents load the skills, `loupe render-adapters --check-install` (no `--dir`) exits 0 | add what is missing; `--write-embedded <file>` regenerates a stale block, `--install` a stale skill |
 | compatibility | no rule contradicts the installed adapter (an agent forbidden to push when `handoff` pushes; a different tool named as the reviewer; a round started by the reviewer; a rule telling an agent to bypass the repository's own hooks so the tool's git calls fit its time limit, where the remedy is `[limits] git_timeout`; a rule telling an agent to read the tool's procedure or adapters from a sibling checkout rather than from the installed tool) | repair the repository file, never the adapter |
 | efficiency | every reader that loads this repository's file WITHOUT the operator's global file has been named, each sentence restating that global file is listed, and each has the operator's own keep-or-delete answer | measure, list, ask — in that order. Name the readers: collaborators on the forge (read-only, `gh api repos/<owner>/<repo>/collaborators --jq '.[].login'`), organisation, Team or cloud accounts that load no personal file, and other agents' surfaces whose global file is not the one this session loaded. List each restating sentence, then ask the operator, per group of readers, keep or delete: recommend KEEP wherever such a reader exists, and DELETE only where you are the single operator of a repository nobody else's session reads; the global file is read here, never edited — it travels with nobody, which is exactly why removing what it covers is the operator's call and never the session's |
 

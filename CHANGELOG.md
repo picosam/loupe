@@ -5,6 +5,24 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.28.1
+
+Documentation only: nothing an adopter runs changes, and no configuration
+needs a new floor.
+
+**The onboarding floor is four items again.** `docs/onboarding.md` §8 no
+longer writes a plain-language rule into the adopted repository's
+instruction file, in any topology. How an agent talks to the person it
+works for belongs to that person's own instructions; a repository copy
+reaches only readers who load none, and drifts. The floor carries no
+language rules. A repository that carries the old item 5 may keep or
+delete it; the conformity check no longer asks for it.
+
+**One statement per rule, whichever tool wrote it.** Another tool's
+onboarding may have written the instruction file first. §8 now adds to its
+list of generated files, and makes its branch and push rule true (it must
+admit `handoff`'s push), instead of writing a second one beside it.
+
 ## 0.28.0
 
 **For upgraders — read before crossing this version.** One value joins the
