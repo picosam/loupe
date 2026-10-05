@@ -395,9 +395,11 @@ class TestFullLoopIntegration(unittest.TestCase):
         self.assertEqual(code, 0, lin)
         self.assertTrue(lin["open_request"])
         self.assertIsNone(lin["next_lineage"])
+        # RR1 (2026-10-04): the closed lineage's target is this tip, so
+        # the new review of the same commit is declared.
         code, r1b = self._run(self.author, self.author_state, "handoff",
                               "--claim-file", str(self.claim),
-                              "--base", self.base)
+                              "--base", self.base, "--shared-target")
         self.assertEqual(code, 0, r1b)
         self.assertEqual(r1b["round"], 1)
         self.assertNotEqual(r1b["lineage"], lin["lineage"])
@@ -490,9 +492,11 @@ class TestFullLoopIntegration(unittest.TestCase):
         code, closed = self._run(self.author, self.author_state, "close",
                                  "--verdict", str(v2))
         self.assertEqual(code, 0, closed)
+        # RR1 (2026-10-04): the closed lineage's target is this tip, so
+        # the new review of the same commit is declared.
         code, r1b = self._run(self.author, self.author_state, "handoff",
                               "--claim-file", str(self.claim),
-                              "--base", self.base)
+                              "--base", self.base, "--shared-target")
         self.assertEqual(code, 0, r1b)
         self.assertEqual(r1b["round"], 1)
 

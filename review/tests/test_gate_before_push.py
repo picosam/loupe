@@ -1739,5 +1739,354 @@ class TestEveryStatementOfTheOneBaseNamesItsLimit(unittest.TestCase):
                         f"{guidance}")
 
 
+#: A blocking gate that records the bytes it read at `f.txt` (or ABSENT)
+#: into the control directory and passes: what a gate judged, kept beside
+#: what the commit holds.
+DISK_SCRIPT = ("import pathlib; root = pathlib.Path.cwd(); f = root / 'f.txt'; "
+               "(root.parent / 'ctl' / 'disk.txt').write_bytes("
+               "f.read_bytes() if f.exists() else b'ABSENT')")
+DISK_GATE = (f"\n[[gates]]\nid = \"disk\"\n"
+             f"command = {json.dumps([sys.executable, '-c', DISK_SCRIPT])}\n"
+             f"blocking = true\n")
+
+#: Each flag state as the update-index calls that make it: one flag per
+#: call, since one call applies only one of the two (measured, git 2.54).
+FLAGS = {"assume-unchanged": (["--assume-unchanged"],),
+         "skip-worktree": (["--skip-worktree"],),
+         "both": (["--assume-unchanged"], ["--skip-worktree"])}
+
+
+class TestWhatTheIndexHidesIsNotBound(_Gated):
+    """Round-2 F1 of lineage L4746274c96, loupe's own half. `git status`
+    trusts an index entry flagged assume-unchanged or skip-worktree, so a
+    flagged file edited on disk left the status clean, every gate read the
+    edit, and `run_gates` recorded `bound` to a commit that does not hold
+    those bytes: a hand-off pushed and emitted it. `emit.index_hidden` now
+    makes every record `unbound`, naming the paths, whenever an entry is
+    flagged (a sparse checkout's omitted paths included), and the
+    validator's A-UNBOUND stops the hand-off before its push.
+
+    END TO END through `python3 -m review handoff`: each flag state, with
+    the flagged file's disk bytes differing from and matching HEAD's, and
+    a sparse checkout, each refused before the push with no commit made;
+    the controls are the same edit with the flag cleared (committed,
+    pushed, emitted) and the untouched scratch. IN PROCESS on `run_gates`:
+    the binding's wording, the bound on named paths, `pending_tree` not
+    overriding it, and the guard mutated (`index_hidden` answering "")
+    reproducing the defect: `bound` over a flagged edit.
+
+    MUTATION (manual, the CLI rows; recorded in the round-3 disposition):
+    `elif hidden:` weakened to `elif False:` in a copy of review/emit.py
+    sends every refusal row red, the hand-off pushing and emitting."""
+
+    EXTRA_GATES = DISK_GATE
+
+    def flag(self, s, how: str) -> None:
+        for args in FLAGS[how]:
+            git(s.repo, "update-index", *args, "f.txt")
+
+    def disk(self) -> bytes:
+        return (self.ctl / "disk.txt").read_bytes()
+
+    def refused(self, s, tip, code, payload, stderr) -> str:
+        self.assert_refused_before_push(code, payload, stderr,
+                                        failed=["block", "disk"], tip=tip)
+        self.assertIn(f"no commit was made (HEAD is {s.head})",
+                      payload["error"])
+        self.assertEqual(git(s.repo, "rev-parse", "HEAD"), s.head)
+        unbound = [i["message"] for i in payload["items"]
+                   if i["code"] == "A-UNBOUND"]
+        self.assertTrue(unbound, payload["items"])
+        return "\n".join(unbound)
+
+    def test_a_flagged_entry_refuses_the_hand_off_before_its_push(self):
+        for how in FLAGS:
+            for disk in ("differs", "matches"):
+                with self.subTest(flag=how, disk=disk):
+                    s = self.fresh()
+                    tip = self.remote_tip()
+                    if disk == "differs":
+                        (s.repo / "f.txt").write_text("edited\n",
+                                                      encoding="utf-8")
+                    self.flag(s, how)
+                    # The premise: git's own status sees nothing.
+                    self.assertEqual(git(s.repo, "status", "--porcelain"),
+                                     "")
+                    code, payload, stderr = s.handoff()
+                    text = self.refused(s, tip, code, payload, stderr)
+                    self.assertIn("the index hides 1 tracked path(s)", text)
+                    state = ("assume-unchanged and skip-worktree"
+                             if how == "both" else how)
+                    self.assertIn(f"'f.txt' ({state})", text)
+                    if disk == "differs":
+                        # What the gate judged is not what HEAD holds.
+                        self.assertEqual(self.disk(), b"edited\n")
+                        self.assertEqual(git(s.repo, "show", "HEAD:f.txt"),
+                                         "two")
+
+    def test_a_sparse_checkout_refuses_the_hand_off_before_its_push(self):
+        s = self.scratch
+        tip = self.remote_tip()
+        # A copied scratch's index carries the template's stat data, and
+        # sparse-checkout keeps a file it cannot prove unmodified.
+        Scratch.settle(s.repo)
+        git(s.repo, "sparse-checkout", "set", "--no-cone", "/*", "!/f.txt")
+        self.assertFalse((s.repo / "f.txt").exists())
+        code, payload, stderr = s.handoff()
+        text = self.refused(s, tip, code, payload, stderr)
+        self.assertIn("the index hides 1 tracked path(s)", text)
+        self.assertIn("'f.txt' (skip-worktree)", text)
+        self.assertEqual(self.disk(), b"ABSENT")
+
+    def test_control_the_flag_cleared_the_edit_is_committed_and_pushed(self):
+        s = self.scratch
+        (s.repo / "f.txt").write_text("edited\n", encoding="utf-8")
+        self.flag(s, "both")
+        git(s.repo, "update-index", "--no-assume-unchanged", "f.txt")
+        git(s.repo, "update-index", "--no-skip-worktree", "f.txt")
+        code, payload, stderr = s.handoff()
+        self.assertEqual(code, 0, (payload, stderr))
+        committed = git(s.repo, "rev-parse", "HEAD")
+        self.assertNotEqual(committed, s.head)
+        self.assertEqual(self.remote_tip(), committed)
+        self.assertEqual(git(s.repo, "show", "HEAD:f.txt"), "edited")
+        self.assertEqual(self.disk(), b"edited\n")
+        self.assertEqual(len(self.requests()), 1)
+
+    def test_control_nothing_hidden_pushes_and_emits(self):
+        s = self.scratch
+        code, payload, stderr = s.handoff()
+        self.assertEqual(code, 0, (payload, stderr))
+        self.assertEqual(self.remote_tip(), s.head)
+
+    # ---------------------------------------------------------- in process
+
+    def binding(self, s, **kw) -> str:
+        with child_environment(s.state):
+            cfg = config.load(s.repo, ledger_dir=str(s.state))
+            records = emit.run_gates(cfg, git(s.repo, "rev-parse", "HEAD"),
+                                     **kw)
+        bindings = {r["binding"] for r in records}
+        self.assertEqual(len(bindings), 1, bindings)
+        return bindings.pop()
+
+    def test_the_binding_names_five_paths_and_counts_the_rest(self):
+        s = self.scratch
+        names = [f"p{i}.txt" for i in range(7)]
+        for name in names:
+            (s.repo / name).write_text(name, encoding="utf-8")
+        git(s.repo, "add", *names)
+        git(s.repo, "commit", "-qm", "seven")
+        git(s.repo, "update-index", "--assume-unchanged", *names)
+        binding = self.binding(s)
+        self.assertTrue(binding.startswith(
+            "unbound: the index hides 7 tracked path(s) from git's "
+            "comparison ('p0.txt' (assume-unchanged), "), binding)
+        self.assertIn("'p4.txt' (assume-unchanged) and 2 more), so the "
+                      "executed tree cannot be shown to be the target "
+                      "commit's content", binding)
+        self.assertNotIn("p5.txt", binding)
+
+    def test_a_pending_tree_does_not_bind_what_the_index_hides(self):
+        s = self.scratch
+        (s.repo / "f.txt").write_text("edited\n", encoding="utf-8")
+        self.flag(s, "skip-worktree")
+        tree = git(s.repo, "rev-parse", "HEAD^{tree}")
+        binding = self.binding(s, pending_tree=tree)
+        self.assertTrue(binding.startswith("unbound: the index hides 1 "),
+                        binding)
+        # The control: the flag cleared, the same pending tree binds.
+        git(s.repo, "update-index", "--no-skip-worktree", "f.txt")
+        git(s.repo, "checkout", "--", "f.txt")
+        self.assertTrue(self.binding(s, pending_tree=tree).startswith(
+            "bound to the pending commit's tree"))
+
+    def test_the_guards_mutated_bind_a_flagged_edit(self):
+        """`index_hidden` answering "" and `tree_differs` answering [] is
+        the pre-fix runner: the flagged edit reaches the gate and the
+        record says `bound`. Either guard alone still refuses it: the flag
+        names it, and the cold index (round 3) reads its bytes."""
+        s = self.scratch
+        (s.repo / "f.txt").write_text("edited\n", encoding="utf-8")
+        self.flag(s, "assume-unchanged")
+        self.assertTrue(self.binding(s).startswith("unbound: the index "))
+        with mock.patch.object(emit, "index_hidden", return_value=""):
+            self.assertIn("differ from the target commit's content",
+                          self.binding(s))
+            with mock.patch.object(emit, "tree_differs", return_value=[]):
+                self.assertEqual(self.binding(s), "bound")
+        self.assertEqual(self.disk(), b"edited\n")
+
+
+#: A filesystem monitor (hook version 2) that reports nothing changed:
+#: a monitor that missed an edit. `ACCURATE_MONITOR` reports everything.
+STALE_MONITOR = '#!/bin/sh\nprintf "token\\0"\n'
+ACCURATE_MONITOR = '#!/bin/sh\nprintf "token\\0/\\0"\n'
+
+
+class TestWhatAnyCacheHidesIsNotBound(_Gated):
+    """Round-3 F1 of lineage L4746274c96. Round 2's fix read the flags
+    `git ls-files -v` shows, and a filesystem monitor's valid bit is not
+    one of them (`ls-files -f` shows it); trusted stat data
+    (`core.trustctime=false` and a same-size edit with its time restored)
+    is not in the index at all. Either left `git status` clean over an
+    edit the gate read, so `run_gates` recorded `bound` and a hand-off
+    pushed and emitted a commit holding the earlier bytes. Now the
+    working tree is compared with the tree being bound through a cold
+    index (`emit.tree_differs`), so no cache answers for the disk.
+
+    END TO END through `python3 -m review handoff`, each refused before
+    the push with the remote unchanged: a stale monitor over an edit, over
+    a deletion, and over an edit beside staged outstanding work (the
+    hand-off commits that work, names its commit and pushes nothing); and
+    trusted stat data over a same-size edit. Controls, each pushing and
+    emitting: the stale monitor with nothing edited; an accurate monitor
+    over the edit (committed and pushed); the stale monitor with the
+    edit's valid bit cleared, the remedy (committed and pushed). IN
+    PROCESS on `run_gates`: the wording against the target and against a
+    pending tree, and the guard mutated (`tree_differs` answering [])
+    binding the stale edit.
+
+    MUTATION (manual, the CLI rows; recorded in the commit): `elif
+    differ:` weakened to `elif False:` in a copy of review/emit.py sends
+    every refusal row red, the hand-off pushing and emitting."""
+
+    EXTRA_GATES = DISK_GATE
+
+    def monitor(self, s, script: str = STALE_MONITOR) -> None:
+        hook = s.root / "monitor"
+        hook.write_text(script, encoding="utf-8")
+        hook.chmod(0o755)
+        git(s.repo, "config", "core.fsmonitor", str(hook))
+        git(s.repo, "config", "core.fsmonitorHookVersion", "2")
+
+    def stale(self, s, edit: str | None) -> None:
+        """f.txt cached as monitor-valid, then `edit`ed (None deletes)."""
+        self.monitor(s)
+        git(s.repo, "status", "--porcelain")
+        git(s.repo, "update-index", "--fsmonitor-valid", "--", "f.txt")
+        if edit is None:
+            (s.repo / "f.txt").unlink()
+        else:
+            (s.repo / "f.txt").write_text(edit, encoding="utf-8")
+        # The premise: the monitor's valid bit, which -v does not show, and
+        # a status that sees nothing.
+        self.assertEqual(git(s.repo, "ls-files", "-f", "--", "f.txt"),
+                         "h f.txt")
+        self.assertEqual(git(s.repo, "ls-files", "-v", "--", "f.txt"),
+                         "H f.txt")
+        self.assertEqual(git(s.repo, "status", "--porcelain", "--", "f.txt"),
+                         "")
+
+    def disk(self) -> bytes:
+        return (self.ctl / "disk.txt").read_bytes()
+
+    def refused(self, s, tip, code, payload, stderr, *, committed=None):
+        self.assert_refused_before_push(code, payload, stderr,
+                                        failed=["block", "disk"], tip=tip)
+        head = git(s.repo, "rev-parse", "HEAD")
+        if committed is None:
+            self.assertIn(f"no commit was made (HEAD is {s.head})",
+                          payload["error"])
+            self.assertEqual(head, s.head)
+        else:
+            self.assertIn(f"committed its outstanding work locally at "
+                          f"{head}", payload["error"])
+        text = "\n".join(i["message"] for i in payload["items"]
+                         if i["code"] == "A-UNBOUND")
+        self.assertIn("1 tracked path(s) on disk differ from the target "
+                      "commit's content ('f.txt') when read through a cold "
+                      "index", text)
+        self.assertEqual(git(s.repo, "show", "HEAD:f.txt"), "two")
+
+    def test_a_stale_monitor_refuses_the_hand_off_before_its_push(self):
+        for label, edit in (("an edit", "edited\n"), ("a deletion", None)):
+            with self.subTest(disk=label):
+                s = self.fresh()
+                tip = self.remote_tip()
+                self.stale(s, edit)
+                code, payload, stderr = s.handoff()
+                self.refused(s, tip, code, payload, stderr)
+                self.assertEqual(self.disk(),
+                                 b"edited\n" if edit else b"ABSENT")
+
+    def test_a_stale_monitor_beside_staged_work_commits_it_and_refuses(self):
+        s = self.scratch
+        tip = self.remote_tip()
+        (s.repo / "g.txt").write_text("staged\n", encoding="utf-8")
+        git(s.repo, "add", "g.txt")
+        self.stale(s, "edited\n")
+        code, payload, stderr = s.handoff()
+        self.refused(s, tip, code, payload, stderr, committed=True)
+        self.assertEqual(git(s.repo, "show", "HEAD:g.txt"), "staged")
+
+    def test_trusted_stat_data_refuses_the_hand_off_before_its_push(self):
+        s = self.scratch
+        tip = self.remote_tip()
+        git(s.repo, "config", "core.trustctime", "false")
+        Scratch.settle(s.repo)
+        path = s.repo / "f.txt"
+        then = path.stat()
+        path.write_text("TWO\n", encoding="utf-8")       # the same size
+        os.utime(path, ns=(then.st_atime_ns, then.st_mtime_ns))
+        self.assertEqual(git(s.repo, "status", "--porcelain"), "")
+        code, payload, stderr = s.handoff()
+        self.refused(s, tip, code, payload, stderr)
+        self.assertEqual(self.disk(), b"TWO\n")
+
+    def test_control_a_stale_monitor_and_nothing_edited_pushes(self):
+        s = self.scratch
+        self.stale(s, "two\n")
+        code, payload, stderr = s.handoff()
+        self.assertEqual(code, 0, (payload, stderr))
+        self.assertEqual(self.remote_tip(), s.head)
+
+    def test_control_an_accurate_monitor_commits_and_pushes_the_edit(self):
+        s = self.scratch
+        self.monitor(s, ACCURATE_MONITOR)
+        git(s.repo, "status", "--porcelain")
+        (s.repo / "f.txt").write_text("edited\n", encoding="utf-8")
+        code, payload, stderr = s.handoff()
+        self.assertEqual(code, 0, (payload, stderr))
+        committed = git(s.repo, "rev-parse", "HEAD")
+        self.assertNotEqual(committed, s.head)
+        self.assertEqual(self.remote_tip(), committed)
+        self.assertEqual(git(s.repo, "show", "HEAD:f.txt"), "edited")
+
+    def test_control_the_valid_bit_cleared_commits_and_pushes_the_edit(self):
+        s = self.scratch
+        self.stale(s, "edited\n")
+        git(s.repo, "update-index", "--no-fsmonitor-valid", "--", "f.txt")
+        code, payload, stderr = s.handoff()
+        self.assertEqual(code, 0, (payload, stderr))
+        committed = git(s.repo, "rev-parse", "HEAD")
+        self.assertEqual(self.remote_tip(), committed)
+        self.assertEqual(git(s.repo, "show", "HEAD:f.txt"), "edited")
+
+    # ---------------------------------------------------------- in process
+
+    def binding(self, s, **kw) -> str:
+        return TestWhatTheIndexHidesIsNotBound.binding(self, s, **kw)
+
+    def test_the_binding_names_the_path_against_the_target_or_the_pending_tree(self):
+        s = self.scratch
+        self.stale(s, "edited\n")
+        self.assertTrue(self.binding(s).startswith(
+            "unbound: 1 tracked path(s) on disk differ from the target "
+            "commit's content ('f.txt') when read through a cold index, "
+            "though the index's own view showed no change"))
+        tree = git(s.repo, "rev-parse", "HEAD^{tree}")
+        self.assertTrue(self.binding(s, pending_tree=tree).startswith(
+            f"unbound: 1 tracked path(s) on disk differ from the pending "
+            f"commit's tree {tree} ('f.txt')"))
+
+    def test_the_guard_mutated_binds_a_stale_monitors_edit(self):
+        s = self.scratch
+        self.stale(s, "edited\n")
+        with mock.patch.object(emit, "tree_differs", return_value=[]):
+            self.assertEqual(self.binding(s), "bound")
+        self.assertEqual(self.disk(), b"edited\n")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

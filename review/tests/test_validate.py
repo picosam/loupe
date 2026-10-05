@@ -1686,12 +1686,22 @@ class TestClaimGrammarClosedWorld(unittest.TestCase):
         # there is no "the" lineage to fall back to, and an emitter that
         # derived one here could render a round into a review the caller
         # never chose.
+        #
+        # `target` is the seventh, KEYWORD-ONLY and REQUIRED (0.29.0 review
+        # round 1 F1): the caller's head reservation, so neither emitting
+        # verb reaches the shared-target admission without one.
         for boundary in params.values():
             self.assertIs(boundary.default, inspect.Parameter.empty,
                           f"{boundary.name} is optional again: an omitted "
                           f"capture is a capture nobody made")
-        self.assertEqual(len(params), 6, f"unexpected _emit signature "
+        self.assertEqual(list(params)[:6], ["args", "cfg", "ledger",
+                                            "captured", "selected_transport",
+                                            "lineage"],
+                         f"unexpected _emit signature {list(params)}")
+        self.assertEqual(len(params), 7, f"unexpected _emit signature "
                                          f"{list(params)}")
+        self.assertIs(params["target"].kind, inspect.Parameter.KEYWORD_ONLY,
+                      "the head reservation is passed by name")
         self.assertNotIn("roles", params,
                          "a pre-commit role resolution is back in `_emit`: "
                          "the checkout is not an authority over roles "

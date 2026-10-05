@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -295,8 +296,39 @@ def copy_tree(src, dst):
     copy of a 45-entry fixture repository, against 5.1 ms and none for
     `copytree`; fixture trees are small enough that copy-on-write buys
     nothing. A copy shares no file with `src` or any other copy, so a
-    write in one is invisible in every other."""
+    write in one is invisible in every other.
+
+    `src` is settled first (`settle_maintenance`): a tree whose build has
+    just committed may still be held by git's detached maintenance."""
+    settle_maintenance(src)
     shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+
+
+#: How long `settle_maintenance` waits, in seconds, before it gives up.
+MAINTENANCE_SETTLE_S = 60.0
+
+
+def settle_maintenance(src):
+    """Return once no `maintenance.lock` exists anywhere under `src`.
+
+    Every `git commit` runs `git maintenance run --auto --detach`, which
+    takes `<objects>/maintenance.lock`, forks a daemon to hold it and
+    returns; the daemon deletes the lock when it is done. So the lock of
+    every git command already returned is on disk before this looks, and
+    its absence means that daemon has finished. Copying while it runs is a
+    race: `copytree` lists the lock, the daemon deletes it, and the copy
+    fails with ENOENT — measured 2026-10-01, nightly run 36839648235 at
+    7a68c0f, three gates red on a two-core runner; not reproduced on the
+    author's Mac in 80 commits.
+    Waiting, rather than turning maintenance off, leaves the git config
+    every test exercises as git ships it."""
+    deadline = time.monotonic() + MAINTENANCE_SETTLE_S
+    while held := sorted(Path(src).rglob("maintenance.lock")):
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"git maintenance still holds {', '.join(map(str, held))} "
+                f"after {MAINTENANCE_SETTLE_S:g}s; refusing to copy {src}")
+        time.sleep(0.01)
 
 
 def fixture_tree(key, build):

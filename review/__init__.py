@@ -163,7 +163,7 @@ TOOL_NAME = "loupe"
 #   - the reviewer procedure gains the falsification-anchoring rule (D3):
 #     anchor in the reviewed tree wherever the defect admits it, and name
 #     an external mutable dependency in the finding when it does not.
-TOOL_VERSION = "0.28.1"
+TOOL_VERSION = "0.29.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never
@@ -291,6 +291,11 @@ IDENTITY_EXCLUDED = {
     "README.md": DOCS,
     "adapters/claude/SKILL.md": ADAPTERS,
     "adapters/codex/SKILL.md": ADAPTERS,
+    # RR8 (2026-10-04): each skill's two procedures, beside its SKILL.md.
+    "adapters/claude/author.md": ADAPTERS,
+    "adapters/claude/reviewer.md": ADAPTERS,
+    "adapters/codex/author.md": ADAPTERS,
+    "adapters/codex/reviewer.md": ADAPTERS,
     "adapters/instructions-block.md": ADAPTERS,
     "docs/design.md": DOCS,
     "docs/overview.md": DOCS,
@@ -345,8 +350,11 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_blocking_authority.py": TESTS,
     "review/tests/test_objective_authority.py": TESTS,
     "review/tests/test_take_compact.py": TESTS,
+    # Brief `loupe-payload-and-launch-trim` (2026-10-04).
+    "review/tests/test_payload_trim.py": TESTS,
     "review/tests/test_tool_identity.py": TESTS,
     "review/tests/_transport_fixtures.py": TESTS,
+    "review/tests/test_fixture_copy.py": TESTS,
     "review/tests/test_transport_authority.py": TESTS,
     "review/tests/test_transport_events.py": TESTS,
     "review/tests/test_transport_integration.py": TESTS,

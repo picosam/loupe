@@ -45,14 +45,27 @@ class TestOneSource(unittest.TestCase):
     def test_bodies_are_identical_across_kinds(self):
         # The header names the surface; everything after "## What this is"
         # is the one procedure. Two adapters with different bodies would be
-        # two sources.
-        bodies = set()
-        for kind in adapters.OUTPUTS:
-            text = adapters.render(kind)
-            bodies.add(text[text.index("## What this is"):]
-                       .replace(f"<!-- END GENERATED: {TOOL_NAME} adapter -->",
-                                "").rstrip())
-        self.assertEqual(len(bodies), 1)
+        # two sources. RR8 (2026-10-04): a skill carries its two sides in
+        # role files, so the procedure it holds is its SKILL.md with the
+        # routing section replaced by those files' sections, which must
+        # rebuild the instruction block's body byte for byte.
+        def body(text):
+            return (text[text.index("## What this is"):]
+                    .replace(f"<!-- END GENERATED: {TOOL_NAME} adapter -->",
+                             "").rstrip())
+        block = body(adapters.render("instructions-block"))
+        for surface, kinds in adapters.SKILL_ROLE_KINDS.items():
+            with self.subTest(surface=surface):
+                skill = body(adapters.render(surface))
+                start = skill.index("## Your side's procedure")
+                end = skill.index("## Verbs (from the CLI itself)")
+                roles = "".join(
+                    # A role file ends its section with one newline; the
+                    # block separates two sections with a blank line.
+                    (lambda t: t[t.index("## If you hold the"):] + "\n")(
+                        adapters.render(kind))
+                    for kind in kinds.values())
+                self.assertEqual(skill[:start] + roles + skill[end:], block)
 
     def test_skill_frontmatter(self):
         for kind in ("claude-skill", "codex-skill"):
@@ -60,16 +73,34 @@ class TestOneSource(unittest.TestCase):
             self.assertTrue(text.startswith("---\nname: " + TOOL_NAME + "\n"))
             self.assertIn("\ndescription: ", text.split("---")[1])
 
-    def test_the_trigger_covers_both_config_layers(self):
-        # The trigger once named only the in-tree review.toml. It must name
-        # both layers: the in-tree file every reviewed door requires, and
-        # the user-level config that still governs local verbs — the skill
-        # fires for local-verb work too, in a repo with no open request
-        # (found by the first pilot; scoping per 0.9.0 / lineage 18 F1).
+    def test_the_procedure_covers_both_config_layers(self):
+        # The trigger once named only the in-tree review.toml. The procedure
+        # must name both layers: the in-tree file every reviewed door
+        # requires, and the user-level config that still governs local
+        # verbs (found by the first pilot; scoping per 0.9.0 / lineage 18
+        # F1). SL-B10 (2026-10-03) moved both sentences from the description
+        # into the body, which every kind shares and reads first.
+        for kind in adapters.SURFACES:
+            text = adapters.render(kind)
+            what = text[text.index("## What this is"):
+                        text.index("## Rules that hold on both sides")]
+            self.assertIn(f"~/.config/{TOOL_NAME}/", what, kind)
+            self.assertIn("review.toml", what, kind)
+
+    def test_the_description_is_the_trigger_and_the_stamp_clause(self):
+        """SL-B10: the description is loaded into every session whether or
+        not the skill fires, so it holds the trigger and the stamp clause
+        and nothing else — no configuration rule, which the body carries.
+        FALSIFICATION: put the config sentences back into the description
+        and the first assertion fails; drop the stamp clause and the
+        second does."""
         for kind in ("claude-skill", "codex-skill"):
             description = adapters.render(kind).split("---")[1]
-            self.assertIn(f"~/.config/{TOOL_NAME}/", description)
-            self.assertIn("review.toml", description)
+            self.assertNotIn("review.toml", description, kind)
+            self.assertIn("the envelope stamp says which side you hold",
+                          description, kind)
+            self.assertIn("Use when asked to hand off work for review",
+                          description, kind)
 
     def test_verb_table_matches_the_parser_both_ways(self):
         parser_verbs = {name for name, _ in adapters.verb_table()}
@@ -77,8 +108,8 @@ class TestOneSource(unittest.TestCase):
         sub = next(a for a in cli.build_parser()._actions
                    if getattr(a, "choices", None))
         self.assertEqual(parser_verbs, set(sub.choices))
-        for kind in adapters.OUTPUTS:
-            text = adapters.render(kind)
+        for kind in adapters.SURFACES:
+            text = adapters.surface_text(kind)
             table = text[text.index("## Verbs"):text.index("## Where things")]
             in_table = set(VERB_RE.findall(table))
             self.assertEqual(in_table, parser_verbs, kind)
@@ -101,8 +132,8 @@ class TestOneSource(unittest.TestCase):
         lineage 20) lives in the both-sides rules of every rendered surface,
         and in the contract; a forgery finding is out of taxonomy unless it
         names a party with less than operator access."""
-        for surface in ("instructions-block", "claude-skill", "codex-skill"):
-            text = adapters.render(surface)
+        for surface in adapters.SURFACES:
+            text = adapters.surface_text(surface)
             both = text[text.index("both sides"):text.index("author stamp")]
             self.assertIn("Trust model.", both)
             self.assertIn("LESS than operator access", both)
@@ -129,8 +160,8 @@ class TestOneSource(unittest.TestCase):
         of `procedure()`'s `"rule"` step and this fails in every kind (the
         text is shared, per `test_bodies_are_identical_across_kinds`).
         """
-        for kind in adapters.OUTPUTS:
-            text = adapters.render(kind)
+        for kind in adapters.SURFACES:
+            text = adapters.surface_text(kind)
             rule = text[text.index("**rule**"):text.index("**validate")]
             self.assertIn("mutable artifact outside the tree", rule, kind)
             self.assertIn("cannot_execute", rule, kind)
@@ -157,8 +188,8 @@ class TestOneSource(unittest.TestCase):
         """
         markers = ("make the fix", "falsification test", "mutation",
                    "`--out`", "hand off again")
-        for kind in adapters.OUTPUTS:
-            text = adapters.render(kind)
+        for kind in adapters.SURFACES:
+            text = adapters.surface_text(kind)
             # From the descriptive paragraph, not the command line above it
             # — that line names `--out` too, as a flag, and would satisfy
             # the marker before the ordering it is meant to check.
@@ -177,8 +208,8 @@ class TestOneSource(unittest.TestCase):
         FALSIFICATION: drop the "proposed but not made" sentence from the
         `"respond"` entry of `procedure()` and this fails in every kind.
         """
-        for kind in adapters.OUTPUTS:
-            text = adapters.render(kind)
+        for kind in adapters.SURFACES:
+            text = adapters.surface_text(kind)
             respond = text[text.index("**respond**"):
                           text.index("**close a lineage")]
             self.assertIn("proposed but not made", respond, kind)
@@ -1740,8 +1771,7 @@ class TestInstallIndependence(_Scratch):
         self.assertEqual(code, 0, done)
         self.assertEqual(
             {r["source"] for r in done["installed"]},
-            {str(rendered / adapters.OUTPUTS[k])
-             for k in ("claude-skill", "codex-skill")})
+            {str(rendered / adapters.OUTPUTS[k]) for k in adapters.INSTALL})
         (rendered / adapters.OUTPUTS["codex-skill"]).write_text(
             "stale\n", encoding="utf-8")
         code, refused = self.alone("render-adapters", "--install",
@@ -1814,8 +1844,7 @@ class TestCodexSkillPath(_Scratch):
         code, check = self.loupe("render-adapters", "--check-install")
         self.assertEqual(code, 0, check)
         self.assertEqual(self.statuses(check["install"]),
-                         [("claude-skill", "in_sync"),
-                          ("codex-skill", "in_sync")])
+                         sorted((k, "in_sync") for k in adapters.INSTALL))
 
     def test_a_legacy_copy_alone_is_drift_then_migrated_and_kept(self):
         legacy = self.legacy_at(self.home / ".codex", self.OLD)
@@ -1861,9 +1890,8 @@ class TestCodexSkillPath(_Scratch):
         code, done = self.loupe("render-adapters", "--install")
         self.assertEqual(code, 0, done)
         self.assertEqual(self.statuses(done["installed"]),
-                         [("claude-skill", "unchanged"),
-                          ("codex-skill", "migrated"),
-                          ("codex-skill", "unchanged")])
+                         sorted([(k, "unchanged") for k in adapters.INSTALL]
+                                + [("codex-skill", "migrated")]))
         self.assertFalse(legacy.exists())
 
     def test_a_legacy_directory_holding_anything_else_is_refused(self):
@@ -3016,8 +3044,8 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
         for name, attrs in self.DERIVED.items():
             patches, expected = self._sentinels(name, attrs)
             with self._patched(patches):
-                for kind in adapters.OUTPUTS:
-                    rendered = adapters.render(kind)
+                for kind in adapters.SURFACES:
+                    rendered = adapters.surface_text(kind)
                     for member in expected:
                         with self.subTest(vocabulary=name, kind=kind,
                                           member=member):
@@ -3032,8 +3060,8 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
         """The paired control: with the real authorities in place, every
         member of every derived vocabulary appears in every rendered
         kind."""
-        for kind in adapters.OUTPUTS:
-            rendered = adapters.render(kind)
+        for kind in adapters.SURFACES:
+            rendered = adapters.surface_text(kind)
             for name, attrs in self.DERIVED.items():
                 for attr, fixed in attrs.items():
                     value = getattr(vocab, attr)
@@ -3055,8 +3083,8 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
         the first time."""
         suite = TestShippedRestatements
         detector = suite._enumerates
-        for kind in adapters.OUTPUTS:
-            rendered = adapters.render(kind)
+        for kind in adapters.SURFACES:
+            rendered = adapters.surface_text(kind)
             for name, value in sorted(self._collections().items()):
                 members = self._members_of(value)
                 with self.subTest(kind=kind, vocabulary=name):

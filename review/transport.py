@@ -3383,6 +3383,154 @@ class NewLineageReservation(LineageReservation):
                      if ledger.path is not None else None)
 
 
+#: The directory, beside the ledger, that holds one `TargetReservation`
+#: file per head a hand-off has admitted. A subdirectory because there is
+#: one per reviewed commit rather than one per review.
+TARGET_LOCK_DIR = "targets"
+
+
+def target_lock_basename(sha: str) -> str:
+    """The reservation file for the head `sha`: the id itself when it is the
+    hexadecimal object name git hands back, a digest of it otherwise, so no
+    value can name a path outside the directory or collide with another
+    head's file."""
+    if re.fullmatch(r"[0-9a-f]{40,64}", sha or ""):
+        return f"{sha}.lock"
+    return f"x-{hashlib.sha256((sha or '').encode('utf-8')).hexdigest()}.lock"
+
+
+class TargetReservation(LineageReservation):
+    """The claim on one HEAD, held from the shared-target admission to the
+    end of the verb that admitted it (0.29.0 review round 1 F1).
+
+    `cli.require_unshared_target` READS which lineages already name a head.
+    A read is one moment, and the hand-off that follows it runs the gates
+    for minutes before `record_handoff` writes the request that would make
+    the head visible to the next reader. Two hand-offs of one commit on two
+    branches — two lineages, so two DIFFERENT lineage reservations, neither
+    excluding the other — therefore both read "nobody targets this head",
+    both gate, push and record, and the reviewer's SHA-only resolver then
+    refuses between the two lineages (measured: both exited 0 and the
+    ledger raised `AmbiguousLineage`). The sequential order refused the
+    second. So the head is reserved like the lineage is, by the same OS
+    lock, keyed on the SHA: `targets/<sha>.lock`.
+
+    Two modes, because the admission has two answers:
+
+      * an UNDECLARED admission takes it EXCLUSIVE — it is claiming that no
+        other lineage targets this head, through its own record;
+      * a `--shared-target` admission takes it SHARED — it declares the
+        overlap, so two declared reviews of one head may run side by side,
+        but an undeclared one may not run beside either.
+
+    Either refuses at once, never waits, when the other mode holds it: that
+    is the sequential order's answer moved to the moment the overlap is
+    visible. The ledger is re-read under the lock (`Ledger.reload`), so the
+    check sees every request recorded before the holder it waited behind
+    released.
+
+    Released by the CALLER, after the request is recorded or the verb ends —
+    refusal, red gate, exception — because the protected interval ends at
+    `record_handoff`, which `_emit` does not reach. A holder that dies
+    releases it through the kernel, exactly as `LineageReservation` does:
+    no stale state, no timeout, no override.
+
+    Only an exclusive holder writes the holder record. Shared holders may be
+    several at once and would overwrite one another's, so they clear any
+    record a dead exclusive holder left and write none; a refusal that finds
+    no record says the holder is a declared shared review.
+    """
+
+    def __init__(self, ledger: Ledger, branch: str = "",
+                 verb: str = "handoff", lineage: str | None = None):
+        super().__init__(ledger, branch=branch, verb=verb, lineage=lineage)
+        self._dir = (ledger.path.parent / TARGET_LOCK_DIR
+                     if ledger.path is not None else None)
+        self.path = None
+        self.sha = ""
+        self.shared = False
+
+    def reserve(self, sha: str, shared: bool) -> "TargetReservation":
+        """Acquire the reservation for `sha`, EXCLUSIVE unless `shared`.
+        Raises Refusal when another hand-off of that head holds it in the
+        other mode (or, exclusive, in any mode). Idempotent for the head it
+        already holds: `_emit` calls it once per admission."""
+        if self._fh is not None:
+            if sha == self.sha and shared == self.shared:
+                return self
+            self.release()
+        self.sha, self.shared = sha, bool(shared)
+        if self._dir is None:
+            return self
+        self.path = self._dir / target_lock_basename(sha)
+        return self.acquire()
+
+    def acquire(self) -> "TargetReservation":
+        if self.path is None:
+            return self
+        if fcntl is None:
+            raise Refusal(
+                f"this platform has no `fcntl`, so the reservation that "
+                f"keeps two hand-offs of the head {self.sha[:12]} from both "
+                f"being admitted as its only review cannot be taken",
+                "",
+                remedy="a person runs this on a POSIX host. The tool does "
+                       "not grant admission it cannot make exclusive")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fh = self.path.open("a+", encoding="utf-8")
+        mode = fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX
+        try:
+            fcntl.flock(fh.fileno(), mode | fcntl.LOCK_NB)
+        except OSError:
+            holder = self.holder()
+            fh.close()
+            evidence = (_reservation_evidence(holder) if holder else
+                        "a hand-off that declared --shared-target holds it, "
+                        "or its holder has not yet written its record")
+            raise Refusal(
+                f"another hand-off of the head {self.sha[:12]} is being "
+                f"admitted right now — {evidence} — and its request is not "
+                f"recorded yet, so no ledger read can say whether this one "
+                f"would be a second review of that commit"
+                + ("" if self.shared else
+                   " that nobody declared with --shared-target"),
+                "",
+                remedy="nobody has to decide anything yet — the reservation "
+                       "is released the moment the holder's command "
+                       "finishes, whether it succeeds or fails, and the OS "
+                       "releases it if that process dies. Wait for it and "
+                       "run this again; if the holder recorded its request, "
+                       "the run then says what clears the shared target")
+        self._fh = fh
+        try:
+            fh.truncate(0)
+            if not self.shared:
+                fh.write(json.dumps(
+                    {"branch": known_branch(self.branch), "pid": os.getpid(),
+                     "verb": self.verb, "lineage": self.lineage,
+                     "sha": self.sha,
+                     "ts": datetime.now(timezone.utc).isoformat(
+                         timespec="seconds")}, sort_keys=True) + "\n")
+            fh.flush()
+        except OSError:
+            pass
+        return self
+
+    def release(self) -> None:
+        """As `LineageReservation.release`, except that a SHARED holder
+        leaves the file alone: another shared holder may still hold it, and
+        only an exclusive holder ever wrote a record into it."""
+        if self.shared and self._fh is not None:
+            fh, self._fh = self._fh, None
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fh.close()
+            return
+        super().release()
+
+
 def handoff_preflight(cfg: Config, ledger: Ledger, lineage: str,
                       branch: str | None = None, git=None) -> None:
     """Refuse a handoff the lifecycle does not permit — BEFORE the cache is

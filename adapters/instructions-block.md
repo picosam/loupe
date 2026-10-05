@@ -1,11 +1,13 @@
 <!-- BEGIN GENERATED: loupe adapter — do not edit; `loupe render-adapters` regenerates, `--check` guards -->
 # loupe — review procedure (instruction block, GENERATED)
 
-For a project instruction file (AGENTS.md / CLAUDE.md region) on a surface that reads no skill directory. Tool version 0.28.1.
+For a project instruction file (AGENTS.md / CLAUDE.md region) on a surface that reads no skill directory. Tool version 0.29.0.
 
 ## What this is
 
 `loupe` is a deterministic review tool: request → verdict → disposition envelopes bound to SHAs, a gate manifest the tool runs itself, fingerprinted findings, an append-only ledger with breakers. No model runs inside it. You are either the **author** or the **reviewer** of a given envelope — the envelope's stamp (`author=… reviewer=…`) says which, per invocation, and this text does not.
+
+A REVIEWED commit must carry `review.toml` in the repo root: `handoff` and `take` both refuse a target that tracks none, because rules living on one machine cannot be shown to a second. A user-level `~/.config/loupe/<repo-id>.toml` still governs every LOCAL verb, so do not require an in-tree file before acting locally.
 
 ## Rules that hold on both sides
 

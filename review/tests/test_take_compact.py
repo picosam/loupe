@@ -26,9 +26,14 @@ reader, and every check still runs over the original bytes.
 import json
 import os
 import re
+import shutil
+import string
 import subprocess
 import unittest
+import urllib.parse
+from html.parser import HTMLParser
 from pathlib import Path
+from unittest import mock
 
 from review import (TOOL_NAME, brief, cli, config, env_var, transport, vocab,
                     wire)
@@ -157,11 +162,684 @@ class TestTheCompactRequest(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertEqual(brief.compact_request(env, kept="/k"), env)
 
+    def _log_cells(self, out):
+        return [r.rstrip(" |").rsplit(" | ", 1)[-1] for r in rows(out)]
+
+    def test_a_shared_log_directory_is_named_once(self):
+        """RR3 (2026-10-04): the directory most pointers share is named once
+        above the table and each row in it prints `…/` and its file name
+        (round-2 F5, 2026-10-05: the prefix tells it from a bare pointer,
+        which prints as recorded — `f.log` below). Every
+        other class keeps its whole pointer: a second directory, a prefix
+        that is not a directory boundary, a deeper directory, a pointer
+        naming no directory, and a pointer that is not a string."""
+        def at(gate, pointer):
+            rec = record(gate)
+            rec["output"] = dict(rec["output"], pointer=pointer)
+            return rec
+        recs = [at("a", "/logs/run/a.log"), at("b", "/logs/run/b.log"),
+                at("c", "/other/c.log"), at("d", "/logs/runner/d.log"),
+                at("e", "/logs/run/sub/e.log"), at("f", "f.log"),
+                at("g", 7)]
+        out = brief.compact_request(envelope(recs))
+        self.assertIn("Logs: `/logs/run/`", out)
+        self.assertEqual(out.count("/logs/run/"), 2,
+                         "the directory is named once, plus one deeper row")
+        self.assertEqual(self._log_cells(out),
+                         ["…/a.log", "…/b.log", "/other/c.log",
+                          "/logs/runner/d.log", "/logs/run/sub/e.log",
+                          "f.log", "7"])
+
+    def test_a_directory_one_row_names_is_not_hoisted(self):
+        """The control for the shared directory: one row per directory
+        saves nothing by naming it once, so every pointer stays whole."""
+        def at(gate, pointer):
+            rec = record(gate)
+            rec["output"] = dict(rec["output"], pointer=pointer)
+            return rec
+        out = brief.compact_request(envelope(
+            [at("a", "/x/a.log"), at("b", "/y/b.log")]))
+        self.assertNotIn("Logs:", out)
+        self.assertEqual(self._log_cells(out), ["/x/a.log", "/y/b.log"])
+
+    def test_a_tie_goes_to_the_directory_that_appears_first(self):
+        def at(gate, pointer):
+            rec = record(gate)
+            rec["output"] = dict(rec["output"], pointer=pointer)
+            return rec
+        out = brief.compact_request(envelope(
+            [at("a", "/y/a.log"), at("b", "/x/b.log"), at("c", "/y/c.log"),
+             at("d", "/x/d.log")]))
+        self.assertIn("Logs: `/y/`", out)
+        self.assertEqual(self._log_cells(out),
+                         ["…/a.log", "/x/b.log", "…/c.log", "/x/d.log"])
+
     def test_a_pipe_in_a_command_cannot_forge_a_column(self):
         rec = record(command="run | tee log")
         (row,) = rows(brief.compact_request(envelope([rec])))
         self.assertIn("run \\| tee log", row)
         self.assertEqual(row.replace("\\|", "").count("|"), 11)
+
+
+#: The `Logs:` rule as `compact_request` prints it since round-2 F5, and as
+#: it printed it before (the mutation row reads the old one by its own
+#: rule, so the oracle is never what turns the mutation red).
+_RULE = re.compile(
+    r"^Logs: `(?P<dir>[^`]*)` — a `log` cell beginning `(?P<mark>[^`]+)` is "
+    r"in this directory: replace `(?P=mark)` with this path\. Every other "
+    r"`log` cell is the pointer as recorded\.$", re.M)
+_ENCODED_RULE = re.compile(
+    r"^A `log` cell beginning `(?P<mark>[^`]+)` is its whole pointer "
+    r"percent-encoded \(RFC 3986, UTF-8\): decode what follows "
+    r"`(?P=mark)`\.", re.M)
+_OLD_RULE = re.compile(
+    r"^Logs: `(?P<dir>[^`]*)/` — a `log` cell holding a file name alone is "
+    r"in this directory; any other prints its whole path\.$", re.M)
+
+
+def reconstruct(view: str) -> list:
+    """Every row's log pointer, rebuilt from the printed table and the
+    printed rule alone: `None` where the cell says the field is absent."""
+    new, old = _RULE.search(view), _OLD_RULE.search(view)
+    encoded = _ENCODED_RULE.search(view)
+    errors = ("surrogatepass" if "decode with surrogates passed" in view
+              else "strict")
+    if "\nLogs:" in view:
+        assert new or old, "a Logs line that states no known rule"
+    out = []
+    lines = view.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith(
+        "| gate | result |")) + 2
+    table = []
+    for line in lines[start:]:
+        if not line.startswith("| "):
+            break
+        table.append(line)
+    for row in table:
+        cell = row[2:-2].split(" | ")[-1]
+        if encoded and cell.startswith(encoded["mark"]):
+            out.append(urllib.parse.unquote(cell[len(encoded["mark"]):],
+                                            errors=errors))
+            continue
+        if cell == "-":
+            out.append(None)
+            continue
+        # A cell's `\|` is its pipe; the directory is in a code span,
+        # where it is not.
+        cell = cell.replace("\\|", "|")
+        if new and cell.startswith(new["mark"]):
+            cell = new["dir"] + cell[len(new["mark"]):]
+        elif old and "/" not in cell:
+            cell = old["dir"] + "/" + cell
+        out.append(cell)
+    return out
+
+
+class TestEveryLogCellReconstructsItsPointer(unittest.TestCase):
+    """Round-2 F5 of the final review (2026-10-05): a bare `c.log` printed
+    beside two hoisted file names read, by the printed rule, as
+    `<dir>/c.log`. A shortened cell now prints `…/<name>`, every other cell
+    the pointer verbatim, and the rule line says exactly that.
+
+    THE PARTITION of a request's pointers (class · Logs line):
+      R1  absolute, all in one directory           · hoisted, named once
+      R2  relative, all in one directory           · hoisted, named once
+      R3  `./`-relative                            · hoisted (`.`)
+      R4  bare relative names only                 · none
+      R5  one directory each                       · none
+      R6  a shared directory and a bare name (the reviewer's case)
+                                                   · hoisted, named once
+      R7  shared, another directory, a deeper one, a non-boundary prefix,
+          a bare name                              · hoisted
+      R8  shared and an empty pointer              · hoisted
+      R9  shared, a record with no pointer, one with no output
+                                                   · hoisted
+      R10 shared and the directory itself as a pointer · hoisted
+      R11 shared and the directory with a trailing slash · hoisted
+      R12 two pointers ending in a slash, one directory each · none
+      R13 shared and an unshortened pointer beginning `…/` · NONE: it would
+          read as shortened, so every pointer prints whole
+      R14 a directory named `…`                    · none (not ASCII)
+      R15 a `|` in a file name                     · hoisted
+      R16 a doubled slash                          · hoisted (`/logs/`)
+    Each row: the pointers rebuilt from the table and rule equal the
+    record's, and the Logs line is present exactly where expected.
+    """
+
+    ROWS = {
+        "R1": (["/logs/run/a.log", "/logs/run/b.log", "/logs/run/c.log"],
+               "/logs/run"),
+        "R2": (["logs/a.log", "logs/b.log"], "logs"),
+        "R3": (["./a.log", "./b.log"], "."),
+        "R4": (["a.log", "b.log"], None),
+        "R5": (["/x/a.log", "/y/b.log"], None),
+        "R6": (["/logs/run/a.log", "/logs/run/b.log", "c.log"], "/logs/run"),
+        "R7": (["/logs/run/a.log", "/logs/run/b.log", "/other/c.log",
+                "/logs/runner/d.log", "/logs/run/sub/e.log", "f.log"],
+               "/logs/run"),
+        "R8": (["/logs/run/a.log", "/logs/run/b.log", ""], "/logs/run"),
+        "R9": (["/logs/run/a.log", "/logs/run/b.log", "NO POINTER",
+                "NO OUTPUT"], "/logs/run"),
+        "R10": (["/logs/run/a.log", "/logs/run/b.log", "/logs/run"],
+                "/logs/run"),
+        "R11": (["/logs/run/a.log", "/logs/run/b.log", "/logs/run/"],
+                "/logs/run"),
+        "R12": (["/d/a/", "/d/b/"], None),
+        "R13": (["/logs/run/a.log", "/logs/run/b.log", "…/c.log"], None),
+        # Round-1 F2 of the 0.29.0 review: a hoisted directory is ASCII.
+        "R14": (["…/a.log", "…/b.log"], None),
+        "R15": (["/logs/run/a|b.log", "/logs/run/c.log"], "/logs/run"),
+        "R16": (["/logs//a.log", "/logs//b.log"], "/logs/"),
+        # Round-3 F2: what a cell cannot print as recorded is encoded.
+        "R17": (["/logs/run/a.log", "/logs/run/b.log", "/logs/run/a  b.log"],
+                "/logs/run"),
+        "R18": (["/logs/run/a.log", "/logs/run/b.log", "/logs/run/c\td.log"],
+                "/logs/run"),
+        "R19": (["/logs/run/a.log", "/logs/run/b.log", "/logs/run/c\nd.log"],
+                "/logs/run"),
+        "R20": (["/logs/run/a.log", "/logs/run/b.log", "/logs/run/c\rd.log"],
+                "/logs/run"),
+        "R21": (["/logs/run/a.log", "/logs/run/b.log", "/logs/run/ e.log"],
+                "/logs/run"),
+        "R22": (["/logs/run/a.log", "/logs/run/b.log", "/logs/run/a.log "],
+                "/logs/run"),
+        "R23": (["/logs/my\nrun/x.log", "/logs/my\nrun/y.log"], None),
+        "R24": (["/logs/a`b/x.log", "/logs/a`b/y.log"], None),
+        "R25": (["a  b.log", " lead.log", "c.log"], None),
+        "R26": (["-", "/x/a.log"], None),
+        "R27": (["%:x.log", "%41.log"], None),
+        "R28": (["/logs/run/a\\|b.log", "/logs/run/c%20d.log",
+                 "/logs/run/é.log"], "/logs/run"),
+        "R29": (["/logs/my  run/a.log", "/logs/my  run/b.log"], None),
+    }
+    #: Rows whose table must carry the encoded rule line, and rows that
+    #: must not.
+    ENCODED = ("R13", "R14", "R15", "R17", "R18", "R19", "R20", "R21", "R22",
+               "R23", "R24", "R25", "R26", "R27", "R28", "R29")
+    #: Rows whose directory is long enough to count: named exactly once.
+    SAVING = ("R1", "R2", "R6")
+
+    @staticmethod
+    def records(pointers):
+        out = []
+        for i, pointer in enumerate(pointers):
+            rec = record(f"g{i}")
+            if pointer == "NO OUTPUT":
+                del rec["output"]
+            elif pointer == "NO POINTER":
+                del rec["output"]["pointer"]
+            else:
+                rec["output"] = dict(rec["output"], pointer=pointer)
+            out.append(rec)
+        return out
+
+    @staticmethod
+    def originals(pointers):
+        return [None if p in ("NO OUTPUT", "NO POINTER") else p
+                for p in pointers]
+
+    def check(self, name, view):
+        pointers, directory = self.ROWS[name]
+        self.assertEqual(reconstruct(view), self.originals(pointers), view)
+        if directory is None:
+            self.assertNotIn("\nLogs:", view)
+        else:
+            self.assertIn(f"\nLogs: `{directory}/` ", view)
+        if name in self.SAVING:
+            self.assertEqual(view.count(directory + "/"), 1, view)
+        self.assertEqual(bool(_ENCODED_RULE.search(view)),
+                         name in self.ENCODED, view)
+
+    def test_every_row_reconstructs_its_pointers(self):
+        for name, (pointers, _d) in self.ROWS.items():
+            with self.subTest(row=name):
+                self.check(name, brief.compact_request(
+                    envelope(self.records(pointers))))
+
+    def test_the_distinction_mutated_away_mislocates_a_bare_pointer(self):
+        """The mutation, kept in the suite: a copy of the package whose
+        renderer prints the bare file name under the old rule line, run
+        with `python -B` in a child. R6 (the reviewer's case) goes red, and
+        R1, whose pointers all lie in the directory, stays green."""
+        import shutil
+        import sys
+        import tempfile
+        package = Path(brief.__file__).resolve().parent
+        with tempfile.TemporaryDirectory(prefix="f5-mutation-") as tmp:
+            copy = Path(tmp) / package.name
+            shutil.copytree(package, copy, ignore=shutil.ignore_patterns(
+                "__pycache__", "tests"))
+            target = copy / "brief.py"
+            text = target.read_text(encoding="utf-8")
+            for old, new in (
+                    ("        return shown if name is None else _HOISTED "
+                     "+ name\n",
+                     "        return shown\n"),
+                    ('''    logs_line = ([f"Logs: `{log_dir}/` — a `log` cell beginning `{_HOISTED}` "
+                  f"is in this directory: replace `{_HOISTED}` with this "
+                  f"path. Every other `log` cell is the pointer as "
+                  f"recorded."] if log_dir is not None else [])
+''', '''    logs_line = ([f"Logs: `{log_dir}/` — a `log` cell holding a file name "
+                  f"alone is in this directory; any other prints its whole "
+                  f"path."] if log_dir is not None else [])
+''')):
+                self.assertEqual(text.count(old), 1, old)
+                text = text.replace(old, new)
+            target.write_text(text, encoding="utf-8")
+            for name, red in (("R6", True), ("R1", False)):
+                with self.subTest(row=name, red=red):
+                    env_text = envelope(self.records(self.ROWS[name][0]))
+                    proc = subprocess.run(
+                        [sys.executable, "-B", "-c",
+                         f"import sys; from {package.name} import brief; "
+                         "sys.stdout.write(brief.compact_request("
+                         "sys.stdin.read()))"],
+                        input=env_text, capture_output=True, text=True,
+                        cwd=tmp, env={**os.environ, "PYTHONPATH": tmp},
+                        timeout=60)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    if red:
+                        with self.assertRaises(AssertionError):
+                            self.check(name, proc.stdout)
+                    else:
+                        self.check(name, proc.stdout)
+
+
+    def mutated(self, tmp, edits):
+        """A copy of the package under `tmp` with `edits` applied, each
+        anchor found exactly once."""
+        import shutil
+        package = Path(brief.__file__).resolve().parent
+        copy = Path(tmp) / package.name
+        shutil.copytree(package, copy, ignore=shutil.ignore_patterns(
+            "__pycache__", "tests"))
+        target = copy / "brief.py"
+        text = target.read_text(encoding="utf-8")
+        for old, new in edits:
+            self.assertEqual(text.count(old), 1, old)
+            text = text.replace(old, new)
+        target.write_text(text, encoding="utf-8")
+        return package.name
+
+    def run_copy(self, tmp, package, name):
+        import sys
+        proc = subprocess.run(
+            [sys.executable, "-B", "-c",
+             f"import sys; from {package} import brief; "
+             "sys.stdout.write(brief.compact_request(sys.stdin.read()))"],
+            input=envelope(self.records(self.ROWS[name][0])),
+            capture_output=True, text=True, cwd=tmp,
+            env={**os.environ, "PYTHONPATH": tmp}, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_the_encoding_mutated_away_loses_each_whitespace_row(self):
+        """Round-3 F2's mutation, kept in the suite: `_log_cell` printing
+        every pointer as it is (the encoding off) sends each row whose
+        pointer a cell cannot print red, each on its own; R1 and R2, whose
+        pointers print as recorded, stay green. (This oracle reads the
+        source; `TestEveryLogCellSurvivesRendering` reads it rendered.)"""
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="f2-mutation-") as tmp:
+            package = self.mutated(tmp, [("    if _verbatim(shown):\n",
+                                          "    if True:\n")])
+            for name in (*self.ENCODED, "R1", "R2"):
+                with self.subTest(row=name):
+                    view = self.run_copy(tmp, package, name)
+                    if name in self.ENCODED:
+                        with self.assertRaises(AssertionError):
+                            self.check(name, view)
+                    else:
+                        self.check(name, view)
+
+    def test_the_directory_guard_mutated_breaks_the_logs_line(self):
+        """A directory a code span cannot carry (a newline, a backtick)
+        hoisted anyway: R23 and R24 no longer read back."""
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="f2-dir-mutation-") as tmp:
+            package = self.mutated(tmp, [
+                ("    if not _spans_verbatim(best):\n",
+                 "    if False:\n")])
+            for name in ("R23", "R24"):
+                with self.subTest(row=name):
+                    with self.assertRaises(AssertionError):
+                        self.check(name, self.run_copy(tmp, package, name))
+
+#: A `log` cell as `compact_request` may print it: the absent field, a
+#: hoisted name, a pointer as recorded, or the encoded form. Every
+#: character outside the prefixes is in `[A-Za-z0-9./-]`, which no GFM
+#: inline construct reads (round-1 F2 of the 0.29.0 review).
+_CELL = re.compile(r"\A(?:-|…/[A-Za-z0-9./-]*|[A-Za-z0-9./-]*"
+                   r"|%:(?:[A-Za-z0-9./-]|%[0-9A-F]{2})*)\Z")
+
+
+def _code_span_safe(directory: str) -> bool:
+    """The test's own statement of a directory a code span carries as it
+    is, written from CommonMark §6.1 (a backtick closes the span, a line
+    ending becomes a space, a space at both ends is stripped), §2.3
+    (U+0000 is replaced) and pandoc's NFC normalisation, not read from
+    `brief`: printable ASCII but the backtick, single interior spaces."""
+    return (directory != "" and "`" not in directory
+            and all(0x20 <= ord(c) <= 0x7E for c in directory)
+            and not directory.startswith(" ") and not directory.endswith(" ")
+            and "  " not in directory)
+
+
+def structural(view: str) -> list:
+    """The always-running oracle: every `log` cell matches `_CELL`, a
+    hoisted directory is one a code span carries, and the printed rule
+    rebuilds every pointer from the source."""
+    lines = view.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith(
+        "| gate | result |")) + 2
+    for line in lines[start:]:
+        if not line.startswith("| "):
+            break
+        cell = line[2:-2].split(" | ")[-1]
+        assert _CELL.match(cell), f"a cell outside the inert grammar: {cell!r}"
+    logs = _RULE.search(view)
+    if logs:
+        assert _code_span_safe(logs["dir"][:-1]), (
+            f"a hoisted directory a code span changes: {logs['dir']!r}")
+    return reconstruct(view)
+
+
+class _RenderedView(HTMLParser):
+    """What a reader of the rendered page sees: each paragraph's text with
+    its code spans marked `\\x02…\\x03` (neither is printable, so neither
+    is in a hoisted directory), and each table row's cells."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.paragraphs, self.rows = [], []
+        self._p = self._cell = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "p":
+            self._p = ""
+        elif tag == "code" and self._p is not None:
+            self._p += "\x02"
+        elif tag == "tr":
+            self.rows.append([])
+        elif tag == "td":
+            self._cell = ""
+
+    def handle_endtag(self, tag):
+        if tag == "p" and self._p is not None:
+            self.paragraphs.append(self._p)
+            self._p = None
+        elif tag == "code" and self._p is not None:
+            self._p += "\x03"
+        elif tag == "td" and self._cell is not None:
+            self.rows[-1].append(self._cell)
+            self._cell = None
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell += data
+        elif self._p is not None:
+            self._p += data
+
+
+_RENDERED_LOGS = re.compile(
+    "Logs: \x02(?P<dir>[^\x03]*)/\x03 — a \x02log\x03 cell beginning "
+    "\x02(?P<mark>[^\x03]+)\x03 is in this directory: replace "
+    "\x02(?P=mark)\x03 with this path\\. Every other \x02log\x03 cell is "
+    "the pointer as recorded\\.")
+_RENDERED_ENCODED = re.compile(
+    "A \x02log\x03 cell beginning \x02(?P<mark>[^\x03]+)\x03 is its whole "
+    "pointer percent-encoded \\(RFC 3986, UTF-8\\): decode what follows "
+    "\x02(?P=mark)\x03\\.")
+
+
+def rendered(view: str) -> tuple:
+    """`view` through `pandoc -f gfm`, read back by the rule as it renders:
+    `(the hoisted directory or None, the pointers)`."""
+    # `--wrap=none`: the HTML writer's own line wrapping is layout, not
+    # Markdown, and a browser shows it as the space it replaced.
+    html = subprocess.run(["pandoc", "-f", "gfm", "-t", "html",
+                           "--wrap=none"], input=view, text=True,
+                          capture_output=True, check=True, timeout=60).stdout
+    page = _RenderedView()
+    page.feed(html)
+    text = "\n".join(page.paragraphs)
+    logs, encoded = _RENDERED_LOGS.search(text), _RENDERED_ENCODED.search(text)
+    errors = ("surrogatepass" if "decode with surrogates passed" in text
+              else "strict")
+    out = []
+    for row in (r for r in page.rows if r):
+        cell = row[-1]
+        if encoded and cell.startswith(encoded["mark"]):
+            out.append(urllib.parse.unquote(cell[len(encoded["mark"]):],
+                                            errors=errors))
+        elif cell == "-":
+            out.append(None)
+        elif logs and cell.startswith(logs["mark"]):
+            out.append(logs["dir"] + "/" + cell[len(logs["mark"]):])
+        else:
+            out.append(cell)
+    return (logs["dir"] if logs else None), out
+
+
+_PUNCTUATION = [c for c in string.punctuation if c not in "./-"]
+_VERDICT_CONTROLS = ["plain.log", "a  b.log", "-", "%:literal.log"]
+_VERDICT_TOKENS = [
+    r"a\*b.log", r"a\|b.log", "`x`.log", "*x*.log", "**x**.log",
+    "~~x~~.log", "<b>x</b>.log", "a<!--x-->b.log", "a&amp;b.log",
+    "a&#65;b.log", "[x](target).log", "![x](target).log",
+    "<https://example.test/x>", "~~x~~  y.log", "_x_  y.log",
+    "__x__  y.log"]
+_PUNCT_DIR = (r"/h/j_d/~x~/*a*/a\|b/&amp;/&#65;/<b>/[x](y)/$m$/:smile:"
+              r"/a@b.c/#1/<!--c-->/!x/^y/{z}/'q'/" '"w"')
+_REJECTED_DIRS = {
+    "backtick": "/a`b", "lf": "/a\nb", "cr": "/a\rb", "tab": "/a\tb",
+    "run": "/a  b", "lead": " /a", "trail": "/a ", "nul": "/a\x00b",
+    "soh": "/a\x01b", "del": "/a\x7fb", "nbsp": "/a\xa0b",
+    "u2028": "/a\u2028b", "surrogate": "/a\udcffb",
+    "nfd": "/e\u0301/x", "nfc": "/é/x", "cjk": "/日本", "astral": "/\U0001f600"}
+
+
+class TestEveryLogCellSurvivesRendering(unittest.TestCase):
+    """Round-1 F2 of the 0.29.0 review (2026-10-05): the encoded branch
+    kept `_` and `~` (`urllib.parse.quote`'s unreserved set) and the plain
+    branch admitted any Markdown, so `~~x~~  y.log` rendered as `x  y.log`
+    and sixteen pointers lost characters once the table was READ, which
+    the source-level oracle above never did. A cell now holds only
+    `[A-Za-z0-9./-]` after its prefix, and the hoisted directory sits in a
+    code span that carries it literally, or is not hoisted.
+
+    THE PARTITION of the admitted pointer domain (a JSON string, which
+    `A-OUTPUT` admits non-empty; the empty string and an absent pointer are
+    rendered too). Each case is one request with an inert control row, and
+    states the directory it must hoist (none unless named):
+      inert          only [A-Za-z0-9./-], `www.` and dash runs included
+      punct-single   every ASCII punctuation mark but `./-`, in a name
+      punct-delim    each as a delimiter pair, doubled, and alone
+      whitespace     space, runs, tab, LF, CR, CRLF, leading, trailing,
+                     NBSP, U+2028, VT, FF, U+3000, U+200B
+      control        NUL, SOH, ESC, DEL, NEL
+      unicode        composed and decomposed é, CJK, astral, `…`, BOM
+      prefix         `-`, `%`, `%:`, `%:x`, `%41`, `%2F`, `…/c.log`, `…`,
+                     an interior `%:`
+      verdict        the review's sixteen failing pointers, four controls
+      combined       Markdown with whitespace, math, emoji, mail, bare
+                     URL, entity, escape and link, one pointer each
+      surrogate      a lone surrogate (JSON admits one)
+      h-inert        a hoisted inert directory, every name class under it,
+                     and pointers outside it              · hoisted
+      h-punct        a directory full of Markdown, in a code span · hoisted
+      h-space        a directory with one interior space  · hoisted
+      h-encoded, h-dash, h-dot, h-slashes: the directories `%:`, `-`,
+                     `.`, `/logs/`                         · hoisted
+      h-ellipsis     the directory `…` (the hoisted prefix; not ASCII)
+                                                  · NOT hoisted, encoded
+      h-rejected-*   a directory a code span or a renderer might change:
+                     a backtick, LF, CR, tab, a space run, a leading or
+                     trailing space, NUL, SOH, DEL, NBSP, U+2028, a lone
+                     surrogate, decomposed (pandoc composes it) and
+                     composed é, CJK, astral   · NOT hoisted, encoded
+    The structural test runs everywhere; the rendered test runs where
+    `pandoc` is (the author's Mac, not the CI runner) and skips saying so.
+    """
+
+    CASES = {
+        "inert": (["plain.log", "/logs/x/a.log", "www.example.com",
+                   "--a---b--.log", "1.log", "...", "/", "", "a.b-c/d",
+                   "NO POINTER"], None),
+        "punct-single": (["plain.log",
+                          *(f"a{c}b.log" for c in _PUNCTUATION)], None),
+        "punct-delim": (["plain.log", *(p for c in _PUNCTUATION for p in (
+            f"{c}x{c}.log", f"{c}{c}x{c}{c}.log", c))], None),
+        "whitespace": (["plain.log", " ", "a b.log", "a  b.log", "a\tb",
+                        "a\nb", "a\rb", "a\r\nb", " lead.log", "trail.log ",
+                        "a\xa0b", "a\u2028b", "a\x0bb", "a\x0cb", "a\u3000b",
+                        "a\u200bb"], None),
+        "control": (["plain.log", "a\x00b", "a\x01b", "a\x1bb", "a\x7fb",
+                     "a\x85b"], None),
+        "unicode": (["plain.log", "é.log", "e\u0301.log", "日本.log",
+                     "\U0001f600.log", "a…b", "\ufeffa"], None),
+        "prefix": (["plain.log", "-", "%", "%:", "%:x.log", "%41.log", "%2F",
+                    "…/c.log", "…", "x%:y"], None),
+        "verdict": ([*_VERDICT_CONTROLS, *_VERDICT_TOKENS], None),
+        "combined": (["plain.log", "~~x~~  y.log", "_x_  y.log",
+                      "a_b c~d\te.log", "$x$ y.log", ":smile: x.log",
+                      "a@b.c d", "https://example.test/x y",
+                      "&#x41; \\` [x]", "<b>_x_</b>\n**y**", "a\\\\|b",
+                      "www.x.com/_y_"], None),
+        "surrogate": (["plain.log", "a\udcffb.log", "\ud800"], None),
+        "h-inert": (["/logs/run/a.log", "/logs/run/b.log",
+                     "/logs/run/_x_.log", "/logs/run/a  b.log",
+                     "/logs/run/-", "/logs/run/%:x", "/logs/run/",
+                     "/logs/run/sub/c.log", "c.log", "/other/~~x~~.log",
+                     "-", "plain.log", "NO OUTPUT"], "/logs/run"),
+        "h-punct": ([f"{_PUNCT_DIR}/a.log", f"{_PUNCT_DIR}/b.log",
+                     f"{_PUNCT_DIR}/_c_.log", "plain.log"], _PUNCT_DIR),
+        "h-space": (["/my run/a.log", "/my run/b.log", "plain.log"],
+                    "/my run"),
+        "h-ellipsis": (["…/a.log", "…/b.log", "plain.log"], None),
+        "h-encoded": (["%:/a.log", "%:/b.log", "plain.log"], "%:"),
+        "h-dash": (["-/a.log", "-/b.log", "plain.log"], "-"),
+        "h-dot": (["./a.log", "./b.log", "plain.log"], "."),
+        "h-slashes": (["/logs//a.log", "/logs//b.log", "plain.log"],
+                      "/logs/"),
+        **{f"h-rejected-{k}": ([f"{d}/x.log", f"{d}/y.log", "plain.log"],
+                               None)
+           for k, d in _REJECTED_DIRS.items()},
+    }
+
+    @staticmethod
+    def view(pointers):
+        return brief.compact_request(envelope(
+            TestEveryLogCellReconstructsItsPointer.records(pointers)))
+
+    @staticmethod
+    def originals(pointers):
+        return TestEveryLogCellReconstructsItsPointer.originals(pointers)
+
+    def red(self, oracle, names=None):
+        """The cases `oracle` does not read back exactly (pointers and
+        hoisted directory), by name."""
+        out = []
+        for name, (pointers, directory) in self.CASES.items():
+            if names is not None and name not in names:
+                continue
+            try:
+                view = self.view(pointers)
+                if oracle is rendered:
+                    ok = rendered(view) == (directory,
+                                            self.originals(pointers))
+                else:
+                    logs = _RULE.search(view)
+                    ok = (structural(view) == self.originals(pointers)
+                          and (logs["dir"][:-1] if logs else None)
+                          == directory)
+            except (AssertionError, UnicodeDecodeError, ValueError):
+                ok = False
+            if not ok:
+                out.append(name)
+        return out
+
+    def require_pandoc(self):
+        if shutil.which("pandoc") is None:
+            self.skipTest("pandoc is not on PATH (it is on the author's Mac, "
+                          "not on the CI runner); the structural test still "
+                          "holds every cell to the inert grammar")
+
+    def test_every_case_matches_the_grammar_and_reads_back(self):
+        for name, (pointers, directory) in self.CASES.items():
+            with self.subTest(case=name):
+                view = self.view(pointers)
+                self.assertEqual(structural(view), self.originals(pointers),
+                                 view)
+                logs = _RULE.search(view)
+                self.assertEqual(logs["dir"][:-1] if logs else None,
+                                 directory, view)
+
+    def test_every_case_reads_back_once_rendered(self):
+        self.require_pandoc()
+        for name, (pointers, directory) in self.CASES.items():
+            with self.subTest(case=name):
+                view = self.view(pointers)
+                self.assertEqual(rendered(view),
+                                 (directory, self.originals(pointers)), view)
+
+    #: One mutation per guard: the attribute patched, its replacement (a
+    #: callable taking the attribute's own value is called with it, so
+    #: this module imports against a `brief` without the guard), the cases
+    #: red once rendered, the cases red in the source, and a case that
+    #: stays green under both.
+    MUTATIONS = {
+        "the cell guard off (the review's own mutation)": (
+            "_verbatim", lambda guard: lambda text: True,
+            ("whitespace", "verdict", "combined"),
+            ("whitespace", "verdict", "combined"), "inert"),
+        "the round's encoder (`quote`, `_` and `~` kept)": (
+            "_percent_encoded",
+            lambda encode: lambda text: urllib.parse.quote(text, safe="/"),
+            ("combined", "verdict"), ("combined", "verdict"), "inert"),
+        "`_` and `~` admitted as inert": (
+            "_INERT", lambda inert: inert | {"_", "~"},
+            ("punct-delim", "verdict"), ("punct-delim", "verdict"),
+            "inert"),
+        "the `-` exclusion dropped": (
+            "_verbatim",
+            lambda guard: lambda text: all(c in brief._INERT for c in text),
+            ("prefix",), ("prefix",), "inert"),
+        "the directory guard off": (
+            "_spans_verbatim", lambda guard: lambda d: True,
+            ("h-rejected-backtick", "h-rejected-lf", "h-rejected-nul",
+             "h-rejected-nfd"),
+            ("h-rejected-backtick", "h-rejected-lf", "h-rejected-nul",
+             "h-rejected-nfd"), "h-punct"),
+        "the directory guard without its ASCII bound": (
+            "_spans_verbatim", lambda guard: (
+                lambda d: "`" not in d and d == d.strip(" ")
+                and "  " not in d),
+            ("h-rejected-lf", "h-rejected-nul", "h-rejected-nfd"),
+            ("h-rejected-lf", "h-rejected-nul", "h-rejected-nfd"),
+            "h-punct"),
+        "the surrogate rule unprinted": (
+            "_SURROGATE_RULE", lambda rule: "",
+            ("surrogate",), ("surrogate",), "inert"),
+    }
+
+    def check_mutations(self, oracle):
+        for label, (attr, value, reds_rendered, reds_source,
+                    green) in self.MUTATIONS.items():
+            reds = reds_rendered if oracle is rendered else reds_source
+            with self.subTest(mutation=label):
+                with mock.patch.object(brief, attr,
+                                       value(getattr(brief, attr))):
+                    seen = self.red(oracle, {*reds, green})
+                self.assertEqual(sorted(seen), sorted(reds), label)
+        self.assertEqual(self.red(oracle), [], "every guard restored")
+
+    def test_each_guard_mutated_turns_its_cases_red_in_the_source(self):
+        self.check_mutations(structural)
+
+    def test_each_guard_mutated_turns_its_cases_red_rendered(self):
+        self.require_pandoc()
+        self.check_mutations(rendered)
 
 
 class TestTheGateBanner(unittest.TestCase):

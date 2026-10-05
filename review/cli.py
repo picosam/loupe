@@ -1577,8 +1577,105 @@ def _review_base(args, ledger, lineage: str) -> str | None:
     return base
 
 
+class SharedTarget(RuntimeError):
+    """The head a hand-off would target is already another lineage's request
+    or take target (RR1, the determinism and efficiency pass, 2026-10-03).
+
+    Raised from the gate-before-push callback: the commit is known, and no
+    gate has run and nothing has been pushed, emitted or recorded. Raised
+    there too, with the same promise, when another hand-off of the same
+    head holds its `transport.TargetReservation` in a mode this one cannot
+    share (0.29.0 review round 1 F1): its request is not recorded yet, so
+    the ledger cannot answer, and the overlap is refused rather than
+    admitted twice. A
+    reviewer whose invocation carries no lineage — `validate --from-target`
+    on a verdict, a harness's step — resolves a round from the SHA alone and
+    refuses between two lineages, so such a round spent a full manifest and
+    112,429 reviewer tokens on this workbench and filed no verdict (2 shared
+    targets in 489 requests). Two reviews of one commit stay possible: the
+    author says so with `--shared-target`. Carries a remedy: a blocked exit
+    has no runnable `next`."""
+
+    def __init__(self, message: str, remedy: str):
+        super().__init__(message)
+        self.remedy = remedy
+
+
+def _made(record: dict) -> str:
+    """What a refusal at the gate-before-push callback leaves behind."""
+    sha = record["sha"]
+    return (f"committed {sha[:12]} locally, and nothing was gated, pushed, "
+            f"emitted or recorded" if record.get("committed") else
+            f"made no commit, and nothing was gated, pushed, emitted or "
+            f"recorded")
+
+
+def admit_target(ledger, lineage: str, record: dict, allowed: bool,
+                 hold) -> None:
+    """THE shared-target admission, for every verb that reaches `_emit`
+    (0.29.0 review round 1 F1): reserve the head, re-read the ledger under
+    the reservation, then judge it (`require_unshared_target`).
+
+    `hold` is the caller's `transport.TargetReservation`, released by the
+    caller after its request is recorded or it ends, so the reservation
+    spans the check through the record — the interval in which a second
+    hand-off of the same head could otherwise read the same "nobody targets
+    this" and be admitted beside it. Undeclared, it is exclusive; with
+    `--shared-target`, shared (`TargetReservation`). Raises SharedTarget,
+    before any gate and with nothing pushed, emitted or recorded, both when
+    the reservation is held by a hand-off this one cannot run beside and
+    when the current ledger already names the head."""
+    try:
+        hold.reserve(record["sha"], shared=allowed)
+    except transport.Refusal as exc:
+        raise SharedTarget(f"{exc} The hand-off {_made(record)}",
+                           remedy=exc.remedy) from None
+    # The authoritative read, taken under the reservation: a holder this one
+    # waited behind may have recorded its request since the lineage was
+    # selected and `Ledger.events` cached its first read.
+    ledger.reload()
+    require_unshared_target(ledger, lineage, record, allowed)
+
+
+def require_unshared_target(ledger, lineage: str, record: dict,
+                            allowed: bool) -> None:
+    """Refuse a head another lineage's request or take already names, unless
+    the author declared the share. Lineages are read exactly as every SHA
+    resolver reads them (`Ledger.lineages_for_sha`, exact SHA); a closed
+    lineage counts, because the reviewer's resolver counts it. So the
+    remedy offers only what clears the refusal — a new commit, or the
+    declared share — and says that closing the other lineage does not
+    (round-2 F6 of the final review, 2026-10-05).
+
+    A READ, and that is its limit: it sees requests already recorded, not
+    one being admitted beside it. `admit_target` is what makes it current
+    and exclusive; call that, not this, from a verb."""
+    if allowed:
+        return
+    sha = record["sha"]
+    others = [key for key in ledger.lineages_for_sha(sha)
+              if key != str(lineage)]
+    if not others:
+        return
+    made = _made(record)
+    raise SharedTarget(
+        f"the head {sha[:12]} is already the target of lineage(s) "
+        f"{', '.join(sorted(others))} in this ledger, and this hand-off is "
+        f"lineage {lineage}: a reviewer whose invocation carries no lineage "
+        f"resolves a round from its SHA alone and refuses between two, so "
+        f"this round would be gated, pushed and reviewed and could file no "
+        f"verdict. The hand-off {made}",
+        remedy="the author commits the work this review is about, so its "
+               "target is a commit no other lineage names, and hands off "
+               "again; or, when a second review of this same commit is "
+               "intended, re-runs with --shared-target. Closing the other "
+               "lineage does not clear this: a closed lineage's target "
+               "still counts")
+
+
 def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
-          selected_transport: str, lineage: str):
+          selected_transport: str, lineage: str, *,
+          target: "transport.TargetReservation"):
     """emit-request's body, shared with handoff: commit, gate, push, emit,
     validate. Returns (envelope, parsed, scope) or an int exit code, where
     `scope` is the non-blocking claim-versus-span report
@@ -1607,6 +1704,12 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
     collided with the sentinel and this function reopened the path. The
     emitted Claim could then come from the second read while the cache
     digest and the ledger attested the first.
+
+    `target` is the caller's head reservation (0.29.0 review round 1 F1),
+    required so neither emitting verb can reach the admission without one:
+    `admit_target` takes it inside the callback, and the CALLER releases it
+    in its `finally`, after `record_handoff` for `handoff` and after the
+    envelope is written for `emit-request`.
     """
     claim = captured.claim
     # 0.25.0 (public issue #4): the claim's record-bound members, judged
@@ -1632,6 +1735,14 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
         # The governing configuration's manifest, at the commit, with the
         # base the emission will bind. Refuses by raising GatesRefused.
         nonlocal local_gates
+        # RR1: the head is known now, and nothing has run or left the
+        # machine. A head another lineage already targets refuses here,
+        # before the gates — and, since 0.29.0 review round 1 F1, so does a
+        # head another hand-off is admitting right now: the head is
+        # reserved first and the ledger read under the reservation
+        # (`admit_target`).
+        admit_target(ledger, lineage, record,
+                     getattr(args, "shared_target", False), target)
         # The claim's attestation_map names gates of the GOVERNING manifest,
         # which exists only now that the commit does — judged here, before
         # any gate runs and before anything is pushed (0.25.0; the same
@@ -1666,7 +1777,7 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
                                     base=base,
                                     before_push=gate_before_push)
     except (emit.AuthorityAbsent, emit.RoleSelectionError,
-            emit.SweepRefused) as exc:
+            emit.SweepRefused, SharedTarget) as exc:
         # RVW-T17: ONE catch, reached by both author doors, because both
         # reach `ensure_pushed` through this function. Round 7 F2's defect —
         # two author doors accepting different states — has no second place
@@ -1800,20 +1911,32 @@ def cmd_emit_request(args, cfg) -> int:
         lineage = _read_lineage(ledger, cfg, "emit-request")
     except LineageUnchoosable as exc:
         return _blocked("", str(exc), remedy=exc.remedy)
-    result = _emit(args, cfg, ledger, captured, selected_transport, lineage)
-    if isinstance(result, int):
-        return result
-    envelope, parsed, scope = result
-    if args.out:
-        Path(args.out).write_text(envelope, encoding="utf-8")
-        _out({"ok": True, "out": args.out, "sha": parsed.sha,
-              **_scope_report(scope),
-              "decide": _decide(cfg, {vocab.DECIDE_TRANSPORT:
-                                      selected_transport})},
-             f"wrote {args.out}{_scope_text(scope)}")
-    else:
-        print(envelope, end="")
-    return EXIT_OK
+    # The same head admission as `handoff`, through the same `_emit`
+    # (0.29.0 review round 1 F1). This verb records no request, so the
+    # reservation spans its admission through the envelope it writes: a
+    # hand-off of the same head running beside it is refused, or refuses
+    # it, exactly as two hand-offs are.
+    target = transport.TargetReservation(
+        ledger, branch=transport.current_branch(cfg), verb="emit-request",
+        lineage=lineage)
+    try:
+        result = _emit(args, cfg, ledger, captured, selected_transport,
+                       lineage, target=target)
+        if isinstance(result, int):
+            return result
+        envelope, parsed, scope = result
+        if args.out:
+            Path(args.out).write_text(envelope, encoding="utf-8")
+            _out({"ok": True, "out": args.out, "sha": parsed.sha,
+                  **_scope_report(scope),
+                  "decide": _decide(cfg, {vocab.DECIDE_TRANSPORT:
+                                          selected_transport})},
+                 f"wrote {args.out}{_scope_text(scope)}")
+        else:
+            print(envelope, end="")
+        return EXIT_OK
+    finally:
+        target.release()
 
 
 # Round 3 F3's exception moved to `emit` with the capture it belongs to;
@@ -1986,7 +2109,9 @@ def cmd_handoff(args, cfg) -> int:
             opening_lock.release()
         return _blocked("", str(exc), remedy=exc.remedy)
     # Held through `record_handoff` on every path — a refused emission, a
-    # red gate, an exception — which is what `finally` is for.
+    # red gate, an exception — which is what `finally` is for. The head's
+    # reservation, once `_emit` takes it, is released there too.
+    target = None
     try:
         try:
             # Round-2 F2: THE AUTHORITATIVE LIFECYCLE SNAPSHOT, taken here
@@ -2085,8 +2210,16 @@ def cmd_handoff(args, cfg) -> int:
                       f"{render_tool_agreement(agreement)}\n{rec['relay']}\n\n"
                       f"author: {rec['author_next']}")
             return EXIT_OK
+        # 0.29.0 review round 1 F1: the head's reservation, taken inside
+        # `_emit` once the commit is known and released in the `finally`
+        # below — after `record_handoff`, so no second hand-off of this
+        # head is admitted between this one's ledger read and its record.
+        # The cached branch above takes none: it re-records a request this
+        # lineage already holds for this head, so it adds no lineage to it.
+        target = transport.TargetReservation(ledger, branch=branch,
+                                             verb="handoff", lineage=lineage)
         result = _emit(args, cfg, ledger, captured, selected_transport,
-                       lineage)
+                       lineage, target=target)
         if isinstance(result, int):
             return result
         envelope, parsed, scope = result
@@ -2112,6 +2245,8 @@ def cmd_handoff(args, cfg) -> int:
                   f"author: {rec['author_next']}")
         return EXIT_OK
     finally:
+        if target is not None:
+            target.release()
         if reservation is not None:
             reservation.release()
         if opening_lock is not None:
@@ -3510,6 +3645,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "is fetchable from no other machine; stamped on "
                              "the envelope, and an error when a remote is "
                              "configured (§9bis.4)")
+        sp.add_argument("--shared-target", action="store_true",
+                        help="hand off a head another lineage already "
+                             "targets, as a deliberate second review of "
+                             "that commit. Without it such a head refuses "
+                             "before any gate runs: a reviewer whose "
+                             "invocation carries no lineage cannot tell the "
+                             "two reviews apart")
         sp.add_argument("--allow-outside-scope", action="store_true",
                         help="sweep outstanding paths the claim's "
                              "`scope_paths` does not cover, instead of "

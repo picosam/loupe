@@ -105,9 +105,24 @@ class TestTheInterpreterGuard(unittest.TestCase):
         self.assertEqual(declared_interval(">=3.14,<3.15"),
                          ((3, 14), (3, 15)))
 
+    def _older_candidates(self):
+        """The interpreters tried as older ones: the system `python3`, then
+        every minor from 3.8 up to the one below the floor, derived from
+        `REQUIRES_PYTHON` so the previous minor (3.14 under a 3.15 floor)
+        counts as older and the floor's own never does."""
+        return ["/usr/bin/python3"] + [
+            f"python3.{m}" for m in range(8, review.REQUIRES_PYTHON[1])]
+
+    def test_the_candidates_reach_the_minor_below_the_floor(self):
+        """Mutation: the range back to a literal that stops before the
+        previous minor, or one that reaches the floor's own."""
+        names = self._older_candidates()
+        floor = review.REQUIRES_PYTHON[1]
+        self.assertIn(f"python3.{floor - 1}", names)
+        self.assertNotIn(f"python3.{floor}", names)
+
     def _older_interpreter(self):
-        names = ["/usr/bin/python3"] + [f"python3.{m}" for m in range(8, 14)]
-        for name in names:
+        for name in self._older_candidates():
             found = shutil.which(name)
             if not found:
                 continue

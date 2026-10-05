@@ -5,6 +5,176 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.29.0
+
+**For upgraders — read before crossing this version.** Three sections below
+say so, and one key joins the grammar. A record no longer reads `bound` when
+the index or a cache hides an edit from git, so a hand-off refuses where it
+used to push; a hand-off refuses a head another lineage targets, or another
+hand-off is admitting at that moment, unless `--shared-target` says the
+second review is meant; each skill is now three files, so re-run
+`render-adapters --install` on every machine. The optional `[tool]
+commit_subject_check` makes a configuration unreadable to an older reader:
+raise `[tool] requires` to 0.29.0 in the commit that declares it. Published
+on the Python 3.15.0 release candidate 3.15.0rc3, as 0.26.0 to 0.28.1 were
+on rc2: until 3.15.0 final ships, run `uv python install 3.15` before the
+pinned install, as before.
+
+**`run_gates` takes `pending_tree`.** A caller that runs the gates before its
+commit exists may pass the id of the tree it commits next, once it has
+established that tree is the executed tree's tracked content. Each record's
+`binding` then reads `bound to the pending commit's tree <id>: its caller
+established that the executed tree's tracked content is that tree`, with the
+untracked paths beside it counted, where a staged commit used to read
+`unbound: the executed tree is dirty`. A moved HEAD is unbound as before.
+Absent, nothing changes, and a hand-off never passes it.
+
+**For upgraders: what the index hides is never bound.** `git status`
+trusts an index entry flagged assume-unchanged or skip-worktree, so a
+flagged file edited on disk left the status clean while every gate read
+the edit, and the record said `bound` to a commit that does not hold those
+bytes; a hand-off pushed and emitted it. Every record now reads `unbound:
+the index hides N tracked path(s) from git's comparison (…)`, naming the
+first five, whenever any entry carries either flag (a sparse checkout's
+omitted paths do), whatever the status or `pending_tree` say; the
+validator's A-UNBOUND then refuses the hand-off before its push, nothing
+committed. A repository that keeps a file assume-unchanged on purpose
+clears it (`git update-index --no-assume-unchanged <path>`,
+`--no-skip-worktree`, or `git sparse-checkout disable`) before a hand-off.
+
+The flags are not the only cache that answers for the disk: a filesystem
+monitor's valid bit (which `ls-files -v` does not show) and trusted stat
+data (`core.trustctime=false`, a same-size edit with its time restored)
+hid an edit the same way. So, wherever a record would otherwise read
+`bound`, the working tree is now compared with the tree being bound
+through a cold index (`emit.tree_differs`: the tree read into a scratch
+index, every tracked file re-hashed, no monitor, no flag, no stat data
+trusted, the real index never written), and a difference reads `unbound:
+N tracked path(s) on disk differ from the target commit's content (…)
+when read through a cold index`. It costs one hash of every tracked file
+per gate run: 0.23 s over 1,081 files (24 MB) on the authoring workbench.
+
+**For upgraders: a hand-off refuses a head another lineage targets.** When
+the commit `handoff` would target is already the target of another
+lineage's request or take in this ledger, open or closed, the hand-off now
+refuses once the commit is known and before any gate runs: nothing is
+gated, pushed, emitted or recorded. A reviewer whose invocation carries no
+lineage resolves a round from its SHA alone and refuses between two, so
+such a round could file no verdict; on the authoring workbench one spent a
+full gate manifest and 112,429 reviewer tokens that way. Commit first, so
+the target is a commit no lineage names; closing the other lineage does not
+clear the refusal, because a closed lineage's target still counts. When a
+second review of the same commit is meant (a re-review of an unchanged tip
+after a close, two branches at one commit), say so with the new
+`--shared-target` flag on `handoff` and `emit-request`. A script that
+re-hands-off an unchanged tip after closing its lineage needs the flag.
+
+The check holds across the whole hand-off, not one moment of it, so two
+overlapping hand-offs of one commit from two branches cannot both be
+admitted. The hand-off locks the commit before it reads the ledger, and
+keeps the lock until its request is recorded or it ends. The lock is a file
+under `targets/` in the state directory; the operating system releases it
+when the hand-off finishes, fails or dies, so nothing is ever left locked.
+While one hand-off or `emit-request` of a commit is in progress, another one
+of the same commit refuses at the same point and with the same promise:
+before any gate runs, with nothing gated, pushed, emitted or recorded. The
+refusal names who holds the commit; run it again once that hand-off ends.
+Two hand-offs that both pass `--shared-target` can still run side by side,
+and hand-offs of different commits never wait on each other. *For
+upgraders:* a script that hands off one commit twice at the same time now
+sees one of them refuse.
+
+**An optional key: `[tool] commit_subject_check`.** A list of strings, the
+argv of the repository's own subject check. When a hand-off is about to
+commit outstanding work, it runs that command in the repository root with
+the path of a file holding the commit subject appended, under the git
+ceiling; a non-zero exit, a timeout or a command that cannot start refuses
+with nothing committed, pushed or emitted, and the check's output travels
+in the refusal. Absent, nothing runs, as before. An empty list is refused
+at load. Declaring the key makes the configuration unreadable to older
+readers, so a repository raises `[tool] requires` to the release that
+ships it in the same commit.
+
+**`loupe brief` answers in about half the time.** The ledger derived every
+event's lineage key again for each lineage a verb asked about; it now
+derives them once per state of the ledger. On a 9,231-event ledger `brief`
+fell from about 0.35 s to 0.18 s, with identical output.
+
+**A fix for hand-built ledgers.** `Ledger.lineage_of` matched a row without
+a `uid` to the first other row without one, so a hand-built or imported
+`[lineage_closed, request]` ledger named the request's lineage `1` instead
+of `2` (in `waive --sha`'s refusal, and in every SHA resolver). It now finds
+the ledger's own row by identity first, so two EQUAL uid-less rows in two
+lineages each keep their own, and the SHA resolvers read each row's key at
+its position: `[request A, lineage_closed, request A]` binds A in lineages
+`2` and `1`, where it said `1` alone and the shared-target refusal let
+lineage `1` hand off at A. A caller passing a COPY of a row (not the
+ledger's own object) whose equal rows sit in two lineages now gets
+`AmbiguousEvent`, naming them, instead of the oldest one's key. Rows loupe
+writes always carry a uid and were never affected.
+
+**The skill's description is its trigger.** The description an agent
+loads in every session, whether or not the skill fires, carried the two
+configuration sentences (549 bytes). It now carries the trigger and the
+stamp clause (228 bytes), and the two sentences open the procedure's body
+on every surface, the instruction block's included. Re-run `loupe
+render-adapters --install` on every machine; a repository that embeds the
+block finds it stale under `--check-embedded` until `--write-embedded`
+rewrites it.
+
+**For upgraders: each skill splits by role.** `SKILL.md` keeps the rules
+that hold on both sides and a routing line; the author's and the
+reviewer's procedures are now `author.md` and `reviewer.md` beside it, read
+on demand, so a reviewer round no longer loads the author's steps (4,893
+bytes less on the Codex skill). `render-adapters --install` writes both
+files into each skill directory and `--check-install` reports each; re-run
+`--install` on every machine after upgrading. A repository that vendors a
+skill now vendors three files, each carrying the `GENERATED by` line. The
+agent-relayed-window clause is a rule of both sides and stays in
+`SKILL.md`, where the `docs/upgrading.md` §6 check greps for it. The
+instruction block has no directory for siblings and stays whole.
+
+**`take` names the log directory once.** The compact Evidence table printed
+every gate's log pointer whole, and one hand-off's pointers share one
+directory. The directory most rows share is now named once above the table,
+in a `Logs:` line, and a row in it prints `…/` and its file name; every
+other row prints its pointer exactly as recorded, so a bare `c.log` is never
+read as a file in that directory. A directory only one row names is not
+hoisted, and neither is any directory when an unshortened pointer itself
+begins `…/`. About 2.8 KB less per take on this workbench's 25-gate
+requests (2.9 KB measured before the prefix, which costs 4 bytes a row). The
+request file, its digest and every check are unchanged. A `log` cell prints
+a pointer, or a file name under the `Logs:` directory, as recorded only when
+every character is a letter, a digit, `.`, `/` or `-`, and the cell is not
+`-`. GFM reads none of those characters as syntax. Any other pointer prints
+as `%:` and the whole pointer, with every other character percent-encoded as
+UTF-8 (`_` and `~` included). A rule printed above the table says so. A lone
+surrogate is encoded with surrogates passed, under a rule line of its own.
+The directory is printed once, in a code span. It is hoisted only when it is
+printable ASCII with no backtick and no space other than single interior
+ones. Any other directory is not hoisted, and its pointers print encoded.
+Every location in the table reads back exactly from the rendered page, not
+only from its source. The tests read it back through pandoc's GFM reader
+where pandoc is installed, and hold every cell to that character set
+everywhere.
+
+**A request lists the waivers of its own span.** The request's ledger
+report listed every waiver the repository ever recorded, and the gate
+manifest the Evidence block already enumerates. It now lists only the
+waivers whose commit is inside base..head, counts the rest and names
+`loupe ledger report` for them, and drops the `Gate manifest in force` line.
+A waiver SHA abbreviated to seven characters or more still matches.
+`loupe ledger report` is unchanged: every waiver, and the manifest. About
+1.7 KB less per request on this workbench, growing with every waiver.
+
+**A test fixture no longer strands git's maintenance lock.** The
+concurrent-rounds suite renamed a freshly built start state into its
+template while `git maintenance run --auto --detach` could still hold
+`<objects>/maintenance.lock`; git unlinks that lock by its absolute path, so
+the template kept it and every later copy waited 60 s and failed (two tests
+red on a loaded two-core runner). The build is now settled before it moves.
+Test code only.
+
 ## 0.28.1
 
 Documentation only: nothing an adopter runs changes, and no configuration

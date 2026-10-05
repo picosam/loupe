@@ -29,6 +29,14 @@ CONFIG_BASENAME = "review.toml"
 #: to two environment names.
 REQUIRES_KEY = "requires"
 
+#: `[tool] commit_subject_check` (OF-6, the determinism and efficiency pass,
+#: 2026-10-03): an optional argv a hand-off runs on the subject of the
+#: commit it is about to make, the path of a file holding that subject
+#: appended. A non-zero exit refuses with nothing committed. Absent, no
+#: check runs, which is every earlier release's behaviour; so it is not a
+#: `decide` key. Bound here for the reason `REQUIRES_KEY` is.
+SUBJECT_CHECK_KEY = "commit_subject_check"
+
 #: The built-in ceiling, in seconds, on a `git` subprocess at a door that
 #: holds a configuration — and the default of `[limits] git_timeout`. It is
 #: 120 because 120 is what every such door hardcoded before the key existed
@@ -587,6 +595,8 @@ CONFIG_DECLARED_ELSEWHERE = {
     ("limits", "token_budget"): int,    # absent is not zero and not infinity
     ("tool", REQUIRES_KEY): str,        # minimum reader version; absent is
                                         # silence, not a floor of 0.0.0
+    ("tool", SUBJECT_CHECK_KEY): list,  # a hand-off's own subject, checked
+                                        # before it commits; absent, none
 }
 _KIND_OF = {str: "a string", int: "a whole number", list: "a list of strings",
             dict: "a table of string values", bool: "true or false"}
@@ -636,6 +646,9 @@ def _check_value(section: str, key: str, value, errors: list) -> None:
         errors.append(f"{where} must map strings to strings")
     if want is int and value < 0:
         errors.append(f"{where} must not be negative")
+    if (section, key) == ("tool", SUBJECT_CHECK_KEY) and not value:
+        errors.append(f"{where} must name a command: an empty list runs "
+                      f"nothing, and absent already means no check")
     if (section, key) == ("limits", "round_cap") and value < 1:
         errors.append(f"{where} must be at least 1")
     # A zero ceiling is not "no ceiling", it is "refuse at once", and nobody

@@ -477,15 +477,31 @@ def _gate_banners(records: list) -> list[str]:
     if hard or unbound:
         parts = []
         if hard:
-            parts.append(f"{len(hard)} of {len(records)} BLOCKING gate(s) did "
+            # Out of the blocking rows that ran: counting every row made
+            # "1 of 20 BLOCKING" of a manifest with 17 blocking gates.
+            blocking_ran = [r for r in records if not advisory(r)]
+            parts.append(f"{len(hard)} of {len(blocking_ran)} BLOCKING "
+                         f"gate(s) did "
                          f"not pass AT THE TARGET: "
                          + ", ".join(row_id(r) for r in hard))
         if unbound:
             parts.append(f"{len(unbound)} not bound to this commit")
         out.append("- **Gates — " + "; ".join(parts) + "**")
     if soft:
-        rest = ("every blocking gate passed at the target" if not hard
-                else "see the blocking failures above")
+        # Lineage L1ee41bf159, rounds 1 to 3 (tool feedback): with blocking
+        # gates deferred, "every blocking gate passed" claimed rows that
+        # never ran. A deferred row whose `blocking` is not False counts as
+        # blocking: unknown is never the quieter reading.
+        not_run = [r for r in later
+                   if not (isinstance(r, dict) and r.get("blocking") is False)]
+        if hard:
+            rest = "see the blocking failures above"
+        elif not_run:
+            rest = (f"every blocking gate that ran passed at the target; "
+                    f"{len(not_run)} blocking gate(s) deferred, not run: "
+                    + ", ".join(row_id(r) for r in not_run))
+        else:
+            rest = "every blocking gate passed at the target"
         out.append(f"- **Advisory gates — {len(soft)} non-blocking gate(s) "
                    f"did not pass: " + ", ".join(row_id(r) for r in soft)
                    + f"** — not a failure of the target's blocking gates "
@@ -497,9 +513,149 @@ def _gate_banners(records: list) -> list[str]:
 _SHORT = 12
 
 
-def _attestation_row(rec, request_sha: str | None) -> str:
+def _log_directory(records) -> str | None:
+    """The directory most of the records' output pointers share, or None.
+
+    RR3 (the determinism and efficiency pass, 2026-10-03): every row printed
+    its log pointer whole, and the 25 pointers of one hand-off share one
+    directory, about 3.1 KB of a take repeating it. The directory is named
+    once above the table and a row in it prints `…/` and its file name.
+    Two rows at least must share it, or naming it once saves nothing; a tie
+    goes to the directory that appears first. A pointer that is not a
+    string, or names no directory, is never counted. None, too, when an
+    unshortened pointer begins `…/` itself: it would read as shortened.
+    """
+    counts: dict[str, int] = {}
+    for rec in records:
+        output = rec.get("output") if isinstance(rec.get("output"), dict) else {}
+        pointer = output.get("pointer")
+        if isinstance(pointer, str) and "/" in pointer.rstrip("/"):
+            directory = pointer.rsplit("/", 1)[0]
+            if directory:
+                counts[directory] = counts.get(directory, 0) + 1
+    if not counts:
+        return None
+    best = max(counts, key=lambda d: counts[d])
+    if counts[best] < 2:
+        return None
+    # Round-3 F2: the directory is printed once, in a code span, outside
+    # the table: it must print as it is, so one that a code span would
+    # change is never hoisted, and its pointers print encoded.
+    if not _spans_verbatim(best):
+        return None
+    # Round-2 F5: a shortened cell is `…/<name>`, and every other cell is
+    # its pointer verbatim. A pointer that itself begins `…/` and is NOT
+    # shortened would read as shortened, so such a table names no
+    # directory: whole pointers are always exact.
+    for rec in records:
+        output = rec.get("output") if isinstance(rec.get("output"), dict) else {}
+        pointer = output.get("pointer")
+        if (isinstance(pointer, str) and pointer.startswith(_HOISTED)
+                and _hoisted_name(pointer, best) is None):
+            return None
+    return best
+
+
+#: The prefix of a `log` cell shortened under the `Logs:` directory. Every
+#: other cell is the recorded pointer whole, so the two never print alike
+#: (round-2 F5 of the final review, 2026-10-05: a bare `c.log` beside two
+#: hoisted file names read as `<dir>/c.log`).
+_HOISTED = "…/"
+
+#: The prefix of a `log` cell that carries its whole pointer
+#: percent-encoded (RFC 3986, UTF-8): the lossless form of a pointer a
+#: table cell cannot print as recorded (round-3 F2 of the final review,
+#: 2026-10-05: a cell's whitespace is collapsed, so `a  b.log`, `c\td.log`
+#: and `c\nd.log` read back as other, nonexistent files).
+_ENCODED = "%:"
+
+#: The characters a GFM table cell prints as they are, wherever they stand
+#: and whatever surrounds them: no emphasis, strikethrough, code, escape,
+#: entity, HTML, link, autolink scheme, emoji or math delimiter is among
+#: them, and no whitespace. (`www.` begins an extended autolink, whose
+#: text is still these characters.) Round-1 F2 of the 0.29.0 review: an
+#: allowlist of the syntax a cell interprets lost `_x_`, `~~x~~`, `\*`,
+#: `&amp;` and a link's target, in the plain form and the encoded one
+#: alike; every other character is now percent-encoded instead.
+_INERT = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                   "0123456789./-")
+
+
+#: Printed beside the table when an encoded pointer holds a lone surrogate
+#: (a JSON string may; a non-UTF-8 file name read through `surrogateescape`
+#: does), which strict UTF-8 cannot decode.
+_SURROGATE_RULE = (
+    "A lone surrogate, which UTF-8 cannot carry, is encoded as the three "
+    "bytes UTF-8 gives its code point: decode with surrogates passed "
+    "(Python: `errors='surrogatepass'`).")
+
+
+def _verbatim(text: str) -> bool:
+    """Whether a table cell prints `text` exactly as it is: every character
+    inert (`_INERT`), and not the `-` an absent field prints. Neither
+    prefix can begin such a cell: `%`, `:` and `…` are not inert."""
+    return text != "-" and all(c in _INERT for c in text)
+
+
+def _percent_encoded(text: str) -> str:
+    """`text` with every character outside `_INERT` percent-encoded as its
+    UTF-8 bytes, `_` and `~` included (which `urllib.parse.quote` leaves
+    as they are, and a cell reads as emphasis and strikethrough). A lone
+    surrogate, which UTF-8 cannot carry, is encoded as its three bytes
+    (`surrogatepass`)."""
+    return "".join(
+        c if c in _INERT else "".join(
+            f"%{b:02X}" for b in c.encode("utf-8", "surrogatepass"))
+        for c in text)
+
+
+def _spans_verbatim(directory: str) -> bool:
+    """Whether a code span prints `directory` + `/` exactly as it is. A
+    code span takes its content literally (no escape, entity, emphasis or
+    HTML is read inside it) except a backtick, which closes it, a line
+    ending, which it turns into a space, U+0000, which it replaces, and a
+    space at both ends, which it strips; a renderer may also normalise
+    Unicode (pandoc composes `e` + U+0301 into `é`). So: printable ASCII
+    only, no backtick, and no space but single interior ones, which every
+    renderer displays. Any other directory is not hoisted, and its
+    pointers print encoded."""
+    return (all(" " <= c <= "~" for c in directory)
+            and "`" not in directory
+            and directory == directory.strip(" ") and "  " not in directory)
+
+
+def _log_cell(pointer, log_dir: str | None):
+    """What the `log` column prints for `pointer`: `…/<name>` under the
+    directory named above the table, the pointer as recorded, or, when
+    the name or the pointer holds a character a cell might not print as
+    it is, `%:` and the whole pointer percent-encoded. A value that is not
+    a string is left to the table's own cell, as before (the record's
+    validation admits only a string)."""
+    if not isinstance(pointer, str):
+        return pointer
+    name = _hoisted_name(pointer, log_dir)
+    shown = pointer if name is None else name
+    if _verbatim(shown):
+        return shown if name is None else _HOISTED + name
+    return _ENCODED + _percent_encoded(pointer)
+
+
+def _hoisted_name(pointer, log_dir: str | None) -> str | None:
+    """The file name `pointer` prints under `log_dir`, or None when it
+    prints whole: only a string directly inside the directory."""
+    if (log_dir is not None and isinstance(pointer, str)
+            and pointer.rsplit("/", 1)[0] == log_dir
+            and pointer.startswith(log_dir + "/")):
+        return pointer[len(log_dir) + 1:]
+    return None
+
+
+def _attestation_row(rec, request_sha: str | None,
+                     log_dir: str | None = None) -> str:
     """One table row. Every column is a field of the record, shortened at
-    most; a field that is absent prints `-`, never a default."""
+    most; a field that is absent prints `-`, never a default. A log pointer
+    directly inside `log_dir` (named once above the table) prints `…/` and
+    its file name; any other prints whole."""
     def cell(value) -> str:
         return "-" if value is None else " ".join(str(value).split()).replace("|", "\\|")
 
@@ -527,15 +683,17 @@ def _attestation_row(rec, request_sha: str | None) -> str:
         by = "this tool"
     output = rec.get("output") if isinstance(rec.get("output"), dict) else {}
     digest = output.get("sha256")
+    pointer = _log_cell(output.get("pointer"), log_dir)
     return "| " + " | ".join(cell(c) for c in (
         rec.get("id"), result, rec.get("binding"), rec.get("tree"), ran_at,
         "yes" if rec.get("blocking") is True
         else "no" if rec.get("blocking") is False else None,
         by, rec.get("command"),
         f"sha256:{digest[:_SHORT]}" if isinstance(digest, str) else None,
-        # The pointer, whole (asked for in two rounds' tool feedback): a
-        # shortened digest names a log and cannot open it.
-        output.get("pointer"),
+        # The pointer, whole or under the directory named above the table
+        # (asked for in two rounds' tool feedback): a shortened digest
+        # names a log and cannot open it.
+        pointer,
     )) + " |"
 
 
@@ -575,6 +733,30 @@ def compact_request(envelope: str, kept: str | None = None,
     full_at = (f"every field of every record, CI run and receipt objects "
                f"included: {kept}" if kept else
                "every field of every record is in the request file itself")
+    log_dir = _log_directory(records)
+    logs_line = ([f"Logs: `{log_dir}/` — a `log` cell beginning `{_HOISTED}` "
+                  f"is in this directory: replace `{_HOISTED}` with this "
+                  f"path. Every other `log` cell is the pointer as "
+                  f"recorded."] if log_dir is not None else [])
+    encoded = any(
+        isinstance(out := (r.get("output") if isinstance(r.get("output"),
+                                                         dict) else {})
+                   .get("pointer"), str)
+        and str(_log_cell(out, log_dir)).startswith(_ENCODED)
+        for r in records)
+    if encoded:
+        logs_line.append(
+            f"A `log` cell beginning `{_ENCODED}` is its whole pointer "
+            f"percent-encoded (RFC 3986, UTF-8): decode what follows "
+            f"`{_ENCODED}`. It is used for any pointer holding a "
+            f"character other than A-Z, a-z, 0-9, `.`, `/` and `-`, "
+            f"and for the pointer `-`, so no cell holds a character "
+            f"Markdown reads as syntax.")
+        if any(isinstance(out := (r.get("output") if isinstance(
+                r.get("output"), dict) else {}).get("pointer"), str)
+               and any("\ud800" <= c <= "\udfff" for c in out)
+               for r in records):
+            logs_line.append(_SURROGATE_RULE)
     table = "\n".join([
         f"{len(records)} attestation record(s), summarised by `{TOOL_NAME} "
         f"take` from {len(block.group(0).encode('utf-8'))} bytes of JSON — "
@@ -582,11 +764,12 @@ def compact_request(envelope: str, kept: str | None = None,
         f"`= target` means executed_sha = target_sha"
         + (f" = the request's sha {request_sha[:_SHORT]}" if request_sha
            else "") + "; any other row prints both.",
+        *logs_line,
         "",
         "| gate | result | binding | tree | ran at | blocking | executed by "
         "| command | output | log |",
         "|---|---|---|---|---|---|---|---|---|---|",
-        *(_attestation_row(r, request_sha) for r in records),
+        *(_attestation_row(r, request_sha, log_dir) for r in records),
     ])
     return envelope[:block.start()] + table + envelope[block.end():]
 

@@ -213,7 +213,8 @@ correct file.
 
 So derive it from what the file declares, key by key. `attested_by` on a
 gate row and `[limits] ci_timeout` need 0.20.0; the value
-`attested_by = "schedule"` needs 0.28.0. `[roles]
+`attested_by = "schedule"` needs 0.28.0; `[tool] commit_subject_check`
+needs 0.29.0. `[roles]
 review_default` and `[roles] enforcement` need 0.16.0. A configuration
 that declares none of the newer keys needs no new floor at all, and
 raising it anyway is how a reviewing machine that was fine yesterday
@@ -451,15 +452,17 @@ fenced example counts as one — indent the example. A symlinked file
 (`CLAUDE.md -> AGENTS.md`) is followed to its target for reading and
 writing, and the result says so: check each real file once.
 
-A vendored skill is a whole rendered file, not a region. Render beside
-it into a scratch directory and compare:
+A vendored skill is whole rendered files, not a region: `SKILL.md` and,
+since the skill splits by role (see the CHANGELOG), `author.md` and
+`reviewer.md` beside it. Render into a scratch directory and compare the
+whole directory:
 
 ```console
 $ tmp="$(mktemp -d)" && loupe render-adapters --dir "$tmp"
-$ diff -u <your vendored SKILL.md> "$tmp/claude/SKILL.md"
+$ diff -ru <your vendored skill directory> "$tmp/claude"
 ```
 
-(`codex/SKILL.md` for a vendored Codex skill.) No output is the proof;
+(`codex/` for a vendored Codex skill.) No output is the proof;
 any output is the patch you have not applied yet.
 
 **Check:** `loupe --version` prints the target on every machine, and
@@ -683,6 +686,7 @@ substitute.
 | 0.25.0 | Three things move. Re-run `render-adapters --install` on every machine: the Codex skill moves to the documented `~/.agents/skills/loupe/`, and the install keeps a legacy `~/.codex/skills/loupe/` copy and moves it out of discovery. With no `--dir`, `--install` and `--check-install` render from the installed package, so no install form needs anything beside it. `[limits] git_timeout` is a new key: declare it only after every machine that authors or reviews the repository runs 0.25.0, and raise `[tool] requires` to 0.25.0 in the same commit. Five claim members are new: `carried_findings`, `objectives`, `observations`, `attestation_map` and `excluded_paths`. The hand-off now gates before it pushes. A red blocking gate refuses with the local commit named, for the author to amend. | A machine left at 0.24.x reads the Codex skill from the old path, and reports the migrated copy `absent`. A machine holding both paths lists the skill to Codex twice until a 0.25.0 `--install` runs. An older reader refuses a `review.toml` that declares `git_timeout`. An author at 0.24.x refuses a claim carrying any of the new members, while a reviewer at 0.24.x still takes the request. |
 | 0.26.0 | Two things move. Python 3.15 is the one supported interpreter (`>=3.15,<3.16`), and this release is published on the 3.15.0 release candidate: until 3.15.0 final ships, run `uv python install 3.15` before the pinned install, because uv provisions nothing from that range while only the rc exists, and an installed rc is used. Keep `review.toml` in TOML 1.0 while any author or reviewer runs a release below 0.26.0. An `objectives` entry of the claim gains two optional fields, `authority` and `covers`, declared together. | Under 3.14 the package refuses at its first statement, naming both versions. An earlier reader refuses a TOML 1.1-only `review.toml` as invalid TOML, naming the line. An author at 0.25.x refuses a claim whose objective carries either new field, while a reviewer at 0.25.0 still takes the request. |
 | 0.28.0 | One value joins the grammar: `attested_by = "schedule"` on a gate row, which a hand-off records deferred instead of running. An older reader refuses a configuration that uses it, naming the version skew; nothing else in an envelope, refusal or exit code changes. | Declaring it before the reviewing side runs 0.28.0 makes the target refuse there; raise `[tool] requires` with the value, not after it. |
+| 0.29.0 | Four things move. A gate record reads `unbound` whenever the index (assume-unchanged, skip-worktree, a sparse checkout) or a cache (a filesystem monitor, trusted stat data) hides an edit, so a hand-off refuses before its push; clear the flags first. A hand-off refuses a head another lineage targets, open or closed; commit first, or pass `--shared-target` when a second review of that commit is meant. While one hand-off of a commit is being admitted, another hand-off or `emit-request` of the same commit refuses before its gates unless both declared `--shared-target`; run it again once the first ends. Each skill is three files (`SKILL.md`, `author.md`, `reviewer.md`): re-run `render-adapters --install` everywhere, and a vendored skill vendors all three. `[tool] commit_subject_check` joins the grammar. | A flagged or cached edit makes every hand-off refuse until cleared. A script that re-hands-off an unchanged tip after closing its lineage refuses without the flag. A script running two hand-offs of one commit at once sees one refuse. A machine left on the old install reads a skill with no role files. An older reader refuses a configuration that declares the new key, naming the version skew. |
 
 ## What this page does not do
 

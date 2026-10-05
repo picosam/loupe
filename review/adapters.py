@@ -16,6 +16,11 @@ a gate.
 Rendered kinds:
   claude-skill        adapters/claude/SKILL.md   → ~/.claude/skills/loupe/
   codex-skill         adapters/codex/SKILL.md    → ~/.agents/skills/loupe/
+  <skill>-author      adapters/<agent>/author.md   → beside that SKILL.md
+  <skill>-reviewer    adapters/<agent>/reviewer.md → beside that SKILL.md
+                      (RR8: a skill's SKILL.md carries the rules that hold
+                      on both sides and routes to its two role files, one
+                      per stamp, read on demand; `SKILL_ROLE_KINDS`)
   instructions-block  adapters/instructions-block.md — an agent-neutral
                       block for a BEGIN/END GENERATED region in a project
                       instruction file, where a skill directory is not read
@@ -78,6 +83,33 @@ INSTALL = {
                     "https://learn.chatgpt.com/docs/build-skills, "
                     "retrieved 2026-09-21"),
 }
+
+#: The two sides of the procedure, in the order the instruction block
+#: carries them.
+ROLES = ("author", "reviewer")
+
+#: RR8 (the determinism and efficiency pass, 2026-10-03): a skill surface
+#: splits by role. `SKILL.md` keeps what holds on both sides and a routing
+#: line; each side's procedure is a sibling file in the same skill
+#: directory, read on demand, so a reviewer round no longer loads the
+#: author's steps (4,893 bytes on the Codex skill, measured 2026-10-04).
+#: The agent-relayed-window clause is a both-sides rule, so it stays in
+#: `SKILL.md`, the one file a reader outside this tool greps for it
+#: (`docs/upgrading.md` §6). Each role file is its own kind with its
+#: own install target, so the install, the drift check and the retention
+#: of a replaced copy treat it exactly as they treat `SKILL.md`. The
+#: instruction block has no directory to hold siblings and stays whole.
+SKILL_ROLE_KINDS = {
+    surface: {role: f"{surface}-{role}" for role in ROLES}
+    for surface in ("claude-skill", "codex-skill")}
+for _surface, _kinds in SKILL_ROLE_KINDS.items():
+    _target, _why = INSTALL[_surface]
+    for _role, _kind in _kinds.items():
+        INSTALL[_kind] = (_target.rsplit("/", 1)[0] + f"/{_role}.md", _why)
+del _surface, _kinds, _target, _why, _role, _kind
+
+#: Every surface an agent reads the procedure from, by its main kind.
+SURFACES = ("claude-skill", "codex-skill", "instructions-block")
 
 # Observed behaviour, dated, beside the documented path — never instead of it.
 INSTALL_OBSERVED = {
@@ -546,7 +578,9 @@ def _help_of(action, name: str) -> str:
     return ""
 
 
-def _body() -> list[str]:
+def _head_sections() -> list[str]:
+    """What this is, and the rules that hold on both sides: the part of the
+    procedure every surface carries first."""
     L = []
     L.append(f"## What this is")
     L.append("")
@@ -558,19 +592,58 @@ def _body() -> list[str]:
              f"envelope's stamp (`author=… reviewer=…`) says which, per "
              f"invocation, and this text does not.")
     L.append("")
+    # SL-B10 (2026-10-03): these two sentences were the skill's description,
+    # loaded into every session on both skill surfaces; the description now
+    # carries only the trigger and the stamp clause, and the rule lives
+    # here, read when the skill is.
+    L.append(f"A REVIEWED commit must carry `review.toml` in the repo root: "
+             f"`handoff` and `take` both refuse a target that tracks none, "
+             f"because rules living on one machine cannot be shown to a "
+             f"second. A user-level `~/.config/{TOOL_NAME}/<repo-id>.toml` "
+             f"still governs every LOCAL verb, so do not require an in-tree "
+             f"file before acting locally.")
+    L.append("")
     steps = procedure()
     L.append("## Rules that hold on both sides")
     L.append("")
     for rule in steps["both"]:
         L.append(f"- {rule}")
     L.append("")
-    for role in ("author", "reviewer"):
-        L.append(f"## If you hold the {role} stamp")
-        L.append("")
-        for i, (title, cmd, what) in enumerate(steps[role], 1):
-            L.append(f"{i}. **{title}**" + (f" — `{cmd}`" if cmd else ""))
-            L.append(f"   {what}")
-        L.append("")
+    return L
+
+
+def _role_section(role: str) -> list[str]:
+    """One side's procedure, steps in order: the same lines whether the
+    instruction block carries it inline or a role file carries it alone."""
+    L = [f"## If you hold the {role} stamp", ""]
+    for i, (title, cmd, what) in enumerate(procedure()[role], 1):
+        L.append(f"{i}. **{title}**" + (f" — `{cmd}`" if cmd else ""))
+        L.append(f"   {what}")
+    L.append("")
+    return L
+
+
+def _routing_section(surface: str) -> list[str]:
+    """RR8: where a skill surface's two procedures are. Names each role
+    file by its name beside `SKILL.md` and by its install target, both from
+    `INSTALL`, never restated."""
+    L = ["## Your side's procedure", "",
+         "This file carries what holds on both sides. Before you act on an "
+         "envelope, read your side's procedure — the envelope's stamp says "
+         "which side you hold:", ""]
+    for role, kind in SKILL_ROLE_KINDS[surface].items():
+        target = INSTALL[kind][0]
+        L.append(f"- the **{role}** stamp: `{target.rsplit('/', 1)[1]}` "
+                 f"beside this file (`{target}`)")
+    L += ["",
+          "Each is that side's whole procedure, steps in order. Read it "
+          "again for every envelope; never act on a step from memory of an "
+          "earlier read.", ""]
+    return L
+
+
+def _tail_sections() -> list[str]:
+    L = []
     L.append("## Verbs (from the CLI itself)")
     L.append("")
     L.append("| verb | what |")
@@ -593,6 +666,19 @@ def _body() -> list[str]:
     return L
 
 
+def _body() -> list[str]:
+    """The whole procedure, both sides inline: the instruction block's."""
+    return (_head_sections() + [line for role in ROLES
+                                for line in _role_section(role)]
+            + _tail_sections())
+
+
+def _skill_body(surface: str) -> list[str]:
+    """A skill's `SKILL.md`: both-sides rules and the routing line in place
+    of the two procedures, which are its role files (RR8)."""
+    return _head_sections() + _routing_section(surface) + _tail_sections()
+
+
 def _frontmatter(surface: str) -> list[str]:
     return [
         "---",
@@ -605,16 +691,18 @@ def _frontmatter(surface: str) -> list[str]:
         # require the very thing `handoff` and `take` refuse without. The
         # drift gate compares generated bytes to their generator; it cannot
         # notice that the generator describes a rule that changed.
+        #
+        # SL-B10 (the determinism and efficiency pass, 2026-10-03): the
+        # description is loaded into every session on both skill surfaces,
+        # whether or not the skill fires, so it carries only what decides
+        # the firing — the trigger — and the stamp clause. The two config
+        # sentences moved into the body (`_head_sections`, "What this is"),
+        # which every surface carries and an agent reads when the skill
+        # fires: 549 bytes became 228.
         f"description: Use when asked to hand off work for review, take a "
         f"review request, respond to a verdict, or close a round with "
-        f"`{TOOL_NAME}`. A REVIEWED commit must carry `review.toml` in the "
-        f"repo root: `handoff` and `take` both refuse a target that tracks "
-        f"none, because rules living on one machine cannot be shown to a "
-        f"second. A user-level `~/.config/{TOOL_NAME}/<repo-id>.toml` still "
-        f"governs every LOCAL verb, so do not require an in-tree file "
-        f"before acting locally. Carries the literal commands for the "
-        f"author and reviewer sides; the envelope stamp says which side "
-        f"you hold.",
+        f"`{TOOL_NAME}`. Carries the literal commands for the author and "
+        f"reviewer sides; the envelope stamp says which side you hold.",
         "---",
         "",
         f"# {TOOL_NAME} — review procedure ({surface} adapter, GENERATED)",
@@ -626,18 +714,53 @@ def _frontmatter(surface: str) -> list[str]:
     ]
 
 
+_SURFACE_NAMES = {"claude-skill": "Claude Code", "codex-skill": "Codex"}
+
+
+def _role_file(surface: str, role: str) -> str:
+    """A skill's role file (RR8): no frontmatter, so no agent discovers it
+    as a skill of its own; it is read from the routing line in `SKILL.md`."""
+    return "\n".join([
+        f"# {TOOL_NAME} — {role} procedure ({_SURFACE_NAMES[surface]} "
+        f"adapter, GENERATED)",
+        "",
+        f"GENERATED by `{paths.command(*paths.lits(TOOL_NAME, 'render-adapters'))}` from one source "
+        f"(review/adapters.py) at tool version {TOOL_VERSION} — do not edit; "
+        f"regenerate. `{TOOL_NAME} render-adapters --check` guards it.",
+        "",
+        f"Read it with `SKILL.md` beside it, whose rules hold on both "
+        f"sides.",
+        "",
+        *_role_section(role)])
+
+
+def surface_text(surface: str) -> str:
+    """Everything an agent on `surface` can read of the procedure: the
+    instruction block, or a skill's `SKILL.md` followed by its role files.
+    What a check of the procedure's CONTENT reads, so a rule moved between
+    a skill's files is still found."""
+    if surface not in SKILL_ROLE_KINDS:
+        return render(surface)
+    return "\n".join([render(surface), *(render(kind) for kind in
+                                         SKILL_ROLE_KINDS[surface].values())])
+
+
 def render(kind: str) -> str:
+    for surface, kinds in SKILL_ROLE_KINDS.items():
+        for role, role_kind in kinds.items():
+            if kind == role_kind:
+                return _role_file(surface, role)
     if kind == "claude-skill":
         head = _frontmatter("Claude Code")
         head.append(f"Install: `{INSTALL[kind][0]}` ({INSTALL[kind][1]}).")
         head.append("")
-        return "\n".join(head + _body())
+        return "\n".join(head + _skill_body(kind))
     if kind == "codex-skill":
         head = _frontmatter("Codex")
         head.append(f"Install: `{INSTALL[kind][0]}` ({INSTALL[kind][1]}).")
         head.append(f"Observed, separately: {INSTALL_OBSERVED[kind]}.")
         head.append("")
-        return "\n".join(head + _body())
+        return "\n".join(head + _skill_body(kind))
     if kind == "instructions-block":
         head = [
             f"<!-- BEGIN GENERATED: {TOOL_NAME} adapter — do not edit; "
@@ -658,6 +781,13 @@ OUTPUTS = {
     "claude-skill": Path("claude") / "SKILL.md",
     "codex-skill": Path("codex") / "SKILL.md",
     "instructions-block": Path("instructions-block.md"),
+    # RR8: each skill's role files, beside its SKILL.md.
+    **{kind: OUTPUTS_DIR / f"{role}.md"
+       for OUTPUTS_DIR, kinds in ((Path("claude"),
+                                   SKILL_ROLE_KINDS["claude-skill"]),
+                                  (Path("codex"),
+                                   SKILL_ROLE_KINDS["codex-skill"]))
+       for role, kind in kinds.items()},
 }
 
 

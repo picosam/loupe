@@ -273,8 +273,10 @@ them from:
 $ loupe render-adapters --install
 ```
 
-This writes `~/.claude/skills/loupe/SKILL.md` (Claude Code) and
-`~/.agents/skills/loupe/SKILL.md` (Codex), and never clobbers silently: if a
+This writes the skill to `~/.claude/skills/loupe/` (Claude Code) and
+`~/.agents/skills/loupe/` (Codex): `SKILL.md`, which holds the rules both
+sides share and routes each stamp, and `author.md` and `reviewer.md` beside
+it, each read only by its own side. It never clobbers silently: if a
 target already holds different bytes — your own hand edit, or an older
 render — those bytes are written out and proven recoverable *before* the
 target is overwritten, and the install reports where they went; if they
@@ -328,7 +330,7 @@ name it at all, and the process keeps working with nothing installed.
 
 ## Status
 
-Version 0.28.1 — the version is bumped inside the reviewed round of any
+Version 0.29.0 — the version is bumped inside the reviewed round of any
 change that will be published, so `--version` discriminates publishes.
 Implemented and tested: the envelopes and validators, the gate manifest and
 attestation checks, roles and stamps, fingerprints with alias lineage, the

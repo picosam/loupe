@@ -176,6 +176,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -185,7 +186,8 @@ from review import env_var, transport, vocab, wire
 from review.ledger import AmbiguousLineage, Ledger, render_cross_lineage_md
 from review.tests._transport_fixtures import (
     CFG, _build_scratch_loop, copy_fixture, copy_tree, fixture_tree, git_out,
-    run_cli, scratch_loop_repo, scratch_tmp, sh, verdict_text)
+    run_cli, scratch_loop_repo, scratch_tmp, settle_maintenance, sh,
+    verdict_text)
 from review.tests.util import REPO_ROOT
 from review.validate import validate_request
 
@@ -476,7 +478,17 @@ def _start(case, pausing: bool, layers, steps):
     """The template for this start state, built at `_live()` the first time
     this process asks for it — from the template of its own prefix, so
     states that share leading steps share their build — and returned as
-    (template dir, facts). The template is never handed to a test."""
+    (template dir, facts). The template is never handed to a test.
+
+    The build is settled (`settle_maintenance`) BEFORE it is renamed. A
+    step's last git command (`git push` into `origin.git`, a commit) may
+    leave git's detached maintenance holding `<objects>/maintenance.lock`,
+    and git records that lock by its ABSOLUTE path and unlinks that path
+    when done. Renamed under it, the daemon unlinks a path that no longer
+    exists and the template keeps the lock for good, so every later copy of
+    it waits `MAINTENANCE_SETTLE_S` and refuses — nightly 37287818489 at
+    80b47a10 (`start-14`, a pushed commit), two tests red under the
+    config-perturbation gate on a two-core runner."""
     key = (bool(pausing), tuple(layers), tuple(steps))
     if key not in _STARTS:
         prefix = _start(case, pausing, layers, steps[:-1]) if steps else None
@@ -491,6 +503,7 @@ def _start(case, pausing: bool, layers, steps):
             name, *args = steps[-1]
             _STEPS[name](live, facts, *args)
         template = _starts_parent(case) / f"start-{len(_STARTS)}"
+        settle_maintenance(live)
         live.rename(template)
         _STARTS[key] = (template, facts)
     return _STARTS[key]
@@ -508,24 +521,27 @@ def starts_from(steps):
 LOCAL = ("--local-only",)
 GIT = ("--transport", "git")
 PASTE = ("--transport", "paste")
+#: The author's declaration that a second review of one commit is meant
+#: (RR1, 2026-10-04): without it the second hand-off refuses before its gates.
+SHARE = ("--shared-target",)
 
 #: One review, opened from `main`.
 MAIN_OPENED = (("handoff", "first", "repo", *LOCAL),)
 #: ...and a second from the other branch, at its own commit.
 TWO_BRANCHES = MAIN_OPENED + (("handoff", "second", "other", *LOCAL),)
 #: ...or a second from `same`, at main's commit: one commit, two reviews.
-ONE_COMMIT = MAIN_OPENED + (("handoff", "second", "same", *LOCAL),)
+ONE_COMMIT = MAIN_OPENED + (("handoff", "second", "same", *LOCAL, *SHARE),)
 #: The same two reviews of one commit, `same` arriving first.
 ONE_COMMIT_REVERSED = (("handoff", "first", "same", *LOCAL),
-                       ("handoff", "second", "repo", *LOCAL))
+                       ("handoff", "second", "repo", *LOCAL, *SHARE))
 #: Two reviews of one commit on the `git` carrier, and on `paste`: a bare
 #: remote first, because a declared cross-machine round may not bind an
 #: unfetchable SHA.
 ONE_COMMIT_GIT = (("layer", "origin"), ("handoff", "first", "repo", *GIT),
-                  ("handoff", "second", "same", *GIT))
+                  ("handoff", "second", "same", *GIT, *SHARE))
 ONE_COMMIT_PASTE = (("layer", "origin"),
                     ("handoff", "first", "repo", *PASTE),
-                    ("handoff", "second", "same", *PASTE))
+                    ("handoff", "second", "same", *PASTE, *SHARE))
 #: Two branches' reviews on the `git` carrier (layers other, origin).
 TWO_BRANCHES_GIT = (("handoff", "first", "repo", *GIT),
                     ("handoff", "second", "other", *GIT))
@@ -537,7 +553,7 @@ ROUND_TWO_CAPPED = (
     + (("answer", "repo", "first"), ("answer", "same", "second"),
        ("round-two",),
        ("handoff", "b_two", "same", *LOCAL),
-       ("handoff", "a_two", "repo", *LOCAL),
+       ("handoff", "a_two", "repo", *LOCAL, *SHARE),
        ("cli", "raised", "same", "ledger", "authorize-cap", "--to", "2",
         "--reason", "the falsification's own scenario", "--by", "a person")))
 #: Two branches' reviews on the default carrier, both branches pushed
@@ -1088,6 +1104,382 @@ class TestTheReservationExcludesOneLineageAndNotTheOther(_TwoWorktrees):
         second = transport.NewLineageReservation(led, branch="other",
                                                  verb="handoff").acquire()
         second.release()
+
+
+#: One review opened from `main` on the default carrier (bare origin), then
+#: a new commit on `main`: the open lineage's next head, which a test moves
+#: `same` onto so an open and a fresh lineage contend for one head.
+OPENED_THEN_MOVED = (("handoff", "first", "repo"),
+                     ("commit", "repo", "four\n", "more", "main"))
+
+
+class TestTheHeadIsReservedAcrossItsAdmission(_TwoWorktrees):
+    """0.29.0 review round 1 F1: the shared-target admission is HELD, not
+    read once.
+
+    `require_unshared_target` reads which lineages name a head; the hand-off
+    then gates for minutes before `record_handoff` writes the request that
+    makes the head visible. Two hand-offs of one head from two branches hold
+    two DIFFERENT lineage reservations, so both read "nobody targets this",
+    both gated, pushed and recorded, and the SHA-only resolver raised
+    `AmbiguousLineage` (measured on the reviewed tree: both exits 0, two
+    requests). The sequential order refused the second. `admit_target` now
+    reserves the head (`transport.TargetReservation`, `targets/<sha>.lock`)
+    before the read, re-reads the ledger under it, and the caller releases it
+    after the record.
+
+    THE DOMAIN, each row a test (A holds the head inside its gate, B runs):
+
+      refuse  fresh A / fresh B, two branches, both undeclared — either
+              arrival order
+      refuse  A undeclared, B --shared-target (exclusive holder); control:
+              B's same declaration after A ends is admitted
+      refuse  A --shared-target, B undeclared (shared holder)
+      pass    A and B both --shared-target (paired control for the mode)
+      refuse  an OPEN lineage continuing onto the head against a fresh one,
+              both orders; control: sequentially, the ledger refuses
+      pass    B on another branch at another head (unrelated-SHA control)
+      refuse  emit-request beside a hand-off of the head, both orders
+      pass    after A FAILS its gate, B is admitted (released on refusal)
+      pass    after A is KILLED in its gate, B is admitted (the kernel
+              releases a dead holder: no stale state, no race)
+      held    the head stays reserved while `record_handoff` runs
+      read    a request recorded after the caller's ledger was cached is
+              seen under the reservation (`Ledger.reload`)
+
+    Same branch, same head: two hand-offs of ONE branch are refused earlier,
+    by the lineage or opening reservation, before a commit is known
+    (`TestTheReservationExcludesOneLineageAndNotTheOther`), and the cached
+    re-serve of a kept request adds no lineage to its head, so it takes none.
+
+    Every refusal is checked against the promise the refusal makes: B's own
+    gate never started, B's branch never reached the remote, and B recorded
+    no request.
+
+    MUTATIONS (2026-10-05, python3.15, `review/cli.py` and
+    `review/transport.py` copied aside, restored and compared byte for
+    byte; the reviewer's FALSIFICATION script run under each):
+      `admit_target` takes no reservation -> 11 of the 17 red (every refuse
+        row, the cleanup rows and the record-interval row) and the
+        falsification red (two requests, `AmbiguousLineage`);
+      `ledger.reload()` dropped from `admit_target` ->
+        `test_the_read_is_taken_under_the_reservation` red;
+      every reservation taken exclusive -> `test_two_declared_reviews_run_
+        side_by_side`, the shared/shared lock row and the shared-holder
+        evidence red;
+      a declared admission takes none -> both mixed-mode rows and the two
+        mixed lock rows red;
+      the reservation released before `record_handoff` ->
+        `test_the_head_stays_reserved_while_the_request_is_recorded` red.
+    """
+
+    PREFIX = "head-reservation-"
+    PAUSING_GATE = True
+    LAYERS = ("other", "origin", "same")
+
+    def _overlap(self, holder, holder_extra, second):
+        """Hold `holder`'s hand-off inside its gate, run `second()` (which
+        returns (exit, record)), release, and return both outcomes."""
+        for where in (self.repo, self.other, self.same):
+            self._marker(where, "started").unlink(missing_ok=True)
+        self._hold(holder)
+        first = self._spawn_handoff(holder, *holder_extra)
+        try:
+            self._await_gate(holder)
+            b_code, b = second()
+        finally:
+            self._release(holder)
+        a_code, a = self._finish(first)
+        return a_code, a, b_code, b
+
+    def _assert_refused_unrun(self, code, rec, where, *, sha):
+        """The refusal's promise: blocked, before B's gate, nothing pushed
+        from B's branch and no request recorded by B."""
+        self.assertNotEqual(code, 0, rec)
+        self.assertIsNone(rec.get("next"), rec)
+        self.assertEqual(rec.get("next_kind"), "blocked", rec)
+        self.assertIn(f"another hand-off of the head {sha[:12]} is being "
+                      f"admitted right now", rec["error"])
+        self.assertIn("nothing was gated, pushed, emitted or recorded",
+                      rec["error"])
+        self.assertIn("Wait for it and run this again", rec["remedy"])
+        self.assertFalse(self._marker(where, "started").exists(),
+                         "the refused hand-off ran its gate")
+        branch = Path(where).name if Path(where) != self.repo else "main"
+        if branch != "main":
+            self.assertNotIn(f"refs/heads/{branch}",
+                             git_out(self.repo, "ls-remote", "origin"))
+
+    def _head(self, where):
+        return git_out(where, "rev-parse", "HEAD")
+
+    def _one_review_of(self, sha):
+        requests = [e for e in self._events("request") if e["sha"] == sha]
+        self.assertEqual(len({e["lineage"] for e in requests}), 1, requests)
+        Ledger(self.state).recorded_lineage_for_sha(sha)   # no ambiguity
+        return requests
+
+    # ------------------------------------------------- fresh / fresh rows
+
+    def test_an_undeclared_overlap_of_one_head_is_refused(self):
+        sha = self._head(self.repo)
+        a_code, a, b_code, b = self._overlap(
+            self.repo, (), lambda: self._run_handoff(self.same))
+        self._assert_refused_unrun(b_code, b, self.same, sha=sha)
+        self.assertIn("declared with --shared-target", b["error"])
+        self.assertEqual(a_code, 0, a)
+        self.assertEqual(len(self._one_review_of(sha)), 1)
+
+    def test_the_other_arrival_order_is_refused_too(self):
+        sha = self._head(self.same)
+        a_code, a, b_code, b = self._overlap(
+            self.same, (), lambda: self._run_handoff(self.repo))
+        self._assert_refused_unrun(b_code, b, self.repo, sha=sha)
+        self.assertEqual(a_code, 0, a)
+        self.assertEqual(len(self._one_review_of(sha)), 1)
+
+    def test_a_declared_review_cannot_run_beside_an_undeclared_one(self):
+        sha = self._head(self.repo)
+        a_code, a, b_code, b = self._overlap(
+            self.repo, (), lambda: self._run_handoff(self.same, *SHARE))
+        self._assert_refused_unrun(b_code, b, self.same, sha=sha)
+        self.assertEqual(a_code, 0, a)
+        # Control: the same declaration once A has recorded is admitted —
+        # the sequential order, a second review that was meant.
+        code, again = self._run_handoff(self.same, *SHARE)
+        self.assertEqual(code, 0, again)
+        self.assertEqual(again["sha"], sha)
+        self.assertNotEqual(again["lineage"], a["lineage"])
+
+    def test_an_undeclared_review_cannot_run_beside_a_declared_one(self):
+        sha = self._head(self.repo)
+        a_code, a, b_code, b = self._overlap(
+            self.repo, SHARE, lambda: self._run_handoff(self.same))
+        self._assert_refused_unrun(b_code, b, self.same, sha=sha)
+        self.assertIn("declared --shared-target holds it", b["error"])
+        self.assertEqual(a_code, 0, a)
+        self.assertEqual(len(self._one_review_of(sha)), 1)
+
+    def test_two_declared_reviews_run_side_by_side(self):
+        """The mode's paired control: a share both sides declared is what
+        `--shared-target` is for, and neither waits for the other."""
+        sha = self._head(self.repo)
+        a_code, a, b_code, b = self._overlap(
+            self.repo, SHARE, lambda: self._run_handoff(self.same, *SHARE))
+        self.assertEqual(b_code, 0, b)
+        self.assertEqual(a_code, 0, a)
+        self.assertEqual({a["sha"], b["sha"]}, {sha})
+        self.assertNotEqual(a["lineage"], b["lineage"])
+
+    def test_an_unrelated_head_is_not_refused(self):
+        """The unrelated-SHA control: another branch at another commit is
+        another reservation, admitted beside the holder."""
+        a_code, a, b_code, b = self._overlap(
+            self.repo, (), lambda: self._run_handoff(self.other))
+        self.assertEqual(b_code, 0, b)
+        self.assertEqual(a_code, 0, a)
+        self.assertNotEqual(a["sha"], b["sha"])
+        self.assertNotEqual(a["lineage"], b["lineage"])
+
+    # ------------------------------------------------- open / fresh rows
+
+    def _moved(self):
+        """`same` fast-forwarded onto `main`'s new head, which `main`'s open
+        lineage (`first`) has not yet requested."""
+        first = self._started("first")
+        sh("git", "-C", str(self.same), "merge", "-q", "--ff-only", "main")
+        sha = self._head(self.repo)
+        self.assertEqual(self._head(self.same), sha)
+        self.assertNotEqual(first["sha"], sha)
+        return first, sha
+
+    @starts_from(OPENED_THEN_MOVED)
+    def test_an_open_lineage_holding_the_head_refuses_a_fresh_one(self):
+        first, sha = self._moved()
+        a_code, a, b_code, b = self._overlap(
+            self.repo, (), lambda: self._run_handoff(self.same))
+        self._assert_refused_unrun(b_code, b, self.same, sha=sha)
+        self.assertEqual(a_code, 0, a)
+        self.assertEqual(a["lineage"], first["lineage"])
+        self.assertEqual(len(self._one_review_of(sha)), 1)
+        # Control: sequentially, the recorded request refuses it instead.
+        code, after = self._run_handoff(self.same)
+        self.assertNotEqual(code, 0, after)
+        self.assertIn("is already the target of lineage(s) "
+                      f"{first['lineage']}", after["error"])
+
+    @starts_from(OPENED_THEN_MOVED)
+    def test_a_fresh_lineage_holding_the_head_refuses_an_open_one(self):
+        first, sha = self._moved()
+        a_code, a, b_code, b = self._overlap(
+            self.same, (), lambda: self._run_handoff(self.repo))
+        self._assert_refused_unrun(b_code, b, self.repo, sha=sha)
+        self.assertEqual(a_code, 0, a)
+        self.assertNotEqual(a["lineage"], first["lineage"])
+        self.assertEqual(len(self._one_review_of(sha)), 1)
+
+    # ------------------------------------------------- emit-request rows
+
+    def _emit_request(self, where, out):
+        return self._run(where, "emit-request", "--claim-file",
+                         str(self.claim), "--base", self.base,
+                         "--out", str(out))
+
+    def test_emit_request_beside_a_handoff_of_the_head_is_refused(self):
+        sha = self._head(self.repo)
+        out = self.tmp / "beside.xml"
+        a_code, a, b_code, b = self._overlap(
+            self.repo, (), lambda: self._emit_request(self.same, out))
+        self._assert_refused_unrun(b_code, b, self.same, sha=sha)
+        self.assertFalse(out.exists(), "the refused emit-request wrote")
+        self.assertEqual(a_code, 0, a)
+
+    def test_a_handoff_beside_emit_request_of_the_head_is_refused(self):
+        sha = self._head(self.repo)
+        out = self.tmp / "holder.xml"
+        self._marker(self.same, "started").unlink(missing_ok=True)
+        self._hold(self.repo)
+        first = self._spawn(self.repo, "emit-request", "--claim-file",
+                            str(self.claim), "--base", self.base,
+                            "--out", str(out))
+        try:
+            self._await_gate(self.repo)
+            b_code, b = self._run_handoff(self.same)
+        finally:
+            self._release(self.repo)
+        a_code, a = self._finish(first)
+        self._assert_refused_unrun(b_code, b, self.same, sha=sha)
+        self.assertEqual(a_code, 0, a)
+        self.assertTrue(out.exists())
+        self.assertEqual(self._events("request"), [])
+
+    # ------------------------------------------------- cleanup rows
+
+    def test_a_failed_holder_releases_the_head(self):
+        sha = self._head(self.repo)
+        self._fail(self.repo)
+        a_code, a, b_code, b = self._overlap(
+            self.repo, (), lambda: self._run_handoff(self.same))
+        self._assert_refused_unrun(b_code, b, self.same, sha=sha)
+        self.assertNotEqual(a_code, 0, a)
+        self.assertEqual(self._events("request"), [])
+        # Released on the refusal path: the next hand-off is admitted.
+        self._marker(self.same, "started").unlink(missing_ok=True)
+        code, after = self._run_handoff(self.same)
+        self.assertEqual(code, 0, after)
+        self.assertEqual(len(self._one_review_of(sha)), 1)
+
+    def test_a_killed_holder_releases_the_head(self):
+        """A holder that dies mid-gate leaves a holder record and no lock:
+        the kernel released it, so the next hand-off is admitted, with no
+        timeout, override or stale-lock detection involved."""
+        sha = self._head(self.repo)
+        self._hold(self.repo)
+        first = self._spawn_handoff(self.repo)
+        try:
+            self._await_gate(self.repo)
+            lock = (self.state / transport.TARGET_LOCK_DIR
+                    / transport.target_lock_basename(sha))
+            self.assertIn('"verb": "handoff"', lock.read_text("utf-8"))
+            first.kill()
+            first.communicate(timeout=30)
+        finally:
+            self._release(self.repo)
+        code, after = self._run_handoff(self.same)
+        self.assertEqual(code, 0, after)
+        self.assertEqual(len(self._one_review_of(sha)), 1)
+
+    # ------------------------------------------------- the interval itself
+
+    def test_the_head_stays_reserved_while_the_request_is_recorded(self):
+        """In-process: while `record_handoff` writes the request, a second
+        reservation of the head is refused — the interval ends AFTER the
+        record, not when `_emit` returns."""
+        seen = []
+        real = transport.record_handoff
+
+        def recording(cfg, ledger, envelope, *a, **kw):
+            sha = wire.parse_request(envelope).sha
+            probe = transport.TargetReservation(Ledger(self.state),
+                                                branch="probe", verb="probe")
+            try:
+                probe.reserve(sha, shared=False)
+            except transport.Refusal:
+                seen.append("held")
+            else:
+                seen.append("free")
+                probe.release()
+            return real(cfg, ledger, envelope, *a, **kw)
+
+        with mock.patch.object(transport, "record_handoff", recording):
+            code, rec = self._handoff(self._in_main)
+        self.assertEqual(code, 0, rec)
+        self.assertEqual(seen, ["held"])
+
+    @starts_from(None)
+    def test_the_read_is_taken_under_the_reservation(self):
+        """A request recorded after the caller's ledger cached its read is
+        seen once the head is reserved: `admit_target` re-reads."""
+        from review.cli import SharedTarget, admit_target
+        sha = "a" * 40
+        mine = Ledger(self.state)
+        self.assertEqual(mine.events(), [])          # cached, empty
+        Ledger(self.state).add({"event": "request", "sha": sha, "round": 1,
+                                "branch": "other"}, lineage="Lfeedface01")
+        hold = transport.TargetReservation(mine, branch="main")
+        self.addCleanup(hold.release)
+        with self.assertRaises(SharedTarget) as caught:
+            admit_target(mine, "Lmine000001", {"sha": sha}, False, hold)
+        self.assertIn("Lfeedface01", str(caught.exception))
+
+    # ------------------------------------------------- the lock itself
+
+    @starts_from(None)
+    def test_the_modes_exclude_as_the_admission_requires(self):
+        led = Ledger(self.state)
+        sha = "b" * 40
+
+        def res():
+            return transport.TargetReservation(led, branch="x")
+
+        cases = (("exclusive", False, "exclusive", False, False),
+                 ("exclusive", False, "shared", True, False),
+                 ("shared", True, "exclusive", False, False),
+                 ("shared", True, "shared", True, True))
+        for first, f_shared, second, s_shared, admitted in cases:
+            with self.subTest(holder=first, second=second):
+                one = res().reserve(sha, shared=f_shared)
+                try:
+                    two = res()
+                    if admitted:
+                        two.reserve(sha, shared=s_shared).release()
+                    else:
+                        with self.assertRaises(transport.Refusal):
+                            two.reserve(sha, shared=s_shared)
+                finally:
+                    one.release()
+                res().reserve(sha, shared=False).release()   # free again
+        held = res().reserve(sha, shared=False)
+        try:                                   # another head's lock is its own
+            res().reserve("c" * 40, shared=False).release()
+        finally:
+            held.release()
+
+    @starts_from(None)
+    def test_the_lock_files_are_named_by_head(self):
+        self.assertEqual(transport.target_lock_basename("d" * 40),
+                         "d" * 40 + ".lock")
+        odd = transport.target_lock_basename("../HEAD")
+        self.assertNotIn("/", odd)
+        self.assertTrue(odd.startswith("x-"))
+
+    @starts_from(None)
+    def test_without_flock_the_head_is_not_admitted(self):
+        hold = transport.TargetReservation(Ledger(self.state), branch="main")
+        with mock.patch.object(transport, "fcntl", None):
+            with self.assertRaises(transport.Refusal) as caught:
+                hold.reserve("e" * 40, shared=False)
+        self.assertIn("fcntl", str(caught.exception))
 
 
 class TestALegacyLedgerReadsAsItDidBeforeKeying(_TwoWorktrees):
@@ -1780,7 +2172,9 @@ class TestTwoReviewsOfOneCommit(_SameCommitWorktrees):
             self._verdict_file(self.shared, name="clean.md",
                                verdict="clean to advance"))
         self.assertEqual(code, 0, closed)
-        code, second = self._handoff(self._in_main, "--local-only")
+        # RR1 (2026-10-04): a closed lineage's target still counts, so the
+        # second review of this commit is declared.
+        code, second = self._handoff(self._in_main, "--local-only", *SHARE)
         self.assertEqual(code, 0, second)
         self.assertNotEqual(second["lineage"], first["lineage"])
         self.assertEqual(second["sha"], first["sha"])
@@ -2399,6 +2793,56 @@ class TestTheWorktreeTemplateIsCopiedWhole(unittest.TestCase):
                                 "rev-parse", "--verify", "-q", "other"],
                                capture_output=True, text=True).stdout.strip(),
                 moved)
+
+
+class TestAStartIsSettledBeforeItMoves(unittest.TestCase):
+    """`_start` builds every start state at `_live()` and renames it into
+    a template. git's detached maintenance (`git maintenance run --auto
+    --detach`, which a push into a bare origin and a commit both start)
+    takes `<objects>/maintenance.lock` by its ABSOLUTE path and unlinks
+    that path when it finishes (git 2.55 `builtin/gc.c`
+    `maintenance_run_tasks`; `tempfile.c` stores the absolute path). A
+    template renamed while it runs keeps the lock forever, and every copy
+    of it then waits out `MAINTENANCE_SETTLE_S` and refuses: nightly
+    37287818489, reproduced on Linux with git 2.55 under CPU load (48 of
+    150 push-then-rename builds kept the lock; none when settled first).
+
+    The daemon is simulated here, exactly as git behaves and without the
+    race: a step leaves a lock that a thread unlinks by its absolute path
+    after the step has returned.
+
+    MUTATION: drop `settle_maintenance(live)` from `_start` and the
+    template keeps the lock, which the thread then cannot find.
+    """
+
+    HOLD_S = 0.3
+
+    def test_a_lock_released_after_the_step_returns_is_not_kept(self):
+        released = []
+
+        def held_lock(live, facts):
+            lock = live / "daemon" / "objects" / "maintenance.lock"
+            lock.parent.mkdir(parents=True)
+            lock.write_bytes(b"")
+            path = os.path.abspath(lock)
+
+            def finish():
+                time.sleep(self.HOLD_S)
+                try:
+                    os.unlink(path)
+                    released.append(path)
+                except FileNotFoundError:
+                    pass
+            daemon = threading.Thread(target=finish, daemon=True)
+            daemon.start()
+            self.addCleanup(daemon.join)
+
+        with mock.patch.dict(_STEPS, {"held-lock": held_lock}):
+            template, _ = _start(self, False, ("other",), (("held-lock",),))
+        self.assertEqual(
+            sorted(map(str, template.rglob("maintenance.lock"))), [],
+            "the template kept a lock its holder released at the build path")
+        self.assertEqual(len(released), 1)
 
 
 if __name__ == "__main__":

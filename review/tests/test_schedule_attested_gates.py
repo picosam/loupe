@@ -47,7 +47,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from review import brief, config, emit, env_var, validate
+from review import brief, config, emit, env_var, validate, wire
 from review.tests._transport_fixtures import copy_fixture, write_identity
 from review.tests.synth import ONE_GATE, evidence_with
 
@@ -332,6 +332,99 @@ class TestThePrecis(unittest.TestCase):
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("deferred to the schedule", lines[0])
         self.assertIn("later", lines[0])
+
+    def advisory_line(self, *recs):
+        lines = [l for l in brief._gate_banners(list(recs))
+                 if "Advisory gates" in l]
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0]
+
+    def test_a_deferred_blocking_gate_is_never_counted_as_passed(self):
+        """FALSIFICATION — lineage L1ee41bf159's tool feedback. Mutation:
+        restore `rest = "every blocking gate passed at the target" if not
+        hard` and the claim covers `later`, which never ran."""
+        soft = {"id": "ci-evidence", "blocking": False, "exit_code": 1,
+                "binding": "bound"}
+        line = self.advisory_line(self.PASSED, self.DEFERRED, soft)
+        self.assertNotIn("every blocking gate passed", line)
+        self.assertIn("every blocking gate that ran passed at the target; "
+                      "1 blocking gate(s) deferred, not run: later", line)
+
+    def test_the_admitted_domain_of_the_advisory_line(self):
+        """Every combination the line can meet: blocking failure or not,
+        deferred rows blocking, non-blocking or of unknown blocking.
+        Mutations: drop the `blocking is False` exemption (the non-blocking
+        row reads as deferred blocking) or narrow it to `blocking is True`
+        (the unknown row reads as passed)."""
+        soft = {"id": "ci-evidence", "blocking": False, "exit_code": 1,
+                "binding": "bound"}
+        hard = {"id": "tests", "blocking": True, "exit_code": 1,
+                "binding": "bound"}
+        nb_deferred = {**self.DEFERRED, "id": "optional", "blocking": False}
+        unknown = {k: v for k, v in self.DEFERRED.items() if k != "blocking"}
+        unknown["id"] = "unknown"
+        passed = "every blocking gate passed at the target"
+        cases = {
+            # control: nothing deferred, the unqualified claim is true
+            "no deferral": ([self.PASSED, soft], passed, "deferred, not run"),
+            "only a non-blocking deferral": (
+                [self.PASSED, nb_deferred, soft], passed, "deferred, not run"),
+            "a blocking deferral": (
+                [self.PASSED, self.DEFERRED, soft],
+                "deferred, not run: later", passed),
+            "blocking unknown on a deferral": (
+                [self.PASSED, unknown, soft],
+                "deferred, not run: unknown", passed),
+            "both kinds deferred": (
+                [self.PASSED, self.DEFERRED, nb_deferred, soft],
+                "1 blocking gate(s) deferred, not run: later", "optional"),
+            "a blocking failure wins": (
+                [hard, self.DEFERRED, soft],
+                "see the blocking failures above", passed),
+        }
+        for name, (recs, want, never) in cases.items():
+            with self.subTest(case=name):
+                line = self.advisory_line(*recs)
+                self.assertIn(want, line)
+                self.assertNotIn(never, line)
+
+    def test_the_precis_carries_the_qualified_line(self):
+        """The real entry point: a request whose evidence holds a deferred
+        blocking gate and a red advisory one."""
+        from review.tests.test_take_compact import envelope, record
+        env = envelope([record(), record("ci-evidence", exit_code=1,
+                                         blocking=False),
+                        {**self.DEFERRED, "id": "later"}])
+        text = brief.request_precis(wire.parse_request(env))
+        self.assertIn("every blocking gate that ran passed at the target",
+                      text)
+        self.assertNotIn("every blocking gate passed", text)
+
+    def test_the_blocking_count_counts_blocking_rows_that_ran(self):
+        """The N of "k of N BLOCKING" over its admitted domain: non-blocking
+        rows are out, deferred rows are out (they have their own line), and
+        a row of unknown blocking or not an object is in. Mutations: count
+        every row (`len(records)`) and the mixed case reads 1 of 3; count
+        only `blocking is True` and the unknown case reads 1 of 1."""
+        hard = {"id": "tests", "blocking": True, "exit_code": 1,
+                "binding": "bound"}
+        soft = {"id": "ci-evidence", "blocking": False, "exit_code": 0,
+                "binding": "bound"}
+        unknown = {"id": "lint", "exit_code": 0, "binding": "bound"}
+        cases = {
+            # control: every row blocking, the old and new counts agree
+            "all blocking": ([hard, self.PASSED], "1 of 2 BLOCKING"),
+            "a non-blocking row": ([hard, self.PASSED, soft],
+                                   "1 of 2 BLOCKING"),
+            "a deferred row": ([hard, self.PASSED, self.DEFERRED],
+                               "1 of 2 BLOCKING"),
+            "blocking unknown": ([hard, unknown], "1 of 2 BLOCKING"),
+            "not an object": ([hard, "tests"], "2 of 2 BLOCKING"),
+        }
+        for name, (recs, want) in cases.items():
+            with self.subTest(case=name):
+                text = "\n".join(brief._gate_banners(list(recs)))
+                self.assertIn(want, text)
 
     def test_the_control_a_not_run_blocking_gate_is_a_failure(self):
         not_run = {"id": "later", "blocking": True, "error": "not run: x"}

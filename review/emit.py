@@ -28,8 +28,8 @@ from typing import Mapping
 
 from . import (TOOL_NAME, TOOL_VERSION, env_var, paths, refs,
                shape_identity, tool_identity, vocab, wire)
-from .config import (Config, GitCeiling, built_in_git_ceiling, caller_env,
-                     git_ceiling)
+from .config import (SUBJECT_CHECK_KEY, Config, GitCeiling,
+                     built_in_git_ceiling, caller_env, git_ceiling)
 from .digest import sha256_text
 from .ledger import Ledger, render_cross_lineage_md, render_report_md
 
@@ -734,6 +734,52 @@ class _typed_raw_timeout:
                            ).within(self.state) from exc
 
 
+def check_commit_subject(cfg: Config, repo: Path, subject: str) -> None:
+    """Run the repository's declared subject check on the commit a hand-off
+    is about to make, and refuse BEFORE the commit when it fails (OF-6, the
+    determinism and efficiency pass, 2026-10-03).
+
+    A repository whose own gates judge commit subjects found a hand-off's
+    subject wrong only after the commit, at its gate, one full manifest
+    later. `[tool] commit_subject_check` names the repository's own check;
+    it runs in the repository root with the caller's environment, the path
+    of a file holding the subject appended, under the git ceiling (it is
+    the repository's code, as a hook is). Absent, nothing runs. A non-zero
+    exit, a timeout or a command that cannot start refuses with nothing
+    committed, pushed or emitted, and the check's own output travels."""
+    argv = (getattr(cfg, "tool", None) or {}).get(SUBJECT_CHECK_KEY)
+    if not argv:
+        return
+    remedy = (f"the author corrects the commit subject (the claim's "
+              f"`commit_subject`) until `{' '.join(argv)}` accepts it, and "
+              f"re-runs; nothing was committed, pushed or emitted")
+    with tempfile.TemporaryDirectory(prefix=f"{TOOL_NAME}-subject-") as tmp:
+        message = Path(tmp) / "COMMIT_SUBJECT"
+        message.write_text(subject + "\n", encoding="utf-8")
+        ceiling = git_ceiling(cfg)
+        try:
+            proc = subprocess.run([*argv, str(message)], cwd=str(repo),
+                                  capture_output=True, text=True,
+                                  stdin=subprocess.DEVNULL,
+                                  timeout=ceiling.seconds, env=caller_env())
+        except subprocess.TimeoutExpired:
+            raise SweepRefused(
+                f"the commit subject check `{' '.join(argv)}` did not finish "
+                f"in {ceiling.seconds}s ({ceiling.origin}), so the subject "
+                f"{subject!r} is unjudged and was not committed", remedy)
+        except OSError as exc:
+            raise SweepRefused(
+                f"the commit subject check `{' '.join(argv)}` could not "
+                f"start ({exc}), so the subject {subject!r} is unjudged and "
+                f"was not committed", remedy) from exc
+    if proc.returncode != 0:
+        said = " ".join((proc.stdout + proc.stderr).split())[:600]
+        raise SweepRefused(
+            f"the commit subject check `{' '.join(argv)}` refused the "
+            f"subject {subject!r} (exit {proc.returncode})"
+            + (f": {said}" if said else ""), remedy)
+
+
 def ensure_pushed(cfg: Config, head: str | None = None,
                   local_only: bool = False,
                   commit_subject: str | None = None,
@@ -894,6 +940,7 @@ def ensure_pushed(cfg: Config, head: str | None = None,
         subject = commit_subject or (
             f"emit-request: outstanding work for round {round_no}"
             if round_no is not None else "emit-request: outstanding work")
+        check_commit_subject(cfg, repo, subject)
         try:
             run("commit", "-a", "-m", subject)
         except _git_timeout_class() as exc:
@@ -1116,11 +1163,15 @@ def diff_shape(repo_root: Path, base: str, head: str) -> dict:
     # showed the author the span before the human carried it. Report, not
     # refuse — the ci-evidence precedent: the honest failure was prose the
     # author never checked, and a refusal would only relocate it.
-    commits = int(_git(repo_root, "rev-list", "--count", f"{base}..{head}",
-                       no_replace=True))
+    # The span's commits themselves, not only their count (RR4, 2026-10-04):
+    # the request lists the waivers inside this span, so it needs to know
+    # which commits it holds. One read; `commits` is its length, as the
+    # count git printed before.
+    span = _git(repo_root, "rev-list", f"{base}..{head}",
+                no_replace=True).split()
     return {"files": len(files), "insertions": ins, "deletions": dels,
             "changed_lines": ins + dels, "areas": sorted(areas),
-            "commits": commits, "file_list": files,
+            "commits": len(span), "span_commits": span, "file_list": files,
             "entries": _numstat_entries(repo_root, base, head, files)}
 
 
@@ -2213,12 +2264,99 @@ def gate_before_push(cfg: Config, record: dict, base: str | None = None,
         items=items, sha=sha, outputs=outputs)
 
 
+#: How many index-hidden paths an unbound record names before it counts.
+HIDDEN_NAMED = 5
+
+
+def index_hidden(repo_root: Path) -> str:
+    """Why git cannot compare this checkout's tracked content with a commit,
+    or "" when nothing hides it: the tracked entries flagged assume-unchanged
+    (`git ls-files -v`: a lower-case tag) or skip-worktree (`S`, or `s` for
+    both), the first `HIDDEN_NAMED` named and the rest counted. A sparse
+    checkout is caught through the same tags: its omitted paths carry the
+    skip-worktree bit, and a present path whose bit git cleared is an
+    ordinary entry `git status` compares. Read as bytes, so a path git
+    stores need not decode; the read writes no index. Raises what
+    `_git_bytes` raises."""
+    listed = _git_bytes(repo_root, "ls-files", "-v", "-z")
+    found = []
+    for field in listed.split(b"\0"):
+        tag, path = field[:1], field[2:]
+        if tag and (tag.islower() or tag in (b"S", b"s")):
+            state = (" and ".join(name for name, on in (
+                ("assume-unchanged", tag.islower()),
+                ("skip-worktree", tag in (b"S", b"s"))) if on))
+            found.append(f"{path.decode('utf-8', 'replace')!r} ({state})")
+    if not found:
+        return ""
+    named = ", ".join(found[:HIDDEN_NAMED]) + (
+        f" and {len(found) - HIDDEN_NAMED} more"
+        if len(found) > HIDDEN_NAMED else "")
+    return (f"the index hides {len(found)} tracked path(s) from git's "
+            f"comparison ({named}), so the executed tree cannot be shown to "
+            f"be the target commit's content")
+
+
+#: The git options that keep every cache out of `tree_differs`' reads.
+COLD_INDEX = ("-c", "core.fsmonitor=false", "-c", "core.sparseCheckout=false",
+              "-c", "core.ignoreStat=false", "-c", "core.untrackedCache=false",
+              "-c", "core.quotePath=true")
+
+
+def tree_differs(repo_root: Path, tree: str) -> list[str]:
+    """The tracked paths whose working-tree bytes or mode are not `tree`'s
+    (a tree or commit id), read from the disk itself and never from the
+    index's caches (round-3 F1 of lineage L4746274c96): `[]` when the
+    working tree's tracked content IS that tree.
+
+    WHY NOT `git status`. Status and `git diff` trust what the index
+    remembers: an entry flagged assume-unchanged or skip-worktree, an entry
+    a filesystem monitor reported unchanged (`ls-files -f`'s lower-case
+    tag, which `ls-files -v` does not show), and an entry whose stat data
+    git trusts (`core.trustctime=false`, `core.checkStat=minimal`, a
+    same-size edit with its time restored). Each let a gate read edited
+    bytes while the record said `bound`. So the tree is read into a FRESH
+    index in a scratch file (`read-tree`: no flags, no monitor bits, no
+    stat data), refreshed with `--really-refresh` (git hashes every file,
+    since nothing matches its zeroed stat), and `diff-files` lists what
+    still differs: content, a deletion, an executable bit or a type, under
+    git's own filters and `core.fileMode`, exactly as `git add` would
+    judge them. The real index is never written. Every cache that could
+    answer for the disk is switched off on these calls (`COLD_INDEX`);
+    paths come back C-quoted where unusual, so no name can fail to decode.
+    Untracked files are not compared: they are beside the tree, not in it.
+    Raises what `_git` raises."""
+    with tempfile.TemporaryDirectory(prefix=f"{TOOL_NAME}-cold-index-") \
+            as scratch:
+        env = {**caller_env(), "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+        _git(repo_root, "read-tree", tree, no_replace=True,
+             git_options=COLD_INDEX, env=env)
+        _git(repo_root, "update-index", "-q", "--really-refresh",
+             git_options=COLD_INDEX, env=env)
+        listed = _git(repo_root, "diff-files", "--name-only",
+                      git_options=COLD_INDEX, env=env)
+    return [line for line in listed.splitlines() if line]
+
+
+def differs_message(paths_: list[str], what: str) -> str:
+    """One sentence naming the first `HIDDEN_NAMED` of `paths_` and
+    counting the rest, for `tree_differs`' callers."""
+    named = ", ".join(repr(p) for p in paths_[:HIDDEN_NAMED]) + (
+        f" and {len(paths_) - HIDDEN_NAMED} more"
+        if len(paths_) > HIDDEN_NAMED else "")
+    return (f"{len(paths_)} tracked path(s) on disk differ from {what} "
+            f"({named}) when read through a cold index, though the index's "
+            f"own view showed no change: a cache answered for the disk (a "
+            f"filesystem monitor, trusted stat data)")
+
+
 def run_gates(cfg: Config, target_sha: str,
               base: str | None = None, execute_ci_gates: bool = False,
               ci_poll_interval: float = CI_POLL_INTERVAL_S, *,
               local_only: bool = False, prior: LocalGates | None = None,
               token: str | None = None,
-              defer_scheduled: bool = False) -> list[dict]:
+              defer_scheduled: bool = False,
+              pending_tree: str | None = None) -> list[dict]:
     """Execute the declared gate manifest and return attestations (§5.1).
 
     `base` is the review range's other end (audit of 2026-09-05, finding
@@ -2267,6 +2405,37 @@ def run_gates(cfg: Config, target_sha: str,
     `attested_by = "schedule"` is then not executed and gets a deferred
     record (`SCHEDULE_DEFERRED`). Without it such a gate executes like any
     other, which is what a scheduled or pre-publication full run needs.
+
+    `pending_tree` (2026-10-04, a gate run before a commit that does not
+    exist yet): the id of the tree the caller commits next, which its caller
+    has established is the executed tree's tracked content. Against it a
+    tree that is dirty only because that commit is staged is `bound to the
+    pending commit's tree`, not `unbound`; the record names the tree and
+    says whose statement it is, because this runner reads HEAD and the
+    status and nothing that could check it. `bin/loupe-gates
+    --pending-tree` checks it against the working tree before any gate,
+    and `bin/commit-gated`, its one caller, checks the commit's tree after
+    committing. A moved HEAD is unbound all the same.
+
+    WHAT THE INDEX HIDES IS NOT BOUND (round-2 F1 of lineage L4746274c96,
+    the same class as the wrappers' refusal). `git status` and `git diff`
+    trust an entry flagged assume-unchanged or skip-worktree, and a sparse
+    checkout's omitted paths are skip-worktree, so a flagged file edited on
+    disk left the status clean while every gate read the edit: the record
+    said `bound` to a commit that does not hold the bytes judged. Any such
+    entry, a sparse checkout's omitted paths included, now makes every
+    record `unbound`, naming the first paths (`index_hidden`), whatever the
+    status or `pending_tree` say; the validator refuses an unbound
+    attestation (`A-UNBOUND`), so a hand-off refuses before its push.
+
+    NOR WHAT ANY OTHER CACHE HIDES (round-3 F1 of lineage L4746274c96). A
+    filesystem monitor's valid bit and trusted stat data hide an edit from
+    the status exactly as a flag does, and `ls-files -v` shows neither.
+    So, with HEAD at the target and nothing flagged, the working tree is
+    compared with the pending tree, or the target's, through a cold index
+    (`tree_differs`), and any difference makes every record `unbound`,
+    naming the paths, before the status is consulted: a clean status is
+    never by itself what makes a record `bound`.
     """
     # Which gates this process executes, and which it waits for. INSIDE CI
     # everything executes: the attestation has to be produced by somebody,
@@ -2345,6 +2514,12 @@ def run_gates(cfg: Config, target_sha: str,
                             ceiling=git_ceiling(cfg))
         porcelain = _git(cfg.repo_root, "status", "--porcelain",
                          ceiling=git_ceiling(cfg))
+        hidden = index_hidden(cfg.repo_root)
+        # Only where the record would otherwise be bound: a moved HEAD, a
+        # flag and a dirty status each already make it unbound.
+        differ = ([] if executed_sha != target_sha or hidden
+                  or (porcelain and not pending_tree) else
+                  tree_differs(cfg.repo_root, pending_tree or target_sha))
     except _git_timeout_class():
         # A tree git did not describe in time is not "cannot identify": the
         # typed refusal travels (0.25.0).
@@ -2358,6 +2533,20 @@ def run_gates(cfg: Config, target_sha: str,
     if executed_sha != target_sha:
         binding = (f"unbound: gates executed against {executed_sha}, not the "
                    f"attested target {target_sha}")
+    elif hidden:
+        binding = f"unbound: {hidden}"
+    elif differ:
+        what = (f"the pending commit's tree {pending_tree}" if pending_tree
+                else f"the target commit's content")
+        binding = f"unbound: {differs_message(differ, what)}"
+    elif pending_tree:
+        untracked = sum(line.startswith("??")
+                        for line in porcelain.splitlines())
+        binding = (f"bound to the pending commit's tree {pending_tree}: its "
+                   f"caller established that the executed tree's tracked "
+                   f"content is that tree"
+                   + (f"; {untracked} untracked path(s) beside it, not in it"
+                      if untracked else ""))
     elif porcelain:
         binding = ("unbound: the executed tree is dirty, so it is not the "
                    "target commit's content")
@@ -3474,7 +3663,10 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
         # 0.26.0: a run's blocking state, judged by the commit its finding
         # was ruled on — not by this emission's target, a later commit.
         blocking_at=target_blocking(cfg)),
-        pending_round=round_no)
+        pending_round=round_no,
+        # RR4: the waivers of THIS span are listed, the rest counted.
+        request_span=(f"{base[:12]}..{head[:12]}",
+                      frozenset(shape["span_commits"])))
     # Ruling 1 of 2026-09-06: the cross-lineage notice, ON THE ENVELOPE'S
     # FACE. Empty when no standing identity of this lineage is also ruled in
     # another open one, which is every ordinary round.

@@ -19,9 +19,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import vocab
-
-from . import vocab
+from . import TOOL_NAME, vocab
 from .fingerprint import resolve_identity
 
 LEDGER_BASENAME = "ledger.jsonl"
@@ -88,6 +86,25 @@ class AmbiguousLineage(Exception):
             f"lineages ({', '.join(self.candidates)}), and this invocation "
             f"carries nothing that says which review it belongs to — a "
             f"commit identifies code, not the review that owns its findings")
+
+
+class AmbiguousEvent(LookupError):
+    """A COPY of a ledger row (not the ledger's own object) whose matches
+    sit in more than one lineage (round-2 F4, 2026-10-05).
+
+    Raised only by `Ledger.lineage_of`, and only for a copy: the ledger's
+    own objects resolve by identity, so no selector of this module, which
+    passes only those, can raise it. A copy carries nothing that says
+    which of its equal rows it was taken from, and answering the oldest
+    would hand one lineage's row to another."""
+
+    def __init__(self, candidates: list[str]):
+        self.candidates = list(candidates)
+        super().__init__(
+            f"the event is a copy that matches rows in "
+            f"{len(self.candidates)} lineages ({', '.join(self.candidates)}); "
+            f"pass the ledger's own event object, which resolves by its "
+            f"position")
 
 
 def _uid(event: dict) -> str:
@@ -233,6 +250,9 @@ class Ledger:
     def __init__(self, directory: Path | None = None):
         self.path = Path(directory) / LEDGER_BASENAME if directory else None
         self._events: list[dict] | None = [] if directory is None else None
+        # TL-2 (brief `loupe-payload-and-launch-trim`): the lineage index,
+        # built once per state of `events()` — see `_lineage_index`.
+        self._index: tuple | None = None
 
     @classmethod
     def in_memory(cls) -> "Ledger":
@@ -319,30 +339,98 @@ class Ledger:
         counting, and it stays with the last legacy ordinal rather than
         inventing a new one from a closure that belongs to a keyed lineage.
         """
+        return list(self._lineage_index()[0])
+
+    def _lineage_index(self) -> tuple[list[str], dict[str, list[dict]]]:
+        """(the key of every event, parallel to `events()` · every key's
+        events, in file order), derived ONCE per state of the event list.
+
+        TL-2 (the determinism and efficiency pass, 2026-10-03): `loupe
+        brief` derived the keys again for every lineage it asked about —
+        296 derivations and 2.7M `declared_lineage` calls over a 9.2k-event
+        ledger. The ledger is append-only through `add` and re-read only
+        through `reload`, so the state is the event list's identity and its
+        length: `reload` replaces the list, `add` lengthens it, and either
+        derives the index afresh. Nothing in this package edits an event in
+        place, and the derivation below is the one rule, unchanged.
+        """
+        events = self.events()
+        cached = self._index
+        if cached is not None and cached[0] is events \
+                and cached[1] == len(events):
+            return cached[2], cached[3]
         keys: list[str] = []
+        by_key: dict[str, list[dict]] = {}
         ordinal = 1
         legacy_prefix = True
-        for event in self.events():
+        for event in events:
             declared = declared_lineage(event)
             if declared:
                 legacy_prefix = False
-                keys.append(declared)
-                continue
-            keys.append(str(ordinal))
-            if legacy_prefix and event.get("event") == self.LINEAGE_CLOSED:
-                ordinal += 1
-        return keys
+                key = declared
+            else:
+                key = str(ordinal)
+                if legacy_prefix and event.get("event") == self.LINEAGE_CLOSED:
+                    ordinal += 1
+            keys.append(key)
+            by_key.setdefault(key, []).append(event)
+        positions = {id(event): i for i, event in enumerate(events)}
+        self._index = (events, len(events), keys, by_key, positions)
+        return keys, by_key
+
+    def _position_of(self, event: dict) -> int | None:
+        """The position of THIS object in `events()`, or None when the
+        ledger does not hold it (a copy, or a row not yet added).
+
+        Read from the index's identity map, built with the keys; the map is
+        confirmed against the list, so an id the interpreter reused for
+        another object can never answer."""
+        self._lineage_index()
+        events = self.events()
+        i = self._index[4].get(id(event))
+        return i if i is not None and events[i] is event else None
 
     def lineage_of(self, event: dict) -> str:
         """The lineage id an event belongs to (sweep F10 — a waiver refusal
-        names which lineage reviewed the commit, closed or open)."""
+        names which lineage reviewed the commit, closed or open).
+
+        Resolved in this order, and only this order (round-2 F4 of the
+        final review, 2026-10-05):
+
+          1. the lineage the event DECLARES;
+          2. the ledger's own object, by IDENTITY: its key at its own
+             position, whatever other rows hold equal content;
+          3. a COPY carrying a `uid`: the key of the row(s) with that uid;
+          4. a COPY carrying none: the key of the row(s) of equal content.
+
+        Steps 3 and 4 answer only when every match sits in ONE lineage.
+        Matches in several raise `AmbiguousEvent` naming them: a copy
+        carries nothing that says which position it was taken from, and the
+        oldest match is a file position, not an answer. A copy matching no
+        row answers the newest key (`"1"` on an empty ledger), as before.
+
+        History: matching `e.get("uid") == event.get("uid")` alone made
+        `None == None` true, so a uid-less row resolved to the FIRST
+        uid-less event's key (2026-10-03); identity and equal content were
+        then tested together from the oldest event, so an equal uid-less row
+        earlier in the file still won over the very object asked about —
+        `[request(A), lineage_closed, request(A)]` named the second request
+        `"1"` where `lineage_keys` says `"2"`."""
         declared = declared_lineage(event)
         if declared:
             return declared
-        keys = self.lineage_keys()
-        for i, e in enumerate(self.events()):
-            if e is event or e.get("uid") == event.get("uid"):
-                return keys[i]
+        keys = self._lineage_index()[0]
+        position = self._position_of(event)
+        if position is not None:
+            return keys[position]
+        uid = event.get("uid")
+        matched = [keys[i] for i, e in enumerate(self.events())
+                   if ((e.get("uid") == uid) if uid else (e == event))]
+        found = list(dict.fromkeys(matched))
+        if len(found) == 1:
+            return found[0]
+        if found:
+            raise AmbiguousEvent(found)
         return keys[-1] if keys else "1"
 
     def all_closures(self) -> list[dict]:
@@ -375,17 +463,12 @@ class Ledger:
         (`lineage_keys`). Fingerprint identity aliases stay global (see
         `lineage`), and so do waivers.
         """
-        key = str(lineage)
-        keys = self.lineage_keys()
-        return [e for e, k in zip(self.events(), keys) if k == key]
+        return list(self._lineage_index()[1].get(str(lineage), ()))
 
     def lineages(self) -> list[str]:
         """Every lineage this ledger holds, in the order they first appear."""
-        out: list[str] = []
-        for key in self.lineage_keys():
-            if key not in out:
-                out.append(key)
-        return out
+        # A dict keeps first-insertion order: the order they first appear.
+        return list(self._lineage_index()[1])
 
     def lineage_number(self, lineage: str) -> int:
         """The 1-based ORDINAL of `lineage` among the lineages this ledger
@@ -672,12 +755,21 @@ class Ledger:
         """
         if not sha:
             return []
+        return self._lineages_where(
+            lambda e: e.get("sha") == sha
+            and e.get("event") in ("request", "take"))
+
+    def _lineages_where(self, matches) -> list[str]:
+        """The key of every event `matches` accepts, newest first, each
+        once — read from the index AT EACH POSITION, never re-resolved from
+        the event's content (round-2 F4): two equal rows in two lineages
+        yield both keys."""
+        keys = self._lineage_index()[0]
+        events = self.events()
         seen: list[str] = []
-        for e in reversed(self.events()):
-            if e.get("sha") == sha and e.get("event") in ("request", "take"):
-                key = self.lineage_of(e)
-                if key not in seen:
-                    seen.append(key)
+        for i in range(len(events) - 1, -1, -1):
+            if matches(events[i]) and keys[i] not in seen:
+                seen.append(keys[i])
         return seen
 
     def _round_event_for_sha(self, sha: str | None,
@@ -719,10 +811,13 @@ class Ledger:
             return None
         else:
             raise AmbiguousLineage(str(sha), candidates)
-        for e in reversed(self.events()):
+        keys = self._lineage_index()[0]
+        events = self.events()
+        for i in range(len(events) - 1, -1, -1):
+            e = events[i]
             if (e.get("sha") == sha
                     and e.get("event") in ("request", "take")
-                    and self.lineage_of(e) == chosen):
+                    and keys[i] == chosen):
                 return e
         return None
 
@@ -740,14 +835,9 @@ class Ledger:
         """
         if not digest:
             return []
-        seen: list[str] = []
-        for e in reversed(self.events()):
-            if (e.get("source_digest") == digest
-                    and e.get("event") in ("request", "take")):
-                key = self.lineage_of(e)
-                if key not in seen:
-                    seen.append(key)
-        return seen
+        return self._lineages_where(
+            lambda e: e.get("source_digest") == digest
+            and e.get("event") in ("request", "take"))
 
     def recorded_lineage_for_sha(self, sha: str | None,
                                  prefer: str | None = None) -> str | None:
@@ -2420,8 +2510,28 @@ def render_convergence_md(c: dict) -> str:
     return "\n".join(lines)
 
 
-def render_report_md(report: dict, pending_round: int | None = None) -> str:
+def _in_span(sha, span: frozenset) -> bool:
+    """Whether a recorded waiver SHA names a commit of `span`: equal, or a
+    prefix of seven characters or more (a hand-built row may abbreviate).
+    The wider match only lists more, never hides one."""
+    if not isinstance(sha, str) or len(sha.strip()) < 7:
+        return False
+    sha = sha.strip().lower()
+    return sha in span or any(full.startswith(sha) for full in span)
+
+
+def render_report_md(report: dict, pending_round: int | None = None, *,
+                     request_span: tuple[str, frozenset] | None = None
+                     ) -> str:
     """Markdown rendering of report(); every number comes from the dict.
+
+    `request_span` is `(label, the commits of base..head)` when the report
+    renders INTO a request (RR4, the determinism and efficiency pass,
+    2026-10-03): a reviewer is owed the waivers of the span under review,
+    so only those are listed and the rest are counted, and the gate
+    manifest line is dropped because the request's Evidence block already
+    enumerates every gate. `loupe ledger report` passes none and prints
+    every waiver and the manifest, unchanged.
 
     `pending_round` names the round whose request is being emitted FROM this
     snapshot and is therefore not in it (lineage 20 round 4 tool feedback:
@@ -2449,8 +2559,18 @@ def render_report_md(report: dict, pending_round: int | None = None) -> str:
     if report.get("convergence"):
         lines.append(render_convergence_md(report["convergence"]))
     waived = report.get("waived") or {"count": 0, "commits": []}
-    lines.append(f"Waived (deliberately unreviewed): **{waived['count']}**")
-    for w in waived["commits"]:
+    listed = waived["commits"]
+    head = f"Waived (deliberately unreviewed): **{waived['count']}**"
+    if request_span is not None:
+        label, span = request_span
+        listed = [w for w in listed if _in_span(w.get("sha"), span)]
+        rest = waived["count"] - len(listed)
+        if waived["count"]:
+            head += (f" — {len(listed)} inside {label}, this request's span"
+                     + (f"; the other {rest} are outside it and listed by "
+                        f"`{TOOL_NAME} ledger report`" if rest else ""))
+    lines.append(head)
+    for w in listed:
         lines.append(f"- `{(w.get('sha') or '?')[:12]}` — {w.get('reason')} "
                      f"(authorized by {w.get('authorized_by')})")
     lines.append("")
@@ -2461,8 +2581,9 @@ def render_report_md(report: dict, pending_round: int | None = None) -> str:
     # supplied and matched nothing" and "no manifest was supplied" are the
     # distinction F8 and F5 both turned on.
     manifest = report.get("gate_manifest") or []
-    lines.append(f"Gate manifest in force: "
-                 f"{', '.join(manifest) if manifest else 'none declared'}")
+    if request_span is None:
+        lines.append(f"Gate manifest in force: "
+                     f"{', '.join(manifest) if manifest else 'none declared'}")
     tokens = report.get("tokens") or {}
     if tokens:
         lines.append(f"Token budget: {tokens['state']} — {tokens['why']}")
