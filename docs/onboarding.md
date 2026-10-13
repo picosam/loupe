@@ -148,6 +148,13 @@ attest:
   hand-off does not check that it did. Keep this for gates that re-prove
   what the hand-off's own gates already cover from another angle (a
   second run of the suite in an extracted copy, under perturbed limits).
+- **Mark the slow gates `heavy = true` so a red quick one stops them.**
+  (0.30.0; absent means `false`.) The runner executes every other gate
+  first, then the heavy ones, and only when every blocking gate of the
+  first group passed; otherwise each heavy gate is recorded "not run:
+  blocked by <id>" and the hand-off refuses naming the red gate first. A
+  non-blocking red stops nothing. Declaring the key needs `[tool]
+  requires = "0.30.0"` in the same commit.
 - **A guard over prose is advisory drift evidence by construction.** No
   lexical check holds a semantic guarantee, so a check over prose reports
   drift and the claims around it narrow to what the check actually owns —

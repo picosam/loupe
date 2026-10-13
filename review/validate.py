@@ -614,6 +614,76 @@ SCHEDULE_ATTESTER = "schedule"
 #: Lb8575b3a9a round 1 F1). `emit.run_gates` writes exactly these four.
 DEFERRED_SHAPE = ("id", "blocking", "attested_by", "deferred")
 
+#: 0.30.0: the reason a heavy gate's record carries when blocking gates kept
+#: it from running (`emit.BLOCKED_PREFIX`, spelled here as `CI_ATTESTER` is;
+#: a test holds the two equal).
+BLOCKED_PREFIX = "not run: blocked by "
+
+
+def _blocked_problems(rec: dict, by_id: dict, manifest_blocking: dict,
+                      manifest_heavy: dict) -> list[str]:
+    """What is wrong with the blocked-by relation a not-run record claims.
+
+    `emit.run_gates` records a heavy gate that blocking gates kept from
+    running in the not-run shape: the reason `BLOCKED_PREFIX` plus the
+    blocker ids, and those ids again in `blocked_by`. A structured consumer
+    reads the list instead of parsing the reason, so it is judged against
+    what it claims and never trusted: against the reason (id for id, in
+    order), against the manifest (the record's gate is declared `heavy`, each
+    blocker is declared blocking and is not heavy) and against the block
+    (each blocker has a record in it that failed or could not execute, and is
+    not a deferral). A record that carries `blocked_by` without being a
+    blocked record, and one that claims a block without carrying it, are the
+    same relation read from the other side.
+    """
+    reason = rec.get("error")
+    claims = isinstance(reason, str) and reason.startswith(BLOCKED_PREFIX)
+    if "blocked_by" not in rec:
+        return (["its reason says a gate blocked it, but it carries no "
+                 "`blocked_by` naming which"] if claims else [])
+    if not claims:
+        return ["carries `blocked_by`, but its `error` is not a blocked-by "
+                f"reason (one that starts {BLOCKED_PREFIX!r}): only a heavy "
+                "gate that blocking gates kept from running takes that "
+                "shape"]
+    ids = rec["blocked_by"]
+    if not (isinstance(ids, list) and ids
+            and all(isinstance(i, str) and i.strip() for i in ids)):
+        return [f"`blocked_by` is {ids!r}, not a non-empty list of gate ids"]
+    problems = []
+    repeated = sorted({i for i in ids if ids.count(i) > 1})
+    if repeated:
+        problems.append(f"`blocked_by` names {repeated} more than once")
+    if reason != BLOCKED_PREFIX + ", ".join(ids):
+        problems.append(f"its reason {reason!r} does not name the ids in "
+                        f"`blocked_by` {ids!r}, id for id and in order")
+    if not manifest_heavy.get(rec.get("id")):
+        problems.append("the manifest does not declare its gate `heavy`, "
+                        "and only a heavy gate is kept from running by "
+                        "another's failure")
+    for bid in dict.fromkeys(ids):
+        if bid not in manifest_blocking:
+            problems.append(f"blocker {bid!r} is declared in no manifest row")
+        elif not manifest_blocking[bid]:
+            problems.append(f"blocker {bid!r} is not a blocking gate, and a "
+                            f"non-blocking failure blocks nothing")
+        elif manifest_heavy.get(bid):
+            problems.append(f"blocker {bid!r} is a heavy gate, and heavy "
+                            f"gates run after the ones that block")
+        else:
+            blocker = by_id.get(bid)
+            if blocker is None:
+                problems.append(f"blocker {bid!r} has no record in this "
+                                f"block")
+            elif "deferred" in blocker:
+                problems.append(f"blocker {bid!r} was deferred and not run, "
+                                f"and a gate this run does not execute "
+                                f"blocks nothing")
+            elif "error" not in blocker and blocker.get("exit_code") == 0:
+                problems.append(f"blocker {bid!r} passed (exit 0), so it "
+                                f"blocked nothing")
+    return problems
+
 
 def _nonempty(value) -> bool:
     return isinstance(value, str) and bool(value.strip())
@@ -830,7 +900,9 @@ def parse_attestations(evidence: str, tags: list[str] | None = None):
 
 
 def validate_attestations(evidence: str, cfg: Config,
-                          request_sha: str | None = None) -> list[Item]:
+                          request_sha: str | None = None, *,
+                          whole: tuple[list, list] | None = None
+                          ) -> list[Item]:
     """§5.1 attestations, checked one field at a time (round-4 F3, F4).
 
     Previously this checked that an Evidence *section* existed. Removing the
@@ -848,6 +920,12 @@ def validate_attestations(evidence: str, cfg: Config,
     the record, which previously could downgrade its own failure to
     advisory; and a not-run record meets its own evidence requirements — a
     gate id, a reason, and none of the fields only a run could produce.
+
+    `whole` (0.30.0) is `(manifest rows, records)` of the whole run, passed
+    when the block judged is one record of a larger run: the pre-push refusal
+    judges a gate at a time, against its own row, so it can name each one,
+    and a blocked record's blockers are in neither. The blocked-by relation
+    is then judged against `whole` instead of this block and this manifest.
     """
     records, err, matched = parse_attestations(evidence, accepted_tags(cfg))
     if err is not None:
@@ -878,6 +956,21 @@ def validate_attestations(evidence: str, cfg: Config,
     # 0.28.0: which gates the MANIFEST lets a hand-off leave unrun. A deferred
     # record is judged against this, never against its own claim.
     manifest_attester = {g["id"]: g.get("attested_by") for g in cfg.gates}
+    # 0.30.0: the manifest rows and the records a blocked record's
+    # `blocked_by` is judged against (`_blocked_problems`), never against its
+    # own claim: this block's own, or `whole`'s when the block is one record
+    # of a larger run.
+    relation_gates, relation_records = (whole if whole is not None
+                                        else (cfg.gates, records))
+    relation_blocking = {g["id"]: bool(g.get("blocking", False))
+                         for g in relation_gates}
+    manifest_heavy = {g["id"]: g.get("heavy") is True
+                      for g in relation_gates}
+    by_id: dict = {}
+    for candidate in relation_records:
+        if isinstance(candidate, dict) and isinstance(candidate.get("id"),
+                                                      str):
+            by_id.setdefault(candidate["id"], candidate)
     attested = set()
     for i, rec in enumerate(records):
         if not isinstance(rec, dict):
@@ -965,6 +1058,10 @@ def validate_attestations(evidence: str, cfg: Config,
             for problem in problems:
                 items.append(_err("A-NOT-RUN-SHAPE",
                                   f"{gate_id}: not-run record: {problem}"))
+            for problem in _blocked_problems(rec, by_id, relation_blocking,
+                                             manifest_heavy):
+                items.append(_err("A-BLOCKED-SHAPE",
+                                  f"{gate_id}: blocked record: {problem}"))
             level = _err if blocking else _notice
             items.append(level("A-NOT-RUN",
                                f"{gate_id}: {rec.get('error')} — uncaptured "

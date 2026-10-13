@@ -1621,6 +1621,28 @@ SCHEDULE_DEFERRED = (
     "publication, not by the hand-off; nothing at the hand-off checks that "
     "run")
 
+#: FAIL FAST (0.30.0, brief `shared-checkout-guards`, guard 2). Measured on
+#: the authoring workbench on 2026-10-05: a full manifest spent 10m49s in
+#: its heavy gates after a three-second gate had already failed, and the
+#: run's answer was the three-second gate's. A gate row declaring
+#: `heavy = true` therefore runs in a second phase: every executed gate
+#: without it runs first, in manifest order and the usual execution model;
+#: then, only if every BLOCKING one of those passed, the heavy ones. When
+#: one did not (a non-zero exit, or it could not execute), no heavy gate
+#: executes, and each is recorded in the not-run shape with this reason
+#: followed by the blocking ids, and those ids again in `blocked_by`. A
+#: non-blocking failure blocks nothing. A gate this run does not execute
+#: (CI-attested, deferred to the schedule, or declared away by its caller)
+#: neither blocks nor is blocked: its record is whatever its own executor's
+#: is. A manifest declaring no heavy gate runs exactly as before.
+BLOCKED_PREFIX = "not run: blocked by "
+
+
+def blocked_reason(ids) -> str:
+    """The `error` a heavy gate's record carries when `ids` blocked it."""
+    return BLOCKED_PREFIX + ", ".join(ids)
+
+
 #: GitHub Actions sets this in every step. INSIDE CI the runner is the
 #: executor — somebody has to actually run the command, and it is this
 #: process — so an attested gate there executes exactly as an unattested one
@@ -2192,15 +2214,20 @@ def local_gate_failures(cfg: Config, local: LocalGates
     manifest itself. So the refusal before the push and the validation
     after the emission cannot disagree — on a failed exit, an unbound
     tree, a not-run record, `not run: nested` included.
+
+    The cause before its consequence (0.30.0): a heavy gate the run left
+    unexecuted because a fast gate failed (`blocked_by`) is judged like any
+    not-run record, and listed after every other gate, so the refusal and
+    its items name the red gate first whatever the manifest's order.
     """
     from .validate import errors_in, validate_attestations
     rows = {g["id"]: g for g in cfg.gates}
     failed, items = [], []
-    for rec in local.records:
+    for rec in sorted(local.records, key=lambda r: bool(r.get("blocked_by"))):
         one = dataclasses.replace(cfg, gates=[rows[rec["id"]]])
         errors = errors_in(validate_attestations(
             _attestation_block(cfg.wrapper_tag, [rec]), one,
-            request_sha=local.sha))
+            request_sha=local.sha, whole=(cfg.gates, local.records)))
         if errors:
             failed.append(rec["id"])
             items.extend(errors)
@@ -2249,12 +2276,22 @@ def gate_before_push(cfg: Config, record: dict, base: str | None = None,
     where = (f"the hand-off committed its outstanding work locally at "
              f"{sha}" if record.get("committed") else
              f"no commit was made (HEAD is {sha})")
-    names = ", ".join(failed) if failed else "the local attestation block"
+    # The red gates first, then the heavy ones they kept from running
+    # (`local_gate_failures` orders both lists that way).
+    blocked = [gid for gid in failed if by_id[gid].get("blocked_by")]
+    red = [gid for gid in failed if gid not in blocked]
+    shown = red or failed
+    names = ", ".join(shown) if shown else "the local attestation block"
+    if red and blocked:
+        # One run, one set of blockers: every blocked record names the same.
+        names += (f"; {len(blocked)} heavy gate(s) not run, blocked by "
+                  f"{', '.join(by_id[blocked[0]]['blocked_by'])}: "
+                  f"{', '.join(blocked)}")
     undo = (f"then amends or resets the local commit {sha[:12]} — the tool "
             f"does not undo its own commit — and re-runs"
             if record.get("committed") else "then commits the fix and re-runs")
     raise GatesRefused(
-        f"{len(failed) or 1} local gate(s) did not pass at {sha[:12]}: "
+        f"{len(shown) or 1} local gate(s) did not pass at {sha[:12]}: "
         f"{names} — judged by the request validator's own attestation rule "
         f"before anything left this machine. Nothing was pushed, emitted or "
         f"recorded; {where}",
@@ -2350,6 +2387,78 @@ def differs_message(paths_: list[str], what: str) -> str:
             f"filesystem monitor, trusted stat data)")
 
 
+#: The request's `Tree:` value for a clean emitting checkout.
+TREE_CLEAN = "clean at emission"
+#: The request's `Tree:` value for a checkout whose TRACKED content is not
+#: provably the target's: a tracked edit, or an untracked path beside an
+#: edit the index or a cache hides. Worded as it always was.
+TREE_DIRTY = "DIRTY — attestations from a dirty tree are not attestations"
+
+
+def emission_tree(repo_root: Path, head: str, porcelain: str) -> dict:
+    """What the emitting checkout's `git status --porcelain` (read once, by
+    the caller, at emission) says about the request's TARGET, as
+    `{"state": "clean" | "untracked" | "dirty", "untracked": [paths]}`.
+
+    Brief `loupe-tool-feedback-2026-10-06` item 1. The header said every
+    status line made the attestations "not attestations", and both
+    reviewers of lineage Lb81962e787 read it beside 27 records each
+    `bound` to the target: the hand-off ran its local gates at the commit,
+    and an analyst deposit landed under `briefs/inbox/` before emission.
+    An untracked path is beside the tree, not in it (`tree_differs` never
+    compares one), so ALONE it is a notice naming the paths. It is alone
+    only when nothing hides a tracked edit from that status: no entry the
+    index flags (`index_hidden`) and no tracked path on disk that differs
+    from the target read through a cold index (`tree_differs`). Anything
+    else — a tracked change in the status, a flag, a cache that answered for
+    the disk, a check that could not run — is `dirty`, exactly as strict as
+    before. Those checks run only when untracked paths are the status's
+    only lines: an empty status is `clean` without them, as before 0.30.0,
+    so an edit an index flag or a cache hides, with nothing untracked
+    beside it, reads clean here (review round 2 of lineage Lb33715f372, F4,
+    answered by narrowing; `test_emission_tree` E11 and E12 pin it). A
+    timeout travels typed, as in `run_gates`."""
+    lines = [ln for ln in porcelain.splitlines() if ln.strip()]
+    if not lines:
+        return {"state": "clean", "untracked": []}
+    untracked = [ln[3:] for ln in lines if ln.startswith("?? ")]
+    if len(untracked) != len(lines):
+        return {"state": "dirty", "untracked": untracked}
+    try:
+        if index_hidden(repo_root) or tree_differs(repo_root, head):
+            return {"state": "dirty", "untracked": untracked}
+    except _git_timeout_class():
+        raise
+    except RuntimeError:
+        return {"state": "dirty", "untracked": untracked}
+    return {"state": "untracked", "untracked": untracked}
+
+
+def emission_tree_line(tree: dict, attestations: list[dict]) -> str:
+    """The request's `Tree:` value for `emission_tree`'s answer. Clean and
+    dirty read exactly as before; untracked-only opens with the clean text
+    (so a reader that looks for "clean" stays silent, an older one
+    included), names the first `HIDDEN_NAMED` paths, counts the rest, and
+    says what the attestations' own `binding` fields say — counted from
+    the records this request carries, never asserted."""
+    if tree["state"] == "clean":
+        return TREE_CLEAN
+    if tree["state"] != "untracked":
+        return TREE_DIRTY
+    paths_ = tree["untracked"]
+    named = ", ".join(repr(p) for p in paths_[:HIDDEN_NAMED]) + (
+        f" and {len(paths_) - HIDDEN_NAMED} more"
+        if len(paths_) > HIDDEN_NAMED else "")
+    with_binding = [a for a in attestations
+                    if isinstance(a, dict) and "binding" in a]
+    bound = sum(a.get("binding") == "bound" for a in with_binding)
+    return (f"{TREE_CLEAN} in its tracked content, which is the target "
+            f"commit's; {len(paths_)} untracked path(s) beside it, not in "
+            f"it: {named} — a notice, not an invalidation: {bound} of "
+            f"{len(with_binding)} attestation(s) below bind the target "
+            f"commit's tree, each by its own `binding`")
+
+
 def run_gates(cfg: Config, target_sha: str,
               base: str | None = None, execute_ci_gates: bool = False,
               ci_poll_interval: float = CI_POLL_INTERVAL_S, *,
@@ -2405,6 +2514,13 @@ def run_gates(cfg: Config, target_sha: str,
     `attested_by = "schedule"` is then not executed and gets a deferred
     record (`SCHEDULE_DEFERRED`). Without it such a gate executes like any
     other, which is what a scheduled or pre-publication full run needs.
+
+    FAIL FAST (0.30.0): a gate declaring `heavy = true` executes only after
+    every executed gate without it, and only if every blocking one of those
+    passed; otherwise it is recorded not run, `blocked by <ids>`, with the
+    ids in `blocked_by` (`BLOCKED_PREFIX` says which gates take part). The
+    deferral above wins over a block: a deferred gate was never going to
+    run here, and its record says why.
 
     `pending_tree` (2026-10-04, a gate run before a commit that does not
     exist yet): the id of the tree the caller commits next, which its caller
@@ -2634,6 +2750,35 @@ def run_gates(cfg: Config, target_sha: str,
                                    "attested_by": SCHEDULE_ATTESTER,
                                    "deferred": SCHEDULE_DEFERRED}
     executed = [g for g in local_gates if g["id"] not in deferred_ids]
+    # FAIL FAST (0.30.0, `BLOCKED_PREFIX`): two phases over the executed
+    # gates, each in manifest order. With no heavy gate the second phase is
+    # empty and the run is exactly the one-phase run it always was.
+    first = [g for g in executed if g.get("heavy") is not True]
+    heavy = [g for g in executed if g.get("heavy") is True]
+
+    def run_phase(phase: list[dict], pool) -> None:
+        if pool is None:
+            for gate in phase:
+                records[gate["id"]] = run_one(gate)
+        else:
+            for rec in pool.map(run_one, phase):
+                records[rec["id"]] = rec
+
+    def run_heavy(pool) -> None:
+        # Blocking is the manifest's, as everywhere: a record's own claim
+        # decides nothing. A record that ran and exited non-zero, or could
+        # not execute, is what blocks.
+        blockers = [g["id"] for g in first if g.get("blocking", False)
+                    and ("error" in records[g["id"]]
+                         or records[g["id"]].get("exit_code") != 0)]
+        if not blockers:
+            run_phase(heavy, pool)
+            return
+        for gate in heavy:
+            records[gate["id"]] = {"id": gate["id"],
+                                   "blocking": gate.get("blocking", False),
+                                   "error": blocked_reason(blockers),
+                                   "blocked_by": list(blockers)}
 
     workers = max(1, min(workers, len(executed) or 1))
     if workers == 1 or not executed:
@@ -2642,20 +2787,22 @@ def run_gates(cfg: Config, target_sha: str,
         # the two halves in one obvious order for whoever is debugging.
         if wait:
             records.update(wait_for_ci())
-        for gate in executed:
-            records[gate["id"]] = run_one(gate)
+        run_phase(first, None)
+        run_heavy(None)
     else:
         # The CI wait rides in the pool beside the local gates rather than
         # before or after them: it is almost entirely sleep, and serialising
         # it would add the whole poll to a loop this change exists to
         # shorten. One extra worker, because it occupies a thread it never
         # computes in. (A hand-off's CI half no longer rides here: it waits
-        # for the push, so it is awaited with `prior`, after it.)
+        # for the push, so it is awaited with `prior`, after it.) It rides
+        # beside both phases, so a CI-attested gate neither waits for the
+        # first phase nor holds up the second.
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=workers + (1 if wait else 0)) as pool:
             waiting = pool.submit(wait_for_ci) if wait else None
-            for rec in pool.map(run_one, executed):
-                records[rec["id"]] = rec
+            run_phase(first, pool)
+            run_heavy(pool)
             if waiting is not None:
                 records.update(waiting.result())
     return [records[g["id"]] for g in order]
@@ -3651,7 +3798,11 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
               if claim.get("carried_findings") or claim.get("attestation_map")
               else None)
     check_map_gates(claim, cfg, head)
-    dirty = _git(repo, "status", "--porcelain")
+    check_directory_paths(claim, repo, head, lambda: span_raw_paths(shape))
+    # The emitting checkout's state, read once, now — not the gates': each
+    # attestation's own `binding` says what its gate ran against (brief
+    # `loupe-tool-feedback-2026-10-06` item 1; `emission_tree`).
+    tree = emission_tree(repo, head, _git(repo, "status", "--porcelain"))
     # Round-4 F8: the declared gate manifest reaches the metric here, not only
     # through the ledger API a test calls directly. Round-4 F5: so does the
     # configured token budget, which is None when none is declared.
@@ -3672,8 +3823,6 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
     # another open one, which is every ordinary round.
     cross_md = render_cross_lineage_md(ledger.cross_lineage_notices(lineage))
 
-    tree_state = ("DIRTY — attestations from a dirty tree are not attestations"
-                  if dirty else "clean at emission")
     # Brief `take-objective-map` item 2: a 12,520-line diff paid full
     # attention on rendered inventories the author never wrote. The span
     # separates them so the reviewer can skip them BY RULE — the rule being
@@ -3693,6 +3842,7 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
     attestations = run_gates(cfg, head, base=base, prior=local_gates,
                              defer_scheduled=True)
     ev_cap = _attestation_block(cfg.wrapper_tag, attestations)
+    tree_state = emission_tree_line(tree, attestations)
     ev_not = "\n".join(f"  - {x}" for x in claim.get("evidence_not_captured", []))
     stops = "\n".join(f"  - {x}" for x in claim.get("stop_conditions", []))
     hand = "\n".join(f"  {i}. {x}"
@@ -4293,6 +4443,81 @@ def check_map_gates(claim, cfg: Config, head: str) -> None:
                        "review.toml, and re-runs the hand-off")
 
 
+def _claim_pattern_sites(claim) -> list[tuple[str, str]]:
+    """(member path, pattern) for every pattern the claim declares in the
+    `scope_paths` grammar — `validate.claim_patterns`' members, each with
+    the location a person corrects (`objectives[1].paths[0]`)."""
+    out: list[tuple[str, str]] = []
+    for member in ("scope_paths", "excluded_paths"):
+        for i, p in enumerate(claim.get(member) or ()):
+            if isinstance(p, str):
+                out.append((f"{member}[{i}]", p))
+    for j, obj in enumerate(claim.get("objectives") or ()):
+        if hasattr(obj, "get"):
+            for i, p in enumerate(obj.get("paths") or ()):
+                if isinstance(p, str):
+                    out.append((f"objectives[{j}].paths[{i}]", p))
+    return out
+
+
+def check_directory_paths(claim, repo: Path, head: str, changed) -> None:
+    """Refuse a claim pattern that names a DIRECTORY at the target without
+    the trailing `/` the grammar gives a directory prefix (brief
+    `loupe-tool-feedback-2026-10-06` item 2).
+
+    The `scope_paths` grammar — `scope_paths`, `excluded_paths` and each
+    objective's `paths`, matched by the one matcher `in_scope` — is an
+    exact path, a directory prefix ending in `/`, or a glob. A bare
+    `src` is an exact path, and a span lists files, so it matched nothing:
+    lineage Lb81962e787 round 1 carried two such objective paths and 27
+    unmapped-path notices, and the reviewer had to work out why. The claim
+    is the author's and the tool never rewrites it (design §Claim), so the
+    pattern is not reinterpreted; it is refused, naming the member and the
+    fix, when ALL of these hold: it has no glob character and no trailing
+    `/`; it is a canonical repository path (no empty, `.` or `..`
+    segment); the target commit's tree holds a directory there; and it is
+    not itself a changed path of the span (a file the span deleted or
+    replaced with that directory, which the exact path does map).
+
+    `changed` is a zero-argument callable returning the span's changed
+    paths, called only when a candidate is found. Two callers, as
+    `check_map_gates` has: the hand-off's gate-before-push callback, after
+    the commit and before any gate runs or anything is pushed, and
+    `emit_request` for a direct caller."""
+    # Three independent tests, each answering one class: a directory
+    # prefix already, a glob, and a spelling that is not a canonical
+    # repository path (judged without the trailing `/` the first test
+    # answers, so neither test stands in for the other).
+    candidates = [(where, p) for where, p in _claim_pattern_sites(claim)
+                  if not p.endswith("/") and not any(ch in p for ch in "*?[")
+                  and not any(seg in ("", ".", "..")
+                              for seg in p.rstrip("/").split("/"))]
+    if not candidates:
+        return
+    run = lambda *a: _git(repo, *a, no_replace=True)          # noqa: E731
+    dirs = [(where, p) for where, p in candidates
+            if refs.target_kind(run, head, p) == "tree"]
+    if not dirs:
+        return
+    span = set(changed())
+    dirs = [(where, p) for where, p in dirs if p not in span]
+    if not dirs:
+        return
+    from . import transport as _transport
+    named = "; ".join(f"{where} is `{p}`, write `{p}/`" for where, p in dirs)
+    raise _transport.Refusal(
+        f"the claim names {len(dirs)} path(s) that are directories at "
+        f"{head[:12]} without the trailing `/` a directory prefix carries "
+        f"({named}): a path "
+        f"without it is an exact path, and a span lists files, so it would "
+        f"match nothing and show only as notices. No gate was run and "
+        f"nothing was pushed, emitted or recorded",
+        "", remedy="a person adds the trailing `/` to each named path in "
+                   "the claim file (or names the files it means), and "
+                   "re-runs the command; the tool does not rewrite the "
+                   "author's claim")
+
+
 def check_claim_record(claim, ledger: Ledger, lineage: str, cfg: Config,
                        path: Path | None = None) -> dict:
     """The claim's record-bound members judged against THIS machine's ledger
@@ -4532,6 +4757,12 @@ def _span_rows(shape: dict) -> list[dict]:
                 for e in entries]
     return [{"path": p, "raw": p, "insertions": None, "deletions": None}
             for p in shape.get("file_list", [])]
+
+
+def span_raw_paths(shape: dict) -> list[str]:
+    """The span's changed paths as the matchers read them (`_span_rows`'
+    raw post-image spellings), for a caller outside this module."""
+    return [r["raw"] for r in _span_rows(shape)]
 
 
 def _in_scope_line(shape: dict, generated: set, excluded) -> str | None:

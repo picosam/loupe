@@ -321,6 +321,15 @@ the author knows which. A repository's generated artefacts are named there
 like any other path: which files a repository generates is identity, not
 mechanism, and does not travel with the tool (§11).
 
+The claim's path patterns (`scope_paths`, `excluded_paths`, each
+objective's `paths`) are an exact path, a directory prefix ending in `/`,
+or a glob, judged by one matcher. A bare name that is a DIRECTORY at the
+target is an exact path that can match nothing a span lists, so it is
+refused before any gate runs, naming the member and the `/` it lacks —
+refused rather than read as a prefix, because the tool carries the claim
+and does not reinterpret it. A name the span itself changed (a file
+replaced by that directory) is a real exact path and is kept.
+
 The SPAN does separate them, and the same §11 line is why it can. A changed
 path whose `linguist-generated` attribute is set in the target tree is
 listed under its own heading with its own two counts, and the header states
@@ -352,7 +361,13 @@ SHA-bound verification cache that got them right repeatedly:
   gate that passed, and only one of them may satisfy anything;
 - **SHA-bound and dirty-invalidated** — an attestation from a dirty tree or a
   different commit is not an attestation (`binding: unbound`, and the
-  validator rejects it);
+  validator rejects it). The tree is the one the gate ran in, and each
+  record's `binding` says so; the request's `Tree:` line reports the
+  checkout at emission, a later observation. It calls a tracked change
+  dirty, and an edit an index flag or a cache hides when untracked paths
+  sit beside it; untracked paths alone are a notice. An empty status reads
+  clean, as before 0.30.0, whatever a flag or a cache hides: the line does
+  not see a hidden edit with nothing untracked beside it;
 - **recompute, don't trust** — the validator checks every field, never the
   presence of a section. A blocking gate that ran and failed does not become
   evidence by being reported accurately.

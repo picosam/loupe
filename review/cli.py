@@ -1753,6 +1753,14 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
             # gates and the push rather than after them: a request with no
             # range cannot be emitted, so nothing is run or sent for one.
             raise RuntimeError("no prior verdict in the ledger; pass --base")
+        # A claim path naming a directory at the target without its `/`
+        # (brief `loupe-tool-feedback-2026-10-06` item 2): the target's
+        # tree exists only now, so it is judged here, before any gate runs
+        # or anything is pushed — the same function `emit_request` applies.
+        emit.check_directory_paths(
+            claim, cfg.repo_root, record["sha"],
+            lambda: emit.span_raw_paths(emit.diff_shape(
+                cfg.repo_root, record["base"], record["sha"])))
         local_gates = emit.gate_before_push(record["governing"], record,
                                             base=record["base"],
                                             verb=args.command)

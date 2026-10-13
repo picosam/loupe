@@ -691,7 +691,13 @@ def _check_value(section: str, key: str, value, errors: list) -> None:
 #: `gates[i] states unknown key(s) ['attested_by']`, and `[tool] requires`
 #: is what makes that refusal name the version skew instead of sending a
 #: person to repair a file that is correct.
-GATE_KEYS = ("id", "command", "blocking", "attested_by")
+#: `heavy` joined it in 0.30.0 (brief `shared-checkout-guards`, guard 2):
+#: an optional boolean, absent meaning false, that makes the runner execute
+#: the gate only after every gate without it has run and every BLOCKING one
+#: of those has passed (`emit.run_gates`). It is a cross-installation
+#: contract like every key here: a repository that declares it raises
+#: `[tool] requires` to 0.30.0 in the same commit.
+GATE_KEYS = ("id", "command", "blocking", "attested_by", "heavy")
 
 #: The admitted executors of a declared gate. The tool runs it, or CI is
 #: asked what it concluded, or (0.28.0) the gate is attested by a scheduled
@@ -750,6 +756,12 @@ def _check_gates(rows, errors: list) -> bool:
                           f"strings")
         if "blocking" in row and not isinstance(row["blocking"], bool):
             errors.append(_bad(f"{at} `blocking`", row["blocking"],
+                               "true or false"))
+        # A real TOML boolean only: `"true"`, `1` and a table are refused by
+        # name, never read as true or as false, because either guess would
+        # move the gate to a phase its author did not declare.
+        if "heavy" in row and not isinstance(row["heavy"], bool):
+            errors.append(_bad(f"{at} `heavy`", row["heavy"],
                                "true or false"))
         if "attested_by" in row:
             attester = row["attested_by"]

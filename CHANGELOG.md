@@ -5,6 +5,86 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.30.0
+
+**For upgraders — read before crossing this version.** One key joins the
+gate grammar: a `[[gates]]` row may declare `heavy`, a boolean whose
+absence means `false`. A reader older than 0.30.0 refuses a configuration
+that declares it, naming the version skew, so raise `[tool] requires` to
+0.30.0 in the commit that declares it, and only once every machine that
+authors or reviews the repository runs 0.30.0. Any other spelling than a
+TOML `true` or `false` (`"true"`, `1`, a table) is refused at load. A
+manifest that declares no heavy gate runs exactly as before: same order,
+same records, same exit codes.
+
+**Heavy gates run last, and not at all after a red blocking gate.** Every
+runner (`loupe handoff`, `run_gates` called directly) executes the gates
+without `heavy = true` first, in manifest order, with the same concurrency
+as before; then, if every blocking one of them passed, the heavy gates, in
+manifest order. When a blocking one exited non-zero or could not execute,
+no heavy gate executes: each is recorded in the not-run shape, `{"id",
+"blocking", "error": "not run: blocked by <id>[, <id>…]", "blocked_by":
+[<id>, …]}`, which the validator judges as any not-run record (an error
+for a blocking gate, a notice for a non-blocking one) and a CI receipt
+carries as that gate's `not_run` reason. The validator also judges
+`blocked_by` itself, as `A-BLOCKED-SHAPE` errors: a record whose reason
+says a gate blocked it carries a non-empty list of distinct gate ids that
+names the same ids in the same order as the reason; its own gate is
+declared `heavy`; and each id is a declared blocking gate that is not
+heavy, with a record in the same block that failed or could not execute,
+never a pass or a deferral. `blocked_by` on any other record is refused.
+A non-blocking failure blocks nothing. A gate the run does not execute neither blocks nor is blocked: a
+CI-attested gate keeps its CI answer, and a gate a hand-off defers to the
+schedule stays deferred. Measured on the authoring workbench on
+2026-10-05: a full manifest ran 10m49s of heavy gates after a three-second
+gate had already failed, and the run's answer was that gate's.
+
+**A hand-off refusal names the red gate first.** When a red fast gate
+blocks heavy ones, the refusal before the push names the red gate(s), then
+`N heavy gate(s) not run, blocked by <id>: <ids>`, and lists the validator
+items in that order, whatever order the manifest declares them in.
+
+**For upgraders: a claim path that names a directory needs its `/`.** A
+pattern in `scope_paths`, `excluded_paths` or an objective's `paths` with
+no glob character and no trailing `/`, naming a directory in the target
+commit's tree, is refused before any gate runs or anything is pushed —
+by `handoff` in its gate-before-push callback, and by `emit-request` —
+naming each one by its member path and its fix
+(``objectives[0].paths[1] is `src`, write `src/` ``). Such a path is
+an exact path, and a span lists files, so it matched nothing and showed
+only as unmapped-path notices (27 of them on one round). The claim is not rewritten. Not refused: a glob, a path
+with its `/`, a file, a symlink, a submodule pointer, a path the target
+does not hold, a non-canonical spelling (`./src`), and a name the span
+itself changed (a file it replaced with that directory), which the exact
+path does map. A claim that passed before and carries such a path now
+refuses until the `/` is added.
+
+**The request's `Tree:` line says what the emitting checkout holds.**
+It said `DIRTY — attestations from a dirty tree are not attestations`
+for any `git status` line at emission, beside records each `bound` to the
+target — after a hand-off had run its gates at the commit and an
+untracked file landed before the emission read the status. Untracked
+paths alone, with nothing hiding a tracked edit (no index flag, and the
+tracked content equal to the target's through a cold index), now read
+``clean at emission in its tracked content, which is the target commit's;
+N untracked path(s) beside it, not in it: <the first five> — a notice,
+not an invalidation: K of M attestation(s) below bind the target
+commit's tree, each by its own `binding` ``, counted from the records the
+request carries. A tracked change or a staged file reads `DIRTY — …`
+exactly as before, and so does an edit an index flag or a cache hides when
+it sits beside the untracked paths. Those hidden-edit checks run only when
+untracked paths are the status's only lines: an empty status reads clean
+without them, as before 0.30.0, so an edit hidden with nothing untracked
+beside it still reads clean at emission. The précis stays silent on the
+notice as on a clean tree.
+
+**Published on Python 3.15.0 final.** 0.26.0 to 0.29.0 were published on
+release candidates, with `uv python install 3.15` first. 3.15.0 shipped on
+2026-10-09, and uv 0.13.0 is the first release that lists it, so on uv
+0.13.0 or later that command installs 3.15.0, which `>=3.15,<3.16`
+admits. On an older uv the same command still installs a release
+candidate, which `>=3.15,<3.16` refuses: update uv first.
+
 ## 0.29.0
 
 **For upgraders — read before crossing this version.** Three sections below
