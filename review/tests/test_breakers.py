@@ -399,8 +399,10 @@ class TestGateManifestReachesTheMetric(unittest.TestCase):
         # The manifest reaches the metric as the declared ids, never as the
         # commands that implement them (the exact id list is review.toml's
         # to declare — restating it here made this test fail on every
-        # manifest change, which is config drift, not a defect).
-        self.assertIn("tests", synth.CFG.gate_ids)
+        # manifest change, which is config drift, not a defect; so is one
+        # restated id: `tests` split into two rows on 2026-10-20).
+        self.assertTrue(synth.CFG.gate_ids)
+        gate = synth.CFG.gate_ids[0]
         self.assertEqual(synth.CFG.gate_ids, [g["id"] for g in synth.CFG.gates])
         self.assertTrue(all(" " not in gid for gid in synth.CFG.gate_ids))
         self.assertNotIn("python3 -m unittest discover -s review/tests -t .",
@@ -410,13 +412,13 @@ class TestGateManifestReachesTheMetric(unittest.TestCase):
         ledger.add({"event": "verdict", "round": 1, "sha": "a" * 40,
                     "verdict": "changes requested", "finding_ids": 2})
         ledger.add({"event": "finding", "round": 1, "id": "F1", "fp": "fp2:1",
-                    "severity": "High", "preventable_by": "tests"})
+                    "severity": "High", "preventable_by": gate})
         ledger.add({"event": "finding", "round": 1, "id": "F2", "fp": "fp2:2",
                     "severity": "High",
                     "preventable_by": "a doc-consistency linter nobody built"})
         m = ledger.metrics(LINEAGE, gate_manifest=synth.CFG.gate_ids)["rounds"][1]
         self.assertEqual(m["deterministic_preventable"]["count"], 1)
-        self.assertEqual(m["deterministic_preventable"]["gates"], ["tests"])
+        self.assertEqual(m["deterministic_preventable"]["gates"], [gate])
 
     def test_absent_manifest_is_still_a_distinct_state(self):
         ledger = Ledger.in_memory()

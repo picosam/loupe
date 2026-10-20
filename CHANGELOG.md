@@ -5,6 +5,18 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.30.1
+
+**The two human verbs defer to the standing instructions.** The adapters
+said `loupe waive` and `loupe authorize-advance` were never an agent's.
+They now say so unless the standing instructions the agent operates under
+say otherwise, and where those instructions allow it, the agent runs either
+only to record exactly what the human selected in an interactive prompt
+that session, under the human's name. Without such an instruction nothing
+changes: the agent reports what it would say and lets the human answer. The
+sentence also names the case a waiver most often records, a commit that
+goes unreviewed. No grammar, record or exit code changes.
+
 ## 0.30.0
 
 **For upgraders — read before crossing this version.** One key joins the
