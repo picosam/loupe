@@ -294,7 +294,12 @@ So close the question now, not on a blocked PR:
   silently). Under `pr-approval` work is always on a branch, an open pull
   request exists for it before `handoff` (the author opens one with the
   forge's CLI if none does — the tool touches no forge), and `handoff`
-  refuses the default branch.
+  refuses the default branch. Under either value `handoff` pushes a
+  branch only to its own name — a branch cut with `git switch -c <branch>
+  origin/main` tracks `origin/main`, and is refused — so cut work with
+  `--no-track`, or give it its own upstream with `git push -u origin
+  refs/heads/<branch>:refs/heads/<branch>` (the explicit refspec, which no
+  `remote.origin.push` mapping can redirect).
 - **Write the approval policy into the repository** — who approves what,
   and what a loupe verdict authorizes them to do. A rule that exists only
   in an operator's head is exactly the class of defect the review round

@@ -487,9 +487,10 @@ class TestEveryConfiguredDoorTakesTheCeiling(unittest.TestCase):
         self.assertEqual(held, self.HELD_AT_BUILT_IN)
         # The audit table's configured runners: ensure_pushed, _await_ci,
         # check_enforcement, check_references (held at the built-in until
-        # integration) and the twelve in transport. Counted, so a door that
-        # stops binding a runner is noticed rather than silently skipped.
-        self.assertEqual(len(configured), 16, sorted(configured))
+        # integration), check_renamed_push (0.31.0) and the twelve in
+        # transport. Counted, so a door that stops binding a runner is
+        # noticed rather than silently skipped.
+        self.assertEqual(len(configured), 17, sorted(configured))
 
     def test_the_byte_doors_take_it_too(self):
         for fn in (transport._blob_of, transport.run_bytes):

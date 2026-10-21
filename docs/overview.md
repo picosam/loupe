@@ -246,7 +246,9 @@ and no shared remote, it costs an actual human paste per leg of every
 round.
 
 **The tool refuses more than it guesses.** No declared taxonomy, no
-emission. No fetchable target, no request. The default branch under a
+emission. No fetchable target, no request. A push to a branch of another
+name than the reviewed one — the remote's default branch, for a branch cut
+from `origin/main` — no `handoff`, whatever the repository declares. The default branch under a
 declared approval-enforcement pathway, no `handoff` — the runtime check
 is the branch state alone; establishing the open pull request itself is
 the author's own procedural step with the forge's CLI, outside this

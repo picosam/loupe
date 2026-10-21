@@ -1785,7 +1785,8 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
                                     base=base,
                                     before_push=gate_before_push)
     except (emit.AuthorityAbsent, emit.RoleSelectionError,
-            emit.SweepRefused, SharedTarget) as exc:
+            emit.SweepRefused, emit.RenamedPush,
+            SharedTarget) as exc:
         # RVW-T17: ONE catch, reached by both author doors, because both
         # reach `ensure_pushed` through this function. Round 7 F2's defect —
         # two author doors accepting different states — has no second place
@@ -2038,6 +2039,19 @@ def cmd_handoff(args, cfg) -> int:
         emit.check_enforcement(cfg)
     except emit.EnforcementUnsatisfiable as exc:
         return _blocked("", str(exc), remedy=exc.remedy)
+    # The push's destination, at the same door and under every declared
+    # pathway (0.31.0): a branch whose upstream has another name — the
+    # remote's default branch, when it was cut from `origin/main` — would
+    # put the work there before the review ran. `ensure_pushed` refuses it
+    # again before its commit, for every verb that pushes; this answer
+    # comes before the ledger is consulted, so no reservation is taken and
+    # no kept request is re-recorded. `--local-only` pushes nothing and is
+    # judged where it always was.
+    if not getattr(args, "local_only", False):
+        try:
+            emit.check_renamed_push(cfg)
+        except emit.RenamedPush as exc:
+            return _blocked("", str(exc), remedy=exc.remedy)
     # WHICH LINEAGE THIS HANDOFF IS (brief `keyed-lineage`, item 3): the
     # OPEN lineage whose requests were recorded on this worktree's branch,
     # and a NEW one when this branch holds none. A second worktree on a

@@ -17,7 +17,8 @@ import unittest
 from pathlib import Path
 
 from review import config, validate, wire
-from review.emit import _git, emit_request, ensure_pushed, next_round
+from review.emit import (RenamedPush, _git, emit_request, ensure_pushed,
+                         next_round)
 from review.ledger import Ledger
 from review.tests.util import LINEAGE, REPO_ROOT
 
@@ -192,16 +193,20 @@ class TestEnsurePushedDecisions(unittest.TestCase):
             ensure_pushed(CFG, git=git)
         self.assertIn("not derivable", str(ctx.exception))
 
-    def test_upstream_with_different_remote_branch_name(self):
+    def test_upstream_with_different_remote_branch_name_refuses(self):
+        """0.31.0: a hand-off pushes a reviewed branch only to its own
+        name, so `main` with upstream `origin/trunk` is refused — before
+        the commit, with nothing pushed (`refuse_renamed_push`; the domain
+        is in test_default_landing)."""
         git = fake_git(clean_repo_map({
+            ("status", "--porcelain"): " M review/emit.py",
             ("for-each-ref", UPSTREAM_FMT, "refs/heads/main"):
-                "origin\trefs/heads/trunk",
-            ("push", "origin", "refs/heads/main:refs/heads/trunk"): "",
-            ("ls-remote", "origin", "refs/heads/trunk"):
-                f"{SHA}\trefs/heads/trunk"}))
-        record = ensure_pushed(CFG, git=git)
-        self.assertEqual(record["ref"], "refs/heads/trunk",
-                         "the stamp names the REMOTE ref, not the local one")
+                "origin\trefs/heads/trunk"}))
+        with self.assertRaises(RenamedPush) as ctx:
+            ensure_pushed(CFG, git=git)
+        self.assertIn("origin:refs/heads/trunk", str(ctx.exception))
+        self.assertFalse([c for c in git.calls if c[0] in ("commit", "push")],
+                         "refused before the commit and the push")
 
     def test_no_remote_refuses_without_the_flag(self):
         git = fake_git(clean_repo_map({("remote",): ""}))

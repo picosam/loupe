@@ -5,6 +5,43 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.31.0
+
+**For upgraders — read before crossing this version: `handoff` can refuse
+a push it used to make.** A hand-off pushes a reviewed branch only to a
+branch of its own name. When the push `handoff` or `emit-request` would
+make lands on a branch of another name, the verb refuses as `blocked`
+(exit 1, `next` null, a `remedy`) before anything is committed, pushed,
+run or recorded, under every `[roles] enforcement` value. That is the
+state of a branch cut with `git switch -c <branch> origin/main`: git's
+default `branch.autoSetupMerge` makes `origin/main` its upstream, and the
+hand-off pushes to the upstream. Measured in an adopter's repository on
+2026-10-20: the hand-off fast-forwarded `main` before the review ran, past
+the repository's own merge rule, under `enforcement = "none"`. git's
+`push.default = simple` refuses that push when it is made without a
+refspec; the explicit refspec the tool always passes is what skipped git's
+check.
+
+The remedy gives the branch a destination of its own name: `git branch
+--unset-upstream` where there is one remote, or `git push -u <remote>
+refs/heads/<branch>:refs/heads/<branch>`, whose explicit refspec no
+`remote.<name>.push` mapping can redirect (the short `git push -u <remote>
+<branch>` takes a mapped destination). Cut new work with `--no-track`.
+
+The rule compares the two names and reads nothing else: no remote is
+asked for its default branch, so the answer is the same offline and no
+push url, url rewrite or cached `refs/remotes/<remote>/HEAD` can make it
+wrong. It therefore also refuses a branch whose upstream is a non-default
+branch of another name; measured on the authoring machine on 2026-10-21,
+the only 2 of 40 tracking branches in 19 repositories with an upstream of
+another name both tracked `origin/main`. A local `main` pushed to the
+remote's `main` pushes to its own name and still opens a round;
+`enforcement = "pr-approval"` remains the declaration that refuses it.
+`push.default`, `branch.<name>.pushRemote`, `remote.pushDefault` and
+`remote.<name>.push` never moved the push, which names its remote and
+refspec, and do not now. No grammar, record or exit code changes beyond
+the new refusal.
+
 ## 0.30.1
 
 **The two human verbs defer to the standing instructions.** The adapters

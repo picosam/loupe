@@ -838,8 +838,13 @@ branch with an explicit refspec, runs `git ls-remote`, and stamps the
 reviewer's literal verification command as `Verify:`. Each state is refused
 distinctly: untracked files (add or ignore is the author's call), detached
 HEAD (the push authorization is bounded to a branch), several remotes and no
-upstream (not derivable), rejected push (with git's stderr), post-push
-mismatch (concurrent push), base not an ancestor of head. One auditable
+upstream (not derivable), a destination of another name than the local
+branch (0.31.0: a branch cut from `origin/main` tracks it, and the work
+would land on the default branch before its review ran; refused before
+the commit, under every `[roles] enforcement` value, by comparing the two
+names alone, so no remote is asked and nothing about the remote can make
+the answer wrong), rejected push (with git's stderr), post-push mismatch
+(concurrent push), base not an ancestor of head. One auditable
 exception: a repository with **no remote at all** may emit `--local-only`,
 stamped `LOCAL-ONLY` on the envelope's face — an error when any remote
 exists, so it cannot become a bypass. Credentials embedded in a remote URL
@@ -1065,8 +1070,10 @@ carries the one carrier the round declared.
   the just-closed verdict has exactly one recorded disposition, no fired
   breaker lacks a recorded decision, and, where the repository declares
   `[roles] enforcement = "pr-approval"` (§5.4), the branch under review is
-  not the remote's default branch — refusing as `blocked` before anything
-  is committed, pushed, run or emitted (a finding never dies by omission,
+  not the remote's default branch; under every declared value, the push it
+  would make lands on a branch of the reviewed branch's own name (§5.1,
+  0.31.0) — refusing as `blocked` before anything is committed, pushed,
+  run or emitted (a finding never dies by omission,
   and the next round is not opened until every one is answered); then
   commit, run the local gates at that commit (a blocking one the request
   validator would refuse stops the hand-off before the push, the local
@@ -1377,6 +1384,9 @@ explicit one. Under `pr-approval` the tool does exactly one thing, at the
 author's door: `handoff` refuses when the branch under review IS the remote's
 default branch, because a commit already on it has no pull request for an
 approval to bind to, and the declared pathway would silently not apply.
+Under every value, including `none`, a push to a branch of ANOTHER name than
+the reviewed branch is refused (§5.1, 0.31.0): no declaration makes the
+hand-off the step that merges a reviewed branch.
 Everything else in that pathway is outside a tool that touches no forge —
 opening the pull request, posting the approval, and merging are the agents'
 steps with their own credentials, under their standing instructions.

@@ -849,11 +849,22 @@ class TestTheEnforcementRefusalAtTheVerb(unittest.TestCase):
     def test_a_sibling_slash_branch_opens_the_round(self):
         """The control: `publish`'s default is still `release/main`, but
         this push lands on the sibling `release/work` — not the default
-        — so the round proceeds."""
+        — so the round proceeds.
+
+        0.31.0: the local branch is `release/work` itself, since a hand-off
+        pushes a reviewed branch only to its own name (`work` to
+        `release/work` is refused before this check could matter); and
+        `release/main` EXISTS on `publish`, so `ls-remote --symref` names
+        it — a remote's HEAD naming an unborn branch is not listed
+        (measured), and this control used to pass by that silence rather
+        than by comparing the destination with the default."""
         self._declare('enforcement = "pr-approval"')
-        sh("git", "-C", str(self.repo), "checkout", "-q", "-b", "work")
-        self._add_decoy_and_publish("work", "release/work",
+        sh("git", "-C", str(self.repo), "checkout", "-q", "-b",
+           "release/work")
+        self._add_decoy_and_publish("release/work",
                                     remote_default="release/main")
+        sh("git", "-C", str(self.repo), "push", "-q", "publish",
+           "main:refs/heads/release/main")
         code, rec = self._handoff()
         self.assertEqual(code, 0, rec)
         self.assertEqual(rec["round"], 1)

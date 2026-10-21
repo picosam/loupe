@@ -258,6 +258,132 @@ def _destination_branch(remote: str, remote_ref: str) -> str:
     return remote_ref[len(prefix):]
 
 
+class RenamedPush(RuntimeError):
+    """The push `handoff` would make lands on a branch of ANOTHER NAME than
+    the reviewed branch's (0.31.0; Osama, 2026-10-20).
+
+    Measured in an adopter's repository: a branch cut with `git switch -c
+    <work> origin/main` takes `origin/main` as its upstream (git's default
+    `branch.autoSetupMerge`), `ensure_pushed` pushes the reviewed branch to
+    its upstream by an explicit refspec, and the hand-off fast-forwarded
+    the remote's default branch before the review ran — past the merge
+    procedure that repository requires. git's own `push.default = simple`
+    refuses a push to an upstream of another name when it is made without
+    a refspec; the explicit refspec this tool always passes is what
+    skipped git's check, so the tool makes it itself.
+
+    The rule is the NAME, not the remote's default branch, by Osama's
+    choice of the deterministic option (2026-10-21): three review rounds of
+    lineage L3b14a226c9 each found the default-branch reading answering
+    for the wrong repository — one push url's answer standing for
+    another's, a cached `refs/remotes/<remote>/HEAD` gone stale, a url
+    rewritten twice — and a rule that asks no remote anything has no such
+    domain. It refuses more than the default branch: a branch tracking a
+    non-default branch of another name is refused too, with the same
+    remedy. Measured on 2026-10-21: of 40 tracking branches across the 19
+    repositories on the authoring machine, the 2 with an upstream of
+    another name both tracked `origin/main`.
+
+    Refused under every `[roles] enforcement` value. A local branch named
+    like the default (local `main` to the remote's `main`) pushes to its
+    own name and is not this state (Osama, 2026-10-20: "Allow it");
+    `enforcement = "pr-approval"` is the declaration that refuses it.
+
+    Raised before anything is committed, pushed, run or recorded. Its
+    remedy is the author's — give the branch a destination of its own
+    name — so the CLI maps it to `blocked`.
+    """
+
+    def __init__(self, message: str, remedy: str):
+        super().__init__(message)
+        self.remedy = remedy
+
+
+def refuse_renamed_push(branch: str, remote: str, merge_ref: str,
+                        remotes: list[str]) -> None:
+    """Refuse when pushing local `branch` to `remote`:`merge_ref` would
+    land on a branch of another name.
+
+    `remote` and `merge_ref` are `_resolve_push_destination`'s answer —
+    the destination `ensure_pushed` pushes to by an explicit refspec, so
+    `push.default`, `remote.<name>.push`, `branch.<name>.pushRemote`,
+    `remote.pushDefault`, push urls and url rewriting cannot move the push
+    off it, and none is read here. The comparison is of the two complete
+    names, byte for byte (`release/work` is not `work`, `Work` is not
+    `work`: git compares ref names exactly). Nothing else is read: no
+    remote, no cache, no network, so the answer is the same offline.
+    """
+    destination = _destination_branch(remote, merge_ref)
+    if destination == branch:
+        return
+    # The fix names a configured remote: an upstream may name `.` (this
+    # repository, under `branch.autoSetupMerge = always`) or a url, and
+    # `git push -u .` is no destination of the branch's own.
+    if len(remotes) == 1:
+        target = remotes[0]
+    else:
+        target = remote if remote in remotes else paths.Ph("<remote>")
+    # Round 1 F2 of lineage L3b14a226c9: the source AND the destination
+    # spelt out. `git push -u <remote> <branch>` takes its destination from
+    # a `remote.<name>.push` mapping of that source when one exists, so the
+    # short form could itself land on the default branch; a refspec on the
+    # command line is the one form no configuration redirects.
+    own_ref = f"refs/heads/{branch}"
+    own = paths.command(*paths.lits("git", "push", "-u"), target,
+                        f"{own_ref}:{own_ref}")
+    unset = paths.command(*paths.lits("git", "branch", "--unset-upstream"))
+    fix = (f"`{unset}`, which makes {target}'s {own_ref} the "
+           f"destination, or `{own}`"
+           if len(remotes) == 1 else f"`{own}`")
+    raise RenamedPush(
+        f"the reviewed branch {branch} would be pushed to "
+        f"{remote}:{merge_ref}, a branch of another name: a hand-off pushes "
+        f"a reviewed branch only to its own name, because the other name "
+        f"may be the remote's default branch, and the push would put the "
+        f"work there before the review has run, past whatever procedure "
+        f"the repository merges by. {merge_ref} is {branch}'s upstream, "
+        f"which a branch cut from {remote}/{destination} takes by default "
+        f"(`branch.autoSetupMerge`). Nothing has been committed, pushed, "
+        f"run or recorded",
+        remedy=f"the author gives {branch} a destination of its own name — "
+               f"{fix} — and re-runs; the branch of the other name takes "
+               f"the work by the repository's own merge procedure, after "
+               f"the review")
+
+
+def check_renamed_push(cfg: Config, git=None) -> None:
+    """`refuse_renamed_push` at the hand-off's door (0.31.0), before the
+    ledger is consulted — so a refused push opens no reservation,
+    re-serves no kept request and records nothing.
+
+    The same derivation `ensure_pushed` makes, which applies the same
+    refusal again before its own commit: that one is the guarantee for
+    every verb that pushes, this one is `handoff`'s early answer. A state
+    with no derivable destination — a detached HEAD, no remote, several
+    remotes and no upstream, an upstream outside `refs/heads/` — passes
+    here and meets `ensure_pushed`'s own refusal, still before its commit.
+    The reads are local configuration only; a timeout is the typed
+    refusal every git door raises (0.25.0), never a pass.
+    """
+    repo = cfg.repo_root
+    run = git or (lambda *a: _git(repo, *a, ceiling=git_ceiling(cfg)))
+    timeout = _git_timeout_class()
+    try:
+        branch = run("rev-parse", "--abbrev-ref", "HEAD")
+        if branch == "HEAD":
+            return
+        remotes = [r for r in run("remote").splitlines() if r.strip()]
+        if not remotes:
+            return
+        remote, merge_ref = _resolve_push_destination(repo, branch,
+                                                      remotes, run)
+    except timeout:
+        raise
+    except RuntimeError:
+        return
+    refuse_renamed_push(branch, remote, merge_ref, remotes)
+
+
 def _repo_slug(url: str) -> str:
     """`[HOST/]OWNER/REPO` from a remote URL — the explicit `--repo` value.
 
@@ -935,6 +1061,19 @@ def ensure_pushed(cfg: Config, head: str | None = None,
     sweep = sweep_preflight(changes, scope_paths, allow_outside_scope)
     environment = environment_report()
 
+    # 0.31.0: the destination, derived BEFORE the commit and refused when
+    # it is a branch of another name than the reviewed one
+    # (`refuse_renamed_push`), so that refusal leaves no commit behind.
+    # Derived once: the push below is made to this answer, by an explicit
+    # refspec, so the destination judged here is the destination pushed.
+    # `--local-only` pushes nothing and is judged below, where it always
+    # was.
+    remotes = [r for r in run("remote").splitlines() if r.strip()]
+    destination = None
+    if remotes and not local_only:
+        destination = _resolve_push_destination(repo, branch, remotes, run)
+        refuse_renamed_push(branch, *destination, remotes)
+
     committed = False
     if tracked:
         subject = commit_subject or (
@@ -1065,7 +1204,6 @@ def ensure_pushed(cfg: Config, head: str | None = None,
     effective_roles = resolve_roles(governing, author=author_flag,
                                     reviewer=reviewer_flag)
 
-    remotes = [r for r in run("remote").splitlines() if r.strip()]
     if local_only:
         if remotes:
             raise RuntimeError(
@@ -1086,7 +1224,7 @@ def ensure_pushed(cfg: Config, head: str | None = None,
             "genuinely same-clone, re-run with --local-only, which stamps "
             "that state on the envelope's face")
 
-    remote, merge_ref = _resolve_push_destination(repo, branch, remotes, run)
+    remote, merge_ref = destination
 
     url = _scrub_url(run("remote", "get-url", remote))
 
