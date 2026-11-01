@@ -163,7 +163,7 @@ TOOL_NAME = "loupe"
 #   - the reviewer procedure gains the falsification-anchoring rule (D3):
 #     anchor in the reviewed tree wherever the defect admits it, and name
 #     an external mutable dependency in the finding when it does not.
-TOOL_VERSION = "0.31.0"
+TOOL_VERSION = "0.32.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never
@@ -321,6 +321,7 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_convergence.py": TESTS,
     "review/tests/test_debug_round.py": TESTS,
     "review/tests/test_default_landing.py": TESTS,
+    "review/tests/test_disposition_body.py": TESTS,
     "review/tests/test_human_override.py": TESTS,
     "review/tests/test_command_surface.py": TESTS,
     "review/tests/test_falsification_record.py": TESTS,
@@ -346,6 +347,8 @@ IDENTITY_EXCLUDED = {
     # 0.30.0, brief `loupe-tool-feedback-2026-10-06` items 1 and 2.
     "review/tests/test_emission_tree.py": TESTS,
     "review/tests/test_claim_directory_paths.py": TESTS,
+    # The same brief's item 5 (2026-10-22): respond --from-json's grammar.
+    "review/tests/test_respond_input.py": TESTS,
     "review/tests/test_shadow_round.py": TESTS,
     "review/tests/test_handoff_preflight.py": TESTS,
     # 0.26.0: the real-entry helper and the modules that hold issues #7,

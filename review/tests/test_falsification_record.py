@@ -75,10 +75,14 @@ class TestRecordRequired(unittest.TestCase):
         d = wire.parse_disposition(disposition_envelope([accepted()]))
         self.assertEqual(falsification_errors(
             errs(validate.validate_disposition(d, CFG))), set())
+        # A record that is not an object is refused by the body's grammar
+        # (wire.parse_disposition), by its path, before this rule runs.
         d = wire.parse_disposition(
             disposition_envelope([accepted("passed, trust me")]))
-        self.assertIn("D-FALSIFICATION",
-                      errs(validate.validate_disposition(d, CFG)))
+        items = validate.validate_disposition(d, CFG)
+        self.assertIn("D-JSON-SHAPE", errs(items))
+        self.assertTrue(any("dispositions[0].payload.falsification is the "
+                            "string" in i.message for i in items), items)
 
 
 class TestRecordShape(unittest.TestCase):

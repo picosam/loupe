@@ -222,11 +222,14 @@ class TestF9EveryNonZeroExitIsStructured(unittest.TestCase):
         )
         for argv, what in cases:
             with self.subTest(case=what):
+                # A byte stream under the text one: `respond --from-json -`
+                # reads `sys.stdin.buffer`, as every envelope reader does.
                 stdin = unittest.mock.patch(
-                    "sys.stdin", io.StringIO(json.dumps(
+                    "sys.stdin", io.TextIOWrapper(io.BytesIO(json.dumps(
                         {"verdict_sha": "9" * 40, "head": "8" * 40,
                          "author": "claude", "round": 1,
-                         "dispositions": []})))
+                         "dispositions": []}).encode("utf-8")),
+                        encoding="utf-8"))
                 with stdin:
                     code, out = run_cli(argv)
                 self.assertNotEqual(code, 0, what)

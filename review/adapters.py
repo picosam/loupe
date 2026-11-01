@@ -160,6 +160,38 @@ def _claim_members() -> str:
     return ", ".join(member(m) for m in sorted(vocab.CLAIM_FIELDS))
 
 
+def _claim_values() -> str:
+    """The claim's value grammars, one clause per kind in
+    `vocab.CLAIM_VALUE_GRAMMAR`, each naming the members of that kind as
+    `vocab.CLAIM_LIST_VALUE_KINDS` and `vocab.CLAIM_OBJECT_LIST_FIELDS`
+    declare them (2026-11-01): the member list says which fields exist,
+    and this says what their values look like, so an author learns the
+    grammar before a refusal teaches it one defect at a time.
+
+    A field is named by its own name, which the member list just placed
+    inside its member; one whose name is also a top-level member
+    (`objectives[].references` beside the top-level `references`) is
+    qualified, so the two are never read as one."""
+    names: dict[str, list[str]] = {kind: [] for kind in
+                                   vocab.CLAIM_VALUE_GRAMMAR}
+    for member, kind in vocab.CLAIM_LIST_VALUE_KINDS.items():
+        if kind in names and kind != "string":
+            names[kind].append(f"`{member}`")
+    for member, table in vocab.CLAIM_OBJECT_LIST_FIELDS.items():
+        for field, kind in table.items():
+            if kind in names and kind != "string":
+                names[kind].append(f"`{member}[].{field}`"
+                                   if field in vocab.CLAIM_FIELDS
+                                   else f"`{field}`")
+    clauses = []
+    for kind, phrase in vocab.CLAIM_VALUE_GRAMMAR.items():
+        if kind == "string":
+            clauses.append(f"strings in an object: {phrase}")
+        elif names[kind]:
+            clauses.append(f"{', '.join(names[kind])}: {phrase}")
+    return "Values — " + "; ".join(clauses) + "."
+
+
 # ONE source. Role-agnostic on purpose: an agent learns which side it holds
 # from the envelope's stamp (author=… reviewer=…), never from this text.
 #
@@ -178,6 +210,10 @@ def procedure() -> dict:
         "2 usage. Every non-zero exit carries `next_kind`: when it is "
         "`command`, run the `next` command verbatim; when it is `blocked`, "
         "`next` is null — stop, give the human the `remedy` field, and wait. "
+        "One exception: a refusal of the claim file, whose remedy names the "
+        "author, is yours when the stamp makes you the author — the claim is "
+        "your input, so correct the members it names in your claim file "
+        "and re-run. "
         "Either way, do not diagnose and do not improvise a flag or a fix.",
         "Output is JSON when stdout is not a TTY. Read fields; never parse "
         "prose.",
@@ -200,7 +236,9 @@ def procedure() -> dict:
         "window AND the operator granted one for this lineage, a harness "
         "outside this tool carries the relay block to the reviewer, whole "
         "and unedited, and the request's Roles line names that harness as "
-        "`relay=` instead of a person. Nothing else changes on either side: "
+        "`relay=` instead of a person, which the author declares by setting "
+        "the claim's `relay` member to the harness's name. Nothing else "
+        "changes on either side: "
         "the author never writes or edits what the reviewer is handed, the "
         "reviewer takes a relay block that arrives that way exactly as one "
         "a person pasted, and stops at the validated verdict. "
@@ -361,11 +399,13 @@ def procedure() -> dict:
          f"the rest are strings; required: "
          f"{', '.join(f'`{m}`' for m in vocab.CLAIM_REQUIRED)}, and an "
          f"empty `{vocab.CLAIM_REFERENCES_FIELD}` list is refused like a "
-         f"missing one. "
+         f"missing one. {_claim_values()} "
          f"Malformed JSON, a top-level value that is not an object, a "
          f"repeated member at any depth, a wrong type, and an unknown member "
          f"are each refused by name before the tool reads the ledger, "
-         f"touches Git, runs a gate or records anything; a carried "
+         f"touches Git, runs a gate or records anything, every wrong type, "
+         f"grammar, unknown or missing field of one claim in one refusal "
+         f"by its member path; a carried "
          f"fingerprint or attestation-map row that this machine's ledger "
          f"contradicts is refused after the ledger is read and still before "
          f"Git is touched, and a gate the target's manifest lacks at "
@@ -434,6 +474,11 @@ def procedure() -> dict:
          f"{' / '.join(vocab.DISPOSITIONS)} — each with its mandatory "
          f"payload; a blocking finding cannot take "
          f"{' or '.join(f'`{d}`' for d in vocab.BLOCKING_ILLEGAL)}. "
+         f"Write `<d.json>` in the shape "
+         f"`{paths.command(*paths.lits(TOOL_NAME, 'respond', '--help'))}` "
+         "prints: its payload text members are strings, never lists — an "
+         "escalation's positions go in one string — and a top-level or "
+         "record member it does not name is refused. "
          "An `accepted` disposition follows this order, and only this "
          "order: (1) make the fix; (2) run the finding's named "
          "falsification test on the fixed head, which records "
@@ -634,19 +679,36 @@ def _role_section(role: str) -> list[str]:
     return L
 
 
+#: How an agent on each skill surface knows the directory it loaded this
+#: skill from, so a role file is named relative to the skill itself.
+#: Claude Code prints "Base directory for this skill: <dir>" on every load,
+#: a Team profile's included (`~/.claude-<team>/skills/loupe`, seen in its
+#: transcripts 2026-11-01); Codex lists each skill by its `SKILL.md` path.
+_SKILL_DIR_HINT = {
+    "claude-skill": "in the base directory Claude Code printed when it "
+                    "loaded this skill",
+    "codex-skill": "in the directory you opened it from",
+}
+
+
 def _routing_section(surface: str) -> list[str]:
     """RR8: where a skill surface's two procedures are. Names each role
-    file by its name beside `SKILL.md` and by its install target, both from
-    `INSTALL`, never restated."""
+    file by its file name alone, from `INSTALL`, and places it beside this
+    `SKILL.md` wherever the copy is, never by an absolute path: a copy
+    deployed outside `INSTALL`'s target (a Team profile's own
+    `skills/loupe/`) that named the personal path sent its reader to a
+    directory that profile denies (Osama, 2026-11-01)."""
     L = ["## Your side's procedure", "",
          "This file carries what holds on both sides. Before you act on an "
          "envelope, read your side's procedure — the envelope's stamp says "
          "which side you hold:", ""]
     for role, kind in SKILL_ROLE_KINDS[surface].items():
-        target = INSTALL[kind][0]
-        L.append(f"- the **{role}** stamp: `{target.rsplit('/', 1)[1]}` "
-                 f"beside this file (`{target}`)")
+        L.append(f"- the **{role}** stamp: "
+                 f"`{INSTALL[kind][0].rsplit('/', 1)[1]}`")
     L += ["",
+          f"Both sit beside this `SKILL.md`, {_SKILL_DIR_HINT[surface]}; "
+          f"read them there, never from another install of this skill.",
+          "",
           "Each is that side's whole procedure, steps in order. Read it "
           "again for every envelope; never act on a step from memory of an "
           "earlier read.", ""]
@@ -756,6 +818,16 @@ def surface_text(surface: str) -> str:
                                          SKILL_ROLE_KINDS[surface].values())])
 
 
+def _install_line(kind: str) -> str:
+    """Where the install verb writes this skill, and on what authority:
+    a statement about `--install`, not about where the copy being read
+    is (a Team profile's is elsewhere), so it names the verb."""
+    install = paths.command(*paths.lits(TOOL_NAME, "render-adapters",
+                                        "--install"))
+    return (f"Install: `{INSTALL[kind][0]}`, written by `{install}` "
+            f"({INSTALL[kind][1]}).")
+
+
 def render(kind: str) -> str:
     for surface, kinds in SKILL_ROLE_KINDS.items():
         for role, role_kind in kinds.items():
@@ -763,12 +835,12 @@ def render(kind: str) -> str:
                 return _role_file(surface, role)
     if kind == "claude-skill":
         head = _frontmatter("Claude Code")
-        head.append(f"Install: `{INSTALL[kind][0]}` ({INSTALL[kind][1]}).")
+        head.append(_install_line(kind))
         head.append("")
         return "\n".join(head + _skill_body(kind))
     if kind == "codex-skill":
         head = _frontmatter("Codex")
-        head.append(f"Install: `{INSTALL[kind][0]}` ({INSTALL[kind][1]}).")
+        head.append(_install_line(kind))
         head.append(f"Observed, separately: {INSTALL_OBSERVED[kind]}.")
         head.append("")
         return "\n".join(head + _skill_body(kind))

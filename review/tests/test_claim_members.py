@@ -93,6 +93,26 @@ THE PARTITION:
     judged under its own name. The rename treatment the
     comparison uses is the one `in_scope` has: it judges a rename by its
     target, so a source is never selected and the command must name none.
+  TestEveryShapeDefectInOneRefusal — 2026-11-01: a claim's shape defects
+    are refused together, each by its member path, in one refusal, in the
+    order the first-defect-only validator met them (18 of one adopting
+    repository's refusals were carried-finding shapes found one per run).
+    Every row through a real `loupe handoff` on a copy of a DIRTY
+    fixture: each defect class alone (origin, `fix` a string, `fix[0]`
+    short, in the first and the second entry, `authority` prose, `covers`
+    a string, an empty object string, an unknown member, a missing one, a
+    top-level element's type), whose detail is unchanged; two in one
+    claim, two in one entry, the three carried-finding shapes, three
+    across three members, each named with its alone-detail, in order; the
+    first named is the first the claim's order meets; a shape defect
+    beside a bare directory names only the shape defect, and the
+    directory is then refused in its own place (after the hand-off's
+    commit, where that check has always run); the corrected claim hands
+    off. Every capture refusal: exit 1, blocked, `next` null, refs,
+    index, worktree and ledger byte-identical. MUTATION (manual, recorded
+    in the commit): `emit._Defects` first-defect-only sends the
+    several-defect rows and the first-met row red, and leaves the alone
+    rows, the directory row and the control green.
 """
 from __future__ import annotations
 
@@ -1506,6 +1526,235 @@ class TestScopedMatchesInScope(_Loop):
         with self.subTest(scope=["cp/", "cp2/"], path="end-to-end"):
             self.assert_end_to_end(loop, base, ["cp/", "cp2/"], "copies",
                                    view)
+
+
+class TestEveryShapeDefectInOneRefusal(_Loop):
+    """A claim's shape defects in one refusal (module docstring)."""
+
+    SHA = "a" * 40
+    FP2 = "fp2:fedcba9876543210"
+    CARRIED = {"fingerprint": FP, "origin": "Lfeedbeef00/2",
+               "outcome": "fixed", "fix": [SHA]}
+    OBJECTIVE = {"title": "t", "paths": ["f.txt"],
+                 "authority": "inventory.txt", "covers": ["a"]}
+    OBSERVATION = {"command": "c", "result": "r", "context": "x"}
+
+    #: (case, claim, member path) — one defect each.
+    ALONE = (
+        ("origin not <lineage>/<round>",
+         claim(carried_findings=[{**CARRIED, "origin": "round 2"}]),
+         "carried_findings[0].origin"),
+        ("fix a string, not a list",
+         claim(carried_findings=[{**CARRIED, "fix": SHA}]),
+         "carried_findings[0].fix"),
+        ("fix[0] a short id",
+         claim(carried_findings=[{**CARRIED, "fix": ["abc1234"]}]),
+         "carried_findings[0].fix[0]"),
+        ("fix[0] a short id, in the second entry",
+         claim(carried_findings=[CARRIED, {**CARRIED, "fingerprint": FP2,
+                                           "fix": ["abc1234"]}]),
+         "carried_findings[1].fix[0]"),
+        ("authority written as prose",
+         claim(objectives=[{**OBJECTIVE,
+                            "authority": "the inventory file"}]),
+         "objectives[0].authority"),
+        ("covers a string",
+         claim(objectives=[{**OBJECTIVE, "covers": "a"}]),
+         "objectives[0].covers"),
+        ("an empty string in an object",
+         claim(observations=[{**OBSERVATION, "context": ""}]),
+         "observations[0].context"),
+        ("an unknown member", claim(stop_condition=["x"]),
+         "stop_condition"),
+        ("a missing required member", {"objective": "all defects"},
+         "references"),
+        ("a top-level list element of the wrong type",
+         claim(scope_paths=[1]), "scope_paths[0]"),
+    )
+
+    #: (case, claim, [member paths in the order they must be named]).
+    SEVERAL = (
+        ("two members",
+         claim(carried_findings=[{**CARRIED, "origin": "round 2"}],
+               objectives=[{**OBJECTIVE, "covers": "a"}]),
+         ["carried_findings[0].origin", "objectives[0].covers"]),
+        ("two in one entry",
+         claim(carried_findings=[{**CARRIED, "origin": "round 2",
+                                  "fix": SHA}]),
+         ["carried_findings[0].origin", "carried_findings[0].fix"]),
+        ("three: the carried-finding shapes",
+         claim(carried_findings=[
+             {**CARRIED, "origin": "round 2", "fix": SHA},
+             {**CARRIED, "fingerprint": FP2, "fix": ["abc1234"]}]),
+         ["carried_findings[0].origin", "carried_findings[0].fix",
+          "carried_findings[1].fix[0]"]),
+        ("three across three members",
+         claim(stop_condition=["x"],
+               carried_findings=[{**CARRIED, "fix": ["abc1234"]}],
+               observations=[{**OBSERVATION, "context": ""}]),
+         ["stop_condition", "carried_findings[0].fix[0]",
+          "observations[0].context"]),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.loop = ScratchLoop(_ClassCase(cls),
+                               taxonomy_toml(("High", "Low"), ("High",),
+                                             gates=GATE))
+        # A directory at the target for the tree-check row, and the valid
+        # control's objective authority, read at the target.
+        cls.loop.write("src/a.py", "a\n")
+        cls.loop.write("inventory.txt", "a\n")
+        cls.loop.git("add", "src/a.py", "inventory.txt")
+        cls.loop.git("commit", "-q", "-m", "src and inventory")
+        # A DIRTY tree: a refusal that reached the sweep would commit it.
+        cls.loop.write("g.txt", "outstanding\n")
+        cls.alone_details = {}
+
+    def refused(self, body, case) -> dict:
+        """`loupe handoff` refuses `body` on a copy of the dirty fixture,
+        blocked, moving nothing. Returns the payload."""
+        loop = copy_loop(self, self.loop)
+        before, ledger = loop.snapshot(), self.state_bytes(loop)
+        code, payload = loop.handoff(loop.claim(body, name="refused.json"))
+        self.assertEqual(code, 1, f"{case}: {payload}")
+        self.assertIsInstance(payload, dict, case)
+        self.assertEqual(payload.get("next_kind"), "blocked", case)
+        self.assertIsNone(payload.get("next"), case)
+        self.assertEqual(loop.snapshot(), before, f"{case}: the repo moved")
+        self.assertEqual(self.state_bytes(loop), ledger,
+                         f"{case}: the ledger moved")
+        return payload
+
+    @staticmethod
+    def detail(payload) -> str:
+        prefix = "the claim file "
+        assert payload["error"].startswith(prefix), payload["error"]
+        return payload["error"][len(prefix):]
+
+    def alone(self, member) -> str:
+        """The single-defect detail of the ALONE row naming `member`."""
+        if member not in self.alone_details:
+            for case, body, where in self.ALONE:
+                if where == member:
+                    self.alone_details[where] = self.detail(
+                        self.refused(body, case))
+        return self.alone_details[member]
+
+    def test_a_each_defect_class_alone(self):
+        for case, body, where in self.ALONE:
+            with self.subTest(row=case):
+                payload = self.refused(body, case)
+                self.assertTrue(payload["remedy"].startswith(
+                    f"the author corrects their claim file "), payload)
+                self.assertIn(f"(at {where})", payload["remedy"])
+                self.assertNotIn("defects, each named", payload["error"])
+                self.alone_details[where] = self.detail(payload)
+
+    def test_b_c_several_defects_are_named_in_one_refusal(self):
+        for case, body, members in self.SEVERAL:
+            with self.subTest(row=case):
+                payload = self.refused(body, case)
+                detail = self.detail(payload)
+                # The remedy names the author and every member, in order.
+                self.assertIn(
+                    f"the author corrects their claim file ", payload["remedy"])
+                self.assertIn(f"(at {', '.join(members[:-1])} and "
+                              f"{members[-1]})", payload["remedy"])
+                self.assertTrue(detail.startswith(
+                    f"has {len(members)} defects, each named by its "
+                    f"member: "), detail)
+                at = -1
+                for k, member in enumerate(members, 1):
+                    item = f"({k}) {self.alone(member)}"
+                    self.assertIn(item, detail, member)
+                    self.assertGreater(detail.index(item), at, member)
+                    at = detail.index(item)
+                self.assertNotIn(f"({len(members) + 1}) ", detail)
+
+    def test_o_the_first_named_is_the_first_met(self):
+        """The first defect named is the one the first-defect-only
+        validator reported: the claim's order decides it, not the kind."""
+        body = claim(observations=[{**self.OBSERVATION, "context": ""}],
+                     carried_findings=[{**self.CARRIED,
+                                        "origin": "round 2"}])
+        detail = self.detail(self.refused(body, "observations first"))
+        self.assertIn(f"(1) {self.alone('observations[0].context')}",
+                      detail)
+        self.assertIn(f"(2) {self.alone('carried_findings[0].origin')}",
+                      detail)
+
+    def test_o_a_tree_check_keeps_its_place(self):
+        """A shape defect beside a bare directory: only the shape defect is
+        named, since the claim is refused at capture, before the target
+        tree is read; without it, the directory is refused in its own
+        place, naming the member and the fix."""
+        paths = [{**self.OBJECTIVE, "paths": ["src"]}]
+        payload = self.refused(
+            claim(objectives=paths,
+                  observations=[{**self.OBSERVATION, "context": ""}]),
+            "shape beside a bare directory")
+        self.assertIn("observations[0].context", payload["error"])
+        self.assertNotIn("src", payload["error"])
+        # The tree check runs after the hand-off's commit, as it always
+        # has (`emit.check_directory_paths`), so this half judges the
+        # refusal and its place, not an unmoved tree.
+        loop = copy_loop(self, self.loop)
+        code, payload = loop.handoff(loop.claim(claim(objectives=paths),
+                                                name="directory.json"))
+        self.assertEqual(code, 1, payload)
+        self.assertEqual(payload.get("next_kind"), "blocked", payload)
+        self.assertIn("objectives[0].paths[0] is `src`, write `src/`",
+                      payload["error"])
+        self.assertTrue(payload["remedy"].startswith(
+            "the author adds the trailing `/` to each named path in their "
+            "claim file (at objectives[0].paths[0])"), payload)
+
+    def test_r_every_claim_file_remedy_names_the_author(self):
+        """2026-11-01: a claim-file refusal's remedy says the AUTHOR acts in
+        their claim file, never "a person" — the claim is the author's.
+        Through the real entry point: a claim file that cannot be read, and
+        an attestation_map row naming a gate the manifest lacks; in-process,
+        through the exit both emitting verbs print: an empty path."""
+        loop = copy_loop(self, self.loop)
+        code, payload = loop.loupe("handoff", "--claim-file",
+                                   loop.tmp / "absent.json", "--base",
+                                   loop.base, "--local-only")
+        self.assertEqual((code, payload.get("next_kind")), (1, "blocked"),
+                         payload)
+        self.assertTrue(payload["remedy"].startswith(
+            "the author makes their claim file "), payload)
+        loop = copy_loop(self, self.loop)
+        code, payload = loop.handoff(loop.claim(claim(
+            carried_findings=[self.CARRIED],
+            attestation_map=[{"fingerprint": FP, "gate": "nope"}]),
+            name="gate.json"))
+        self.assertEqual((code, payload.get("next_kind")), (1, "blocked"),
+                         payload)
+        self.assertIn("nope", payload["error"])
+        self.assertTrue(payload["remedy"].startswith(
+            "the author corrects attestation_map in their claim file"),
+            payload)
+        try:
+            cli._capture_claim(types.SimpleNamespace(claim_file=""))
+        except emit.ClaimDefective as exc:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cli._claim_defect_exit(exc), 1)
+            self.assertTrue(json.loads(out.getvalue())["remedy"].startswith(
+                "the author passes a real path to --claim-file"))
+        else:
+            self.fail("an empty --claim-file was admitted")
+
+    def test_v_the_corrected_claim_hands_off(self):
+        """The paired control: the three-defect claim, corrected."""
+        loop = copy_loop(self, self.loop)
+        body = claim(carried_findings=[
+            self.CARRIED, {**self.CARRIED, "fingerprint": self.FP2}],
+            objectives=[self.OBJECTIVE], observations=[self.OBSERVATION])
+        code, payload = loop.handoff(loop.claim(body, name="valid.json"))
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload.get("ok"), True, payload)
 
 
 if __name__ == "__main__":

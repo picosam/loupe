@@ -138,7 +138,10 @@ class TestShadowRound(unittest.TestCase):
         })
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            with unittest.mock.patch("sys.stdin", io.StringIO(payload)):
+            # A byte stream under the text one: `--from-json -` reads
+            # `sys.stdin.buffer`, as every envelope reader does.
+            with unittest.mock.patch("sys.stdin", io.TextIOWrapper(
+                    io.BytesIO(payload.encode("utf-8")), encoding="utf-8")):
                 code = main(["respond", "--verdict", str(fixture),
                              "--from-json", "-"])
         self.assertEqual(code, 0)

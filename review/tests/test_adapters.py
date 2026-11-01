@@ -67,6 +67,76 @@ class TestOneSource(unittest.TestCase):
                     for kind in kinds.values())
                 self.assertEqual(skill[:start] + roles + skill[end:], block)
 
+    def test_the_claim_step_states_each_value_grammar(self):
+        # 2026-11-01: 40 of 45 refused hand-offs in one adopting repository
+        # were claim-grammar refusals the author procedure never explained.
+        # The claim step states each kind's value grammar beside the
+        # members of that kind, derived from the tables, in about 300
+        # characters, on every surface that carries the author's steps.
+        values = adapters._claim_values()
+        for kind in ("instructions-block",
+                     *(k["author"] for k in
+                       adapters.SKILL_ROLE_KINDS.values())):
+            with self.subTest(kind=kind):
+                self.assertIn(values, adapters.render(kind))
+        for phrase in vocab.CLAIM_VALUE_GRAMMAR.values():
+            self.assertIn(phrase, values)
+        for member, kind in vocab.CLAIM_LIST_VALUE_KINDS.items():
+            if kind in vocab.CLAIM_VALUE_GRAMMAR:
+                self.assertIn(f"`{member}`", values)
+        for member, table in vocab.CLAIM_OBJECT_LIST_FIELDS.items():
+            for field, kind in table.items():
+                if kind in vocab.CLAIM_VALUE_GRAMMAR and kind != "string":
+                    with self.subTest(field=f"{member}[].{field}"):
+                        self.assertRegex(values, rf"`(?:{re.escape(member)}"
+                                                 rf"\[\]\.)?{field}`")
+        # A field named like a top-level member is qualified, so an
+        # objective's list of strings is never read as the reference
+        # manifest.
+        self.assertIn("`objectives[].references`", values)
+        self.assertNotRegex(values, r"(?<!\.)`references`")
+        self.assertLessEqual(len(values), 360, values)
+
+    def test_a_claim_file_refusal_is_the_authors_to_correct(self):
+        # 2026-11-01: a claim-file refusal's remedy names the author
+        # (`cli._claim_defect_exit`, `emit.check_directory_paths`,
+        # `emit.check_map_gates`), so the blocked rule says that one
+        # remedy is the author's to carry out, and only that one.
+        for kind in adapters.SURFACES:
+            with self.subTest(kind=kind):
+                text = " ".join(adapters.surface_text(kind).split())
+                self.assertIn(
+                    "One exception: a refusal of the claim file, whose "
+                    "remedy names the author, is yours when the stamp makes "
+                    "you the author", text)
+                self.assertIn("stop, give the human the `remedy` field, "
+                              "and wait", text)
+
+    def test_no_skill_file_names_a_side_file_by_an_absolute_path(self):
+        # Osama, 2026-11-01: the Team profiles' copy of the Claude skill
+        # named `~/.claude/skills/loupe/author.md`, a personal-profile path
+        # every Team profile denies, and agents were refused ~25 times in
+        # two weeks following it. A side file is named relative to the skill
+        # itself; this holds on every rendered file of every skill surface
+        # and on the instruction block, so no install location reads wrong.
+        side = "|".join(re.escape(name) for name in sorted(
+            {adapters.INSTALL[kind][0].rsplit("/", 1)[1]
+             for kinds in adapters.SKILL_ROLE_KINDS.values()
+             for kind in kinds.values()}))
+        # An absolute path starts at `~`, an environment variable or `/`,
+        # and not inside a relative one (`adapters/claude/author.md`).
+        absolute = re.compile(
+            rf"(?<![\w.~$/-])(?:~|\$\{{?\w+\}}?|/)[^\s`()]*/(?:{side})\b")
+        kinds = ["instructions-block"] + [
+            kind for surface, roles in adapters.SKILL_ROLE_KINDS.items()
+            for kind in (surface, *roles.values())]
+        for kind in kinds:
+            with self.subTest(kind=kind):
+                text = adapters.render(kind)
+                self.assertIsNone(absolute.search(text), kind)
+                self.assertNotRegex(
+                    text, rf"~/\.claude/skills/[^\s`]*/(?:{side})")
+
     def test_skill_frontmatter(self):
         for kind in ("claude-skill", "codex-skill"):
             text = adapters.render(kind)
@@ -141,6 +211,53 @@ class TestOneSource(unittest.TestCase):
         # spec_path() resolves the design text in the workbench (public/docs)
         # and in the published candidate (docs/) alike.
         self.assertIn("Trust model — one principal", spec_path().read_text())
+
+    def test_the_window_clause_names_the_claim_member_behind_relay(self):
+        """Brief `adapter-names-claim-relay-member` (finding 4 of Codex's
+        status review, 2026-10-22): the agent-relayed-window clause says
+        the author puts the harness on the Roles line through the claim's
+        `relay` member, on every surface, and that member is one the claim
+        grammar admits. That the member renders as `relay=` is
+        test_role_stamp's to prove. Mutations: drop the words naming the
+        member from `review/adapters.py` and the surface assertion fails;
+        rename the member in `vocab.CLAIM_STRING_FIELDS` and the grammar
+        assertion fails."""
+        self.assertIn("relay", vocab.CLAIM_FIELDS)
+        for surface in adapters.SURFACES:
+            with self.subTest(surface=surface):
+                text = " ".join(adapters.surface_text(surface).split())
+                both = text[text.index("both sides"):
+                            text.index("author stamp")]
+                clause = both[both.index("agent-relayed window"):]
+                self.assertIn(
+                    "names that harness as `relay=` instead of a person, "
+                    "which the author declares by setting the claim's "
+                    "`relay` member to the harness's name", clause)
+
+    def test_the_respond_step_sends_the_author_to_the_input_shape(self):
+        """Brief `loupe-publication-input-compat` (Osama, 2026-11-01: keep
+        the refusals, and keep skills out of the trap): the respond step
+        names the shape `respond --help` prints and the measured trap, an
+        escalation's positions as a list, on every surface, and the member
+        it names is one the input reads as text. That `--help` prints the
+        shape is test_respond_input's to prove. Mutations: drop the
+        sentence from `review/adapters.py` and the surface assertion fails;
+        take `positions` out of the payload's text members and the grammar
+        assertion fails."""
+        from review import cli
+        self.assertIn("positions", vocab.DISPOSITION_PAYLOADS["escalated"])
+        self.assertIn("positions", cli.RESPOND_PAYLOAD_TEXT)
+        for surface in adapters.SURFACES:
+            with self.subTest(surface=surface):
+                text = " ".join(adapters.surface_text(surface).split())
+                step = text[text.index("Exactly one disposition per "
+                                       "finding"):]
+                self.assertIn(
+                    "Write `<d.json>` in the shape `loupe respond --help` "
+                    "prints: its payload text members are strings, never "
+                    "lists — an escalation's positions go in one string — "
+                    "and a top-level or record member it does not name is "
+                    "refused.", step)
 
     def test_transport_verbs_are_the_procedure(self):
         text = adapters.render("claude-skill")
@@ -730,6 +847,13 @@ class TestShippedRestatements(unittest.TestCase):
         "claim_required (readme)": (vocab.CLAIM_REQUIRED, "readme",
                                     r"\$ cat > \S*claim\.json <<'EOF'\n(.*?)\nEOF",
                                     "_json_keys"),
+        # 2026-11-01: the top-level members in the `scope_paths` grammar,
+        # named since by the claim step's value grammars; the specification
+        # lists them where it states that grammar.
+        "claim pattern members": (
+            tuple(m for m, kind in vocab.CLAIM_LIST_VALUE_KINDS.items()
+                  if kind == "scope_paths"), "design",
+            r"The claim's path patterns \((.*?)each objective's", "_ticked"),
     }
 
     #: Authorities no shipped document enumerates. Kept explicit, and kept
@@ -2793,7 +2917,20 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
         "CLAIM_OBJECT_TOGETHER": {"CLAIM_OBJECT_TOGETHER": lambda v: (
             {m: ((f"zz-{m}-one", f"zz-{m}-two"),) for m in v},
             [s for m in v for s in (f"zz-{m}-one", f"zz-{m}-two")])},
+        # 2026-11-01: the claim step's value grammars. A top-level list
+        # member of a grammar kind is named in it; each kind's PHRASE is
+        # what renders (its key is an internal kind name), so the patch
+        # replaces every phrase.
+        "CLAIM_LIST_VALUE_KINDS": {"CLAIM_LIST_VALUE_KINDS": lambda v: (
+            {**v, "zz-list-member": "scope_paths"}, ["zz-list-member"])},
+        "CLAIM_VALUE_GRAMMAR": {"CLAIM_VALUE_GRAMMAR": lambda v: (
+            {k: f"zz-grammar-{k}" for k in v},
+            [f"zz-grammar-{k}" for k in v])},
     }
+
+    #: Derived mappings whose VALUES render rather than their keys; the
+    #: unpatched control looks for those.
+    RENDERED_BY_VALUE = frozenset({"CLAIM_VALUE_GRAMMAR"})
 
     #: Vocabularies the advisory scan may flag in adapter text without a
     #: derived enumeration standing behind them, each with the reason the
@@ -3066,6 +3203,8 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
                 for attr, fixed in attrs.items():
                     value = getattr(vocab, attr)
                     members = ([value] if isinstance(value, str)
+                               else list(value.values())
+                               if attr in self.RENDERED_BY_VALUE
                                else self._members_of(value))
                     for member in members:
                         with self.subTest(kind=kind, vocabulary=name,

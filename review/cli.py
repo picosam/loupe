@@ -1,14 +1,17 @@
 """CLI (design §9bis.3): exit codes mean exactly one thing — 0 ok, 1 findings,
 2 usage. Every non-zero exit declares its recovery, never a diagnosis:
 `next_kind: command` carries the next command in `next`; `next_kind: blocked`
-carries `next: null` and a `remedy` a person must act on (`_blocked` below).
+carries `next: null` and a `remedy` naming who must act — a person, or the
+author for the author's own claim file (`_blocked` below).
 Structured output when stdout is not a TTY; the agent never parses prose.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+import textwrap
 from pathlib import Path
 
 from . import (FORMER_NAMES, TOOL_NAME, TOOL_VERSION, adapters, brief, config,
@@ -17,10 +20,10 @@ from .digest import sha256_file, sha256_text
 from .ledger import (AmbiguousLineage, Ledger, known_branch,
                      render_convergence_md, render_cross_lineage_md,
                      render_report_md)
-from .validate import (Item, accepted_tags, errors_in, scope_items,
-                       validate_authorization,
-                       validate_disposition, validate_request,
-                       validate_verdict)
+from .validate import (ESCALATION_ALTERNATIVES, Item, accepted_tags,
+                       disposition_body_items, errors_in, scope_items,
+                       validate_authorization, validate_disposition,
+                       validate_request, validate_verdict)
 
 EXIT_OK, EXIT_FINDINGS, EXIT_USAGE = 0, 1, 2
 
@@ -302,7 +305,9 @@ def _blocked(next_cmd: str, why: str, code: int = EXIT_FINDINGS,
     field instead of on the shape of a string:
 
       command — `next` is a literal argv an agent runs verbatim.
-      blocked — `next` is null and `remedy` says what a PERSON must do.
+      blocked — `next` is null and `remedy` says what a PERSON must do —
+                or, for a refusal of the author's own claim file, what the
+                AUTHOR corrects there before re-running (2026-11-01).
 
     Blocked is a real state, not a gap to be papered over with an invented
     command: malformed TOML, a merge only a human can arbitrate, an envelope
@@ -559,6 +564,206 @@ def cmd_fingerprint(args, cfg) -> int:
     return EXIT_OK
 
 
+# ------------------------------------------------ respond's --from-json input
+#
+# loupe-tool-feedback item 5 (2026-10-22; observed in an adopter's round
+# at 0.29.0 and still true at 0.30.0). The author's judgment file was read
+# as `data["head"]` and `data["dispositions"]`, so a file without `head`
+# refused as `{"error": "'head'", "next": "loupe respond --help"}` — a
+# KeyError's repr, exit 2 — and `--help` named no member. Measured with
+# `--out` on the code before this block existed: a top level or a payload
+# that is not an object reached an AttributeError traceback; a record
+# written as an array of pairs was read as an object; an unknown top-level
+# member was dropped from the envelope in silence; null for an optional
+# member, `"round": "1"`, and a wrong kind for a payload text member or a
+# `note` exited 0 and wrote the file; and a lone surrogate created the
+# `--out` file empty before the encode failed.
+#
+# One closed grammar, declared ONCE, in `review/wire.py` (the disposition
+# body's tables and the one walker over them, `disposition_body_defects`,
+# moved there the same day so the envelope reader could share them: wire
+# cannot import this module). It is read four ways: by the envelope reader
+# (`wire.parse_disposition`, for `validate` and `ledger add`), by this
+# verb's input reader (`_respond_input`), by `--from-json`'s help, and by
+# the tests that partition each door (`test_respond_input.py`,
+# `test_disposition_body.py`). Every refusal names the member by its JSON
+# path and the kind it expected. The grammar types what the tool READS, so
+# nothing is stringified or crashes on its way to the validator; the closed
+# vocabularies and the per-term payload rules stay `validate_disposition`'s,
+# whose items carry the same paths.
+
+#: The top level of the author's INPUT: the body's (`wire.DISPOSITION_TOP`)
+#: with two members narrowed. A supplied `author` is an actor identifier,
+#: where the body admits the configured role as written; a supplied `round`
+#: is positive, because `--out` compares it with a recorded round, where
+#: the body admits the 0 a preview carries. CLOSED like the body:
+#: `emit_disposition` rebuilds the body from these five. Built from pairs
+#: (`test_command_boundary` reads a dict literal here as a result key); a
+#: later pair replaces an earlier one in place, so the order is the body's.
+RESPOND_TOP = dict((*wire.DISPOSITION_TOP.items(),
+                    ("author", ("actor", False)),
+                    ("round", ("round", False))))
+
+#: One disposition record, the payload's text members and the
+#: falsification record's: the body's own, unnarrowed.
+RESPOND_RECORD = wire.DISPOSITION_RECORD
+RESPOND_PAYLOAD_TEXT = wire.DISPOSITION_PAYLOAD_TEXT
+RESPOND_FALSIFICATION_TEXT = wire.DISPOSITION_FALSIFICATION_TEXT
+
+
+class RespondInputDefect(ValueError):
+    """`respond --from-json` was handed something that is not a disposition
+    file. `member` is the JSON path (empty for the file as a whole), and
+    `usage` marks the two defects of the invocation rather than of the
+    file — an empty path and one that cannot be opened — which keep the
+    usage exit every unreadable path argument of this verb has."""
+
+    def __init__(self, member: str, detail: str, *, defect: str,
+                 usage: bool = False):
+        super().__init__(detail)
+        self.member = member
+        self.detail = detail
+        self.defect = defect
+        self.usage = usage
+
+
+def _respond_input(arg: str) -> dict:
+    """The author's dispositions: read once, decoded, parsed and closed
+    against `RESPOND_TOP` and the body's record grammar by the walker the
+    envelope reader shares (`wire.disposition_body_defects`), or
+    RespondInputDefect naming the FIRST defect.
+
+    `-` reads standard input as bytes, like every envelope reader of this
+    CLI, so a non-UTF-8 byte is named as one rather than decoded by the
+    locale into something else."""
+    if not arg.strip():
+        raise RespondInputDefect(
+            "", "--from-json was given an empty path, which names no file; "
+                "pass the dispositions file, or - to read it from standard "
+                "input", defect="empty_path", usage=True)
+    if arg == "-":
+        raw = sys.stdin.buffer.read()
+    else:
+        try:
+            raw = Path(arg).read_bytes()
+        except OSError as exc:
+            raise RespondInputDefect(
+                "", f"--from-json {arg}: {exc.strerror or exc} — it names "
+                    f"no readable file", defect="unreadable",
+                usage=True) from exc
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RespondInputDefect(
+            "", f"is not UTF-8 text: {exc.reason} at byte {exc.start}",
+            defect="encoding") from exc
+    if not text.strip():
+        raise RespondInputDefect(
+            "", "is empty; expected a JSON object carrying head and "
+                "dispositions", defect="empty")
+    try:
+        data = wire.load_json(text)
+        first = next(wire.disposition_body_defects(data, RESPOND_TOP), None)
+    except wire.DuplicateMember as exc:
+        path = wire.duplicate_member_path(text) or exc.name
+        raise RespondInputDefect(
+            path, f"member {exc.name!r} is stated more than once, at "
+                  f"{path}; every member is single-valued, and the tool "
+                  f"will not choose between two declarations",
+            defect="duplicate") from exc
+    except wire.NumberOutOfRange as exc:
+        raise RespondInputDefect(
+            exc.path, f"{exc.msg} (line {exc.lineno}, column {exc.colno})",
+            defect="number") from exc
+    except json.JSONDecodeError as exc:
+        raise RespondInputDefect(
+            "", f"is not valid JSON: {exc.msg} (line {exc.lineno}, column "
+                f"{exc.colno})", defect="syntax") from exc
+    except RecursionError as exc:
+        raise RespondInputDefect(
+            "", "nests deeper than the reader can follow; a disposition "
+                "file needs a handful of levels", defect="depth") from exc
+    if first is not None:
+        raise RespondInputDefect(first.path, first.detail,
+                                 defect=first.defect)
+    return data
+
+
+def _respond_input_exit(arg: str, exc: RespondInputDefect) -> int:
+    """The one recovery for a disposition file that is not one: blocked,
+    exit 1 — a person edits the file, and no flag repairs it — except the
+    invocation's own two defects, which keep this verb's usage exit."""
+    help_cmd = paths.command(*paths.lits(TOOL_NAME, "respond", "--help"))
+    if exc.usage:
+        return _usage_exit(help_cmd, exc.detail)
+    source = ("--from-json - (standard input)" if arg == "-"
+              else f"--from-json {paths.display_path(arg)}")
+    target = (f"{exc.member} in it" if exc.member else "it")
+    return _blocked(
+        "", f"{source}: {exc.detail}",
+        remedy=f"a person corrects {target} and re-runs this command; "
+               f"`{help_cmd}` shows the shape under --from-json, and the "
+               f"tool will not edit the author's own input file")
+
+
+def _respond_shape_help() -> str:
+    """`--from-json`'s help: the grammar above, rendered from it and from
+    the vocabularies, never restated."""
+    terms = "|".join(vocab.DISPOSITIONS)
+    status, mutation = vocab.FALSIFICATION_RECORD
+    lines = [
+        "JSON file of the author's dispositions, or - for stdin.",
+        "Shape (? marks an optional member):",
+        '{"head": <40-hex commit this answer produced>,',
+        ' "dispositions": [{"finding_id": <the verdict\'s finding id>,',
+        f'   "disposition": {terms},',
+        '   "payload": {...}, "subtype"?: '
+        + "|".join(vocab.ACCEPTED_SUBTYPES) + '|null, "note"?: <string>}],',
+        ' "author"?: <actor>, "round"?: <positive integer>,',
+        ' "verdict_sha"?: <40-hex>}',
+        "payload, by disposition:",
+    ]
+    for term, members in vocab.DISPOSITION_PAYLOADS.items():
+        text = ", ".join(members)
+        if term == "accepted":
+            text += (f", falsification?: {{{status}: "
+                     f"{'|'.join(vocab.FALSIFICATION_STATUSES)}, {mutation}: "
+                     f"{'|'.join(vocab.MUTATION_OUTCOMES)}, note?}}; with "
+                     f"subtype {vocab.ACCEPTED_SUBTYPES[0]} also "
+                     f"{', '.join(vocab.TEST_AMENDED_PAYLOAD)}")
+        if term == "escalated":
+            text += ", and " + " or ".join(
+                " + ".join(option) for option in ESCALATION_ALTERNATIVES)
+        lines.append(f"  {term}: {text}")
+    lines += [
+        "Those payload members are strings; any other payload member is "
+        "carried as written.",
+        "author, round and verdict_sha derive from the recorded round, and "
+        "fingerprint and severity from the verdict: a supplied one may "
+        "only agree.",
+        "Any other top-level or record member is refused, by its JSON "
+        "path.",
+    ]
+    return "\n".join(lines)
+
+
+class _LayoutHelpFormatter(argparse.HelpFormatter):
+    """argparse's wrapping, except that a help text carrying newlines keeps
+    them: each line is wrapped on its own and keeps its indentation, so a
+    grammar keeps its layout. A one-line help wraps exactly as before."""
+
+    def _split_lines(self, text, width):
+        if "\n" not in text:
+            return super()._split_lines(text, width)
+        lines = []
+        for line in text.splitlines():
+            indent = " " * (len(line) - len(line.lstrip()))
+            lines.extend(textwrap.wrap(
+                line.strip(), max(width, 20), initial_indent=indent,
+                subsequent_indent=indent + "  ") or [""])
+        return lines
+
+
 def cmd_respond(args, cfg) -> int:
     # Round 4 F2, the half this verb owns: `close` has always accepted `-`
     # and read the verdict from stdin, and this verb did not — so the relay
@@ -650,22 +855,15 @@ def cmd_respond(args, cfg) -> int:
                        f"`{report_cmd}` shows which round is open")
     # `-` reads the dispositions from stdin, so an agent can pipe them and a
     # read-only surface can exercise the command without writing a file.
-    raw = (sys.stdin.read() if args.from_json == "-"
-           else Path(args.from_json).read_text(encoding="utf-8"))
+    # The author's judgment file goes through the same duplicate-refusing
+    # boundary as every envelope body (lineage-3 round 4 F1): two
+    # `disposition` members for one finding is not a choice the tool makes
+    # on the author's behalf — and then through its own closed grammar
+    # (`_respond_input`), which names any defect by its JSON path.
     try:
-        # The author's judgment file goes through the same duplicate-
-        # refusing boundary as every envelope body (lineage-3 round 4 F1):
-        # two `disposition` members for one finding is not a choice the
-        # tool makes on the author's behalf.
-        data = wire.load_json(raw)
-    except wire.DuplicateMember as exc:
-        return _blocked(
-            "",
-            f"{args.from_json} states JSON member {exc.name!r} more than "
-            f"once; every member is single-valued, and the tool will not "
-            f"choose between two declarations",
-            remedy=f"a person removes the repeated member from "
-                   f"{args.from_json} and re-runs this command")
+        data = _respond_input(args.from_json)
+    except RespondInputDefect as exc:
+        return _respond_input_exit(args.from_json, exc)
     if args.out and recorded is not None:
         for key, derived in (("round", recorded["round"]),
                              ("verdict_sha", recorded["sha"])):
@@ -1013,6 +1211,17 @@ def _dispositions_answered(ledger: Ledger, verdict,
 def cmd_ledger_add(args, cfg) -> int:
     text = _read_envelope(args.envelope)
     kind, parsed = _detect_and_parse(text)
+    # A disposition body that is not the declared shape refuses here,
+    # before the lineage, the ledger or the verdict it answers is read:
+    # `answered_verdict` and the author check read its `round` with `int()`
+    # and its records with `.get`, and a body the reader refused has no
+    # round or record to read (`wire.parse_disposition`). The recovery is
+    # the one every refused envelope at this door has: `validate` names
+    # the items.
+    if kind == "disposition" and parsed.body_defects:
+        return _finish(disposition_body_items(parsed),
+                       paths.command(*paths.lits(TOOL_NAME, "validate"),
+                                     args.envelope))
     ledger = _ledger(cfg, args)
     # The lineage this envelope belongs to: the one its SHA resolves to
     # through the request that carries it, else this branch's open one,
@@ -1467,9 +1676,10 @@ def _claim_unreadable_exit(args, exc: "emit.ClaimUnreadable") -> int:
     error, never mistaken for "no claim given"."""
     return _blocked(
         "", f"the claim file could not be read ({exc})",
-        remedy=f"a person must make {args.claim_file} readable, or pass a "
-               f"different --claim-file; the tool will not emit a request "
-               f"whose authored Claim it could not load")
+        remedy=f"the author makes their claim file {args.claim_file} "
+               f"readable, or passes a different --claim-file, and re-runs "
+               f"this command; the tool will not emit a request whose "
+               f"authored Claim it could not load")
 
 
 def _claim_defect_exit(exc: "emit.ClaimDefective") -> int:
@@ -1481,20 +1691,27 @@ def _claim_defect_exit(exc: "emit.ClaimDefective") -> int:
     declared member of the wrong type; an unknown member; and malformed JSON,
     which escaped as a raw JSONDecodeError, the one input defect the tool
     answered with a traceback rather than a structured refusal. They all
-    arrive here now: the defect and its location are named, and a person
+    arrive here now: the defect and its location are named, and the author
     edits the file — the tool will not edit the author's own input.
+
+    2026-11-01: the remedy names the AUTHOR, who owns the claim (the
+    procedure: "It is your judgment; the tool carries it"), not "a
+    person", and every member a gathered refusal names (`exc.members`).
     """
-    where = f" (at {exc.member})" if exc.member else ""
+    members = exc.members
+    where = (f" (at {members[0]})" if len(members) == 1 else
+             f" (at {', '.join(members[:-1])} and {members[-1]})"
+             if members else "")
     if exc.path is None:
         # The defect is in the invocation, so there is no file to correct.
-        remedy = ("a person passes a real path to --claim-file, or omits the "
-                  "option entirely — omission is the recorded no-claim "
+        remedy = ("the author passes a real path to --claim-file, or omits "
+                  "the option entirely — omission is the recorded no-claim "
                   "state, and an empty path is not the same invocation")
     else:
-        remedy = (f"a person corrects {exc.path}{where} and re-runs this "
-                  f"command; the tool will not edit the author's own input "
-                  f"file, and will not emit a request whose authored Claim "
-                  f"it could not read as one")
+        remedy = (f"the author corrects their claim file {exc.path}{where} "
+                  f"and re-runs this command; the tool will not edit the "
+                  f"author's own input file, and will not emit a request "
+                  f"whose authored Claim it could not read as one")
     return _blocked("", f"the claim file {exc.detail}", remedy=remedy)
 
 
@@ -3578,10 +3795,11 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("verdict")
     f.set_defaults(func=cmd_fingerprint)
 
-    r = sub.add_parser("respond", help="emit a disposition envelope")
+    r = sub.add_parser("respond", help="emit a disposition envelope",
+                       formatter_class=_LayoutHelpFormatter)
     r.add_argument("--verdict", required=True)
     r.add_argument("--from-json", required=True,
-                   help="JSON file of author dispositions, or - for stdin")
+                   help=_respond_shape_help())
     r.add_argument("--out", help="write the envelope here AND record it in "
                                  "the ledger (stdout emission records nothing)")
     r.set_defaults(func=cmd_respond)

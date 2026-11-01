@@ -12,7 +12,9 @@ distinct state it is (absent != none).
 from __future__ import annotations
 
 import json
+import math
 import re
+import sys
 from dataclasses import dataclass, field
 
 from . import paths, shape_identity, tool_identity, vocab
@@ -251,7 +253,9 @@ class Disposition:
     wrapped: bool
     exact: bool = False  # the wrapper spans the whole document (F16)
     attr_defects: tuple = ()  # repeated / malformed wrapper attributes
-    body_defects: tuple = ()  # repeated JSON members in the body
+    # (code, message) for a body that is unreadable, repeats a member, or
+    # is not the declared shape; `data` is {} whenever there is one.
+    body_defects: tuple = ()
 
 
 @dataclass
@@ -780,10 +784,119 @@ class DuplicateMember(ValueError):
         self.name = name
 
 
+class NumberOutOfRange(json.JSONDecodeError):
+    """A JSON number this reader cannot carry (lineage L369bb23a2f, round 1
+    F3). The interpreter raised a plain ValueError for an integer of more
+    than `sys.get_int_max_str_digits()` digits, which no reader typed:
+    `respond --from-json`, `validate` and `ledger add` left by the usage
+    exit naming no member. Beside it, a number past a double's range read
+    as infinity, and `NaN`, `Infinity` and `-Infinity`, which JSON does not
+    have, read as themselves; `respond` then wrote `Infinity` or `NaN` into
+    an envelope body that is no longer JSON.
+
+    A `json.JSONDecodeError`, so every reader that already types malformed
+    JSON types this too with nothing added there; `path` is the number's
+    JSON path, empty for the top level, for the readers that refuse by
+    path, and `msg` is the sentence naming it."""
+
+    def __init__(self, msg: str, doc: str, pos: int, path: str):
+        super().__init__(msg, doc, pos)
+        self.path = path
+
+
+class _Uncarried:
+    """A number token `load_json` read and cannot carry, held in its place
+    until the whole text is read, so the refusal can say where it is."""
+
+    __slots__ = ("token", "why")
+
+    def __init__(self, token: str, why: str):
+        self.token, self.why = token, why
+
+
+_NON_JSON_NUMBERS = ("NaN", "Infinity", "-Infinity")
+
+
+def _number(token: str):
+    """The value one number token reads as, or `_Uncarried`: THE numeric
+    limit, applied by the decoder's three hooks and by the locator that
+    finds the token's position. An integer token is read exactly or not at
+    all (the interpreter's digit limit, the one ValueError `int` raises on
+    a JSON integer token); any other number reads as a finite double."""
+    if token in _NON_JSON_NUMBERS:
+        return _Uncarried(token, "constant")
+    if not any(c in token for c in ".eE"):
+        try:
+            return int(token)
+        except ValueError:
+            return _Uncarried(token, "digits")
+    value = float(token)
+    if math.isinf(value):
+        return _Uncarried(token, "range")
+    return value
+
+
+#: A JSON string or number token, for locating a number in text that has
+#: already been read: outside a string, every digit belongs to a number.
+_JSON_TOKEN_RE = re.compile(
+    r'"[^"\\]*(?:\\.[^"\\]*)*"|-?Infinity|NaN'
+    r'|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?')
+
+
+def _uncarried_error(text: str, data) -> NumberOutOfRange:
+    """The refusal of the FIRST number `text` cannot carry: its JSON path
+    from a pre-order walk of `data` (iterative, so no depth the decoder
+    accepted defeats it) and its position from the first such token in
+    the text, which is the same number because both orders are the text's."""
+    path, number = "", None
+    stack = [("", data)]
+    while stack:
+        here, value = stack.pop()
+        if isinstance(value, _Uncarried):
+            path, number = here, value
+            break
+        if isinstance(value, dict):
+            stack.extend((json_path(here, k), v)
+                         for k, v in reversed(list(value.items())))
+        elif isinstance(value, list):
+            stack.extend((json_path(here, i), v)
+                         for i, v in reversed(list(enumerate(value))))
+    pos = next((m.start() for m in _JSON_TOKEN_RE.finditer(text)
+                if m.group()[0] != '"'
+                and isinstance(_number(m.group()), _Uncarried)), 0)
+    where = path or "the top level"
+    token = number.token
+    shown = token if len(token) <= 60 else token[:57] + "..."
+    remedy = "state it as a string, or as the number it should be"
+    if number.why == "digits":
+        msg = (f"{where} is an integer of {len(token.lstrip('-'))} digits; "
+               f"this reader reads an integer of at most "
+               f"{sys.get_int_max_str_digits()} digits, exactly, and refuses "
+               f"a longer one rather than misread it — {remedy}")
+    elif number.why == "range":
+        msg = (f"{where} is the number {shown}, past the range of a "
+               f"double; it would read as infinity, which JSON cannot state "
+               f"— {remedy}")
+    else:
+        msg = (f"{where} is {token}, which is not a JSON number (JSON has "
+               f"no NaN or infinity) — {remedy}")
+    return NumberOutOfRange(msg, text, pos, path)
+
+
 def load_json(text: str):
     """json.loads with repeated object members refused (DuplicateMember)
-    at every depth; other JSON errors raise json.JSONDecodeError as usual.
-    Every JSON body an envelope or a gate carries is read through this."""
+    at every depth, and every number this reader cannot carry refused
+    (NumberOutOfRange, itself a json.JSONDecodeError); other JSON errors
+    raise json.JSONDecodeError as usual. Every JSON body an envelope or a
+    gate carries, and every claim, is read through this.
+
+    THE NUMERIC LIMIT, deliberate: an integer of at most
+    `sys.get_int_max_str_digits()` digits, read exactly, the same limit
+    every writer of this tool writes an integer back under; any other
+    number as a finite double, rounded as Python's float rounds (an
+    underflow reads as zero). Refused: a longer integer, a number past a
+    double's range, and `NaN`, `Infinity` and `-Infinity`, which Python's
+    reader admits and JSON does not."""
     def hook(pairs):
         seen: dict = {}
         for k, v in pairs:
@@ -791,7 +904,18 @@ def load_json(text: str):
                 raise DuplicateMember("", k)
             seen[k] = v
         return seen
-    return json.loads(text, object_pairs_hook=hook)
+    uncarried = []
+
+    def number(token: str):
+        value = _number(token)
+        if isinstance(value, _Uncarried):
+            uncarried.append(value)
+        return value
+    data = json.loads(text, object_pairs_hook=hook, parse_int=number,
+                      parse_float=number, parse_constant=number)
+    if uncarried:
+        raise _uncarried_error(text, data)
+    return data
 
 
 # ------------------------------------------------------------ dialect fence
@@ -1000,23 +1124,388 @@ def parse_authorization(text: str) -> Authorization:
         attr_defects=wrapper_attr_defects(text), body_defects=body_defects)
 
 
+# ------------------------------------------------------ the disposition body
+#
+# loupe-tool-feedback item 5, the envelope half (2026-10-22). `respond
+# --from-json` closed the grammar of its INPUT that day; the body an
+# envelope carries was still read as whatever `json.loads` returned, and
+# only when it began with `{`. A body that was empty, not JSON or not an
+# object read as `{}` and validated as an answer with no records; a record
+# that was not an object reached an AttributeError traceback inside
+# `validate_disposition`, and a list `finding_id`, a malformed body or a
+# string `round` a TypeError or ValueError that left `loupe validate` and
+# `loupe ledger add` by the usage exit, naming no member; and a lone
+# surrogate in a payload reached the ledger's encoder after the rows before
+# it were appended.
+#
+# One grammar, declared here, and ONE walker over it
+# (`disposition_body_defects`), read by the envelope reader below and by
+# `respond`'s input reader (`review.cli._respond_input`), which narrows two
+# members of the top level (`review.cli.RESPOND_TOP`). Built from pairs,
+# the precedent `transport._LEGACY_ENUM_TYPES` set, because `review/cli.py`
+# re-exports them and its advisory scan reads a dict literal as a result
+# key.
+
+#: What an `escalated` disposition must name beside its mandatory payload
+#: (§5.2): settling evidence, OR a decision authority plus the criterion it
+#: applies. Each inner tuple is one sufficient set. The grammar below types
+#: these members as text; `validate_disposition` judges the alternatives.
+ESCALATION_ALTERNATIVES = (("evidence",), ("authority", "criterion"))
+
+#: The body's top level, member -> (kind, required). CLOSED:
+#: `emit_disposition` writes exactly these five, and so do all 306
+#: envelopes kept on this machine (measured 2026-10-22). `author` is any
+#: string and `round` admits 0 because `respond` writes them as it finds
+#: them: the configured `[roles] author`, which no grammar closes (its
+#: default is ""), and round 0 for an answer it previews with no recorded
+#: round (one kept envelope carries it).
+DISPOSITION_TOP = dict((
+    ("head", ("commit", True)),
+    ("dispositions", ("records", True)),
+    ("author", ("string", False)),
+    ("round", ("count", False)),
+    ("verdict_sha", ("commit", False)),
+))
+
+#: One disposition record. CLOSED: the members the tool reads or derives,
+#: and `note`, the one member authors were measured adding (27 of the 851
+#: records kept on this machine, 2026-10-22), carried to the reviewer as
+#: written. `subtype` admits null because authors write it (53 of 851).
+DISPOSITION_RECORD = dict((
+    ("finding_id", ("string", True)),
+    ("disposition", ("string", True)),
+    ("payload", ("payload", True)),
+    ("subtype", ("string_or_null", False)),
+    ("fingerprint", ("string", False)),
+    ("severity", ("string", False)),
+    ("note", ("string", False)),
+))
+
+#: The payload members the tool reads as text: every term's mandatory
+#: members, accepted(test_amended)'s, and an escalation's alternatives. The
+#: payload's KEY SET stays open — it is the author's own record and §5.2
+#: fixes only its floor, the ruling `transport._payload_problem` states for
+#: the import door — so any other payload member is carried as written.
+DISPOSITION_PAYLOAD_TEXT = tuple(dict.fromkeys(
+    [m for members in vocab.DISPOSITION_PAYLOADS.values() for m in members]
+    + list(vocab.TEST_AMENDED_PAYLOAD)
+    + [m for option in ESCALATION_ALTERNATIVES for m in option]))
+
+#: `payload.falsification`'s members the tool reads; its key set stays open
+#: for the same reason (authors were measured adding `test`).
+DISPOSITION_FALSIFICATION_TEXT = (*vocab.FALSIFICATION_RECORD, "note")
+
+#: Member kind -> what a refusal says was expected. `actor` and `round` are
+#: the two narrowings `respond`'s input applies; the body uses the others.
+DISPOSITION_WANT = dict((
+    ("commit", "a 40-character lowercase hex commit id"),
+    ("records", "an array of disposition records"),
+    ("actor", vocab.ACTOR_WANT),
+    ("round", "a positive integer"),
+    ("count", "a non-negative integer"),
+    ("string", "a string"),
+    ("string_or_null", "a string or null"),
+    ("payload", "an object"),
+))
+
+#: What an absent required member is FOR, so the refusal says more than
+#: its name.
+DISPOSITION_ROLE = dict((
+    ("head", "the commit this answer produced"),
+    ("dispositions", "one record per finding of the verdict"),
+    ("finding_id", "the id of the verdict's finding this record answers"),
+    ("disposition", "one of " + ", ".join(vocab.DISPOSITIONS)),
+    ("payload", "the disposition's mandatory members"),
+))
+
+_COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+_ACTOR_RE = re.compile(vocab.ACTOR_RE)
+_JSON_NAME_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def admits(kind: str, value) -> bool:
+    """Whether `value` is of the declared member `kind`. `bool` is an `int`
+    in Python and is never a count here."""
+    if kind == "commit":
+        return isinstance(value, str) and bool(_COMMIT_RE.match(value))
+    if kind == "records":
+        return isinstance(value, list)
+    if kind == "actor":
+        return isinstance(value, str) and bool(_ACTOR_RE.match(value))
+    if kind in ("round", "count"):
+        return (isinstance(value, int) and not isinstance(value, bool)
+                and value >= (1 if kind == "round" else 0))
+    if kind == "string":
+        return isinstance(value, str)
+    if kind == "string_or_null":
+        return value is None or isinstance(value, str)
+    if kind == "payload":
+        return isinstance(value, dict)
+    raise AssertionError(f"no check declared for member kind {kind!r}")
+
+
+def json_path(parent: str, key) -> str:
+    """`parent` extended by one member name or array index, in the
+    notation every refusal uses: `dispositions[2].payload.falsification`. A
+    name that is not an identifier is written as a JSON string in brackets,
+    escaped to ASCII, so a name the terminal cannot show is still named."""
+    if isinstance(key, int):
+        return f"{parent}[{key}]"
+    if _JSON_NAME_RE.match(key):
+        return f"{parent}.{key}" if parent else key
+    return f"{parent}[{json.dumps(key)}]"
+
+
+def described(value) -> str:
+    """A supplied value as a refusal shows it: its JSON kind, and for a
+    scalar the value itself, escaped to ASCII and shortened."""
+    kind = json_kind(value)
+    if isinstance(value, (dict, list)):
+        return f"an {kind}"
+    if value is None:
+        return "null"
+    shown = json.dumps(value)
+    if len(shown) > 60:
+        shown = shown[:57] + "..."
+    return f"the {kind} {shown}"
+
+
+def members_text(table: dict) -> str:
+    required = [m for m, (_kind, req) in table.items() if req]
+    optional = [m for m, (_kind, req) in table.items() if not req]
+    return (f"{', '.join(required)} (required) and {', '.join(optional)} "
+            f"(optional)")
+
+
+@dataclass(frozen=True)
+class BodyDefect:
+    """One way a loaded disposition body is not the declared shape.
+
+    `path` is the member's JSON path (empty for the body as a whole),
+    `detail` the sentence naming it and the kind expected, and `defect` the
+    class: unicode, not_object, unknown, missing or type."""
+    path: str
+    detail: str
+    defect: str
+
+
+def _wrong_kind(path: str, value, want: str) -> BodyDefect:
+    return BodyDefect(path, f"{path} is {described(value)}; expected {want}",
+                      "type")
+
+
+def _member_defects(value: dict, where: str, table: dict, what: str):
+    """One object against one closed member table: unknown members first
+    (a misspelling names itself before the member it meant is reported
+    absent), then absent required members, then each member's kind."""
+    for member in value:
+        if member not in table:
+            path = json_path(where, member)
+            yield BodyDefect(
+                path, f"{path} is not a member of {what}, which carries "
+                      f"{members_text(table)} and nothing else — a member "
+                      f"the tool does not read would otherwise be dropped "
+                      f"or hide the one it meant", "unknown")
+    for member, (kind, required) in table.items():
+        if required and member not in value:
+            path = json_path(where, member)
+            yield BodyDefect(
+                path, f"{path} is absent; expected {DISPOSITION_WANT[kind]}"
+                      f" — {DISPOSITION_ROLE[member]}", "missing")
+    for member, item in value.items():
+        if member in table and not admits(table[member][0], item):
+            yield _wrong_kind(json_path(where, member), item,
+                              DISPOSITION_WANT[table[member][0]])
+
+
+def _record_defects(record, where: str):
+    if not isinstance(record, dict):
+        yield _wrong_kind(where, record, "an object — one disposition record")
+        return
+    yield from _member_defects(record, where, DISPOSITION_RECORD,
+                               "a disposition record")
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return  # absent or the wrong kind, and reported as such above
+    at = json_path(where, "payload")
+    for member in DISPOSITION_PAYLOAD_TEXT:
+        if member in payload and not isinstance(payload[member], str):
+            yield _wrong_kind(json_path(at, member), payload[member],
+                              "a string")
+    if "falsification" not in payload:
+        return
+    record_at = json_path(at, "falsification")
+    falsification = payload["falsification"]
+    if not isinstance(falsification, dict):
+        yield _wrong_kind(record_at, falsification,
+                          "an object {status, mutation[, note]}")
+        return
+    for member in DISPOSITION_FALSIFICATION_TEXT:
+        if member in falsification and \
+                not isinstance(falsification[member], str):
+            yield _wrong_kind(json_path(record_at, member),
+                              falsification[member], "a string")
+
+
+def _unencodable(value, path: str):
+    """Every member name and string at every depth is UTF-8 encodable. JSON
+    admits an escaped lone surrogate (`"\\ud800"`), which decodes to a
+    Python string and to no Unicode scalar value; the envelope and the
+    ledger are UTF-8, so it fails at the write — after `--out` was created,
+    or after the rows before it were appended."""
+    if isinstance(value, str):
+        yield from _encoding_defect(value, path, path or "the top level")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            here = json_path(path, key)
+            yield from _encoding_defect(key, here, f"the member name {here}")
+            yield from _unencodable(item, here)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _unencodable(item, json_path(path, index))
+
+
+def _encoding_defect(text: str, path: str, what: str):
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        yield BodyDefect(
+            path, f"{what} carries a character the envelope cannot encode "
+                  f"({exc.reason} at position {exc.start}); a string must be "
+                  f"UTF-8 encodable, and a lone surrogate is valid JSON but "
+                  f"not a Unicode scalar value", "unicode")
+
+
+def disposition_body_defects(data, top: dict = DISPOSITION_TOP):
+    """Every way a loaded body is not a disposition body, in the order a
+    reader that stops at the first reports it: an unencodable string, a top
+    level that is not an object, then the top level's members, then each
+    record's, its payload's text members and its falsification record.
+
+    The ONE walker over the grammar above. `parse_disposition` collects
+    every defect; `respond --from-json` raises the first, passing its own
+    narrowed top level. A member whose kind is wrong is reported and not
+    descended into, so nothing below it is judged as if it had a shape.
+    May raise RecursionError on a body nested past the interpreter's
+    limit; both readers catch it."""
+    yield from _unencodable(data, "")
+    if not isinstance(data, dict):
+        yield BodyDefect(
+            "", f"the top level is {described(data)}; expected an object "
+                f"carrying {members_text(top)}", "not_object")
+        return
+    yield from _member_defects(data, "", top, "the top level")
+    records = data.get("dispositions")
+    if isinstance(records, list):
+        for index, record in enumerate(records):
+            yield from _record_defects(record, json_path("dispositions",
+                                                         index))
+
+
+class _AllPairs(list):
+    """An object as every (name, value) pair it states, repeats kept."""
+
+
+def duplicate_member_path(text: str) -> str | None:
+    """The JSON path of the first repeated member, in a pre-order walk, or
+    None when the text cannot be walked.
+
+    `load_json` refuses a repeat at any depth but cannot say where: its
+    hook sees one object's pairs and not their place. The text already in
+    hand is parsed once more, here, only to name it, its numbers read by
+    `load_json`'s own hook so a number it refuses cannot hide the path."""
+    def walk(value, path):
+        if isinstance(value, _AllPairs):
+            names = set()
+            for name, _item in value:
+                if name in names:
+                    return json_path(path, name)
+                names.add(name)
+            for name, item in value:
+                found = walk(item, json_path(path, name))
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                found = walk(item, json_path(path, index))
+                if found:
+                    return found
+        return None
+    try:
+        return walk(json.loads(text, object_pairs_hook=_AllPairs,
+                               parse_int=_number, parse_float=_number,
+                               parse_constant=_number), "")
+    except (RecursionError, ValueError):
+        return None
+
+
+#: The item code each class of shape defect is reported under. A body this
+#: tool cannot read or carry as JSON text is MALFORMED, mirroring
+#: `A-JSON-MALFORMED`; one that reads but is not the declared shape is
+#: SHAPE, mirroring `A-JSON-SHAPE`, at every depth, because every such
+#: defect stops the per-term rules alike. A repeat keeps its own code.
+_BODY_DEFECT_CODE = dict((
+    ("unicode", "D-JSON-MALFORMED"),
+    ("not_object", "D-JSON-SHAPE"),
+    ("unknown", "D-JSON-SHAPE"),
+    ("missing", "D-JSON-SHAPE"),
+    ("type", "D-JSON-SHAPE"),
+))
+
+
+def _read_disposition_body(body: str) -> tuple[dict, tuple]:
+    """(data, defects) of a disposition body: the parsed object and no
+    defect, or `{}` and every defect as (code, message) — never an
+    exception. A body with any defect is not read at all, so no consumer
+    of `Disposition.data` meets a value whose shape was not checked."""
+    if not body.strip():
+        return {}, (("D-JSON-MALFORMED",
+                     f"the disposition body is empty; a disposition is a "
+                     f"JSON object carrying {members_text(DISPOSITION_TOP)}"
+                     f", and a body that states nothing answers no "
+                     f"finding"),)
+    try:
+        loaded = load_json(body)
+        defects = list(disposition_body_defects(loaded))
+    except DuplicateMember as exc:
+        # The body is not read at all: a document that states one member
+        # twice has no single value for the validator to judge, and reading
+        # either would be choosing one declaration over the other.
+        where = duplicate_member_path(body) or exc.name
+        return {}, (("D-JSON-DUPLICATE",
+                     f"the disposition body states JSON member "
+                     f"{exc.name!r} more than once, at {where}; every "
+                     f"member is single-valued and a repeat would let one "
+                     f"declaration hide another"),)
+    except NumberOutOfRange as exc:
+        return {}, (("D-JSON-MALFORMED",
+                     f"in the disposition body, {exc.msg} (line "
+                     f"{exc.lineno} column {exc.colno})"),)
+    except json.JSONDecodeError as exc:
+        return {}, (("D-JSON-MALFORMED",
+                     f"the disposition body is not readable JSON "
+                     f"({exc.msg} at line {exc.lineno} column {exc.colno}); "
+                     f"an envelope is refused by name, never by a crash "
+                     f"inside the verb asked to judge it"),)
+    except RecursionError:
+        return {}, (("D-JSON-MALFORMED",
+                     "the disposition body nests deeper than the reader "
+                     "can follow; a disposition body needs a handful of "
+                     "levels"),)
+    if defects:
+        return {}, tuple((_BODY_DEFECT_CODE[d.defect],
+                          f"in the disposition body, {d.detail}")
+                         for d in defects)
+    return loaded, ()
+
+
 def parse_disposition(text: str) -> Disposition:
+    """The disposition envelope, with EVERY body that is not the declared
+    shape (`DISPOSITION_TOP` and below) converted to typed defects the
+    validator reports, and its data `{}` — the one boundary every reader of
+    a disposition goes through (`validate`, `ledger add`, `respond`)."""
     tag, kind, attrs, body, exact = unwrap(text)
-    data: dict = {}
-    body_defects: tuple = ()
-    if body.lstrip().startswith("{"):
-        try:
-            data = load_json(body)
-        except DuplicateMember as exc:
-            # The body is not read at all: a document that states one
-            # member twice has no single value for the validator to judge,
-            # and reading either would be choosing one declaration over the
-            # other. The defect travels on the record; validation refuses.
-            body_defects = (("D-JSON-DUPLICATE",
-                             f"the disposition body states JSON member "
-                             f"{exc.name!r} more than once; every member is "
-                             f"single-valued and a repeat would let one "
-                             f"declaration hide another"),)
+    data, body_defects = _read_disposition_body(body)
     return Disposition(
         tag=tag, attrs=attrs, data=data,
         wrapped=kind == "review-disposition", exact=exact,

@@ -18,9 +18,9 @@ from dataclasses import dataclass
 
 from . import FORMER_NAMES, TOOL_NAME, paths, vocab
 from .config import GATE_ATTESTERS, Config
-from .wire import (Authorization, Disposition, DuplicateMember, Finding,
-                   Request, Verdict, attestation_fence, load_json,
-                   parse_push_line)
+from .wire import (ESCALATION_ALTERNATIVES, Authorization, Disposition,
+                   DuplicateMember, Finding, Request, Verdict,
+                   attestation_fence, load_json, parse_push_line)
 from .wire import json_kind as wire_json_kind
 # ONE section splitter for the emitter, the parser and this validator. A
 # second copy here is exactly how §10.1 found the emitter and the validator
@@ -1345,29 +1345,50 @@ def validate_request(r: Request, cfg: Config,
 
 
 # --------------------------------------------------------------- disposition
+#
+# Every item below names the member it judges by its JSON path in the
+# disposition body — `dispositions[2].payload.falsification.status` — as
+# well as the finding id (loupe-tool-feedback item 5, 2026-10-22). The body
+# `respond --from-json` reads and the one an envelope carries have the same
+# shape, so the path is the line to edit whichever door the record came by.
+#
+# The SHAPE is not judged here. `wire.parse_disposition` walks the body
+# against its declared grammar (`wire.DISPOSITION_TOP` and below) and
+# reports every defect as a body defect with `data` left `{}`, so every
+# function below reads a record that is an object, a `finding_id` that is
+# a string, a payload that is an object and text members that are text.
+# `ESCALATION_ALTERNATIVES` is that grammar's, imported above and read here.
+
+
+def _member_paths(where: str, *members: str) -> str:
+    return ", ".join(f"{where}.{m}" for m in members)
+
 
 def _payload_items(fid: str, disp: str, subtype: str | None,
-                   payload: dict) -> list[Item]:
+                   payload: dict, where: str) -> list[Item]:
     items: list[Item] = []
     required = vocab.DISPOSITION_PAYLOADS.get(disp, ())
     missing = [k for k in required if not str(payload.get(k, "")).strip()]
     if missing:
         items.append(_err("D-PAYLOAD",
                           f"{fid}: disposition {disp!r} missing mandatory "
-                          f"payload {missing}"))
+                          f"payload "
+                          f"{_member_paths(where + '.payload', *missing)} "
+                          f"(absent or blank)"))
     if disp == "escalated":
-        has_evidence = bool(str(payload.get("evidence", "")).strip())
-        has_authority = bool(str(payload.get("authority", "")).strip()) and \
-            bool(str(payload.get("criterion", "")).strip())
-        if not (has_evidence or has_authority):
+        if not any(all(str(payload.get(k, "")).strip() for k in option)
+                   for option in ESCALATION_ALTERNATIVES):
+            sets = " or ".join(_member_paths(where + ".payload", *option)
+                               for option in ESCALATION_ALTERNATIVES)
             items.append(_err("D-ESCALATION",
                               f"{fid}: escalation must name either settling "
                               f"evidence or a decision authority plus "
-                              f"criterion (§5.2)"))
+                              f"criterion (§5.2): {sets}"))
     if subtype:
         if disp != "accepted" or subtype not in vocab.ACCEPTED_SUBTYPES:
             items.append(_err("D-SUBTYPE",
-                              f"{fid}: subtype {subtype!r} is only legal as "
+                              f"{fid}: {where}.subtype {subtype!r} is only "
+                              f"legal as "
                               f"accepted({'|'.join(vocab.ACCEPTED_SUBTYPES)})"))
         elif subtype == "test_amended":
             missing = [k for k in vocab.TEST_AMENDED_PAYLOAD
@@ -1375,12 +1396,13 @@ def _payload_items(fid: str, disp: str, subtype: str | None,
             if missing:
                 items.append(_err("D-TEST-AMENDED",
                                   f"{fid}: accepted(test_amended) missing "
-                                  f"{missing}"))
+                                  f"{_member_paths(where + '.payload', *missing)}"
+                                  f" (absent or blank)"))
     return items
 
 
 def _falsification_items(fid: str, disp: str, payload: dict,
-                         finding: Finding | None) -> list[Item]:
+                         finding: Finding | None, where: str) -> list[Item]:
     """The falsification record an `accepted` disposition must carry (§5.3a).
 
     Before this, `accepted` carried a free-text `verification` and the
@@ -1409,48 +1431,49 @@ def _falsification_items(fid: str, disp: str, payload: dict,
     """
     if disp != "accepted":
         return []
+    at = f"{where}.payload.falsification"
     record = payload.get("falsification")
     if record is None:
         if finding is not None and finding.falsification.strip():
             return [_err("D-FALSIFICATION-MISSING",
                          f"{fid}: the finding names a falsification test and "
                          f"this acceptance records no run of it — "
-                         f"payload.falsification {{status, mutation}} is "
+                         f"{at} {{status, mutation}} is "
                          f"required (§5.3a: fixed means the named test "
                          f"flipped, not that something nearby was edited)")]
         return []
-    if not isinstance(record, dict):
-        return [_err("D-FALSIFICATION",
-                     f"{fid}: payload.falsification must be an object "
-                     f"{{status, mutation[, note]}}, got "
-                     f"{type(record).__name__}")]
+    # An object by the reader's grammar (`wire._record_defects`); a record
+    # of any other kind never reaches here.
     items: list[Item] = []
     missing = [k for k in vocab.FALSIFICATION_RECORD
                if not str(record.get(k, "")).strip()]
     if missing:
         items.append(_err("D-FALSIFICATION",
-                          f"{fid}: payload.falsification missing {missing}"))
+                          f"{fid}: {at} missing "
+                          f"{_member_paths(at, *missing)} (absent or blank)"))
     status = str(record.get("status", "")).strip()
     mutation = str(record.get("mutation", "")).strip()
     note = str(record.get("note", "")).strip()
     if status and status not in vocab.FALSIFICATION_STATUSES:
         items.append(_err("D-FALSIFICATION",
-                          f"{fid}: falsification status {status!r} is not in "
+                          f"{fid}: {at}.status {status!r} is not in "
                           f"{vocab.FALSIFICATION_STATUSES}"))
     if mutation and mutation not in vocab.MUTATION_OUTCOMES:
         items.append(_err("D-FALSIFICATION",
-                          f"{fid}: falsification mutation {mutation!r} is not "
+                          f"{fid}: {at}.mutation {mutation!r} is not "
                           f"in {vocab.MUTATION_OUTCOMES}"))
     if status == "fail":
         items.append(_err("D-FALSIFICATION-FAILS",
-                          f"{fid}: the named test still fails on the head this "
+                          f"{fid}: {at}.status is 'fail': "
+                          f"the named test still fails on the head this "
                           f"disposition binds, so the finding is not fixed — "
                           f"`accepted` is not available; fix it, or if the "
                           f"test itself is unsatisfiable, "
                           f"accepted(test_amended) with one that can pass"))
     if mutation == "passes_without_fix":
         items.append(_err("D-FALSIFICATION-INERT",
-                          f"{fid}: the test passes with the defect "
+                          f"{fid}: {at}.mutation is 'passes_without_fix': "
+                          f"the test passes with the defect "
                           f"reintroduced, so it cannot tell fixed from unfixed "
                           f"and falsifies nothing — amend it "
                           f"(accepted(test_amended)) or write one that fails "
@@ -1459,18 +1482,18 @@ def _falsification_items(fid: str, disp: str, payload: dict,
         items.append(_err("D-FALSIFICATION",
                           f"{fid}: a test that cannot be executed was not "
                           f"executed against a mutation either — "
-                          f"status and mutation contradict"))
+                          f"{at}.status and {at}.mutation contradict"))
     if (status == "cannot_execute" or mutation == "not_run") and not note:
         items.append(_err("D-FALSIFICATION-SILENT",
                           f"{fid}: {'status ' + status if status == 'cannot_execute' else 'mutation not_run'} "
-                          f"must state its reason in payload.falsification."
+                          f"must state its reason in {at}."
                           f"note — an unexecuted check with no reason is "
                           f"silence"))
     return items
 
 
 def _identity_items(fid: str, rec: dict,
-                    against: Verdict | None) -> list[Item]:
+                    against: Verdict | None, where: str) -> list[Item]:
     """Round 1 F3: a disposition's identity is DERIVED, never supplied.
 
     Dispositions and the reviewer closures that answer them bind by
@@ -1486,8 +1509,9 @@ def _identity_items(fid: str, rec: dict,
     finding = next((f for f in against.findings if f.id == fid), None)
     if finding is None:
         return [_err("D-UNKNOWN-FINDING",
-                     f"{fid}: the answered verdict declares no such finding, "
-                     f"so this record binds to nothing")]
+                     f"{fid}: {where}.finding_id names a finding the "
+                     f"answered verdict does not declare, so this record "
+                     f"binds to nothing")]
     items: list[Item] = []
     for key, derived in (("fingerprint", finding.fingerprint()),
                          ("severity", finding.severity)):
@@ -1495,7 +1519,8 @@ def _identity_items(fid: str, rec: dict,
         if supplied is not None and str(supplied) != str(derived):
             items.append(_err(
                 "D-IDENTITY",
-                f"{fid}: {key} {supplied!r} does not match the verdict's "
+                f"{fid}: {where}.{key} {supplied!r} does not match the "
+                f"verdict's "
                 f"{derived!r}. Identity is computed from the finding it "
                 f"answers and may not be supplied beside it (round 1 F3)"))
     return items
@@ -1749,19 +1774,30 @@ def validate_authorization(a: Authorization, cfg: Config) -> list[Item]:
     return items
 
 
+def disposition_body_items(d: Disposition) -> list[Item]:
+    """The body's defects as error items (`wire.parse_disposition`): what
+    `validate_disposition` reports before it judges anything else, and what
+    `ledger add` refuses by before it reads the ledger for the verdict."""
+    return [_err(code, message) for code, message in d.body_defects]
+
+
 def validate_disposition(d: Disposition, cfg: Config,
                          against: Verdict | None = None) -> list[Item]:
+    """`d` as `wire.parse_disposition` returns it: a body whose shape is not
+    the declared one carries body defects and `{}` for data, and nothing
+    past them is judged."""
     items: list[Item] = []
     if not d.wrapped:
         items.append(_err("D-WRAPPER", "no wrapper tag"))
         return items
     items.extend(envelope_identity(d.tag, d.attrs.get("head"), d.exact, cfg,
                                    "disposition", d.attr_defects))
-    # Lineage-3 round 4 F1: a body that stated one JSON member twice was
-    # not read at all (wire.parse_disposition); the defect names the member
-    # and nothing below is judged as if a value had been chosen.
-    for code, message in d.body_defects:
-        items.append(_err(code, message))
+    # Lineage-3 round 4 F1, and item 5's envelope half: a body that is not
+    # readable JSON, states one member twice, or is not the declared shape
+    # was not read at all (wire.parse_disposition); each defect names the
+    # member by its JSON path and nothing below is judged as if a value had
+    # been chosen.
+    items.extend(disposition_body_items(d))
     if d.body_defects:
         return items
     for attr in ("verdict_sha", "head"):
@@ -1774,26 +1810,30 @@ def validate_disposition(d: Disposition, cfg: Config,
     # it the falsification check can only judge the record's shape; it
     # cannot know whether the finding named a test at all.
     by_id = {f.id: f for f in against.findings} if against is not None else {}
-    seen: dict[str, int] = {}
-    for rec in records:
+    # finding id -> the paths of the records that answer it, in order.
+    seen: dict[str, list[str]] = {}
+    for index, rec in enumerate(records):
+        where = f"dispositions[{index}]"
         fid = rec.get("finding_id", "?")
         disp = rec.get("disposition", "")
-        seen[fid] = seen.get(fid, 0) + 1
+        seen.setdefault(fid, []).append(where)
         if disp not in vocab.DISPOSITIONS:
             items.append(_err("D-TERM",
-                              f"{fid}: {disp!r} is not in the closed vocabulary "
-                              f"{vocab.DISPOSITIONS}"))
+                              f"{fid}: {where}.disposition {disp!r} is not in "
+                              f"the closed vocabulary {vocab.DISPOSITIONS}"))
             continue
         items.extend(_payload_items(fid, disp, rec.get("subtype"),
-                                    rec.get("payload", {})))
+                                    rec.get("payload", {}), where))
         items.extend(_falsification_items(fid, disp, rec.get("payload", {}),
-                                          by_id.get(fid)))
-        items.extend(_identity_items(fid, rec, against))
+                                          by_id.get(fid), where))
+        items.extend(_identity_items(fid, rec, against, where))
 
-    for fid, n in seen.items():
-        if n > 1:
-            items.append(_err("D-DUPLICATE", f"{fid}: dispositioned {n} times; "
-                              f"exactly once is required"))
+    for fid, where in seen.items():
+        if len(where) > 1:
+            items.append(_err("D-DUPLICATE",
+                              f"{fid}: dispositioned {len(where)} times "
+                              f"({', '.join(where)}); exactly once is "
+                              f"required"))
 
     if against is not None:
         if d.attrs.get("verdict_sha") and against.sha and \
@@ -1807,12 +1847,15 @@ def validate_disposition(d: Disposition, cfg: Config,
         extra = sorted(set(seen) - verdict_ids, key=lambda x: (len(x), x))
         if missing:
             items.append(_err("D-COMPLETENESS",
-                              f"findings not dispositioned: {missing} — a "
-                              f"finding never dies by omission (§5.2)"))
+                              f"findings not dispositioned: {missing} — "
+                              f"`dispositions` carries no record for them, "
+                              f"and a finding never dies by omission (§5.2)"))
         if extra:
             items.append(_err("D-UNKNOWN", f"dispositions for unknown findings: "
-                              f"{extra}"))
-        for rec in records:
+                              f"{extra} ("
+                              f"{', '.join(w for x in extra for w in seen[x])}"
+                              f")"))
+        for index, rec in enumerate(records):
             f = by_id.get(rec.get("finding_id"))
             if f is None:
                 continue
@@ -1823,7 +1866,8 @@ def validate_disposition(d: Disposition, cfg: Config,
             if effective_blocking(f.severity, f.falsification, cfg) and \
                     rec.get("disposition") in vocab.BLOCKING_ILLEGAL:
                 items.append(_err("D-BLOCKING",
-                                  f"{f.id}: {rec['disposition']!r} is illegal "
+                                  f"{f.id}: dispositions[{index}].disposition "
+                                  f"{rec['disposition']!r} is illegal "
                                   f"for blocking findings (§5.2)"))
     return items
 

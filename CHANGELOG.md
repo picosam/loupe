@@ -5,6 +5,88 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.32.0
+
+**For upgraders — read before crossing this version: three readers refuse
+input they used to accept.** No key joins the configuration grammar, so no
+`[tool] requires` moves.
+
+- `respond --from-json` reads one closed grammar, which its `--help` now
+  prints: the top level (`author`, `head`, `dispositions`, and the
+  optional members), each disposition record, and the payload members the
+  tool reads as text. An unknown top-level or record member, null or the
+  wrong kind for an optional member, and a non-string payload text member
+  (an array `positions`, say) are refused; each used to be dropped,
+  carried or rendered, and 76 of the 170 refused rows measured on the
+  previous release exited 0. A defect of the file is now `blocked`, exit 1,
+  `next` null, its remedy naming the member by its JSON path and the kind
+  expected (`head is absent; expected a 40-character lowercase hex commit
+  id`); it used to be exit 2 with `next: loupe respond --help`, or a
+  traceback. Only an empty path or a file that cannot be opened keeps
+  exit 2.
+- A disposition envelope's body is read through the same grammar by every
+  reader: `validate`, `validate --against` and `ledger add`. A body that is
+  empty, not JSON, nested too deep or carries a lone surrogate is
+  `D-JSON-MALFORMED`; one of the wrong shape (not an object, an absent,
+  unknown or wrong-kind member at any depth) is `D-JSON-SHAPE`;
+  `D-JSON-DUPLICATE` now names the repeated member's path. `validate`
+  exits 1 `blocked`, and `ledger add` exits 1 with `next: loupe validate
+  <file>` before it reads the lineage, the ledger or the verdict. The
+  envelope differs from `respond`'s input at two members only: `author`
+  is any string and `round` admits the 0 of a preview.
+- The one JSON loader every envelope, claim, attestation and import reader
+  uses refuses a number it cannot carry, by its JSON path: an integer
+  longer than the interpreter's `sys.get_int_max_str_digits()`, a number
+  past a double's range, `NaN`, `Infinity` and `-Infinity`. They used to
+  leave by the usage exit naming no member, or read as themselves and be
+  written back by `respond` into a body that was no longer JSON.
+
+**A kept envelope stays as recorded.** No verb re-reads a kept disposition
+envelope on its own: the ledger, `ledger report` and `ledger convergence`
+read the events recorded when it was added, never its bytes, and the only
+kept envelopes a verb reads back are requests and verdicts. Only `validate`
+or `ledger add` given its path judge it again, and a refusal there is a
+reading of the bytes, not a change to the ledger. Measured on the authoring
+machine before publication: 1 of the 425 disposition envelopes kept under
+its loupe state is refused by `validate` (an `escalated` record whose
+`positions` is an array), the other 424 validate as before, and none of the
+62,223 JSON documents kept there carries a number the loader now refuses.
+
+**The claim.** Every shape defect of one claim is refused in one refusal,
+each by its member path (`has N defects, each named by its member: (1) …;
+(2) …`), the first named the one the previous release met first; a claim
+with one defect reads exactly as before, and the ledger, Git, manifest and
+target-tree checks keep their places and their single refusals. A
+claim-file refusal's remedy names the author: `the author corrects their
+claim file <path> (at <member>, …) and re-runs this command`, where it said
+"a person". The author procedure's `blocked` rule makes that remedy the one
+the author carries without stopping; every other `blocked` still stops and
+goes to the human.
+
+**The adapters.** Re-run `render-adapters --install` on every machine.
+- Each skill names `author.md` and `reviewer.md` by name, beside the
+  `SKILL.md` that was loaded, never by an absolute path, so a copy
+  installed elsewhere (a second profile's skill directory) no longer sends
+  its reader to another install's files. The `Install:` line says where
+  `render-adapters --install` writes the skill, not where the copy being
+  read is.
+- The author procedure states the claim's value grammars beside its
+  members: `scope_paths`, `excluded_paths` and `paths` an exact path, a
+  `dir/` prefix or a glob, never a bare directory; `origin`
+  `<lineage>/<round>`; `fix` a list of 40-hex commit ids; `authority` one
+  repository path.
+- The window paragraph says the author declares an agent-relayed window's
+  `relay=` stamp by setting the claim's `relay` member to the harness's
+  name.
+- The respond step sends the author to the shape `loupe respond --help`
+  prints before writing `<d.json>`: payload text members are strings,
+  never lists, so an escalation's positions go in one string, and a
+  member the shape does not name is refused. It is the one trap the
+  measurement above found.
+
+**Onboarding.** §8's efficiency row recommends keeping or deleting by the
+operator's standing ruling where one exists, and as before where none does.
+
 ## 0.31.0
 
 **For upgraders — read before crossing this version: `handoff` can refuse

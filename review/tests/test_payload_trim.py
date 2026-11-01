@@ -1064,6 +1064,9 @@ class TestTheSkillSplitsByRole(unittest.TestCase):
         self.assertEqual(set(rows.values()), {"in_sync"})
 
     def test_the_routing_line_names_files_beside_it(self):
+        """Each role file by its name alone, placed beside the installed
+        `SKILL.md`, which holds it; no path at all, so a copy deployed
+        anywhere else (a Team profile's `skills/loupe/`) reads right."""
         import re
         self._install()
         for surface, kinds in self.adapters.SKILL_ROLE_KINDS.items():
@@ -1071,13 +1074,15 @@ class TestTheSkillSplitsByRole(unittest.TestCase):
             text = skill.read_text(encoding="utf-8")
             routing = text[text.index("## Your side's procedure"):
                            text.index("## Verbs")]
-            named = re.findall(
-                r"`([a-z]+\.md)` beside this file \(`~/([^`]+)`\)", routing)
-            self.assertEqual(len(named), len(kinds), routing)
-            for name, rel in named:
+            named = re.findall(r"stamp: `([a-z]+\.md)`$", routing, re.M)
+            self.assertEqual(sorted(named),
+                             sorted(f"{role}.md" for role in kinds), routing)
+            self.assertIn("Both sit beside this `SKILL.md`", routing)
+            self.assertNotIn("~/", routing)
+            self.assertNotIn(str(self.home), routing)
+            for name in named:
                 with self.subTest(surface=surface, name=name):
                     self.assertTrue((skill.parent / name).is_file())
-                    self.assertEqual(self.home / rel, skill.parent / name)
 
     def test_each_side_reads_only_its_own_steps(self):
         self._install()

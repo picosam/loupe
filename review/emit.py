@@ -4165,7 +4165,8 @@ class ClaimDefective(ValueError):
     """
 
     def __init__(self, path: Path | None, detail: str, *, defect: str,
-                 member: str | None = None, name: str | None = None):
+                 member: str | None = None, name: str | None = None,
+                 defects: tuple = ()):
         # `path` is None where the defect is in the invocation rather than in
         # a file: an empty --claim-file names nothing to correct.
         super().__init__(detail if path is None else f"{path}: {detail}")
@@ -4174,6 +4175,62 @@ class ClaimDefective(ValueError):
         self.defect = defect
         self.member = member
         self.name = name if name is not None else member
+        # Every shape defect `validate_claim` found, in the order it judges
+        # them (2026-11-01); this one alone when it is the only one.
+        # `defect`, `member` and `name` are the FIRST's, which is the one a
+        # first-defect-only validator reported.
+        self.defects = tuple(defects) or (self,)
+
+    @property
+    def members(self) -> tuple:
+        """The member path of every defect, in order, for a remedy."""
+        return tuple(d.member for d in self.defects if d.member)
+
+    @classmethod
+    def combined(cls, path: Path | None, defects) -> "ClaimDefective":
+        """One refusal for every defect in `defects` (each flattened),
+        or the one defect itself, unchanged, when there is only one."""
+        flat = [d for exc in defects for d in exc.defects]
+        if len(flat) == 1:
+            return flat[0]
+        first = flat[0]
+        detail = (f"has {len(flat)} defects, each named by its member: "
+                  + "; ".join(f"({i}) {d.detail}"
+                              for i, d in enumerate(flat, 1)))
+        return cls(path, detail, defect=first.defect, member=first.member,
+                   name=first.name, defects=tuple(flat))
+
+
+class _Defects:
+    """Every SHAPE defect of one claim, gathered before any is reported
+    (2026-11-01: in one adopting repository, 18 carried-finding refusals
+    were three defects found one hand-off at a time, three runs each).
+
+    `check` runs one independent judgment and keeps what it refuses;
+    `raise_any` refuses with all of them at once, in the order they were
+    judged. A judgment that depends on another (an element's grammar on
+    its type) stays inside one `check`, so it is reached only when the
+    judgment it needs passed. Only shape defects gather here: what needs
+    the ledger, Git or the target tree is judged later, in its own place.
+    """
+
+    def __init__(self):
+        self.found: list = []
+
+    def add(self, exc: ClaimDefective) -> None:
+        self.found.extend(exc.defects)
+
+    def check(self, fn, *args, **kwargs) -> bool:
+        try:
+            fn(*args, **kwargs)
+        except ClaimDefective as exc:
+            self.add(exc)
+            return False
+        return True
+
+    def raise_any(self, path: Path | None) -> None:
+        if self.found:
+            raise ClaimDefective.combined(path, self.found)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4262,35 +4319,38 @@ def _check_reference(path: Path, index: int, ref) -> None:
         raise ClaimDefective(
             path, f"{where} must be an object with a path, not "
                   f"{_kind_of(ref)}", defect="type", member=where)
+    found = _Defects()
     for member in ref:
         if member not in vocab.CLAIM_REFERENCE_FIELDS:
-            raise ClaimDefective(
+            found.add(ClaimDefective(
                 path, f"{where} states unknown member {member!r}; a "
                       f"reference carries "
                       f"{', '.join(sorted(vocab.CLAIM_REFERENCE_FIELDS))} and "
                       f"nothing else", defect="unknown",
-                member=f"{where}.{member}")
+                member=f"{where}.{member}"))
     for member in vocab.CLAIM_REFERENCE_REQUIRED:
         if member not in ref:
-            raise ClaimDefective(
+            found.add(ClaimDefective(
                 path, f"{where} states no {member!r}; a pointer without one "
                       f"is a reference to nothing", defect="missing",
-                member=f"{where}.{member}")
+                member=f"{where}.{member}"))
     for member, value in ref.items():
-        kind = vocab.CLAIM_REFERENCE_FIELDS[member]
+        kind = vocab.CLAIM_REFERENCE_FIELDS.get(member)
         if kind == "string":
-            _check_string(path, f"{where}.{member}", value,
-                          nonempty=member in vocab.CLAIM_REFERENCE_REQUIRED)
+            found.check(_check_string, path, f"{where}.{member}", value,
+                        nonempty=member in vocab.CLAIM_REFERENCE_REQUIRED)
         elif kind == "boolean" and not isinstance(value, bool):
-            raise ClaimDefective(
+            found.add(ClaimDefective(
                 path, f"{where}.{member} must be true or false, not "
                       f"{_kind_of(value)}", defect="type",
-                member=f"{where}.{member}")
+                member=f"{where}.{member}"))
+    found.raise_any(path)
 
 
 def validate_claim(value, path: Path) -> dict:
     """The parsed claim, checked against the ONE field authority in
-    `vocab.CLAIM_FIELDS`, or ClaimDefective naming the defect.
+    `vocab.CLAIM_FIELDS`, or ONE ClaimDefective naming every shape defect
+    by its member path (2026-11-01; until then, the first only).
 
     Closed on every axis the domain has: the top-level kind, the presence of
     what is required, the absence of what is unknown, the type of every
@@ -4302,75 +4362,92 @@ def validate_claim(value, path: Path) -> dict:
         raise ClaimDefective(
             path, f"a claim is a JSON object; this file is a top-level "
                   f"{_kind_of(value)}", defect="not_object")
+    # 2026-11-01: every shape defect in one refusal, in the order the
+    # first-defect-only validator met them, so its first is the same.
+    found = _Defects()
     for member in value:
         if member not in vocab.CLAIM_FIELDS:
-            raise ClaimDefective(
+            found.add(ClaimDefective(
                 path, f"states unknown member {member!r}; the claim's members "
                       f"are {', '.join(sorted(vocab.CLAIM_FIELDS))}. An "
                       f"unknown member was once ignored in silence, so a "
                       f"misspelling erased whatever it meant to declare",
-                defect="unknown", member=member)
+                defect="unknown", member=member))
     for member in vocab.CLAIM_REQUIRED:
         if member not in value:
-            raise ClaimDefective(
+            found.add(ClaimDefective(
                 path, f"states no {member!r}, which every supplied claim must "
-                      f"carry", defect="missing", member=member)
+                      f"carry", defect="missing", member=member))
     for member, item in value.items():
-        kind = vocab.CLAIM_FIELDS[member]
-        if kind == "string":
-            _check_string(path, member, item,
-                          nonempty=member in vocab.CLAIM_NONEMPTY)
-            # Round 3 F3: `relay` is provenance — who carried the request —
-            # closed to the same one-token identifier grammar an author or
-            # reviewer name is written in. A blank value is not a defect
-            # here (emission falls back to the configured relay exactly as
-            # an absent member does); anything ELSE that fails the grammar
-            # is refused before it can be rendered as if it named an actor.
-            #
-            # Round 5 F3: this used to validate `item.strip()` while
-            # emission below (`relay = claim.get("relay") or
-            # cfg.roles.get("relay") or ...`) renders the ORIGINAL,
-            # unstripped member — so `" user "` matched the stripped copy,
-            # passed, and rendered `relay= user  ` on the Roles line. No
-            # stripping here either: the grammar is checked against the
-            # exact value emission will render, and "blank" is exactly what
-            # emission's `or` already treats as absent — a falsy `""`, not
-            # a stripped one.
-            if member == "relay" and item and not \
-                    _ACTOR_RE.match(item):
-                raise ClaimDefective(
-                    path,
-                    f"member 'relay' is {item!r}, which is not "
-                    f"{vocab.ACTOR_WANT} — relay says WHO carried the "
-                    f"request, never what to do with the answer; a "
-                    f"stopping instruction belongs under 'hand_back', the "
-                    f"claim's dedicated field for exactly that",
-                    defect="shape", member=member)
-        elif kind == "list_of_string":
-            if not isinstance(item, list):
-                raise ClaimDefective(
-                    path, f"member {member!r} must be a list of strings, not "
-                          f"{_kind_of(item)}", defect="type", member=member)
-            for i, element in enumerate(item):
-                _check_string(path, f"{member}[{i}]", element, nonempty=False)
-        elif kind == "references":
-            if not isinstance(item, list):
-                raise ClaimDefective(
-                    path, f"member {member!r} must be a list of reference "
-                          f"objects, not {_kind_of(item)}", defect="type",
-                    member=member)
-            if not item:
-                raise ClaimDefective(
-                    path, f"member {member!r} is an empty list; a reference "
-                          f"manifest with no entries hands the reviewer "
-                          f"nothing to read, which is the missing-member "
-                          f"state spelled differently", defect="empty",
-                    member=member)
-            for i, ref in enumerate(item):
-                _check_reference(path, i, ref)
-        elif kind == "list_of_object":
-            _check_object_list(path, member, item)
+        if member in vocab.CLAIM_FIELDS:
+            found.check(_check_member, path, member, item)
+    found.raise_any(path)
     return value
+
+
+def _check_member(path: Path, member: str, item) -> None:
+    """One declared top-level member, by its kind in `vocab.CLAIM_FIELDS`.
+    A list's elements are judged independently of one another, and only
+    once the list itself is one."""
+    kind = vocab.CLAIM_FIELDS[member]
+    if kind == "string":
+        _check_string(path, member, item,
+                      nonempty=member in vocab.CLAIM_NONEMPTY)
+        # Round 3 F3: `relay` is provenance — who carried the request —
+        # closed to the same one-token identifier grammar an author or
+        # reviewer name is written in. A blank value is not a defect
+        # here (emission falls back to the configured relay exactly as
+        # an absent member does); anything ELSE that fails the grammar
+        # is refused before it can be rendered as if it named an actor.
+        #
+        # Round 5 F3: this used to validate `item.strip()` while
+        # emission below (`relay = claim.get("relay") or
+        # cfg.roles.get("relay") or ...`) renders the ORIGINAL,
+        # unstripped member — so `" user "` matched the stripped copy,
+        # passed, and rendered `relay= user  ` on the Roles line. No
+        # stripping here either: the grammar is checked against the
+        # exact value emission will render, and "blank" is exactly what
+        # emission's `or` already treats as absent — a falsy `""`, not
+        # a stripped one.
+        if member == "relay" and item and not \
+                _ACTOR_RE.match(item):
+            raise ClaimDefective(
+                path,
+                f"member 'relay' is {item!r}, which is not "
+                f"{vocab.ACTOR_WANT} — relay says WHO carried the "
+                f"request, never what to do with the answer; a "
+                f"stopping instruction belongs under 'hand_back', the "
+                f"claim's dedicated field for exactly that",
+                defect="shape", member=member)
+    elif kind == "list_of_string":
+        if not isinstance(item, list):
+            raise ClaimDefective(
+                path, f"member {member!r} must be a list of strings, not "
+                      f"{_kind_of(item)}", defect="type", member=member)
+        found = _Defects()
+        for i, element in enumerate(item):
+            found.check(_check_string, path, f"{member}[{i}]", element,
+                        nonempty=False)
+        found.raise_any(path)
+    elif kind == "references":
+        if not isinstance(item, list):
+            raise ClaimDefective(
+                path, f"member {member!r} must be a list of reference "
+                      f"objects, not {_kind_of(item)}", defect="type",
+                member=member)
+        if not item:
+            raise ClaimDefective(
+                path, f"member {member!r} is an empty list; a reference "
+                      f"manifest with no entries hands the reviewer "
+                      f"nothing to read, which is the missing-member "
+                      f"state spelled differently", defect="empty",
+                member=member)
+        found = _Defects()
+        for i, ref in enumerate(item):
+            found.check(_check_reference, path, i, ref)
+        found.raise_any(path)
+    elif kind == "list_of_object":
+        _check_object_list(path, member, item)
 
 
 # ------------------------------------------ the claim's object-list members
@@ -4417,8 +4494,11 @@ _OBJECT_FIELD_WANT = {
 }
 
 
-def _check_field_list(path: Path, where: str, value) -> None:
-    """A non-empty list of non-empty strings."""
+def _check_field_list(path: Path, where: str, value, grammar=None) -> None:
+    """A non-empty list of non-empty strings, each element judged on its
+    own; `grammar(i, element)` then judges each element that IS one, so
+    every element's type defects come first, as they did when the first
+    defect stopped the walk."""
     if not isinstance(value, list):
         raise ClaimDefective(
             path, f"{where} must be a list of strings, not {_kind_of(value)}",
@@ -4427,22 +4507,28 @@ def _check_field_list(path: Path, where: str, value) -> None:
         raise ClaimDefective(
             path, f"{where} is an empty list; it declares nothing — omit the "
                   f"field instead", defect="empty", member=where)
-    for i, element in enumerate(value):
-        _check_string(path, f"{where}[{i}]", element, nonempty=True)
+    found = _Defects()
+    strings = [i for i, element in enumerate(value)
+               if found.check(_check_string, path, f"{where}[{i}]", element,
+                              nonempty=True)]
+    if grammar is not None:
+        for i in strings:
+            found.check(grammar, i, value[i])
+    found.raise_any(path)
 
 
 def _check_object_field(path: Path, where: str, kind: str, value) -> None:
     if kind in ("list_of_string", "scope_paths", "commits"):
-        _check_field_list(path, where, value)
-        if kind == "commits":
-            for i, sha in enumerate(value):
-                if not _COMMIT_RE.fullmatch(sha):
-                    raise ClaimDefective(
-                        path, f"{where}[{i}] is {sha!r}, which is not "
-                              f"{_OBJECT_FIELD_WANT[kind]}: an abbreviated "
-                              f"or symbolic name binds nothing a reviewer "
-                              f"can check", defect="shape",
-                        member=f"{where}[{i}]")
+        def commit(i: int, sha: str) -> None:
+            if not _COMMIT_RE.fullmatch(sha):
+                raise ClaimDefective(
+                    path, f"{where}[{i}] is {sha!r}, which is not "
+                          f"{_OBJECT_FIELD_WANT[kind]}: an abbreviated "
+                          f"or symbolic name binds nothing a reviewer "
+                          f"can check", defect="shape",
+                    member=f"{where}[{i}]")
+        _check_field_list(path, where, value,
+                          commit if kind == "commits" else None)
         return
     _check_string(path, where, value, nonempty=True)
     if kind == "path":
@@ -4472,8 +4558,6 @@ def _check_object_list(path: Path, member: str, item) -> None:
     """One list-of-object member, closed on every axis: the container, its
     emptiness, each element's kind, unknown fields, missing required ones,
     and every field's type and grammar."""
-    table = vocab.CLAIM_OBJECT_LIST_FIELDS[member]
-    required = vocab.CLAIM_OBJECT_REQUIRED[member]
     if not isinstance(item, list):
         raise ClaimDefective(
             path, f"member {member!r} must be a list of objects, not "
@@ -4484,50 +4568,69 @@ def _check_object_list(path: Path, member: str, item) -> None:
                   f"which is the absent state spelled differently — omit the "
                   f"member instead", defect="empty", member=member)
     seen_fps: dict[str, int] = {}
+    found = _Defects()
     for i, element in enumerate(item):
-        where = f"{member}[{i}]"
-        if not isinstance(element, dict):
-            raise ClaimDefective(
-                path, f"{where} must be an object, not {_kind_of(element)}",
-                defect="type", member=where)
-        for field in element:
-            if field not in table:
-                raise ClaimDefective(
-                    path, f"{where} states unknown field {field!r}; an entry "
-                          f"of {member!r} carries "
-                          f"{', '.join(sorted(table))} and nothing else",
-                    defect="unknown", member=f"{where}.{field}")
-        for field in required:
-            if field not in element:
-                raise ClaimDefective(
-                    path, f"{where} states no {field!r}, which every entry of "
-                          f"{member!r} must carry", defect="missing",
-                    member=f"{where}.{field}")
-        for field, value in element.items():
-            _check_object_field(path, f"{where}.{field}", table[field], value)
-        for group in vocab.CLAIM_OBJECT_TOGETHER.get(member, ()):
-            stated = [f for f in group if f in element]
-            if stated and len(stated) != len(group):
-                absent = [f for f in group if f not in element]
-                raise ClaimDefective(
-                    path, f"{where} states {', '.join(repr(f) for f in stated)} "
-                          f"without {', '.join(repr(f) for f in absent)}; an "
-                          f"entry of {member!r} declares "
-                          f"{' and '.join(repr(f) for f in group)} together or "
-                          f"not at all, since either alone is compared with "
-                          f"nothing", defect="missing",
-                    member=f"{where}.{absent[0]}")
-        # A carried fingerprint is the join key the attestation map resolves
-        # against; carried twice, it names two outcomes for one finding.
-        if member == "carried_findings":
-            fp = element["fingerprint"]
-            if fp in seen_fps:
-                raise ClaimDefective(
-                    path, f"{where}.fingerprint {fp!r} is already carried at "
-                          f"{member}[{seen_fps[fp]}]; one finding is carried "
-                          f"once, with one outcome", defect="duplicate",
-                    member=f"{where}.fingerprint")
+        found.check(_check_object_entry, path, member, i, element, seen_fps)
+    found.raise_any(path)
+
+
+def _check_object_entry(path: Path, member: str, i: int, element,
+                        seen_fps: dict) -> None:
+    """One entry of a list-of-object member: its kind, then — each on its
+    own — every unknown field, every missing required one, every field's
+    type and grammar, the fields declared together, and a carried
+    fingerprint carried once."""
+    table = vocab.CLAIM_OBJECT_LIST_FIELDS[member]
+    where = f"{member}[{i}]"
+    if not isinstance(element, dict):
+        raise ClaimDefective(
+            path, f"{where} must be an object, not {_kind_of(element)}",
+            defect="type", member=where)
+    found = _Defects()
+    for field in element:
+        if field not in table:
+            found.add(ClaimDefective(
+                path, f"{where} states unknown field {field!r}; an entry "
+                      f"of {member!r} carries "
+                      f"{', '.join(sorted(table))} and nothing else",
+                defect="unknown", member=f"{where}.{field}"))
+    for field in vocab.CLAIM_OBJECT_REQUIRED[member]:
+        if field not in element:
+            found.add(ClaimDefective(
+                path, f"{where} states no {field!r}, which every entry of "
+                      f"{member!r} must carry", defect="missing",
+                member=f"{where}.{field}"))
+    valid = {field for field, value in element.items()
+             if field in table and found.check(
+                 _check_object_field, path, f"{where}.{field}", table[field],
+                 value)}
+    for group in vocab.CLAIM_OBJECT_TOGETHER.get(member, ()):
+        stated = [f for f in group if f in element]
+        if stated and len(stated) != len(group):
+            absent = [f for f in group if f not in element]
+            found.add(ClaimDefective(
+                path, f"{where} states {', '.join(repr(f) for f in stated)} "
+                      f"without {', '.join(repr(f) for f in absent)}; an "
+                      f"entry of {member!r} declares "
+                      f"{' and '.join(repr(f) for f in group)} together or "
+                      f"not at all, since either alone is compared with "
+                      f"nothing", defect="missing",
+                member=f"{where}.{absent[0]}"))
+    # A carried fingerprint is the join key the attestation map resolves
+    # against; carried twice, it names two outcomes for one finding. Only
+    # a fingerprint that is one is compared: a malformed one is already
+    # named above, and keys nothing.
+    if member == "carried_findings" and "fingerprint" in valid:
+        fp = element["fingerprint"]
+        if fp in seen_fps:
+            found.add(ClaimDefective(
+                path, f"{where}.fingerprint {fp!r} is already carried at "
+                      f"{member}[{seen_fps[fp]}]; one finding is carried "
+                      f"once, with one outcome", defect="duplicate",
+                member=f"{where}.fingerprint"))
+        else:
             seen_fps[fp] = i
+    found.raise_any(path)
 
 
 def _squash(text) -> str:
@@ -4576,9 +4679,9 @@ def check_map_gates(claim, cfg: Config, head: str) -> None:
             f"({', '.join(cfg.gate_ids) or 'it declares none'}); a map row "
             f"can only point at an attestation this request will carry. "
             f"No gate was run and nothing was pushed or recorded",
-            "", remedy="a person corrects the claim's attestation_map to "
-                       "name declared gates, or declares the gate in "
-                       "review.toml, and re-runs the hand-off")
+            "", remedy="the author corrects attestation_map in their claim "
+                       "file to name declared gates (or the gate is "
+                       "declared in review.toml) and re-runs the hand-off")
 
 
 def _claim_pattern_sites(claim) -> list[tuple[str, str]]:
@@ -4586,7 +4689,8 @@ def _claim_pattern_sites(claim) -> list[tuple[str, str]]:
     `scope_paths` grammar — `validate.claim_patterns`' members, each with
     the location a person corrects (`objectives[1].paths[0]`)."""
     out: list[tuple[str, str]] = []
-    for member in ("scope_paths", "excluded_paths"):
+    for member in (m for m, kind in vocab.CLAIM_LIST_VALUE_KINDS.items()
+                   if kind == "scope_paths"):
         for i, p in enumerate(claim.get(member) or ()):
             if isinstance(p, str):
                 out.append((f"{member}[{i}]", p))
@@ -4650,10 +4754,11 @@ def check_directory_paths(claim, repo: Path, head: str, changed) -> None:
         f"without it is an exact path, and a span lists files, so it would "
         f"match nothing and show only as notices. No gate was run and "
         f"nothing was pushed, emitted or recorded",
-        "", remedy="a person adds the trailing `/` to each named path in "
-                   "the claim file (or names the files it means), and "
-                   "re-runs the command; the tool does not rewrite the "
-                   "author's claim")
+        "", remedy=f"the author adds the trailing `/` to each named path "
+                   f"in their claim file (at "
+                   f"{', '.join(where for where, _p in dirs)}), or names the "
+                   f"files it means, and re-runs the command; the tool does "
+                   f"not rewrite the author's claim")
 
 
 def check_claim_record(claim, ledger: Ledger, lineage: str, cfg: Config,

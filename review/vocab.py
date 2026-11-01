@@ -225,6 +225,37 @@ CLAIM_OBJECT_TOGETHER = {
 # by omission the symmetry rule forbids.
 CARRIED_OUTCOMES = ("fixed", "deferred", "superseded")
 
+# The value kind of a top-level list member's elements, where it has a
+# grammar beyond "a string" — the top-level counterpart of the field kinds
+# in CLAIM_OBJECT_LIST_FIELDS, so one rule names every member of a kind.
+# `scope_paths`: the pattern grammar `emit.in_scope` matches, which
+# `emit.check_directory_paths` judges here and in each objective's
+# `paths`. A member absent here holds plain strings.
+CLAIM_LIST_VALUE_KINDS = {"scope_paths": "scope_paths",
+                          "excluded_paths": "scope_paths"}
+
+# The VALUE grammar of each field kind, as the author's claim step states
+# it (2026-11-01: 40 of 45 refused hand-offs in one adopting repository
+# were claim-grammar refusals the procedure never explained — a bare
+# directory, an origin not `<lineage>/<round>`, `fix` as a string or a
+# short id, `authority` as prose, `covers` as a string, an empty string in
+# an object). The adapters render each phrase beside the members of its
+# kind, derived from CLAIM_LIST_VALUE_KINDS and CLAIM_OBJECT_LIST_FIELDS;
+# the rule itself stays the validator's (`emit._check_object_field`,
+# `emit.check_directory_paths`). A kind absent here is stated elsewhere
+# (`carried_outcome` beside its field) or copied, never composed, by an
+# author (`fingerprint` from a verdict, `gate_id` from the manifest).
+# `string` names no member: it is every string field of an object.
+CLAIM_VALUE_GRAMMAR = {
+    "scope_paths": "an exact path, a `dir/` prefix or a glob, never a bare "
+                   "directory",
+    "origin": "`<lineage>/<round>`",
+    "commits": "a list of 40-hex commit ids",
+    "path": "one repository path",
+    "list_of_string": "a list of strings",
+    "string": "non-empty",
+}
+
 # member -> kind. The four kinds are the whole grammar; a member added here
 # without a kind the validator knows is a refusal, not a silent admission.
 CLAIM_FIELDS = {
