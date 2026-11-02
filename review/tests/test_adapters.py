@@ -99,9 +99,9 @@ class TestOneSource(unittest.TestCase):
 
     def test_a_claim_file_refusal_is_the_authors_to_correct(self):
         # 2026-11-01: a claim-file refusal's remedy names the author
-        # (`cli._claim_defect_exit`, `emit.check_directory_paths`,
-        # `emit.check_map_gates`), so the blocked rule says that one
-        # remedy is the author's to carry out, and only that one.
+        # (`cli._claim_defect_exit`, `emit.check_map_gates`), so the
+        # blocked rule says that one remedy is the author's to carry out,
+        # and only that one.
         for kind in adapters.SURFACES:
             with self.subTest(kind=kind):
                 text = " ".join(adapters.surface_text(kind).split())

@@ -5,6 +5,32 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.33.0
+
+**For upgraders — read before crossing this version: a claim path now
+names everything below it.** Every pattern in `scope_paths`,
+`excluded_paths` and an objective's `paths` matches the path it spells and
+every path below it, as git's literal-first pathspec match does: `src` and
+`src/` admit the same files, and a pattern with a glob character matches as
+an fnmatch glob and also, literally, as a path with everything below it.
+`src` never admits `src-old/x`. The refusal of a bare directory, new in
+0.30.0, is gone, and the `Scoped:` command writes a bare directory as its
+`dir/`. No key joins the configuration grammar, so no `[tool] requires`
+moves.
+
+A claim accepted before can therefore match more, wherever one of its
+patterns has paths below it that it did not match: a bare name of a
+directory the span deleted or turned into a file, of a file the span turned
+into a directory, or a glob that also spells a real directory (`lit[1]`).
+Each path it now matches is swept under `scope_paths`, subtracted from the
+in-scope counts under `excluded_paths`, and mapped under an objective's
+`paths`. A pattern ending in `/`, and a pattern with no path below it,
+match what they did.
+
+The author procedure's value grammar says so: a file, a directory written
+`dir/` (a bare `dir` reads the same) or a glob. Re-run `render-adapters
+--install` on every machine.
+
 ## 0.32.0
 
 **For upgraders — read before crossing this version: three readers refuse

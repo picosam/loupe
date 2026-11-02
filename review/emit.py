@@ -670,10 +670,24 @@ class NoCandidate:
         return None
 
 
+def dir_prefix(entry: str) -> str:
+    """The prefix of the paths below a claim path entry: `dir/` for `dir`
+    and for `dir/` alike."""
+    return entry if entry.endswith("/") else entry + "/"
+
+
 def in_scope(path: str, scope_paths) -> bool:
+    """THE matcher of the claim's path patterns (`scope_paths`,
+    `excluded_paths`, each objective's `paths`). An entry names the path it
+    spells and everything below it, as git reads a literal pathspec, so
+    `dir` and `dir/` admit the same paths and `dir` never admits
+    `dir-old/x`; an entry with a glob character also matches as an fnmatch
+    glob (2026-11-01, Osama's ruling, brief `claim-bare-directory-pathspec`:
+    until then a bare `dir` was an exact path, matched nothing a span lists,
+    and was refused)."""
     import fnmatch
     for entry in scope_paths:
-        if path == entry or (entry.endswith("/") and path.startswith(entry)):
+        if path == entry or path.startswith(dir_prefix(entry)):
             return True
         if any(ch in entry for ch in "*?[") and fnmatch.fnmatchcase(path,
                                                                     entry):
@@ -3936,7 +3950,6 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
               if claim.get("carried_findings") or claim.get("attestation_map")
               else None)
     check_map_gates(claim, cfg, head)
-    check_directory_paths(claim, repo, head, lambda: span_raw_paths(shape))
     # The emitting checkout's state, read once, now — not the gates': each
     # attestation's own `binding` says what its gate ran against (brief
     # `loupe-tool-feedback-2026-10-06` item 1; `emission_tree`).
@@ -4684,83 +4697,6 @@ def check_map_gates(claim, cfg: Config, head: str) -> None:
                        "declared in review.toml) and re-runs the hand-off")
 
 
-def _claim_pattern_sites(claim) -> list[tuple[str, str]]:
-    """(member path, pattern) for every pattern the claim declares in the
-    `scope_paths` grammar — `validate.claim_patterns`' members, each with
-    the location a person corrects (`objectives[1].paths[0]`)."""
-    out: list[tuple[str, str]] = []
-    for member in (m for m, kind in vocab.CLAIM_LIST_VALUE_KINDS.items()
-                   if kind == "scope_paths"):
-        for i, p in enumerate(claim.get(member) or ()):
-            if isinstance(p, str):
-                out.append((f"{member}[{i}]", p))
-    for j, obj in enumerate(claim.get("objectives") or ()):
-        if hasattr(obj, "get"):
-            for i, p in enumerate(obj.get("paths") or ()):
-                if isinstance(p, str):
-                    out.append((f"objectives[{j}].paths[{i}]", p))
-    return out
-
-
-def check_directory_paths(claim, repo: Path, head: str, changed) -> None:
-    """Refuse a claim pattern that names a DIRECTORY at the target without
-    the trailing `/` the grammar gives a directory prefix (brief
-    `loupe-tool-feedback-2026-10-06` item 2).
-
-    The `scope_paths` grammar — `scope_paths`, `excluded_paths` and each
-    objective's `paths`, matched by the one matcher `in_scope` — is an
-    exact path, a directory prefix ending in `/`, or a glob. A bare
-    `src` is an exact path, and a span lists files, so it matched nothing:
-    lineage Lb81962e787 round 1 carried two such objective paths and 27
-    unmapped-path notices, and the reviewer had to work out why. The claim
-    is the author's and the tool never rewrites it (design §Claim), so the
-    pattern is not reinterpreted; it is refused, naming the member and the
-    fix, when ALL of these hold: it has no glob character and no trailing
-    `/`; it is a canonical repository path (no empty, `.` or `..`
-    segment); the target commit's tree holds a directory there; and it is
-    not itself a changed path of the span (a file the span deleted or
-    replaced with that directory, which the exact path does map).
-
-    `changed` is a zero-argument callable returning the span's changed
-    paths, called only when a candidate is found. Two callers, as
-    `check_map_gates` has: the hand-off's gate-before-push callback, after
-    the commit and before any gate runs or anything is pushed, and
-    `emit_request` for a direct caller."""
-    # Three independent tests, each answering one class: a directory
-    # prefix already, a glob, and a spelling that is not a canonical
-    # repository path (judged without the trailing `/` the first test
-    # answers, so neither test stands in for the other).
-    candidates = [(where, p) for where, p in _claim_pattern_sites(claim)
-                  if not p.endswith("/") and not any(ch in p for ch in "*?[")
-                  and not any(seg in ("", ".", "..")
-                              for seg in p.rstrip("/").split("/"))]
-    if not candidates:
-        return
-    run = lambda *a: _git(repo, *a, no_replace=True)          # noqa: E731
-    dirs = [(where, p) for where, p in candidates
-            if refs.target_kind(run, head, p) == "tree"]
-    if not dirs:
-        return
-    span = set(changed())
-    dirs = [(where, p) for where, p in dirs if p not in span]
-    if not dirs:
-        return
-    from . import transport as _transport
-    named = "; ".join(f"{where} is `{p}`, write `{p}/`" for where, p in dirs)
-    raise _transport.Refusal(
-        f"the claim names {len(dirs)} path(s) that are directories at "
-        f"{head[:12]} without the trailing `/` a directory prefix carries "
-        f"({named}): a path "
-        f"without it is an exact path, and a span lists files, so it would "
-        f"match nothing and show only as notices. No gate was run and "
-        f"nothing was pushed, emitted or recorded",
-        "", remedy=f"the author adds the trailing `/` to each named path "
-                   f"in their claim file (at "
-                   f"{', '.join(where for where, _p in dirs)}), or names the "
-                   f"files it means, and re-runs the command; the tool does "
-                   f"not rewrite the author's claim")
-
-
 def check_claim_record(claim, ledger: Ledger, lineage: str, cfg: Config,
                        path: Path | None = None) -> dict:
     """The claim's record-bound members judged against THIS machine's ledger
@@ -4888,7 +4824,8 @@ def _pathspecs(scope_paths, changed: list[str],
     where `fnmatchcase` reads a literal caret, reads `\\` as an escape and
     `[[:digit:]]` as a class, and a pathspec without a wildcard also selects
     everything BELOW it, so an exact entry naming a directory showed that
-    directory's contents where `in_scope` selects nothing. Now the one
+    directory's contents where `in_scope` then selected nothing (it
+    selects them too since 2026-11-01). Now the one
     matcher decides the set and git is only told its members, so the two
     agree by construction.
 
@@ -4908,8 +4845,9 @@ def _pathspecs(scope_paths, changed: list[str],
     can pair two of them but never name a path outside them.
 
       - every pathspec is `:(literal)`: no pattern reaches git at all;
-      - a `dir/` entry that matches a changed path is emitted as itself
-        (a file named `dir` is not selected by it; measured), and every
+      - an entry's directory prefix (`dir/`, for `dir` and `dir/` alike)
+        that matches a changed path is emitted as itself (a file named
+        `dir` is not selected by it; measured), and every
         walked path below `dir/` that is not matched — a rename source,
         since every changed path there IS matched — is excluded by name
         with `:(exclude,literal)`, so a prefix stays one word plus one per
@@ -4942,13 +4880,12 @@ def _pathspecs(scope_paths, changed: list[str],
         return not any(c == q or c.startswith(q + "/") for c in chosen)
 
     prefixes, covered = [], set()
-    for entry in dict.fromkeys(scope_paths):
-        if entry.endswith("/"):
-            below = [p for p in matched if p.startswith(entry)]
-            if below and all(keeps_chosen(q) for q in walked
-                             if q.startswith(entry) and q not in chosen):
-                prefixes.append(entry)
-                covered.update(below)
+    for prefix in dict.fromkeys(dir_prefix(e) for e in scope_paths):
+        below = [p for p in matched if p.startswith(prefix)]
+        if below and all(keeps_chosen(q) for q in walked
+                         if q.startswith(prefix) and q not in chosen):
+            prefixes.append(prefix)
+            covered.update(below)
     files = [p for p in matched if p not in covered]
     specs = ([f":(literal){e}" for e in prefixes]
              + [f":(literal){p}" for p in files])
@@ -5000,12 +4937,6 @@ def _span_rows(shape: dict) -> list[dict]:
                 for e in entries]
     return [{"path": p, "raw": p, "insertions": None, "deletions": None}
             for p in shape.get("file_list", [])]
-
-
-def span_raw_paths(shape: dict) -> list[str]:
-    """The span's changed paths as the matchers read them (`_span_rows`'
-    raw post-image spellings), for a caller outside this module."""
-    return [r["raw"] for r in _span_rows(shape)]
 
 
 def _in_scope_line(shape: dict, generated: set, excluded) -> str | None:
@@ -5175,7 +5106,8 @@ def _objectives_block(objectives, shape: dict, generated: set,
               and not (excluded and in_scope(r["raw"], excluded))]
     out = ["", "Objectives — the author's map; the changed files are "
                "computed by the tool from the span, matching each "
-               "objective's paths (exact path, `dir/` prefix or glob):", "",
+               "objective's paths (a path and everything below it, or a "
+               "glob):", "",
            "| objective | declared paths | changed files it maps | tests | "
            "references |", "|---|---|---|---|---|"]
     unmatched = []
@@ -5312,9 +5244,9 @@ def _excluded_block(excluded, shape: dict) -> list[str]:
     rows = _span_rows(shape)
     if not excluded:
         return ["Excluded paths: (declared empty — nothing excluded)", ""]
-    out = ["Excluded paths — declared out of this review's scope (exact "
-           "path, `dir/` prefix or glob), subtracted from the in-scope "
-           "counts:"]
+    out = ["Excluded paths — declared out of this review's scope (a path "
+           "and everything below it, or a glob), subtracted from the "
+           "in-scope counts:"]
     for entry in excluded:
         n = sum(1 for r in rows if in_scope(r["raw"], [entry]))
         out.append(f"  - `{entry}` ("

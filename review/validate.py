@@ -1956,8 +1956,8 @@ def scope_gaps(claim: dict, changed_paths) -> list[str]:
     0.25.0 (public issue #4): a path matched by `scope_paths`,
     `excluded_paths` or any objective's `paths` is accounted for — through
     `emit.in_scope`, the one matcher the hand-off's sweep already holds a
-    commit to, so a `dir/` prefix or a glob accounts for exactly the paths
-    it admits there and no others.
+    commit to, so a path (with everything below it) or a glob accounts for
+    exactly the paths it admits there and no others.
     """
     if not claim:
         return []

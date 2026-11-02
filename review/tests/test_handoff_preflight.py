@@ -157,7 +157,7 @@ class TestTheInterpreterGuard(unittest.TestCase):
 
 class TestScopeEntries(unittest.TestCase):
 
-    def test_scope_entries_are_exact_a_directory_or_a_glob(self):
+    def test_scope_entries_are_a_path_and_what_is_below_or_a_glob(self):
         scope = ["README.md", "review/", "tools/tests/test_*.py", "docs"]
         for path, expected in (
                 ("README.md", True), ("review/emit.py", True),
@@ -166,7 +166,10 @@ class TestScopeEntries(unittest.TestCase):
                 ("tools/tests/helper.py", False),
                 ("reviewer/notes.md", False),   # a prefix is not a directory
                 ("docs", True),
-                ("docs/README.md", False)):   # `docs` names a path, not a tree
+                # `docs` names the path and everything below it, as `docs/`
+                # does (2026-11-01), and never a sibling sharing its name.
+                ("docs/README.md", True),
+                ("docsx/README.md", False)):
             with self.subTest(path=path):
                 self.assertEqual(emit.in_scope(path, scope), expected)
 

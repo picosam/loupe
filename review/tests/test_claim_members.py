@@ -65,9 +65,10 @@ THE PARTITION:
     `none` line, the `[^a].txt` reproduction, the withheld line over 1,400
     paths, the rename prefix that is not compressed, the reviewer's
     diverged rename and both copy prefixes — and each prints exactly the
-    line the in-process row judged. Rows: exact
-    entries (a file, a file in a directory, a name that
-    is only a directory, a file that became a directory and the reverse),
+    line the in-process row judged. Rows: bare
+    entries, each naming everything below it since 2026-11-01 (a file, a
+    file in a directory, a name that is only a directory, a file that
+    became a directory and the reverse, and a glob naming only that file),
     `dir/` prefixes (nested, over a file that became a directory, one
     matching nothing), globs with `*` (crossing `/`), `?`, sets, ranges,
     `[^a]`, `[!a]`, a POSIX class and a backslash, literal metacharacter
@@ -105,11 +106,11 @@ THE PARTITION:
     claim, two in one entry, the three carried-finding shapes, three
     across three members, each named with its alone-detail, in order; the
     first named is the first the claim's order meets; a shape defect
-    beside a bare directory names only the shape defect, and the
-    directory is then refused in its own place (after the hand-off's
-    commit, where that check has always run); the corrected claim hands
-    off. Every capture refusal: exit 1, blocked, `next` null, refs,
-    index, worktree and ledger byte-identical. MUTATION (manual, recorded
+    beside a bare directory names only the shape defect, and the bare
+    directory alone hands off (it names what is below it since
+    2026-11-01); the corrected claim hands off. Every capture refusal:
+    exit 1, blocked, `next` null, refs, index, worktree and ledger
+    byte-identical. MUTATION (manual, recorded
     in the commit): `emit._Defects` first-defect-only sends the
     several-defect rows and the first-met row red, and leaves the alone
     rows, the directory row and the control green.
@@ -950,10 +951,13 @@ class TestScopedMatchesInScope(_Loop):
     ROWS = (
         ("exact file", ["a.txt"]),
         ("exact file in a directory", ["docs/x.md"]),
-        ("exact name of a directory only", ["src"]),              # none
-        ("exact file that became a directory", ["d"]),           # d only
-        ("exact directory that became a file", ["e"]),           # e only
-        ("exact file and one child", ["d", "d/x"]),
+        # Since 2026-11-01 a bare path names everything below it too.
+        ("bare name of a directory only", ["src"]),       # src's two files
+        ("bare file that became a directory", ["d"]),     # d, d/x, d/y
+        ("bare directory that became a file", ["e"]),     # e, e/x
+        ("bare file and one child", ["d", "d/x"]),        # d, d/x, d/y
+        ("glob naming only a file that became a directory",
+         ["[d]"]),                                        # d only
         ("prefix", ["src/"]),
         ("nested prefix", ["src/deep/"]),
         ("prefix over a file that became a directory", ["d/"]),  # d/x, d/y
@@ -1118,23 +1122,33 @@ class TestScopedMatchesInScope(_Loop):
         self.assertEqual(matched(["[[:digit:]].txt"]), {"d].txt"})
         self.assertEqual(matched(["\\*.txt"]), {"\\a.txt"})
         self.assertEqual(matched(["[a].txt"]), {"[a].txt", "a.txt"})
-        self.assertEqual(matched(["d"]), {"d"})
-        self.assertEqual(matched(["e"]), {"e"})
+        # Since 2026-11-01 a bare path names everything below it, as
+        # git's literal pathspec does: `src` and `src/` hold one set.
+        self.assertEqual(matched(["d"]), {"d", "d/x", "d/y"})
+        self.assertEqual(matched(["e"]), {"e", "e/x"})
         self.assertEqual(matched(["d/"]), {"d/x", "d/y"})
-        for scope in (["src"], ["up.txt"], ["old/r.txt"], ["old/"],
-                      ["nothing/"]):
+        self.assertEqual(matched(["src"]), {"src/x.txt", "src/deep/y.py"})
+        self.assertEqual(matched(["src"]), matched(["src/"]))
+        self.assertEqual(matched(["[d]"]), {"d"})
+        for scope in (["up.txt"], ["old/r.txt"], ["old/"], ["nothing/"]):
             self.assertEqual(matched(scope), set(), scope)
         self.assertLessEqual(set(self.END_TO_END_ROWS), set(dict(self.ROWS)))
 
     def test_the_command_is_literal_and_says_how(self):
-        """Every pathspec is `:(literal)`; a prefix stays one word; a path
-        git would also select below a matched FILE is excluded by name."""
-        line, _out = self.assert_agrees(self.span, ["src/", "d"],
-                                        self.view.line(["src/", "d"]))
+        """Every pathspec is `:(literal)`; a prefix stays one word, a bare
+        directory's as its `dir/`; a path git would also select below a
+        FILE only a glob matched is excluded by name."""
+        line, _out = self.assert_agrees(self.span, ["src/", "[d]"],
+                                        self.view.line(["src/", "[d]"]))
         specs = shlex.split(line.split(" -- ", 1)[1])
         self.assertEqual(specs, [":(literal)src/", ":(literal)d",
                                  ":(exclude,literal)d/x",
                                  ":(exclude,literal)d/y"])
+        line, _out = self.assert_agrees(self.span, ["src", "d"],
+                                        self.view.line(["src", "d"]))
+        specs = shlex.split(line.split(" -- ", 1)[1])
+        self.assertEqual(specs, [":(literal)src/", ":(literal)d/",
+                                 ":(literal)d"])
 
     def assert_reproduced(self, span, scope, line, table) -> None:
         """A reproduction's row: the line agrees with `in_scope`, and the
@@ -1684,11 +1698,12 @@ class TestEveryShapeDefectInOneRefusal(_Loop):
         self.assertIn(f"(2) {self.alone('carried_findings[0].origin')}",
                       detail)
 
-    def test_o_a_tree_check_keeps_its_place(self):
+    def test_o_a_bare_directory_beside_a_shape_defect(self):
         """A shape defect beside a bare directory: only the shape defect is
-        named, since the claim is refused at capture, before the target
-        tree is read; without it, the directory is refused in its own
-        place, naming the member and the fix."""
+        named; without it, the bare directory names what is below it and
+        the claim hands off (2026-11-01, brief
+        `claim-bare-directory-pathspec`: until then the directory was
+        refused after the hand-off's commit)."""
         paths = [{**self.OBJECTIVE, "paths": ["src"]}]
         payload = self.refused(
             claim(objectives=paths,
@@ -1696,19 +1711,11 @@ class TestEveryShapeDefectInOneRefusal(_Loop):
             "shape beside a bare directory")
         self.assertIn("observations[0].context", payload["error"])
         self.assertNotIn("src", payload["error"])
-        # The tree check runs after the hand-off's commit, as it always
-        # has (`emit.check_directory_paths`), so this half judges the
-        # refusal and its place, not an unmoved tree.
         loop = copy_loop(self, self.loop)
         code, payload = loop.handoff(loop.claim(claim(objectives=paths),
                                                 name="directory.json"))
-        self.assertEqual(code, 1, payload)
-        self.assertEqual(payload.get("next_kind"), "blocked", payload)
-        self.assertIn("objectives[0].paths[0] is `src`, write `src/`",
-                      payload["error"])
-        self.assertTrue(payload["remedy"].startswith(
-            "the author adds the trailing `/` to each named path in their "
-            "claim file (at objectives[0].paths[0])"), payload)
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload.get("ok"), True, payload)
 
     def test_r_every_claim_file_remedy_names_the_author(self):
         """2026-11-01: a claim-file refusal's remedy says the AUTHOR acts in

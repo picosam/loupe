@@ -1,63 +1,77 @@
-"""A claim pattern naming a directory at the target without its trailing
-`/` is refused, naming the member and the fix (brief
-`loupe-tool-feedback-2026-10-06` item 2).
+"""A claim path names itself and everything below it, as git reads a
+literal pathspec (brief `claim-bare-directory-pathspec`, Osama's ruling of
+2026-11-01, which reverses item 2 of brief `loupe-tool-feedback-2026-10-06`).
 
 The `scope_paths` grammar — `scope_paths`, `excluded_paths`, each
-objective's `paths` — is an exact path, a directory prefix ending in `/`,
-or a glob, matched by the one matcher `emit.in_scope`. A bare `src` is an
-exact path; a span lists files; so it matched nothing, and lineage
-Lb81962e787 round 1 carried two such objective paths and 27 unmapped-path
-notices. The design keeps the claim the author's (§Claim: "the tool
-carries it and never invents it"), so the pattern is refused rather than
-reinterpreted: `emit.check_directory_paths`.
+objective's `paths` — is a path or a glob, matched by the one matcher
+`emit.in_scope`. Until 2026-11-01 a bare `src` was an exact path: a span
+lists files, so it matched nothing, and from 2026-09-19 the hand-off refused
+it after its commit (`emit.check_directory_paths`, deleted). 16 of one
+adopting repository's refused hand-offs in two weeks were that refusal, and
+two of them had first waited 883 s for the machine's suite lock. Now `src`
+and `src/` admit the same paths. Nothing rewrites the claim: the grammar
+gives the bare name its meaning.
 
-THE PARTITION (in-process, on a real scratch repository, against the one
-function both callers run):
+THE PARTITION, in-process, `emit.in_scope` over the span of a real scratch
+repository and probe paths beside it:
 
-  I1  a bare directory with changes under it         refused, located
-  I2  the same with its `/`                          admitted
-  I3  an exact file; I3b one the span did not change admitted
-  I4  a path the target does not hold                admitted
-  I5  a glob; I5b a glob spelling a real directory   admitted
-  I6  non-canonical spellings (`./src`, `/src`)      admitted, not judged
-  I7  a file the span replaced with a directory      admitted (it maps the
-      deleted file); I7c the same name not in the span: refused
-  I8  a submodule pointer; I9 a symlink to a dir     admitted, and
-      I8b, I9b the same the span did not change      admitted
-  I10 a directory nothing in the span changed        refused
-  I11 each member: `scope_paths`, `excluded_paths`, a second objective's
-      second path                                    refused, located
-  I12 two offenders                                  both named, one refusal
-  I13 no candidate                                   the span is never read
+  P1  a bare directory                 admits what its `dir/` admits, nested
+                                       paths included, over every path
+  P2  a sibling sharing the prefix     never admitted (`src-old/x`, `srcx`,
+                                       `src.py`), bare or with its `/`
+  P3  an exact file                    admits itself only; its `file/`
+                                       admits nothing
+  P4  a file the span replaced with a  the bare name admits both the file
+      directory                        and what is below; `x/` the latter
+  P5  a symlink, a submodule pointer   admit themselves only
+  P6  a glob                           fnmatch as before; a glob spelling a
+                                       real directory (`lit[1]`) also names
+                                       it literally, as git's literal-first
+                                       pathspec match does
+  P7  non-canonical spellings          admit nothing (`./src`, `/src`,
+                                       `src/./`, an empty string)
+  P8  a path the target does not hold  admits nothing
+  P9  a directory the span deleted     the bare name admits the deleted
+                                       paths below it, as its `dir/` does
 
 THROUGH THE REAL ENTRY POINT (`emit-request` and `handoff` as
-subprocesses, scratch state): C1 the I1 refusal, the repository and the
-ledger byte-identical and no request written; C2 every admitted class in
-one claim, emitted; C3 and C4 `scope_paths` and `excluded_paths` refused;
-C5 a hand-off with a remote refused in its gate-before-push callback — no
-gate ran (the gate's marker is absent), nothing pushed, the checkout
-byte-identical.
+subprocesses, scratch state): C1 `emit-request` with `src` as an objective
+path, a scope path and an excluded path maps, scopes and subtracts what
+`src/` does, its `Scoped:` command naming `:(literal)src/`; C2 a hand-off
+with a remote and a bare objective directory runs its gate, pushes, and
+keeps a request mapping the directory's files; C3 a hand-off whose
+outstanding work lies under a bare `scope_paths` directory sweeps it, and
+the paired control, a scope that does not hold it, refuses outside the
+scope with the checkout byte-identical; C4 a claim the base admitted,
+naming a directory the span deleted (`docs`) or a glob spelling a real
+directory (`lit[1]`), now maps, subtracts and scopes the paths below it,
+as the brief's upgrader note says (round 1 F1 of lineage L93b1f9d73b), the
+paired `docs/` rendering the same rows.
 
-MUTATIONS (manual, copies of review/emit.py and review/cli.py,
-`python3.15 -B`; recorded in the commit): the callback's call removed
-sends C5 red (the gate runs and the hand-off pushes before the emission
-refuses); the span exemption removed sends I7 and C2 red; the glob
-exclusion removed sends I5b and C2 red; the canonical-path filter removed
-sends I6 and C2 red; `== "tree"` weakened to any kind sends I3b, I8b,
-I9b and C2 red; the trailing-`/` exemption removed sends I2, I13, C2
-and C5's paired control red.
+MUTATIONS (manual, copies of review/emit.py, `python3.15 -B`, restored by
+`cmp`; recorded in the commit): `in_scope` back to a bare exact path sends
+P1, P4, P6, C1, C2 and C3 red; a bare entry matched as a string prefix (no
+`/`) sends P1 to P4 and P7 red; the glob branch removed sends P6 red; the
+`Scoped:` builder compressing only a `dir/` entry sends C1 red. Round 1
+F1: `in_scope` back to a bare exact path sends P9 and C4 red as well.
 """
 from __future__ import annotations
 
-import shutil
 import unittest
 
-from review import emit, transport
+from review import emit
 from review.tests.test_precis_taxonomy import ScratchLoop, taxonomy_toml
 
 MARK_GATE = ('\n[[gates]]\nid = "mark"\ncommand = ["sh", "-c", '
              '"echo ran > ../gate-ran"]\nblocking = false\n')
 REFS = [{"path": "review.toml", "required": True}]
+
+#: Paths beside the span, so a row is judged on what it must NOT admit
+#: as well as on what the span holds.
+PROBES = ("src", "src/deep/c.py", "src-old/x", "srcx", "src.py",
+          "src/a.py.bak", "src/a.pyc", "docs/d.md", "lib/l.py", "x",
+          "x/y", "xy", "lit1", "lit[1]", "lit[1]/z", "link/inner",
+          "sub/inner")
 
 
 def claim(**members) -> dict:
@@ -107,6 +121,20 @@ def build(case, *, remote=False) -> tuple[ScratchLoop, str, str]:
     return loop, base, loop.git("rev-parse", "HEAD")
 
 
+def build_deleted(case) -> tuple[ScratchLoop, str, str]:
+    """`build`, then `docs/d.md` deleted in a commit of its own, so the
+    span holds a directory the target no longer has."""
+    loop, base, _ = build(case)
+    loop.git("rm", "-q", "docs/d.md")
+    loop.git("commit", "-q", "-m", "docs deleted")
+    return loop, base, loop.git("rev-parse", "HEAD")
+
+
+def span_of(loop, base, head) -> list[str]:
+    return [row["raw"] for row in emit._span_rows(
+        emit.diff_shape(loop.repo, base, head))]
+
+
 class TestPartitionInProcess(unittest.TestCase):
 
     @classmethod
@@ -118,104 +146,73 @@ class TestPartitionInProcess(unittest.TestCase):
             def skipTest(self, why):
                 raise unittest.SkipTest(why)
         cls.loop, cls.base, cls.head = build(_Case())
-        cls.span = emit.span_raw_paths(emit.diff_shape(cls.loop.repo,
-                                                       cls.base, cls.head))
+        cls.span = span_of(cls.loop, cls.base, cls.head)
+        cls.paths = sorted(set(cls.span) | set(PROBES))
 
-    def check(self, body, changed=None):
-        emit.check_directory_paths(body, self.loop.repo, self.head,
-                                   changed or (lambda: self.span))
-
-    def refused(self, body, *located, changed=None) -> str:
-        with self.assertRaises(transport.Refusal) as ctx:
-            self.check(body, changed)
-        text = str(ctx.exception)
-        for where, p in located:
-            self.assertIn(f"{where} is `{p}`, write `{p}/`", text)
-        self.assertEqual(ctx.exception.next_cmd, "")
-        self.assertIn("trailing `/`", ctx.exception.remedy)
-        return text
+    def admitted(self, *entries) -> set[str]:
+        return {p for p in self.paths if emit.in_scope(p, list(entries))}
 
     def test_the_span_is_what_the_fixture_says(self):
         self.assertEqual(sorted(self.span),
                          ["link", "lit[1]/z", "src/a.py", "src/b.py", "sub",
                           "x", "x/y"])
 
-    def test_i1_a_bare_directory_is_refused_and_located(self):
-        text = self.refused(claim(objectives=objectives("src")),
-                            ("objectives[0].paths[0]", "src"))
-        self.assertIn("No gate was run and nothing was pushed, emitted or "
-                      "recorded", text)
+    def test_p1_a_bare_directory_admits_what_its_slash_admits(self):
+        self.assertEqual(self.admitted("src"),
+                         {"src/a.py", "src/b.py", "src/deep/c.py",
+                          "src/a.py.bak", "src/a.pyc", "src"})
+        # A glob's `/`-ended twin is a glob of its own (P6), not a pair.
+        for name in ("src", "docs", "x", "src/deep"):
+            with self.subTest(name=name):
+                self.assertEqual(self.admitted(name) - {name},
+                                 self.admitted(f"{name}/"))
 
-    def test_i2_the_directory_with_its_slash_is_admitted(self):
-        self.check(claim(objectives=objectives("src/")))
+    def test_p2_a_sibling_sharing_the_prefix_is_never_admitted(self):
+        for entry in ("src", "src/"):
+            with self.subTest(entry=entry):
+                self.assertFalse({"src-old/x", "srcx", "src.py"}
+                                 & self.admitted(entry))
 
-    def test_i3_an_exact_file_is_admitted(self):
-        self.check(claim(objectives=objectives("src/a.py")))
+    def test_p3_an_exact_file_admits_itself_only(self):
+        self.assertEqual(self.admitted("src/a.py"), {"src/a.py"})
+        self.assertEqual(self.admitted("src/a.py/"), set())
 
-    def test_i3b_a_file_the_span_did_not_change_is_admitted(self):
-        self.check(claim(objectives=objectives("docs/d.md")))
+    def test_p4_a_file_replaced_by_a_directory(self):
+        self.assertEqual(self.admitted("x"), {"x", "x/y"})
+        self.assertEqual(self.admitted("x/"), {"x/y"})
 
-    def test_i4_a_path_the_target_does_not_hold_is_admitted(self):
-        self.check(claim(objectives=objectives("lib")))
+    def test_p5_a_symlink_and_a_submodule_pointer_admit_themselves(self):
+        # Git lists nothing below either; the probes `link/inner` and
+        # `sub/inner` stand for a path the matcher would admit if it did.
+        self.assertEqual(self.admitted("link") & set(self.span), {"link"})
+        self.assertEqual(self.admitted("sub") & set(self.span), {"sub"})
 
-    def test_i5_globs_are_admitted(self):
-        self.check(claim(objectives=objectives("sr?", "src*")))
+    def test_p6_globs(self):
+        self.assertEqual(self.admitted("src*"),
+                         {"src", "src/a.py", "src/b.py", "src/deep/c.py",
+                          "src-old/x", "srcx", "src.py", "src/a.py.bak",
+                          "src/a.pyc"})
+        self.assertEqual(self.admitted("sr?"), {"src"})
+        self.assertEqual(self.admitted("lit[1]"),
+                         {"lit1", "lit[1]", "lit[1]/z"})
 
-    def test_i5b_a_glob_spelling_a_real_directory_is_a_glob(self):
-        self.check(claim(objectives=objectives("lit[1]")))
+    def test_p7_non_canonical_spellings_admit_nothing(self):
+        for entry in ("./src", "/src", "src/./", ""):
+            with self.subTest(entry=entry):
+                self.assertEqual(self.admitted(entry), set())
 
-    def test_i6_non_canonical_spellings_are_not_judged(self):
-        self.check(claim(objectives=objectives("./src", "/src", "src/./")))
+    def test_p8_a_path_the_target_does_not_hold_admits_nothing(self):
+        self.assertEqual(self.admitted("lib") & set(self.span), set())
 
-    def test_i7_a_file_the_span_replaced_with_a_directory_is_admitted(self):
-        self.check(claim(objectives=objectives("x")))
-
-    def test_i7c_control_the_same_name_outside_the_span_is_refused(self):
-        self.refused(claim(objectives=objectives("x")),
-                     ("objectives[0].paths[0]", "x"),
-                     changed=lambda: [p for p in self.span if p != "x"])
-
-    def test_i8_a_submodule_pointer_is_admitted(self):
-        self.check(claim(objectives=objectives("sub")))
-
-    def test_i8b_an_unchanged_submodule_pointer_is_admitted(self):
-        self.check(claim(objectives=objectives("oldsub")))
-
-    def test_i9_a_symlink_to_a_directory_is_admitted(self):
-        self.check(claim(objectives=objectives("link")))
-
-    def test_i9b_an_unchanged_symlink_to_a_directory_is_admitted(self):
-        self.check(claim(objectives=objectives("oldlink")))
-
-    def test_i10_a_directory_nothing_changed_is_refused(self):
-        self.refused(claim(objectives=objectives("docs")),
-                     ("objectives[0].paths[0]", "docs"))
-
-    def test_i11_every_member_is_judged_and_located(self):
-        for body, where, p in (
-                (claim(scope_paths=["src/", "docs"]), "scope_paths[1]",
-                 "docs"),
-                (claim(excluded_paths=["docs"]), "excluded_paths[0]",
-                 "docs"),
-                (claim(objectives=objectives("src/") + [
-                    {"title": "two", "paths": ["src/a.py", "src"]}]),
-                 "objectives[1].paths[1]", "src")):
-            with self.subTest(where=where):
-                self.refused(body, (where, p))
-
-    def test_i12_two_offenders_are_named_in_one_refusal(self):
-        text = self.refused(claim(scope_paths=["docs"],
-                                  objectives=objectives("src")),
-                            ("scope_paths[0]", "docs"),
-                            ("objectives[0].paths[0]", "src"))
-        self.assertIn("the claim names 2 path(s) that are directories",
-                      text)
-
-    def test_i13_no_candidate_never_reads_the_span(self):
-        def boom():
-            raise AssertionError("the span was read")
-        self.check(claim(objectives=objectives("src/", "sr?")), boom)
-        self.check(claim(), boom)
+    def test_p9_a_directory_the_span_deleted(self):
+        loop, base, head = build_deleted(self)
+        span = span_of(loop, base, head)
+        self.assertIn("docs/d.md", span)
+        for entry in ("docs", "docs/"):
+            with self.subTest(entry=entry):
+                self.assertEqual({p for p in span
+                                  if emit.in_scope(p, [entry])},
+                                 {"docs/d.md"})
 
 
 class TestThroughTheCli(unittest.TestCase):
@@ -225,77 +222,90 @@ class TestThroughTheCli(unittest.TestCase):
         code, payload = loop.loupe(
             "emit-request", "--claim-file", loop.claim(body, name=name),
             "--base", base, "--out", out, "--local-only")
-        return code, payload, out
-
-    def state_bytes(self, loop):
-        return ({str(p.relative_to(loop.state)): p.read_bytes()
-                 for p in sorted(loop.state.rglob("*"))
-                 if p.is_file() and p.suffix != ".lock"}
-                if loop.state.exists() else {})
-
-    def assert_refused_untouched(self, loop, base, body, where, p):
-        before, ledger = loop.snapshot(), self.state_bytes(loop)
-        code, payload, out = self.emit_request(loop, base, body,
-                                               f"refused-{where}.json")
-        self.assertEqual(code, 1, payload)
-        self.assertEqual(payload.get("next_kind"), "blocked", payload)
-        self.assertIn(f"{where} is `{p}`, write `{p}/`", payload["error"])
-        self.assertEqual(loop.snapshot(), before)
-        self.assertEqual(self.state_bytes(loop), ledger)
-        self.assertFalse(out.exists())
-        self.assertFalse((loop.tmp / "gate-ran").exists())
-
-    def test_c1_c3_c4_refusals_leave_everything_as_it_was(self):
-        loop, base, _ = build(self)
-        for body, where, p in (
-                (claim(objectives=objectives("src")),
-                 "objectives[0].paths[0]", "src"),
-                (claim(scope_paths=["docs"]), "scope_paths[0]", "docs"),
-                (claim(excluded_paths=["docs"]), "excluded_paths[0]",
-                 "docs")):
-            with self.subTest(where=where):
-                self.assert_refused_untouched(loop, base, body, where, p)
-
-    def test_c2_every_admitted_class_emits(self):
-        loop, base, _ = build(self)
-        code, payload, out = self.emit_request(loop, base, claim(
-            objectives=objectives("src/", "src/a.py", "lib", "sr?",
-                                  "lit[1]", "./src", "x", "sub", "link",
-                                  "docs/d.md", "oldsub", "oldlink")),
-            "admitted.json")
         self.assertEqual(code, 0, payload)
-        text = out.read_text(encoding="utf-8")
-        self.assertIn("Objectives —", text)
-        self.assertIn("src/a.py, src/b.py", text)
+        return out.read_text(encoding="utf-8")
 
-    def test_c5_a_hand_off_refuses_before_any_gate_or_push(self):
+    @staticmethod
+    def lines(text, *starts) -> list[str]:
+        return [ln for ln in text.splitlines() if ln.startswith(starts)]
+
+    def test_c1_bare_and_slashed_emit_the_same_request_rows(self):
+        loop, base, _ = build(self)
+        texts = {}
+        for entry in ("src", "src/"):
+            texts[entry] = self.emit_request(loop, base, claim(
+                objectives=objectives(entry), scope_paths=[entry],
+                excluded_paths=[entry]), f"c1-{entry.strip('/')}"
+                f"{'-slash' if entry.endswith('/') else ''}.json")
+        bare, slashed = texts["src"], texts["src/"]
+        self.assertIn("| o | `src` | src/a.py, src/b.py |", bare)
+        self.assertIn("  - `src` (matches 2 span path(s))", bare)
+        scoped = self.lines(bare, "Scoped:")
+        self.assertEqual(len(scoped), 1, bare)
+        self.assertTrue(scoped[0].endswith(" -- ':(literal)src/'"),
+                        scoped[0])
+        # The paired control: `src/` yields the same rows, only the
+        # declared spelling differs.
+        self.assertEqual(
+            [ln.replace("`src/`", "`src`")
+             for ln in self.lines(slashed, "| o |", "  - `src", "Scoped:")],
+            self.lines(bare, "| o |", "  - `src", "Scoped:"))
+
+    def test_c2_a_hand_off_with_a_bare_directory_gates_and_pushes(self):
         loop, base, head = build(self, remote=True)
-        remote_before = loop.git("ls-remote", "origin", "refs/heads/main")
-        before = loop.snapshot()
         code, payload = loop.loupe(
             "handoff", "--claim-file",
             loop.claim(claim(objectives=objectives("src")), name="h.json"),
-            "--base", base)
-        self.assertEqual(code, 1, payload)
-        self.assertEqual(payload.get("next_kind"), "blocked", payload)
-        self.assertIn("objectives[0].paths[0] is `src`, write `src/`",
-                      payload["error"])
-        self.assertFalse((loop.tmp / "gate-ran").exists(),
-                         "a gate ran before the refusal")
-        self.assertEqual(loop.git("ls-remote", "origin", "refs/heads/main"),
-                         remote_before)
-        self.assertEqual(loop.snapshot(), before)
-        self.assertEqual(loop.git("rev-parse", "HEAD"), head)
-        # The paired control: the same hand-off with the `/` gates and
-        # pushes.
-        code, payload = loop.loupe(
-            "handoff", "--claim-file",
-            loop.claim(claim(objectives=objectives("src/")), name="ok.json"),
             "--base", base)
         self.assertEqual(code, 0, payload)
         self.assertTrue((loop.tmp / "gate-ran").exists())
         self.assertIn(head, loop.git("ls-remote", "origin",
                                      "refs/heads/main"))
+        kept = payload["kept"]
+        with open(kept, encoding="utf-8") as fh:
+            self.assertIn("| o | `src` | src/a.py, src/b.py |", fh.read())
+
+    def test_c3_outstanding_work_under_a_bare_scope_path_is_swept(self):
+        for scope, admitted in ((["src"], True), (["lib"], False)):
+            with self.subTest(scope=scope):
+                loop, base, _ = build(self)
+                loop.write("src/a.py", "a, changed\n")
+                before = loop.snapshot()
+                code, payload = loop.handoff(loop.claim(
+                    claim(scope_paths=scope), name="sweep.json"))
+                if admitted:
+                    self.assertEqual(code, 0, payload)
+                    self.assertIn("src/a.py", loop.git(
+                        "show", "--name-only", "--format=", "HEAD"))
+                else:
+                    self.assertNotEqual(code, 0, payload)
+                    self.assertIn("src/a.py", payload["error"])
+                    self.assertIn("scope", payload["error"])
+                    self.assertEqual(loop.snapshot(), before)
+
+    def test_c4_an_accepted_claim_widens_where_it_has_paths_below(self):
+        loop, base, _ = build_deleted(self)
+        rows = {}
+        for entry, below in (("docs", "docs/d.md"), ("docs/", "docs/d.md"),
+                             ("lit[1]", "lit[1]/z")):
+            with self.subTest(entry=entry):
+                text = self.emit_request(loop, base, claim(
+                    objectives=objectives(entry), scope_paths=[entry],
+                    excluded_paths=[entry]),
+                    f"c4-{len(rows)}.json")
+                self.assertIn(f"| o | `{entry}` | {below} |", text)
+                self.assertIn(f"  - `{entry}` (matches 1 span path(s))",
+                              text)
+                scoped = self.lines(text, "Scoped:")
+                self.assertEqual(len(scoped), 1, text)
+                prefix = entry.rstrip("/") + "/"
+                self.assertTrue(scoped[0].endswith(f"':(literal){prefix}'"),
+                                scoped[0])
+                rows[entry] = [ln.replace(f"`{entry}`", "`E`") for ln in
+                               self.lines(text, "| o |", f"  - `{entry}`",
+                                          "Scoped:")]
+        # The paired control: the bare `docs` renders what `docs/` does.
+        self.assertEqual(rows["docs"], rows["docs/"])
 
 
 if __name__ == "__main__":

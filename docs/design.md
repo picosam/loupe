@@ -322,13 +322,18 @@ like any other path: which files a repository generates is identity, not
 mechanism, and does not travel with the tool (§11).
 
 The claim's path patterns (`scope_paths`, `excluded_paths`, each
-objective's `paths`) are an exact path, a directory prefix ending in `/`,
-or a glob, judged by one matcher. A bare name that is a DIRECTORY at the
-target is an exact path that can match nothing a span lists, so it is
-refused before any gate runs, naming the member and the `/` it lacks —
-refused rather than read as a prefix, because the tool carries the claim
-and does not reinterpret it. A name the span itself changed (a file
-replaced by that directory) is a real exact path and is kept.
+objective's `paths`) are a path or a glob, judged by one matcher. Every
+entry, a glob spelling included, names the path it spells and everything
+below it, as git's literal-first pathspec match does, and an entry with a
+glob character also matches as a glob: `dir` and `dir/` admit the same
+paths, a file admits itself, and `dir` never admits `dir-old/x`. A claim
+accepted before 0.33.0 therefore matches more wherever one of its
+entries has paths below it that it did not match. The grammar, not a
+rewrite, gives the bare name
+its meaning, so the claim stays the author's bytes. Until 0.33.0 a
+bare name was an exact path, a directory named that way matched nothing a
+span lists, and the hand-off refused it; 16 of one adopter's refusals in
+two weeks were that one mistake.
 
 The SPAN does separate them, and the same §11 line is why it can. A changed
 path whose `linguist-generated` attribute is set in the target tree is
