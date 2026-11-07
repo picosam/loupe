@@ -227,7 +227,8 @@ class TestTheReviewerLocalScopedDiff(_TakeRound):
             with self.subTest(rendering=extra or "default"):
                 text = self.take(s, *extra, tty=True)
                 self.assertIn(f"\ndiff:   {payload['diff']}\n"
-                              f"scoped: {payload['scoped']}\nthen:   ",
+                              f"scoped: {payload['scoped']}\n"
+                              f"        {payload['scoped_note']}\nthen:   ",
                               text)
 
     def test_the_emitters_none(self):

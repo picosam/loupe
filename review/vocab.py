@@ -137,6 +137,7 @@ CLAIM_STRING_FIELDS = (
     "access_note",      # how the reviewer reaches the target
     "relay",            # overrides the config's relay line
     "commit_subject",   # the subject handoff commits outstanding work under
+    "redesign_answer",  # past the third `changes requested`, why go on
 )
 
 # Rendered as bulleted lists; every element is a string.
@@ -348,6 +349,43 @@ TRANSPORTS = (TRANSPORT_PATH, TRANSPORT_PASTE, TRANSPORT_GIT)
 DEBUG_ATTR = "debug"
 DEBUG_TOOL_FEEDBACK = "tool-feedback"
 TOOL_FEEDBACK_SECTION = "tool feedback"
+
+# ---------------------------------------------------------------- leads
+
+# A doubt that costs no round (2026-11-04, Osama's ruling on perfection issues,
+# and the recall inventory's proposal 3). `clean to advance` carries exactly
+# `None` under `## findings`, so any finding, Low included, forced another
+# round at a median 112 k tokens, and a finding costs a median 2,242 bytes:
+# 0 Info and 34 Low of 397 were ever filed. `## leads` is the cheap form: one
+# line each, no falsification, legal on either verdict, recorded for the author
+# at `close`. It holds Low and Info only, by name, case-folded, and only where
+# the target's taxonomy declares that severity and does not call it blocking:
+# anything worse is a finding, and a repository with neither name has no leads.
+LEADS_SECTION = "leads"
+# ------------------------------------------------- the redesign question
+
+# Osama, 2026-11-04, in his words: "Beyond 3 rounds of coming back with errors,
+# there should be a 'should we redesign?' trigger that you fire, putting into
+# question the reason why Codex keeps coming back with change requests and
+# ensuring that you're not chasing lexical or perfection issues that add no
+# value." A count of verdicts, not the round cap: a cap can be raised, and the
+# question stands however far. Past it, `close`, `respond` and `ledger
+# convergence` print the question with the lineage's findings, and a request
+# carries `redesign_answer` in its claim, refused without one. The tool asks and
+# records; it does not judge the answer.
+REDESIGN_AFTER_VERDICTS = 3
+REDESIGN_ANSWER_FIELD = "redesign_answer"
+REDESIGN_QUESTION = (
+    "Should we redesign? {verdicts} verdicts have come back with changes "
+    "requested on this lineage. Before another round, ask why they keep "
+    "coming: a design that cannot close, a claim wider than the change, or "
+    "lexical and perfection issues that add no value. A further request "
+    "carries the answer in its claim's `redesign_answer`.")
+
+LEAD_SEVERITIES = ("low", "info")
+LEAD_CONFIDENCES = ("low", "medium", "high")
+LEAD_EVENT = "lead"
+LEAD_GRAMMAR = "- <severity> <confidence> <file[:line]>: <why>"
 
 # ------------------------------------------------- the authority's answer
 

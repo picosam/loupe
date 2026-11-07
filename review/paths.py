@@ -31,22 +31,6 @@ def shell_path(path) -> str:
     return shlex.quote(str(path))
 
 
-def shell_word(value) -> str:
-    """Any dynamic value as one shell word — the same renderer as
-    `shell_path`, under the name that says what the rule actually is
-    (round 4 F1).
-
-    "Not a path" was read as "safe unquoted", and it is not: a reviewer
-    identity and a Git ref are both dynamic values that reach a command an
-    agent runs verbatim, and Git accepts `refs/heads/topic;printf` as a ref
-    name. Every dynamic word in a command goes through here; for ordinary
-    tokens — a SHA, a plain identity, a branch without metacharacters —
-    the output is byte-identical to the input, so quoting everything costs
-    nothing and closes the class.
-    """
-    return shlex.quote(str(value))
-
-
 # The word grammar, one type per meaning (lineage 6 round 1, F1). Three
 # kinds of word render UNQUOTED, and the previous grammar let them share one
 # type: a `Lit` could carry a trailing semicolon, an unmatched quote or a

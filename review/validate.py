@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 
 from . import FORMER_NAMES, TOOL_NAME, paths, vocab
@@ -232,6 +233,16 @@ def residue_items(v: Verdict, ledger, lineage: str | None) -> list[Item]:
         return []
     items: list[Item] = []
     verdict_round = None
+    # A closure of a fingerprint no ruling holds settles nothing: a typo on a
+    # refuted finding is caught by C-MISSING, on any other it no-ops.
+    for c in v.closures:
+        if (c.well_formed and (c.closure != "reclassified" or c.residue)
+                and ledger.thread_anchor(c.fp, lineage) is None):
+            items.append(_notice(
+                "C-UNKNOWN-FINGERPRINT",
+                f"{c.fp}: this ledger holds no ruling of that fingerprint in "
+                f"lineage {lineage}, so this closure settles nothing here; "
+                f"check it for a typo"))
     for c in v.closures:
         if not c.well_formed or c.closure != "reclassified" or c.residue:
             continue
@@ -335,6 +346,9 @@ def _reference_grammar_items(content: str) -> list[Item]:
 
 _VERDICT_HEADING = re.compile(r"^## (.+?)\s*$", re.M)
 REQUIRED_VERDICT_SECTIONS = ("findings", "evidence checked")
+#: `## leads` is known too, and its repeat is `_lead_items`' V-LEAD-DUPLICATE.
+_OPTIONAL_VERDICT_SECTIONS = ("closures", "unavailable references",
+                              vocab.TOOL_FEEDBACK_SECTION)
 
 # The request's §5.1 content model, in the order the emitter renders it and
 # every historical request carries it: the taxonomy the reviewer rules by,
@@ -419,6 +433,32 @@ def _section_grammar_items(v: Verdict) -> list[Item]:
                               f"'## {name}' is present but empty; a declared "
                               f"section with no content states nothing"))
 
+    # The section map keeps the last of a repeated heading and drops a heading
+    # it does not know, so a closure can vanish by either route. On record, 0
+    # repeats and 3 unknown headings in 1,015 kept verdicts, none a near miss.
+    for name in _OPTIONAL_VERDICT_SECTIONS:
+        if headings.count(name) > 1:
+            items.append(_err("V-SECTION-DUPLICATE",
+                              f"'## {name}' appears {headings.count(name)} "
+                              f"times; the last would silently replace the "
+                              f"others when parsed"))
+    known = (*REQUIRED_VERDICT_SECTIONS, *_OPTIONAL_VERDICT_SECTIONS,
+             vocab.LEADS_SECTION)
+    for h in dict.fromkeys(headings):
+        if h in known:
+            continue
+        spelt = re.sub(r"[^a-z ]", "", h).strip().rstrip("s")
+        near = [n for n in known if n.rstrip("s") == spelt]
+        if near:
+            items.append(_err("V-SECTION-SPELLING",
+                              f"'## {h}' is read as nothing: the section is "
+                              f"'## {near[0]}', and what is under this "
+                              f"heading would be dropped"))
+        else:
+            items.append(_notice("V-SECTION-UNKNOWN",
+                                 f"'## {h}' is no section of a verdict, so "
+                                 f"the tool records nothing under it"))
+
     ordered = [h for h in headings if h in REQUIRED_VERDICT_SECTIONS]
     firsts: list[str] = []
     for h in ordered:
@@ -429,6 +469,39 @@ def _section_grammar_items(v: Verdict) -> list[Item]:
         items.append(_err("V-SECTION-ORDER",
                           f"sections appear as {firsts} but the declared "
                           f"order is {list(REQUIRED_VERDICT_SECTIONS)}"))
+    return items
+
+
+def _lead_items(v: Verdict, cfg: Config) -> list[Item]:
+    """`## leads`, where a verdict has one. No verdict of record does: 520
+    verdicts in this repository's exchange, none with the heading, so a rule
+    here moves nothing already accepted. What it holds is the judge's to
+    choose; that it is what it says, a Low or Info in one line, is checked."""
+    items: list[Item] = []
+    headings = [h.strip().lower() for h in _VERDICT_HEADING.findall(v.body)]
+    if headings.count(vocab.LEADS_SECTION) > 1:
+        items.append(_err("V-LEAD-DUPLICATE",
+                          f"'## {vocab.LEADS_SECTION}' appears more than once, "
+                          f"and a repeat silently replaces the first when "
+                          f"parsed"))
+    for line in v.lead_defects:
+        items.append(_err("V-LEAD-GRAMMAR",
+                          f"{line!r} is not a lead: one line each, "
+                          f"`{vocab.LEAD_GRAMMAR}`"))
+    for lead in v.leads:
+        if (lead.severity.lower() not in vocab.LEAD_SEVERITIES
+                or lead.severity not in cfg.severities
+                or lead.severity in cfg.blocking_severities):
+            items.append(_err("V-LEAD-SEVERITY",
+                              f"a lead on {lead.where} says {lead.severity!r}; "
+                              f"a lead is a Low or an Info the taxonomy "
+                              f"declares and does not call blocking, and "
+                              f"anything worse is a finding"))
+        if lead.confidence.lower() not in vocab.LEAD_CONFIDENCES:
+            items.append(_err("V-LEAD-CONFIDENCE",
+                              f"a lead on {lead.where} says confidence "
+                              f"{lead.confidence!r}; it is one of "
+                              f"{', '.join(vocab.LEAD_CONFIDENCES)}"))
     return items
 
 
@@ -467,11 +540,25 @@ def validate_verdict(v: Verdict, cfg: Config,
     if v.verdict == vocab.VERDICT_CLEAN:
         if v.findings:
             items.append(_err("V-CLEAN-FINDINGS",
-                              "clean to advance may not carry findings"))
+                              "clean to advance may not carry findings"
+                              + ("; a Low or Info that should not cost a "
+                                 f"round goes under `## {vocab.LEADS_SECTION}`"
+                                 if all(f.severity.lower()
+                                        in vocab.LEAD_SEVERITIES
+                                        for f in v.findings) else "")))
         elif not v.findings_none:
             items.append(_err("V-CLEAN-NONE",
                               "clean to advance must carry exactly 'None' "
                               "under ## findings"))
+
+    # Nothing to answer and nothing closed: the round asks for a change nobody
+    # can name. Unavailable references owe a finding each (the shape text).
+    if (v.verdict == vocab.VERDICT_CHANGES and not v.findings
+            and not v.closures):
+        items.append(_err("V-CHANGES-NOTHING",
+                          "changes requested names no finding and closes "
+                          "nothing, so the author has nothing to answer; "
+                          "each unavailable reference owes a finding (§5.1)"))
 
     if v.unavailable_references and v.verdict == vocab.VERDICT_CLEAN:
         items.append(_err("V-UNAVAILABLE-CLEAN",
@@ -481,6 +568,7 @@ def validate_verdict(v: Verdict, cfg: Config,
 
     items.extend(validate_closures(v, answering))
     items.extend(residue_items(v, ledger, lineage))
+    items.extend(_lead_items(v, cfg))
 
     sev_rank = {s: i for i, s in enumerate(cfg.severities)}
     expected_ids = [f"F{i}" for i in range(1, len(v.findings) + 1)]
@@ -489,6 +577,15 @@ def validate_verdict(v: Verdict, cfg: Config,
         items.append(_err("V-IDS",
                           f"finding ids must be sequential {expected_ids[:3]}...; "
                           f"got {actual_ids}"))
+
+    # Answers are keyed by fingerprint, so `accepted` for one of two findings
+    # with one fingerprint would be silently replaced by the other's term.
+    by_fp = Counter(f.fingerprint() for f in v.findings)
+    for fp in (fp for fp, n in by_fp.items() if n > 1):
+        items.append(_err("V-FP-DUPLICATE",
+                          f"{by_fp[fp]} findings share the fingerprint {fp}: "
+                          f"their answers would share one key, so they are "
+                          f"one atomic claim or differ in title or anchor"))
 
     last_rank = -1
     gate_ids = cfg.gate_ids

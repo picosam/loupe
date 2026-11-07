@@ -948,20 +948,21 @@ class TestTheRenderedSkillDescription(unittest.TestCase):
                 description = text.split("---")[1].split("description: ",
                                                          1)[1]
                 self.assertNotIn("review.toml", description)
-                self.assertIn("the envelope stamp says which side you hold",
+                self.assertIn("Use when handing off work for review",
                               description)
         for path in sorted(out_dir.rglob("*.md")):
             text = path.read_text(encoding="utf-8")
             if "## What this is" in text:
                 with self.subTest(path=path.name):
-                    self.assertIn("A REVIEWED commit must carry `review.toml`",
+                    self.assertIn("A reviewed commit must carry `review.toml`",
                                   text)
 
 
 #: What a skill directory holds after an install (RR8), stated here rather
 #: than read from `INSTALL`, so an install that stopped writing a role file
 #: cannot agree with the test by construction.
-SKILL_DIRECTORY = {"SKILL.md", "author.md", "reviewer.md"}
+SKILL_DIRECTORY = {"SKILL.md", "author.md", "reviewer.md", "carrier.md",
+                   "closure-authority.md", "decide.md", "tool-feedback.md"}
 
 
 class TestTheSkillSplitsByRole(unittest.TestCase):

@@ -230,7 +230,8 @@ class TestProbeTarget(unittest.TestCase):
         m = {("fetch", "ssh://example.invalid/x.git", "refs/heads/main"): "",
              ("cat-file", "-e", f"{SHA_B}^{{commit}}"): "",
              ("cat-file", "-e", f"{SHA_A}^{{commit}}"): "",
-             ("merge-base", "--is-ancestor", SHA_A, SHA_B): ""}
+             ("merge-base", "--is-ancestor", SHA_A, SHA_B): "",
+             ("merge-base", "--is-ancestor", SHA_B, "FETCH_HEAD"): ""}
         m.update(overrides or {})
         return m
 
@@ -329,7 +330,8 @@ class TestTheClonesRepositoryIsCheckedBeforeTheFetch(unittest.TestCase):
                  "refs/heads/main"): "",
                 ("cat-file", "-e", f"{SHA_B}^{{commit}}"): "",
                 ("cat-file", "-e", f"{SHA_A}^{{commit}}"): "",
-                ("merge-base", "--is-ancestor", SHA_A, SHA_B): ""}
+                ("merge-base", "--is-ancestor", SHA_A, SHA_B): "",
+                ("merge-base", "--is-ancestor", SHA_B, "FETCH_HEAD"): ""}
 
     def absent_map(self):
         m = self.happy_map()

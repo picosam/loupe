@@ -108,6 +108,7 @@ from pathlib import Path
 from unittest import mock
 
 from review import cli, config, emit, env_var, transport
+from review.tests._transport_fixtures import copy_fixture
 from review.tests.util import REPO_ROOT  # noqa: F401 - the travelling set
 
 #: A test that runs real gates must not look nested inside a gate execution
@@ -204,6 +205,51 @@ def in_one_invocation(call):
 BINARY = b"\x00\x01\xff\xfe\r\nline\r\n\x00tail without a newline"
 
 
+ODD_PATH = "dir/space é name.txt"
+
+
+def _build_repo(root: Path) -> tuple[str, str]:
+    """`Repo`'s repository and remote, built once per process and copied per
+    test. Returns (base, target)."""
+    repo, remote = root / "repo", root / "remote.git"
+    _sh("git", "init", "-q", "-b", "main", str(repo))
+
+    def git(*args):
+        return _sh("git", "-C", str(repo), *args)
+    for k, v in (("user.name", "a"), ("user.email", "a@example.invalid"),
+                 ("commit.gpgsign", "false"), ("tag.gpgsign", "false")):
+        git("config", k, v)
+    (repo / "f.txt").write_text("one\n", encoding="utf-8")
+    (repo / "bin.dat").write_bytes(BINARY)
+    (repo / "dir").mkdir()
+    (repo / ODD_PATH).write_text("odd\n", encoding="utf-8")
+    git("add", "f.txt", "bin.dat", ODD_PATH)
+    git("commit", "-q", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    (repo / "f.txt").write_text("two\n", encoding="utf-8")
+    git("commit", "-qam", "target")
+    target = git("rev-parse", "HEAD")
+    _sh("git", "init", "-q", "--bare", "-b", "main", str(remote))
+    git("remote", "add", "origin", str(remote))
+    git("push", "-q", "-u", "origin", "main")
+    return base, target
+
+
+def _build_donor(root: Path) -> tuple[str, str, str]:
+    """`Donor`'s repository; returns (commit, blob of d1.txt, of d2.txt)."""
+    donor = root / "donor"
+    _sh("git", "init", "-q", "-b", "main", str(donor))
+    (donor / "d1.txt").write_text("donor one\n", encoding="utf-8")
+    (donor / "d2.txt").write_text("donor two\n", encoding="utf-8")
+    _sh("git", "-C", str(donor), "add", "d1.txt", "d2.txt")
+    _sh("git", "-C", str(donor), "-c", "user.name=d", "-c",
+        "user.email=d@example.invalid", "-c", "commit.gpgsign=false",
+        "commit", "-q", "-m", "donor")
+    return (_sh("git", "-C", str(donor), "rev-parse", "HEAD"),
+            _sh("git", "-C", str(donor), "rev-parse", "HEAD:d1.txt"),
+            _sh("git", "-C", str(donor), "rev-parse", "HEAD:d2.txt"))
+
+
 class Repo(unittest.TestCase):
     """A scratch repository: a base and a target commit, a binary blob, a
     path with a space and a non-ASCII name, a directory, and a bare remote
@@ -217,24 +263,9 @@ class Repo(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
         self.repo = self.tmp / "repo"
         self.remote = self.tmp / "remote.git"
-        _sh("git", "init", "-q", "-b", "main", str(self.repo))
-        for k, v in (("user.name", "a"), ("user.email", "a@example.invalid"),
-                     ("commit.gpgsign", "false"), ("tag.gpgsign", "false")):
-            self.git("config", k, v)
-        (self.repo / "f.txt").write_text("one\n", encoding="utf-8")
-        (self.repo / "bin.dat").write_bytes(BINARY)
-        (self.repo / "dir").mkdir()
-        self.odd = "dir/space é name.txt"
-        (self.repo / self.odd).write_text("odd\n", encoding="utf-8")
-        self.git("add", "f.txt", "bin.dat", self.odd)
-        self.git("commit", "-q", "-m", "base")
-        self.base = self.git("rev-parse", "HEAD")
-        (self.repo / "f.txt").write_text("two\n", encoding="utf-8")
-        self.git("commit", "-qam", "target")
-        self.target = self.git("rev-parse", "HEAD")
-        _sh("git", "init", "-q", "--bare", "-b", "main", str(self.remote))
-        self.git("remote", "add", "origin", str(self.remote))
-        self.git("push", "-q", "-u", "origin", "main")
+        self.odd = ODD_PATH
+        self.base, self.target = copy_fixture("git-memo-repo", _build_repo,
+                                              self.tmp)
         self.cfg = dataclasses.replace(
             config.load(self.repo, ledger_dir=str(self.tmp / "state")),
             repo_root=self.repo, ledger_dir=self.tmp / "state")
@@ -267,18 +298,8 @@ class Donor(Repo):
     def setUp(self):
         super().setUp()
         self.donor = self.tmp / "donor"
-        _sh("git", "init", "-q", "-b", "main", str(self.donor))
-        (self.donor / "d1.txt").write_text("donor one\n", encoding="utf-8")
-        (self.donor / "d2.txt").write_text("donor two\n", encoding="utf-8")
-        _sh("git", "-C", str(self.donor), "add", "d1.txt", "d2.txt")
-        _sh("git", "-C", str(self.donor), "-c", "user.name=d", "-c",
-            "user.email=d@example.invalid", "-c", "commit.gpgsign=false",
-            "commit", "-q", "-m", "donor")
-        self.lent = _sh("git", "-C", str(self.donor), "rev-parse", "HEAD")
-        self.blob1 = _sh("git", "-C", str(self.donor), "rev-parse",
-                         "HEAD:d1.txt")
-        self.blob2 = _sh("git", "-C", str(self.donor), "rev-parse",
-                         "HEAD:d2.txt")
+        self.lent, self.blob1, self.blob2 = copy_fixture(
+            "git-memo-donor", _build_donor, self.tmp)
         self.alternates = self.repo / ".git" / "objects" / "info" / \
             "alternates"
         self.withdraw()

@@ -249,7 +249,7 @@ def reconstruct(view: str) -> list:
     out = []
     lines = view.splitlines()
     start = next(i for i, l in enumerate(lines) if l.startswith(
-        "| gate | result |")) + 2
+        "| gate | ")) + 2
     table = []
     for line in lines[start:]:
         if not line.startswith("| "):
@@ -531,7 +531,7 @@ def structural(view: str) -> list:
     rebuilds every pointer from the source."""
     lines = view.splitlines()
     start = next(i for i, l in enumerate(lines) if l.startswith(
-        "| gate | result |")) + 2
+        "| gate | ")) + 2
     for line in lines[start:]:
         if not line.startswith("| "):
             break
@@ -913,7 +913,7 @@ class TestTheCheckoutLine(unittest.TestCase):
         take = source[source.index("def cmd_take"):]
         take = take[:take.index("\ndef ")]
         self.assertIn("render_checkout(rec['head'], rec['sha'])", take)
-        self.assertIn("brief.compact_request(", take)
+        self.assertIn("brief.judge_view(", take)
 
     def test_the_probe_reads_head_and_never_refuses(self):
         def git(answers):

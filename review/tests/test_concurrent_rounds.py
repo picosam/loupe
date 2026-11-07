@@ -1727,14 +1727,16 @@ class TestBriefNamesTheDiscardedRound(_TwoWorktrees):
     def _discarded(self):
         """The pre-keying state, built the only way it can now be reached:
         two rounds in ONE lineage, and a close that rules one of them with
-        the unruled-request guard disabled."""
+        the unruled-request guards disabled."""
         first = self._started("first")
         sh("git", "-C", str(self.repo), "commit", "--amend", "-q", "-m",
            "a second emission at a second sha")
         code, second = self._handoff(self._in_main, "--local-only")
         self.assertEqual(code, 0, second)
         with mock.patch.object(transport, "_unruled_open_requests",
-                               lambda *a, **k: []):
+                               lambda *a, **k: []), \
+                mock.patch.object(transport, "_surviving_request",
+                                  lambda *a, **k: None):
             code, closed = self._in_main(
                 "close", "--verdict",
                 self._verdict_file(first["sha"], name="clean.md",

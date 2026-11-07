@@ -1528,8 +1528,8 @@ class TestDecideReadsWhatTheEmittingVerbsAsk(unittest.TestCase):
     def test_the_ask_once_rule_names_the_verb(self):
         """The adapters render the verb table from the parser, so the row
         arrives by itself; the rule that tells an agent to USE it does not."""
-        rule = next(r for r in adapters.procedure()["both"]
-                    if r.startswith("Absent config asks once."))
+        rule = " ".join(adapters.procedure()["rare"]["decide"][2])
+        self.assertIn("Absent config asks once.", rule)
         self.assertIn(f"{TOOL_NAME} decide", rule)
 
 

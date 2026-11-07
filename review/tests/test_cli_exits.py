@@ -513,6 +513,10 @@ class TestEveryFailureExit(unittest.TestCase):
         line = template.split("#", 1)[0].strip()   # the hint form
         if not line:
             return "only a comment"
+        # A rendered command carries this checkout's own path, and a folder
+        # named `...-return` is not prose (2026-11-03: the manifest read it
+        # as English in one worktree and passed the same commit in another).
+        line = line.replace(shlex.quote(str(REPO_ROOT)), "REPO")
         if "<" in line or ">" in line:
             return f"placeholder in a field an agent executes: {template!r}"
         for connective in (", then", " then ", " or ", "re-run", "return "):

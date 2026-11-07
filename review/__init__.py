@@ -163,7 +163,7 @@ TOOL_NAME = "loupe"
 #   - the reviewer procedure gains the falsification-anchoring rule (D3):
 #     anchor in the reviewed tree wherever the defect admits it, and name
 #     an external mutable dependency in the finding when it does not.
-TOOL_VERSION = "0.33.0"
+TOOL_VERSION = "0.34.0"
 
 # Names this tool has carried before, oldest first. Read acceptance for
 # artifacts and state produced under them is deliberate and noticed, never
@@ -252,6 +252,7 @@ IDENTITY_ARTEFACTS = (
     "review/digest.py",
     "review/emit.py",
     "review/fingerprint.py",
+    "review/impact.py",
     "review/ledger.py",
     "review/paths.py",
     "review/refs.py",
@@ -296,6 +297,15 @@ IDENTITY_EXCLUDED = {
     "adapters/claude/reviewer.md": ADAPTERS,
     "adapters/codex/author.md": ADAPTERS,
     "adapters/codex/reviewer.md": ADAPTERS,
+    # 2026-11-04: what each skill reads only on a trigger.
+    "adapters/claude/carrier.md": ADAPTERS,
+    "adapters/claude/closure-authority.md": ADAPTERS,
+    "adapters/claude/decide.md": ADAPTERS,
+    "adapters/claude/tool-feedback.md": ADAPTERS,
+    "adapters/codex/carrier.md": ADAPTERS,
+    "adapters/codex/closure-authority.md": ADAPTERS,
+    "adapters/codex/decide.md": ADAPTERS,
+    "adapters/codex/tool-feedback.md": ADAPTERS,
     "adapters/instructions-block.md": ADAPTERS,
     "docs/design.md": DOCS,
     "docs/overview.md": DOCS,
@@ -323,6 +333,7 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_default_landing.py": TESTS,
     "review/tests/test_disposition_body.py": TESTS,
     "review/tests/test_human_override.py": TESTS,
+    "review/tests/test_lifecycle_edges.py": TESTS,
     "review/tests/test_command_surface.py": TESTS,
     "review/tests/test_falsification_record.py": TESTS,
     "review/tests/test_fingerprint.py": TESTS,
@@ -331,6 +342,10 @@ IDENTITY_EXCLUDED = {
     "review/tests/test_git_memo.py": TESTS,
     "review/tests/test_git_timeout.py": TESTS,
     "review/tests/test_git_reads.py": TESTS,
+    "review/tests/test_redesign_question.py": TESTS,
+    "review/tests/test_leads.py": TESTS,
+    "review/tests/test_impact_map.py": TESTS,
+    "review/tests/test_judge_view.py": TESTS,
     "review/tests/test_paths.py": TESTS,
     "review/tests/test_prune.py": TESTS,
     "review/tests/test_precis_taxonomy.py": TESTS,

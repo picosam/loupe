@@ -28,10 +28,6 @@ build/
 # work they hold reaches the repo as commits on their branch, and the
 # extraction audit must not classify a scratch checkout of the whole tree.
 /.claude/worktrees/
-# Written by Claude Code (2.1.289) into a plugin folder a session loads with
-# --plugin-dir: it points the editor at .claude-plugin/types/, which the
-# engine writes with its own `*` .gitignore, but this file gets none.
-/tools/watch-mod/tsconfig.json
 /*.claim.json
 /request*.md
 /verdict*.md

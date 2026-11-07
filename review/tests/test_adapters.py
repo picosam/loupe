@@ -47,8 +47,9 @@ class TestOneSource(unittest.TestCase):
         # is the one procedure. Two adapters with different bodies would be
         # two sources. RR8 (2026-10-04): a skill carries its two sides in
         # role files, so the procedure it holds is its SKILL.md with the
-        # routing section replaced by those files' sections, which must
-        # rebuild the instruction block's body byte for byte.
+        # routing section replaced by those files' sections and its rare
+        # files under their names, which must rebuild the instruction
+        # block's body byte for byte.
         def body(text):
             return (text[text.index("## What this is"):]
                     .replace(f"<!-- END GENERATED: {TOOL_NAME} adapter -->",
@@ -65,7 +66,16 @@ class TestOneSource(unittest.TestCase):
                     (lambda t: t[t.index("## If you hold the"):] + "\n")(
                         adapters.render(kind))
                     for kind in kinds.values())
-                self.assertEqual(skill[:start] + roles + skill[end:], block)
+                index = "\n".join(adapters._rare_index())
+                rare = f"## Read only when it applies\n\n{index}\n\n"
+                for name, kind in adapters.SKILL_RARE_KINDS[surface].items():
+                    text = adapters.render(kind)
+                    title = text.split("\n", 1)[0].split(" — ", 1)[1]
+                    paragraphs = text[text.index("regenerate.\n\n")
+                                      + len("regenerate.\n\n"):]
+                    rare += f"## `{name}.md`: {title}\n\n{paragraphs}\n"
+                self.assertEqual(skill[:start] + roles + rare + skill[end:],
+                                 block)
 
     def test_the_claim_step_states_each_value_grammar(self):
         # 2026-11-01: 40 of 45 refused hand-offs in one adopting repository
@@ -97,20 +107,21 @@ class TestOneSource(unittest.TestCase):
         self.assertNotRegex(values, r"(?<!\.)`references`")
         self.assertLessEqual(len(values), 360, values)
 
-    def test_a_claim_file_refusal_is_the_authors_to_correct(self):
+    def test_a_blocked_remedy_on_your_own_side_is_yours_to_carry_out(self):
         # 2026-11-01: a claim-file refusal's remedy names the author
-        # (`cli._claim_defect_exit`, `emit.check_map_gates`), so the
-        # blocked rule says that one remedy is the author's to carry out,
-        # and only that one.
+        # (`cli._claim_defect_exit`, `emit.check_map_gates`). 2026-11-04:
+        # the same holds for a reviewer's defective verdict, a red gate, a
+        # branch tracking `origin/main` and a missing `--as`, each `blocked`
+        # with a remedy addressed to the reader's own side, so the rule
+        # names that class and hands everything else to the human.
         for kind in adapters.SURFACES:
             with self.subTest(kind=kind):
                 text = " ".join(adapters.surface_text(kind).split())
                 self.assertIn(
-                    "One exception: a refusal of the claim file, whose "
-                    "remedy names the author, is yours when the stamp makes "
-                    "you the author", text)
-                self.assertIn("stop, give the human the `remedy` field, "
-                              "and wait", text)
+                    "If it is yours to do, because it names your side or a "
+                    "file or commit you wrote, do it and re-run.", text)
+                self.assertIn("Otherwise give the human the remedy and wait.",
+                              text)
 
     def test_no_skill_file_names_a_side_file_by_an_absolute_path(self):
         # Osama, 2026-11-01: the Team profiles' copy of the Claude skill
@@ -121,7 +132,8 @@ class TestOneSource(unittest.TestCase):
         # and on the instruction block, so no install location reads wrong.
         side = "|".join(re.escape(name) for name in sorted(
             {adapters.INSTALL[kind][0].rsplit("/", 1)[1]
-             for kinds in adapters.SKILL_ROLE_KINDS.values()
+             for kinds in (*adapters.SKILL_ROLE_KINDS.values(),
+                           *adapters.SKILL_RARE_KINDS.values())
              for kind in kinds.values()}))
         # An absolute path starts at `~`, an environment variable or `/`,
         # and not inside a relative one (`adapters/claude/author.md`).
@@ -157,20 +169,21 @@ class TestOneSource(unittest.TestCase):
             self.assertIn(f"~/.config/{TOOL_NAME}/", what, kind)
             self.assertIn("review.toml", what, kind)
 
-    def test_the_description_is_the_trigger_and_the_stamp_clause(self):
+    def test_the_description_is_the_trigger(self):
         """SL-B10: the description is loaded into every session whether or
-        not the skill fires, so it holds the trigger and the stamp clause
-        and nothing else — no configuration rule, which the body carries.
-        FALSIFICATION: put the config sentences back into the description
-        and the first assertion fails; drop the stamp clause and the
-        second does."""
+        not the skill fires, so it holds the trigger and nothing else — no
+        configuration rule, which the body carries. No colon, which would
+        break its YAML. FALSIFICATION: put the config sentences back into
+        the description and the first assertion fails; lengthen it past its
+        bound and the last does."""
         for kind in ("claude-skill", "codex-skill"):
             description = adapters.render(kind).split("---")[1]
             self.assertNotIn("review.toml", description, kind)
-            self.assertIn("the envelope stamp says which side you hold",
-                          description, kind)
-            self.assertIn("Use when asked to hand off work for review",
-                          description, kind)
+            self.assertIn("Use when handing off work for review", description,
+                          kind)
+            line = description.split("description: ", 1)[1].strip()
+            self.assertNotIn(":", line, kind)
+            self.assertLessEqual(len(line), 120, kind)
 
     def test_verb_table_matches_the_parser_both_ways(self):
         parser_verbs = {name for name, _ in adapters.verb_table()}
@@ -180,8 +193,8 @@ class TestOneSource(unittest.TestCase):
         self.assertEqual(parser_verbs, set(sub.choices))
         for kind in adapters.SURFACES:
             text = adapters.surface_text(kind)
-            table = text[text.index("## Verbs"):text.index("## Where things")]
-            in_table = set(VERB_RE.findall(table))
+            line = text[text.index("## Verbs"):].split("\n")[2]
+            in_table = set(VERB_RE.findall(line))
             self.assertEqual(in_table, parser_verbs, kind)
             # Every command line the procedure carries names a real verb.
             named = set(VERB_RE.findall(text))
@@ -192,8 +205,8 @@ class TestOneSource(unittest.TestCase):
         text = adapters.render("instructions-block")
         author = text[text.index("author stamp"):text.index("reviewer stamp")]
         reviewer = text[text.index("reviewer stamp"):text.index("## Verbs")]
-        self.assertIn("STOP", author)
-        self.assertIn("STOP", reviewer)
+        self.assertIn("Then stop", author)
+        self.assertIn("Then stop", reviewer)
         self.assertIn("human", text[text.index("both sides"):
                                     text.index("author stamp")])
 
@@ -206,8 +219,8 @@ class TestOneSource(unittest.TestCase):
             text = adapters.surface_text(surface)
             both = text[text.index("both sides"):text.index("author stamp")]
             self.assertIn("Trust model.", both)
-            self.assertIn("LESS than operator access", both)
-            self.assertIn("OMISSION and FATIGUE", both)
+            self.assertIn("less than operator access", both)
+            self.assertIn("omission and fatigue", both)
         # spec_path() resolves the design text in the workbench (public/docs)
         # and in the published candidate (docs/) alike.
         self.assertIn("Trust model — one principal", spec_path().read_text())
@@ -254,10 +267,119 @@ class TestOneSource(unittest.TestCase):
                                        "finding"):]
                 self.assertIn(
                     "Write `<d.json>` in the shape `loupe respond --help` "
-                    "prints: its payload text members are strings, never "
-                    "lists — an escalation's positions go in one string — "
-                    "and a top-level or record member it does not name is "
-                    "refused.", step)
+                    "prints; its payload text members are strings, an "
+                    "escalation's positions included.", step)
+
+    def test_the_lineage_close_command_as_printed_parses(self):
+        """The step printed `close --lineage --reason` with no `--by`, which
+        the verb refuses, so an agent copying it hit a usage error (found
+        2026-11-04). The printed command is the one to run. Mutation: drop
+        the `--by` from the `close a lineage by decision` step and the
+        first assertion fails."""
+        for surface in adapters.SURFACES:
+            with self.subTest(surface=surface):
+                text = adapters.surface_text(surface)
+                self.assertIn(f"`{TOOL_NAME} close --lineage --reason "
+                              f"\"<why>\" --by <who decided>`", text)
+        args = cli.build_parser().parse_args(
+            ["close", "--lineage", "--reason", "why", "--by", "who"])
+        self.assertTrue(args.lineage)
+        self.assertEqual(args.by, "who")
+
+    def test_brief_then_relay_has_no_sentence_against_it(self):
+        """"Add no prose around it" stood beside "Emit them in that order,
+        both, every time", and the brief is prose. Both are given, in
+        order, with nothing of the reader's inside the relay. Mutation:
+        restore either old sentence in a role step and this fails."""
+        for surface in adapters.SURFACES:
+            with self.subTest(surface=surface):
+                text = " ".join(adapters.surface_text(surface).split())
+                self.assertNotIn("Add no prose", text)
+                self.assertIn("Give the human both, in that order", text)
+                self.assertIn("put nothing of yours inside it", text)
+
+    def test_the_reviewers_search_is_not_bound_by_the_authors_framing(self):
+        """The instruction review of 2026-11-04 (Osama): scope is where the
+        author worked, the diff comes before the account, the author's
+        account is claims to test, and findings are reported rather than
+        filtered, each naming who meets what. The taxonomy classifies; it no
+        longer reads as a limit on what to report. Mutation: restore "rule
+        by the declared taxonomy only" and the last assertion fails."""
+        for surface in adapters.SURFACES:
+            with self.subTest(surface=surface):
+                text = " ".join(adapters.surface_text(surface).split())
+                rule = text[text.index("**rule**"):text.index("**validate")]
+                self.assertIn("Read the full diff first", rule)
+                self.assertIn("never limit your search", rule)
+                self.assertIn("are claims to test", rule)
+                self.assertIn("Report everything you find rather than "
+                              "filtering", rule)
+                self.assertIn("names the real input or situation a user or "
+                              "agent would meet", rule)
+                self.assertIn("`unconfirmed`", rule)
+                self.assertIn("classify each finding by its `## Taxonomy`",
+                              rule)
+                self.assertNotIn("taxonomy only", rule)
+
+    def test_a_gap_nobody_reaches_is_low_and_says_so(self):
+        """Osama, 2026-11-04: boundary closure stays for a real boundary and
+        stops demanding a partition of a domain nobody reaches. `validate`
+        keeps its own say over the verdict string, which the text leaves to
+        it rather than promising a clean. Mutation: drop either sentence
+        and this fails."""
+        for surface in adapters.SURFACES:
+            with self.subTest(surface=surface):
+                text = " ".join(adapters.surface_text(surface).split())
+                both = text[text.index("both sides"):
+                            text.index("author stamp")]
+                self.assertIn("A gap no plausible input reaches demands no "
+                              "partition", both)
+                rule = text[text.index("**rule**"):text.index("**validate")]
+                self.assertIn("domain gap with no plausible input goes at "
+                              "Low", rule)
+                self.assertIn("A Low doesn't by itself ask for changes", rule)
+                self.assertIn("`validate` decides the verdict string", rule)
+
+    def test_round_three_asks_should_we_redesign_before_a_fourth(self):
+        """Osama's ruling 46, 2026-11-04: past three rounds of coming back,
+        the author stops and puts the question to the user with a
+        recommendation. Mutation: drop the sentence from `close the round`
+        and this fails."""
+        for surface in adapters.SURFACES:
+            with self.subTest(surface=surface):
+                text = " ".join(adapters.surface_text(surface).split())
+                step = text[text.index("**close the round**"):
+                            text.index("**respond**")]
+                self.assertIn("should we redesign?", step)
+                for words in ("why the reviewer keeps coming back",
+                              "lexical or perfection",
+                              "whether the design is the problem",
+                              "with a recommendation",
+                              "A fourth round waits for their answer"):
+                    self.assertIn(words, step)
+
+    def test_the_routing_names_each_rare_file_and_each_file_exists(self):
+        """Moving text behind a trigger is safe only if the trigger is
+        stated and the file is there. Every rare file is its own kind with
+        an install target beside its `SKILL.md`; every one but
+        `tool-feedback`, which the reviewer's `rule` step names, is listed
+        with its trigger in `SKILL.md`. Mutation: drop a name from
+        `RARE_FILES` and `procedure()["rare"]` no longer matches it."""
+        self.assertEqual(set(adapters.RARE_FILES),
+                         set(adapters.procedure()["rare"]))
+        for surface, kinds in adapters.SKILL_RARE_KINDS.items():
+            skill = adapters.render(surface)
+            reviewer = adapters.render(
+                adapters.SKILL_ROLE_KINDS[surface]["reviewer"])
+            for name, kind in kinds.items():
+                with self.subTest(surface=surface, name=name):
+                    target = adapters.INSTALL[kind][0]
+                    self.assertEqual(target.rsplit("/", 1),
+                                     [adapters.INSTALL[surface][0]
+                                      .rsplit("/", 1)[0], f"{name}.md"])
+                    holder = (reviewer if name == "tool-feedback" else skill)
+                    self.assertIn(f"`{name}.md`", holder)
+                    self.assertNotIn("---", adapters.render(kind)[:3])
 
     def test_transport_verbs_are_the_procedure(self):
         text = adapters.render("claude-skill")
@@ -861,6 +983,9 @@ class TestShippedRestatements(unittest.TestCase):
     #: round-3 F3 was this list containing four vocabularies the
     #: specification spells out in full.
     UNDOCUMENTED = {
+        # Each request's verdict shape prints the confidences, and a lead's
+        # severities are refused by name: the procedure lists neither.
+        "LEAD_CONFIDENCES", "LEAD_SEVERITIES",
         "BLOCKING_ILLEGAL", "FALSIFICATION_KINDS", "FALSIFICATION_RECORD",
         "LINEAGE_KINDS", "LINEAGE_MERGING", "CLAIM_STRING_FIELDS",
         "CLAIM_LIST_FIELDS", "CLAIM_NONEMPTY",
@@ -2159,13 +2284,18 @@ class TestCodexSkillPath(_Scratch):
         code, check = self.loupe("render-adapters", "--check-install")
         self.assertEqual(code, 0, check)
 
-    def test_the_install_line_states_the_documented_path_and_the_observation(self):
-        text = adapters.render("codex-skill")
-        self.assertIn(f"Install: `~/.agents/skills/{TOOL_NAME}/SKILL.md`",
-                      text)
-        self.assertIn("https://learn.chatgpt.com/docs/build-skills", text)
-        self.assertIn("retrieved 2026-09-21", text)
-        self.assertIn("Observed, separately: observed 2026-09-21", text)
+    def test_the_install_authority_and_the_observation_stay_apart(self):
+        # Since 2026-11-04 neither prints into a skill: both are for people,
+        # and `docs/upgrading.md` carries them. They stay two records here,
+        # because an observation is not an authority.
+        target, why = adapters.INSTALL["codex-skill"]
+        self.assertEqual(target, f"~/.agents/skills/{TOOL_NAME}/SKILL.md")
+        self.assertIn("https://learn.chatgpt.com/docs/build-skills", why)
+        self.assertIn("retrieved 2026-09-21", why)
+        self.assertIn("observed 2026-09-21",
+                      adapters.INSTALL_OBSERVED["codex-skill"])
+        self.assertNotIn("Observed, separately",
+                         adapters.render("codex-skill"))
 
 
 def _sha(data: bytes) -> str:
@@ -2953,6 +3083,11 @@ class TestAdapterEnumerationsAreDerived(unittest.TestCase):
     #: the reason — the structural inventory's third arm, so a collection
     #: can never sit in no category (round-1 F3).
     NOT_ENUMERATED = {
+        "LEAD_CONFIDENCES": "every request's verdict shape prints them from "
+                            "here, so the procedure need not",
+        "LEAD_SEVERITIES": "a lead's severities are checked against the "
+                           "target's taxonomy, and V-LEAD-SEVERITY names them "
+                           "where it refuses; the procedure lists no severity",
         "ACCEPTED_SUBTYPES": "the subtype grammar is the validator's; the "
                              "procedure never lists subtypes",
         "AUTHORIZATION_REQUIRED": "the authorization body's grammar belongs "

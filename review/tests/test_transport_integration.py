@@ -109,6 +109,9 @@ def _write_claim(root, objective):
     so a template that hands off with it and the copy that hands off after
     it present one claim, not two."""
     (Path(root) / "claim.json").write_text(json.dumps({
+        # This fixture's fourth round is its subject, so its claim answers
+        # the redesign question that round would otherwise be refused on.
+        "redesign_answer": "the rounds themselves are under test",
         "objective": objective,
         "references": [{"path": "review.toml", "required": True}]}),
         encoding="utf-8")
@@ -679,6 +682,13 @@ class _HeaderLoop(unittest.TestCase):
     def _answer(self, round_no, sha):
         return self.loop.answer(round_no, sha)
 
+    def _answer_the_redesign_question(self):
+        """This copy's claim, as a round past the third asks of it: the rounds
+        are what these tests are about."""
+        claim = json.loads(self.claim.read_text(encoding="utf-8"))
+        claim["redesign_answer"] = "the rounds themselves are under test"
+        self.claim.write_text(json.dumps(claim), encoding="utf-8")
+
     def _next_round(self, previous, *extra):
         """Answer `previous` and emit the round after it."""
         self._answer(previous["round"], previous["sha"])
@@ -786,6 +796,7 @@ class TestTheRoundLineReportsTheRoundsOwnState(_HeaderLoop):
     def test_an_override_keeps_its_half_and_still_reports_the_round(self):
         records = self._copy("header-r4")["records"]
         self.assertEqual([r["round"] for r in records], [1, 2, 3, 4])
+        self._answer_the_redesign_question()
         # An override that puts the round WITHIN the cap.
         code, raised = self._run("ledger", "authorize-cap", "--to", "6",
                                  "--reason", "the loop is converging",
@@ -818,6 +829,7 @@ class TestTheRoundLineReportsTheRoundsOwnState(_HeaderLoop):
         emitted in this test's own copy, so the request taken carries this
         copy's reachability stamp."""
         records = self._copy("header-r3")["records"]
+        self._answer_the_redesign_question()
         records.append(self._next_round(records[-1]))
         self.assertEqual([r["round"] for r in records], [1, 2, 3, 4])
         for rec in records:

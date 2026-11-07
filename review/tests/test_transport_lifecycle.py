@@ -152,7 +152,8 @@ class TestWaiver(unittest.TestCase):
         with self.assertRaises(transport.Refusal) as ctx:
             transport.waive(self._cfg(), led, SHA_C, "skip it", "user",
                             git=self._git())
-        self.assertIn("reviewed rather than waived", str(ctx.exception))
+        self.assertIn("no verdict rules it", str(ctx.exception))
+        self.assertNotIn("reviewed rather than", str(ctx.exception))
 
     def test_a_waiver_is_not_a_round(self):
         # It carries no findings and no verdict, so it must not move the
@@ -971,7 +972,8 @@ class TestCachedHandoff(unittest.TestCase):
         ledger.add({"event": "request", "round": 1, "sha": SHA_B,
                     "source_digest": transport._digest_text(text),
                     "bytes": len(text),
-                    "claim_digest": transport.NO_CLAIM})
+                    "claim_digest": transport.NO_CLAIM,
+                    "answers_digest": transport.answers_digest(ledger, 1, LINEAGE)})
         # Paired control: the canonical LF copy is warm.
         self.assertIsNotNone(transport.cached_handoff(
             cfg, ledger, 1, LINEAGE, git=git, claim_digest=transport.NO_CLAIM,
@@ -1039,7 +1041,8 @@ class TestCachedHandoff(unittest.TestCase):
         ledger = Ledger.in_memory()
         ledger.add({"event": "request", "round": 1, "sha": SHA_B,
                     "source_digest": transport._digest_text(text),
-                    "bytes": len(text), "claim_digest": "claim-one"})
+                    "bytes": len(text), "claim_digest": "claim-one",
+                    "answers_digest": transport.answers_digest(ledger, 1, LINEAGE)})
 
         # Same claim, unchanged tip: warm, which is the rule's whole point.
         self.assertIsNotNone(transport.cached_handoff(
@@ -1144,7 +1147,8 @@ class TestCachedHandoff(unittest.TestCase):
             ledger = Ledger.in_memory()
             event = {"event": "request", "round": 1, "sha": SHA_B,
                      "source_digest": transport._digest_text(text),
-                     "bytes": len(text)}
+                     "bytes": len(text),
+                     "answers_digest": transport.answers_digest(ledger, 1, LINEAGE)}
             if recorded is not None:
                 event["claim_digest"] = recorded
             ledger.add(event)

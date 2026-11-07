@@ -273,19 +273,26 @@ them from:
 $ loupe render-adapters --install
 ```
 
-This writes the skill to `~/.claude/skills/loupe/` (Claude Code) and
-`~/.agents/skills/loupe/` (Codex): `SKILL.md`, which holds the rules both
-sides share and routes each stamp, and `author.md` and `reviewer.md` beside
-it, each read only by its own side. It never clobbers silently: if a
-target already holds different bytes — your own hand edit, or an older
-render — those bytes are written out and proven recoverable *before* the
-target is overwritten, and the install reports where they went; if they
-can't be kept, it refuses instead of overwriting blind. Check either
-target later for drift with:
+This writes each skill as one directory of seven files, to
+`~/.claude/skills/loupe/` (Claude Code) and `~/.agents/skills/loupe/`
+(Codex). `SKILL.md` holds the rules both sides share and routes the
+session: it names `author.md` and `reviewer.md`, and a session reads the
+one its stamp names, beside the `SKILL.md` it loaded. The other four are
+read only when their trigger applies: `decide.md`, `carrier.md` and
+`closure-authority.md`, whose triggers `SKILL.md` states, and
+`tool-feedback.md`, which the reviewer's procedure names for a debug
+round. It never clobbers silently: if a target already holds different
+bytes — your own hand edit, or an older render — those bytes are written
+out and proven recoverable *before* the target is overwritten, and the
+install reports where they went; if they can't be kept, it refuses
+instead of overwriting blind. Check either target later for drift with:
 
 ```console
 $ loupe render-adapters --check-install
 ```
+
+It reads all fourteen files and exits 0 only when each holds this
+installation's rendering, byte for byte.
 
 **Both render from the installed package itself** (from 0.25.0): no
 `adapters/` directory, clone or checkout has to exist beside the install,
@@ -316,7 +323,9 @@ GENERATED: loupe adapter` region of an `AGENTS.md` or `CLAUDE.md` — is
 checked against the current rendering with `loupe render-adapters
 --check-embedded <file>` and repaired, that region's bytes and no others,
 with `--write-embedded <file>`; [docs/upgrading.md](docs/upgrading.md)
-step 4 says what each refusal means.
+step 4 says what each refusal means. A block has no directory beside it,
+so it carries both sides' procedures whole and the four trigger-only
+texts as sections headed by their file names: nothing goes beside it.
 
 **Gemini and Antigravity get no generated skill here, by decision, not
 by any limit on what they can run.** `render-adapters` renders exactly
@@ -330,7 +339,7 @@ name it at all, and the process keeps working with nothing installed.
 
 ## Status
 
-Version 0.33.0 — the version is bumped inside the reviewed round of any
+Version 0.34.0 — the version is bumped inside the reviewed round of any
 change that will be published, so `--version` discriminates publishes.
 Implemented and tested: the envelopes and validators, the gate manifest and
 attestation checks, roles and stamps, fingerprints with alias lineage, the

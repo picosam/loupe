@@ -51,7 +51,9 @@ from pathlib import Path
 
 from review import TOOL_NAME, env_var, vocab
 from review.tests.util import REPO_ROOT
-from review.tests._transport_fixtures import identity_of, write_identity
+from review.tests._real_cli import row
+from review.tests._transport_fixtures import (
+    copy_fixture, identity_of, write_identity)
 
 SHIM = REPO_ROOT / "bin" / TOOL_NAME
 
@@ -124,22 +126,33 @@ class ScratchLoop:
         self.repo = self.tmp / "repo"
         self.state = self.tmp / "state"
         self.remote = remote
-        self._git_top("init", "-q", "-b", "main", str(self.repo))
-        write_identity(self.repo, identity_of("t3", "t3@example.invalid"))
+        # Built once per process per configuration, then copied.
+        self.base, self.head = copy_fixture(
+            ("ScratchLoop", toml, remote),
+            lambda root: ScratchLoop._build(Path(root), toml, remote),
+            self.tmp)
+
+    @staticmethod
+    def _build(root: Path, toml: str, remote: bool) -> tuple[str, str]:
+        """The repository at `root`; returns (base, head)."""
+        s = ScratchLoop.__new__(ScratchLoop)
+        s.repo = root / "repo"
+        s._git_top("init", "-q", "-b", "main", str(s.repo))
+        write_identity(s.repo, identity_of("t3", "t3@example.invalid"))
         if remote:
-            self._git_top("init", "-q", "--bare", str(self.tmp / "origin.git"))
-            self.git("remote", "add", "origin", str(self.tmp / "origin.git"))
-        self.write("review.toml", toml)
-        self.write("f.txt", "one\n")
-        self.write("g.txt", "a\n")
-        self.git("add", ".")
-        self.git("commit", "-q", "-m", "init")
-        self.base = self.git("rev-parse", "HEAD")
+            s._git_top("init", "-q", "--bare", str(root / "origin.git"))
+            s.git("remote", "add", "origin", str(root / "origin.git"))
+        s.write("review.toml", toml)
+        s.write("f.txt", "one\n")
+        s.write("g.txt", "a\n")
+        s.git("add", ".")
+        s.git("commit", "-q", "-m", "init")
+        base = s.git("rev-parse", "HEAD")
         if remote:
-            self.git("push", "-q", "origin", "main")
-        self.write("f.txt", "two\n")
-        self.git("commit", "-q", "-am", "change")
-        self.head = self.git("rev-parse", "HEAD")
+            s.git("push", "-q", "origin", "main")
+        s.write("f.txt", "two\n")
+        s.git("commit", "-q", "-am", "change")
+        return base, s.git("rev-parse", "HEAD")
 
     @staticmethod
     def _git_top(*args) -> str:
@@ -164,17 +177,20 @@ class ScratchLoop:
         return path
 
     def loupe(self, *argv, cwd: Path | None = None):
-        cmd = ([str(SHIM)] if SHIM.is_file()
-               else [sys.executable, "-m", "review"])
-        proc = subprocess.run(cmd + [str(a) for a in argv],
-                              cwd=str(cwd or self.repo),
-                              env=cli_env(self.state), capture_output=True,
-                              text=True, timeout=300,
-                              stdin=subprocess.DEVNULL)
+        words, where = [str(a) for a in argv], str(cwd or self.repo)
+        env = cli_env(self.state)
+        if SHIM.is_file():
+            code, out, err = row(words, where, env, timeout=300)
+        else:
+            proc = subprocess.run([sys.executable, "-m", "review", *words],
+                                  cwd=where, env=env, capture_output=True,
+                                  text=True, timeout=300,
+                                  stdin=subprocess.DEVNULL)
+            code, out, err = proc.returncode, proc.stdout, proc.stderr
         try:
-            return proc.returncode, json.loads(proc.stdout)
+            return code, json.loads(out)
         except json.JSONDecodeError:
-            return proc.returncode, proc.stdout + proc.stderr
+            return code, out + err
 
     def claim(self, body: dict | None = None, name="claim.json") -> Path:
         body = body or {"objective": "t3 fixture",

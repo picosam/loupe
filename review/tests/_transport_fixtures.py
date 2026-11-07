@@ -186,6 +186,7 @@ def reviewer_clone_git():
         ("cat-file", "-e", f"{SHA_B}^{{commit}}"): "",
         ("cat-file", "-e", f"{SHA_A}^{{commit}}"): "",
         ("merge-base", "--is-ancestor", SHA_A, SHA_B): "",
+        ("merge-base", "--is-ancestor", SHA_B, "FETCH_HEAD"): "",
         ("ls-tree", "--full-tree", SHA_B, "--", "review.toml"):
                         "100644 blob 0000000\treview.toml",
                     ("show", f"{SHA_B}:review.toml"): toml,
@@ -608,7 +609,8 @@ def warm_cache_fixture(case, text=None, *, prefix="warm-cache-",
     ledger = Ledger.in_memory()
     ledger.add({"event": "request", "round": 1, "sha": SHA_B,
                 "source_digest": transport._digest_text(text),
-                "bytes": len(text), "claim_digest": claim_digest})
+                "bytes": len(text), "claim_digest": claim_digest,
+                "answers_digest": transport.answers_digest(ledger, 1, LINEAGE)})
     return WarmCache(cfg, ledger, git, text, kept, claim_digest)
 
 

@@ -19,7 +19,7 @@ from . import (FORMER_NAMES, TOOL_NAME, TOOL_VERSION, adapters, brief, config,
 from .digest import sha256_file, sha256_text
 from .ledger import (AmbiguousLineage, Ledger, known_branch,
                      render_convergence_md, render_cross_lineage_md,
-                     render_report_md)
+                     render_redesign_md, render_report_md)
 from .validate import (ESCALATION_ALTERNATIVES, Item, accepted_tags,
                        disposition_body_items, errors_in, scope_items,
                        validate_authorization, validate_disposition,
@@ -90,7 +90,7 @@ PROSE_KEYS = (
     # command the round hands over goes through the runnable door like every
     # other one.
     "carrier", "ref", "remote",
-    "checked", "cites", "claim_digest",
+    "answers_digest", "checked", "cites", "claim_digest", "position",
     "classification", "classification_notes", "classifications", "closures",
     "config", "convergence", "covers", "data", "declared_transport",
     "default_cap", "digest",
@@ -142,6 +142,13 @@ PROSE_KEYS = (
     # attestation objects as a table. Read, never run, and never named
     # `envelope` — that key means the exact bytes.
     "request_view",
+    # The redesign question (Osama, 2026-11-04) and its members: prose an
+    # author answers in a claim, never a command.
+    "redesign", "question", "verdicts", "anchor",
+    # A verdict's `## leads` as `close` reports them: read, never run, and
+    # no round waits on them. `where` and `confidence` are members of the
+    # ledger's lead event, declared for the advisory scan.
+    "leads", "where", "confidence", "index",
     # A member of `take`'s `head` record (the reviewer's checkout: state,
     # sha, tree). Nested, so the egress door never sees it; declared for
     # the advisory scan, which reads dict literals and cannot tell depth.
@@ -956,12 +963,19 @@ def cmd_respond(args, cfg) -> int:
         rec = transport.record_response(cfg, ledger, envelope,
                                         against=verdict, lineage=lineage,
                                         governing=governing)
+        # Past the third `changes requested` a bare `handoff` is refused, so
+        # it is not handed over as the next command: the question is.
+        asked = ledger.redesign_question(lineage)
+        handoff = paths.command(*paths.lits(TOOL_NAME, "handoff"))
         _out({"ok": True, "out": args.out, "dispositions": len(records),
               "kept": rec["kept"], "events_added": rec["events_added"],
-              "next": paths.command(*paths.lits(TOOL_NAME, "handoff"))},
+              "next": None if asked else handoff,
+              **({"redesign": asked,
+                  "then": f"{asked['question']} Then: `{handoff}` with that "
+                          f"answer in the claim."} if asked else {})},
              f"wrote {args.out}; {rec['events_added']} disposition event(s) "
              f"recorded, kept at {paths.display_path(rec['kept'])}\n"
-             f"next: {paths.command(*paths.lits(TOOL_NAME, 'handoff'))}")
+             + (render_redesign_md(asked) if asked else f"next: {handoff}"))
     else:
         print(envelope, end="")
     return EXIT_OK
@@ -1237,6 +1251,30 @@ def cmd_ledger_add(args, cfg) -> int:
             carried=_carried_by(args.envelope, text))
     except LineageUnchoosable as exc:
         return _blocked("", str(exc), remedy=exc.remedy)
+    # The reservation a hand-off and `close` take, around this door's own
+    # read-check-write (round 3 F1, lineage Lfdedc11b17): a review re-emitted
+    # or ended between the admission and the append would lose its live
+    # request, or gain a ruling behind its closure. A lineage holding no
+    # review has no such transition to race. Refused, not queued, as `close`
+    # is; the snapshot is the one read under it.
+    if not lineage or not ledger.holds_review(lineage):
+        return _add_envelope(args, cfg, ledger, lineage, kind, parsed)
+    reservation = transport.LineageReservation(
+        ledger, branch=transport.current_branch(cfg), verb="ledger add",
+        lineage=lineage)
+    try:
+        reservation.acquire()
+    except transport.Refusal as exc:
+        return _blocked("", str(exc), remedy=exc.remedy)
+    try:
+        ledger.reload()
+        return _add_envelope(args, cfg, ledger, lineage, kind, parsed)
+    finally:
+        reservation.release()
+
+
+def _add_envelope(args, cfg, ledger, lineage, kind, parsed) -> int:
+    """`ledger add`'s read-check-write, on the snapshot its caller holds."""
     digest = sha256_file(Path(args.envelope))
     size = Path(args.envelope).stat().st_size
     added = 0
@@ -1249,22 +1287,13 @@ def cmd_ledger_add(args, cfg) -> int:
             return _finish(items,
                            paths.command(*paths.lits(TOOL_NAME, "validate"),
                                          args.envelope))
-        round_no = args.round or ledger.round_for_sha(parsed.sha, lineage)
-        if round_no is None:
-            return _blocked(
-                "",
-                f"no request in the ledger matches sha {parsed.sha}, so the "
-                f"round cannot be derived",
-                remedy=f"a person establishes which round {args.envelope} "
-                       f"belongs to and re-runs this command with `--round "
-                       f"<that number>`; the tool will not pick a round for "
-                       f"an envelope no recorded request accounts for")
         # Round-2 F1: this door could file a SECOND, different verdict for
         # an already-ruled round (`--round N` skips the open-round lookup),
         # and `respond` then answered whichever file the author chose. The
         # same guard `close` applies: a round is ruled once.
-        conflict = transport.verdict_conflict(ledger, round_no, digest,
-                                              lineage)
+        round_no = args.round
+        conflict = (transport.verdict_conflict(ledger, round_no, digest,
+                                               lineage) if round_no else None)
         if conflict is not None:
             return _blocked(
                 "",
@@ -1275,6 +1304,28 @@ def cmd_ledger_add(args, cfg) -> int:
                 remedy=f"nothing to add: the round's verdict is recorded; if "
                        f"this file is the ruling that should stand, that is a "
                        f"lineage decision for a person, not a second event")
+        # Into a review, this door crosses what `close` crosses (round 2 F1,
+        # lineage Lfdedc11b17). Two filings are not rulings on that review and
+        # stay this door's own: a historical verdict, into a lineage with no
+        # request and no closure, whose round only a person can state; and
+        # the ruling already on record filed again, for its `--tokens`.
+        if ledger.holds_review(lineage) and not transport.ruling_refiled(
+                ledger, round_no, digest, lineage):
+            try:
+                round_no = transport.admit_verdict(
+                    ledger, parsed.sha, lineage, args.envelope, round_no,
+                    door="ledger add")
+            except transport.Refusal as exc:
+                return _blocked(exc.next_cmd, str(exc), remedy=exc.remedy)
+        if not round_no:
+            return _blocked(
+                "",
+                f"no request in the ledger matches sha {parsed.sha}, so the "
+                f"round cannot be derived",
+                remedy=f"a person establishes which round {args.envelope} "
+                       f"belongs to and re-runs this command with `--round "
+                       f"<that number>`; the tool will not pick a round for "
+                       f"an envelope no recorded request accounts for")
         # Verdict, alias, finding and closure events come from ONE shape
         # authority shared with `close` (transport.verdict_events): reviewer
         # closures become ledger state through the CLI, not by hand-editing
@@ -1527,7 +1578,10 @@ def cmd_ledger_convergence(args, cfg) -> int:
     result["lineage"] = lineage
     result["ok"] = True
     result["ledger"] = str(ledger.path)
-    _out(result, render_convergence_md(result))
+    result["redesign"] = ledger.redesign_question(lineage)
+    _out(result, render_convergence_md(result)
+         + (f"\n{render_redesign_md(result['redesign'])}"
+            if result["redesign"] else ""))
     return EXIT_OK
 
 
@@ -1934,6 +1988,10 @@ def _emit(args, cfg, ledger, captured: "emit.CapturedClaim",
     # both the ledger and the lineage are in hand (`emit.check_claim_record`
     # says what refuses and what is only stated).
     try:
+        emit.check_redesign_answer(claim, ledger, lineage,
+                                   Path(args.claim_file)
+                                   if getattr(args, "claim_file", None)
+                                   else None)
         emit.check_claim_record(claim, ledger, lineage, cfg,
                                 path=Path(args.claim_file)
                                 if getattr(args, "claim_file", None) else None)
@@ -2592,7 +2650,10 @@ def cmd_take(args, cfg) -> int:
     # undeclared.
     refs = "\n".join(f"  {r['status']:<40} {r['path']}"
                       for r in rec["references"]) or "  (none declared)"
-    rec["brief"] = brief.request_precis(wire.parse_request(envelope), ledger)
+    # The claim is under its author's heading in the view, or in the kept
+    # file `--compact` and `--full` point at: the précis does not lead with it.
+    rec["brief"] = brief.request_precis(wire.parse_request(envelope), ledger,
+                                        claim_shown=True)
     # Round-1 F4: the agreement was returned in JSON and rendered nowhere a
     # human looks. A report-not-refuse decision rests on the human SEEING
     # the difference; a field only the non-TTY path carries cannot support
@@ -2649,7 +2710,7 @@ def cmd_take(args, cfg) -> int:
     if args.full:
         rec["envelope"] = shown = verbatim
     else:
-        rec["request_view"] = shown = brief.compact_request(
+        rec["request_view"] = shown = brief.judge_view(
             verbatim, kept=rec.get("kept"), tags=accepted_tags(cfg))
     _out(rec, f"{shown}\n"
               f"--- taken: round {rec['round']} target {rec['sha']} as "
@@ -3049,7 +3110,12 @@ def cmd_close(args, cfg) -> int:
                   f"({rec['findings']} findings, {rec['closures']} closures), "
                   f"kept at {paths.display_path(rec['kept'])}\n"
                   f"lineage: {rec['lineage']}\n\n"
-                  f"{rec['brief']}\n\n{rec['relay']}")
+                  + (f"{render_redesign_md(rec['redesign'])}\n\n"
+                     if rec.get("redesign") else "")
+                  + ("leads (no round waits on these; answer or file each):\n"
+                     + "".join(f"  - {line}\n" for line in rec["leads"]) + "\n"
+                     if rec.get("leads") else "")
+                  + f"{rec['brief']}\n\n{rec['relay']}")
         return EXIT_OK
     finally:
         reservation.release()
@@ -3359,7 +3425,7 @@ def render_scoped(command, note: str | None) -> str:
     scoped diff rooted in this checkout, or why there is none. Printed in
     every state, beside `diff:`, for the reason `render_checkout` gives."""
     if command is not None:
-        return f"scoped: {command}\n"
+        return f"scoped: {command}\n" + (f"        {note}\n" if note else "")
     return f"scoped: none — {note}\n"
 
 

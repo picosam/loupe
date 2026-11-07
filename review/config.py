@@ -37,6 +37,15 @@ REQUIRES_KEY = "requires"
 #: `decide` key. Bound here for the reason `REQUIRES_KEY` is.
 SUBJECT_CHECK_KEY = "commit_subject_check"
 
+#: `[tool] impact_map` (2026-11-05): whether a request carries the `## Impact
+#: map` section. Absent or false, the request carries none and none is
+#: computed; true, `review/impact.py` computes it at hand-off. Off by default
+#: because the replay measured it not better on held-out work at 1.2 times the
+#: tokens (`research/operating-model-2026-11-03/replay-2/results.md`). Absent
+#: is the built-in off, so it is not a `decide` key, as for
+#: `SUBJECT_CHECK_KEY`. Bound here for the reason `REQUIRES_KEY` is.
+IMPACT_MAP_KEY = "impact_map"
+
 #: The built-in ceiling, in seconds, on a `git` subprocess at a door that
 #: holds a configuration — and the default of `[limits] git_timeout`. It is
 #: 120 because 120 is what every such door hardcoded before the key existed
@@ -270,6 +279,12 @@ def git_timeout(cfg: "Config | None") -> int:
             or declared < 1):
         return GIT_TIMEOUT_DEFAULT_S
     return declared
+
+
+def impact_map_enabled(cfg: "Config | None") -> bool:
+    """Whether a request carries the impact map: `[tool] impact_map` when it
+    is the boolean `true`, else off. The one reader (`emit_request`)."""
+    return (getattr(cfg, "tool", None) or {}).get(IMPACT_MAP_KEY) is True
 
 
 @dataclass(frozen=True)
@@ -544,6 +559,51 @@ def _identity_name(origin: str | None, root: Path) -> str:
     return root.name
 
 
+#: A remote URL naming a host: a network scheme, or git's scp-like `host:path`.
+_HOSTED_URL = re.compile(r"\A(?:(?:ssh|git\+ssh|https?|git)://|(?!file:)[^/:]+:)")
+
+
+def respelled_state_dir(repo_root: Path, base: Path) -> tuple[Path, str] | None:
+    """A sibling of the absent `base` holding this SAME repository's ledger
+    under another spelling of its remote, with that spelling; or None.
+
+    The id hashes the raw URL (`repo_identity`) and stays that way: rehashing
+    would move every existing ledger. But one repository has several spellings
+    (`transport.remote_key`), and `git remote set-url` to another of them
+    points the id at an empty directory, so open rounds, cap and findings
+    vanish with no notice. The spelling a ledger was recorded under is read
+    from the `Push:` stamp of its kept requests, the one place it is on record.
+    A sibling that kept no pushed request cannot be recognised this way.
+
+    Hosted remotes only (ssh, scp-like, https, git): those are the spellings of
+    one repository that a key can compare. A local path remote (`/x`, `../x`,
+    `file://`) is not compared: whether two paths name one repository is the
+    filesystem's to say, so respelling one still starts a separate ledger.
+    """
+    from . import wire
+    from .transport import remote_key
+    root = canonical_root(repo_root).resolve()
+    origin = _git(root, "remote", "get-url", "origin")
+    if (not origin or not _HOSTED_URL.match(origin)
+            or not base.parent.is_dir()):
+        return None
+    name = _identity_name(origin, root).casefold()
+    for sibling in sorted(base.parent.iterdir()):
+        if (sibling.name.rsplit("-", 1)[0].casefold() != name
+                or not (sibling / "ledger.jsonl").is_file()):
+            continue
+        for kept in sorted((sibling / "exchange").rglob("*request*")):
+            push = (wire.parse_push_line(kept.read_text(
+                encoding="utf-8", errors="replace"))
+                if kept.is_file() else None)
+            if push and push.get("url"):
+                if (_HOSTED_URL.match(push["url"])
+                        and remote_key(push["url"]) == remote_key(origin)):
+                    return sibling, push["url"]
+                break
+    return None
+
+
 def repo_identity(repo_root: Path) -> str:
     """Stable repo id: <name>-<hash8 of origin URL, else main-worktree path>.
 
@@ -597,6 +657,7 @@ CONFIG_DECLARED_ELSEWHERE = {
                                         # silence, not a floor of 0.0.0
     ("tool", SUBJECT_CHECK_KEY): list,  # a hand-off's own subject, checked
                                         # before it commits; absent, none
+    ("tool", IMPACT_MAP_KEY): bool,     # the request's impact map; absent, off
 }
 _KIND_OF = {str: "a string", int: "a whole number", list: "a list of strings",
             dict: "a table of string values", bool: "true or false"}
@@ -1209,5 +1270,18 @@ def load(repo_root: Path | None = None, ledger_dir: str | None = None,
                 f"fresh ledger would silently orphan that record (§10.1)",
                 paths.command(*paths.lits(TOOL_NAME, "migrate-state")),
                 code=1)
+        respelled = respelled_state_dir(repo_root, base)
+        if respelled is not None:
+            raise ConfigError(
+                f"this repository's ledger is at {respelled[0]}, recorded "
+                f"under the remote spelling {respelled[1]}; origin now spells "
+                f"the same repository another way, which names the empty "
+                f"{base}: starting a fresh ledger there would silently orphan "
+                f"that record",
+                "", code=1,
+                remedy=f"a person restores the spelling with `"
+                       f"{paths.command(*paths.lits('git', 'remote', 'set-url', 'origin'), respelled[1])}"
+                       f"`, or, to keep a separate ledger on purpose, creates "
+                       f"the directory {base}")
     cfg.ledger_dir = base
     return cfg

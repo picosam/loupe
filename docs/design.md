@@ -183,8 +183,9 @@ finding concerns a parser, a grammar or a lifecycle seam, the acceptance
 that answers it and the closure that rules on it must partition the complete
 admitted domain: every input kind the boundary accepts, every declared field
 and nested shape, every ordering by which the seam can be reached — with
-paired valid controls proving the check is live, and one mutation per bypass
-proving it can fail. Making the named reproducer green is not an answer; it
+paired valid controls proving the check is live. The proof a test can fail is
+the one run with the defect back; neither side asks for a mutation per guard
+or per bypass. Making the named reproducer green is not an answer; it
 is one point of a domain, and the next unpartitioned point is the next
 round. The rule is carried in the generated adapters, so both sides read it
 from the same source.

@@ -828,12 +828,9 @@ class TestEveryReaderOfTheLoader(_Round):
       import-legacy's event lines      blocked, line 1       blocked: no
                                                              --source-commit
 
-    Two readers outside `review/` are not rows here, because these tests
-    travel with the package and those files do not: `tools/loupe_approve`
-    catches `json.JSONDecodeError`, which `NumberOutOfRange` is, and
-    `bin/guarded-merge` catches ValueError, which it also is
-    (`TestTheLoader`); the track report records the one in-process probe of
-    the first."""
+    One reader outside `review/` is not a row here, because these tests
+    travel with the package and that file does not: `bin/guarded-merge`
+    catches ValueError, which `NumberOutOfRange` is (`TestTheLoader`)."""
 
     PREFIX = "disposition-body-loader-"
 
@@ -980,8 +977,8 @@ class TestTheLoader(unittest.TestCase):
                     wire.load_json(token)
 
     def test_it_is_the_error_every_reader_already_types(self):
-        """What the readers outside `review/` catch: `tools/loupe_approve`
-        a json.JSONDecodeError, `bin/guarded-merge` a ValueError."""
+        """What a reader outside `review/` catches: `bin/guarded-merge`, a
+        ValueError; a json.JSONDecodeError is what `wire` raises."""
         self.assertTrue(issubclass(wire.NumberOutOfRange,
                                    json.JSONDecodeError))
         self.assertTrue(issubclass(wire.NumberOutOfRange, ValueError))

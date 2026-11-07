@@ -27,7 +27,8 @@ end of the loop is manual any more.
 
 Ledger events introduced here: `take` and `lineage_closed`. Requests and
 verdicts are recorded in exactly the shape `ledger add` records them, so a
-manual `ledger add` afterwards is a no-op, never a duplicate.
+manual `ledger add` afterwards is a no-op, never a duplicate; behind a terminal
+marker it is refused (`admit_verdict`).
 """
 from __future__ import annotations
 
@@ -986,9 +987,22 @@ def recorded_transport(ledger, sha: str, lineage: str) -> str:
     return vocab.TRANSPORT_DEFAULT
 
 
+def answers_digest(ledger: Ledger, round_no: int, lineage: str) -> str:
+    """Digest of every recorded row of the answers `round_no`'s request
+    carries: the disposition emissions of the round before it, companions
+    included. The `## Disposition ledger` block is rendered from these rows,
+    so two equal digests mean the block would say the same thing."""
+    rows = [e for b in ledger.disposition_batches(lineage,
+                                                  round_no=round_no - 1)
+            for e in ([b["disposition"]] if b["disposition"] else [])
+            + b["evidence"] + b["runs"]]
+    return _digest_text(json.dumps(rows, sort_keys=True, ensure_ascii=False))
+
+
 def request_event(parsed: wire.Request, round_no: int, digest: str,
                   size: int, tokens: int | None = None,
-                  claim_digest: str = "") -> dict:
+                  claim_digest: str = "",
+                  answers: str = "") -> dict:
     """The request event exactly as `ledger add` records it (one shape)."""
     event = {"event": "request", "round": round_no, "sha": parsed.sha,
              "author": parsed.attrs.get("author"),
@@ -1022,12 +1036,17 @@ def request_event(parsed: wire.Request, round_no: int, digest: str,
         # unchanged tip; absent on every pre-round-3 event, and absence is
         # treated as "not recorded", never as "no claim".
         event["claim_digest"] = claim_digest
+    if answers:
+        # `answers_digest` at emission, read by the handoff cache: only the
+        # emitting door records it, so absence is "not recorded" and cold.
+        event["answers_digest"] = answers
     return event
 
 
 def request_events(parsed: wire.Request, round_no: int, digest: str,
                    size: int, tokens: int | None = None,
-                   claim_digest: str = "") -> list[dict]:
+                   claim_digest: str = "",
+                   answers: str = "") -> list[dict]:
     """Everything a recorded request contributes to the ledger, in order:
     the request event, then its content-addressed evidence.
 
@@ -1039,7 +1058,7 @@ def request_events(parsed: wire.Request, round_no: int, digest: str,
     ingestion paths" was false in shape as well as in validation.
     """
     return [request_event(parsed, round_no, digest, size, tokens,
-                          claim_digest=claim_digest),
+                          claim_digest=claim_digest, answers=answers),
             *evidence_events(parsed, round_no)]
 
 
@@ -1147,6 +1166,14 @@ def verdict_events(parsed: wire.Verdict, round_no: int, digest: str,
     if feedback:
         events.append({"event": "tool_feedback", "round": round_no,
                        "sha": parsed.sha, "text": feedback})
+    # Leads feed no breaker and hold no round open: recorded so they reach
+    # the author and can be counted, and nothing here waits on an answer.
+    for index, lead in enumerate(parsed.leads, 1):
+        events.append({"event": vocab.LEAD_EVENT, "round": round_no,
+                       "sha": parsed.sha, "index": index,
+                       "severity": lead.severity,
+                       "confidence": lead.confidence,
+                       "where": lead.where, "text": lead.why})
     for f in parsed.findings:
         if f.legacy_fingerprint() != f.fingerprint():
             events.append(alias_event(f.legacy_fingerprint(), f.fingerprint()))
@@ -2583,6 +2610,19 @@ def verdict_conflict(ledger: Ledger, round_no: int, digest: str,
     return None
 
 
+def ruling_refiled(ledger: Ledger, round_no: int | None, digest: str,
+                   lineage: str) -> bool:
+    """Whether these bytes are the ruling `round_no` already records, in a
+    review still open: `ledger add --round N --tokens T` filing usage metadata
+    about a ruling, which adds no second ruling and which `round_for_sha` no
+    longer finds because the round is answered. Behind a terminal marker
+    nothing is appended, metadata included."""
+    return not ledger.is_closed(lineage) and any(
+        e.get("event") == "verdict" and e.get("round") == round_no
+        and e.get("source_digest") == digest
+        for e in ledger.current(lineage))
+
+
 def _derived_identities(parsed: wire.Disposition,
                         against: wire.Verdict) -> dict:
     """`{finding_id: (fingerprint, severity)}` computed from the verdict.
@@ -3732,7 +3772,10 @@ def cached_handoff(cfg: Config, ledger: Ledger, round_no: int, lineage: str,
     request = next((e for e in reversed(ledger.current(lineage))
                     if e.get("event") == "request"
                     and e.get("round") == round_no
-                    and e.get("sha") == head), None)
+                    and e.get("sha") == head
+                    # `take` on a shared ledger appends a row with no claim
+                    # digest: it is the reviewer's, not this emission's.
+                    and e.get("claim_digest")), None)
     if request is None:
         return None
     # Round 5 F1: the `or ""` that used to be here folded an unrecorded
@@ -3749,6 +3792,13 @@ def cached_handoff(cfg: Config, ledger: Ledger, round_no: int, lineage: str,
     # costs one re-emission, warm costs a reviewer ruling on a claim nobody
     # wrote.
     if request.get("claim_digest") != claim_digest:
+        return None
+    # The standing answers are an input too: `respond` again after this
+    # request was emitted changes what the next request must show, and a
+    # warm serve hands the reviewer an answer the ledger has replaced, with
+    # the clean verdict then refused for a refutation it never saw.
+    if request.get("answers_digest") != answers_digest(ledger, round_no,
+                                                       lineage):
         return None
     # An altered copy — rewritten, CRLF, undecodable, or a legacy flat
     # copy of some other round — is cold, which is the honest state.
@@ -3936,9 +3986,18 @@ def record_handoff(cfg: Config, ledger: Ledger, envelope: str,
     # The request event, then (round 1 F6) the evidence the request carries,
     # content-addressed, so the repetition breaker's documented escape
     # condition is observable — one shape with `take` and `ledger add`.
-    added = ledger.add_all(request_events(parsed, round_no, digest, size,
-                                          claim_digest=claim_digest),
-                           lineage=lineage)
+    added = ledger.add_all(request_events(
+        parsed, round_no, digest, size, claim_digest=claim_digest,
+        answers=answers_digest(ledger, round_no, lineage)), lineage=lineage)
+    # A return to an envelope already on record writes no new request row, and
+    # a row's identity is its content: the order of the visits has to be a row
+    # of its own, told apart by its position in the file.
+    survivor = _surviving_request(ledger, round_no, lineage) if claim_digest \
+        else None
+    if survivor is not None and survivor.get("source_digest") != digest:
+        ledger.add({"event": REQUEST_RETURN, "round": round_no,
+                    "sha": parsed.sha, "digest": digest,
+                    "position": len(ledger.events())}, lineage=lineage)
     reviewer = parsed.attrs.get("reviewer", "")
     return _runnable({"round": round_no, "sha": parsed.sha, "digest": digest,
             "bytes": size, "kept": kept, "recorded": bool(added),
@@ -4092,6 +4151,19 @@ def probe_target(cfg: Config, push: dict | None, sha: str,
         try:
             run("fetch", push["url"], push["ref"])
             result["fetch"] = f"fetched {push['ref']} from {push['url']}"
+            # What the stamp's `Verify:` line promises: the ref holds the
+            # target. A shared clone has the object either way, so without
+            # this an amend and force-push reads as a good fetch. A notice:
+            # the object is what is reviewed, and the author's next hand-off
+            # is what moves on.
+            try:
+                run("merge-base", "--is-ancestor", sha, "FETCH_HEAD")
+            except GitTimeout:
+                raise
+            except RuntimeError:
+                result["fetch"] += (
+                    f"; NOTICE: that ref no longer holds {sha[:12]}: the "
+                    f"branch was rewritten after this request was emitted")
         except GitTimeout:
             # Not "the target is unreachable": the remote or a hook was
             # slower than the ceiling, and the remedy is that decision
@@ -4277,11 +4349,6 @@ def run_bytes(cfg: Config, git, *args: str,
             f"`{paths.command(paths.Lit('git'), *args)}` — "
             f"{out.stderr.decode('utf-8', 'replace').strip()}")
     return out.stdout
-
-
-def _digest_bytes(data: bytes) -> str:
-    import hashlib
-    return hashlib.sha256(data).hexdigest()
 
 
 # Round 4 F3: what "the object store could not answer" is, as a closed set.
@@ -4776,6 +4843,19 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
                       lineage=recorded_lineage)
     ledger.add_all(request_events(parsed, round_no, digest, size),
                    lineage=recorded_lineage)
+    # Read after this take's own request row, as `close` will read it: in a
+    # reviewer's own ledger that row is what stands. A notice, not a refusal:
+    # a reviewer may read a closed or replaced round; `close` is what refuses
+    # the verdict, and this saves the round spent on it.
+    notice = ""
+    if ledger.is_closed(recorded_lineage):
+        notice = (f"NOTICE: {_closure_words(ledger, recorded_lineage)}, and "
+                  f"`close` will refuse a verdict on this request. ")
+    elif ((survivor := _surviving_request(ledger, round_no, recorded_lineage))
+          and survivor.get("sha") != sha):
+        notice = (f"NOTICE: the author has re-emitted round {round_no} at "
+                  f"{str(survivor.get('sha'))[:12]}, and `close` will refuse "
+                  f"a verdict at {sha[:12]}. ")
     ref_summary = {}
     for r in refs:
         key = r["status"].split(" ", 1)[0].rstrip(":")
@@ -4826,6 +4906,9 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
                 f"rooted in this checkout the command is {size} bytes, over "
                 f"the {SCOPED_COMMAND_MAX}-byte bound for one command line, "
                 f"so it is withheld; the diff line is the whole span")
+        else:
+            scoped_note = ("the author's view of the span, never a limit on "
+                           "the search; `diff` is the whole change")
     return _runnable({"round": round_no, "sha": sha, "reviewer": me,
             "lineage": recorded_lineage,
             "target": target, "head": checkout,
@@ -4849,7 +4932,7 @@ def take(cfg: Config, ledger: Ledger, envelope: str, source: str,
             # reviewer validates their verdict against whatever their own
             # checkout happens to hold — which, on the cross-machine round
             # this tool exists for, is routinely nothing at all.
-            "then": f"write the verdict as <{parsed.tag}-review-verdict "
+            "then": f"{notice}write the verdict as <{parsed.tag}-review-verdict "
                     f'sha="{sha}"> and run '
                     f"`{paths.command(*paths.lits(TOOL_NAME, 'validate'), paths.Ph('<verdict.md>'), paths.Lit('--from-target'))}`; "
                     f"then stop — do not start the next round (standing "
@@ -4888,6 +4971,160 @@ def _unruled_open_requests(ledger: Ledger, round_no: int, sha: str,
     return out
 
 
+#: A hand-off that returned to a request already recorded, in a round whose
+#: newest emission was another.
+REQUEST_RETURN = "request_return"
+
+
+def _surviving_request(ledger: Ledger, round_no: int, lineage: str,
+                       branch: str = "") -> dict | None:
+    """The request that stands for `round_no`: the newest the AUTHOR emitted,
+    a warm re-serve included (it records an `ingest`, not a row). `take`
+    records a request too, with no claim digest, and re-taking an old envelope
+    does not make it the round's request. A ledger holding only such rows (a
+    reviewer's own, or a pre-field one) answers with its newest.
+
+    THE ONE AUTHORITY for which emission of a round stands: `take`, `close`,
+    `ledger add`, `brief` and the discarded reading all ask here. A terminal
+    marker ends the question, so what a closed lineage's request was stays what
+    it was when the lineage closed. `branch` narrows it to what that branch can
+    have replaced: its own rows and those naming no branch, because another
+    branch's emission replaces nothing (`known_branch`)."""
+    by_digest, survivor, newest = {}, None, None
+    for e in ledger.current(lineage):
+        if e.get("event") == Ledger.LINEAGE_CLOSED:
+            break
+        if e.get("round") != round_no:
+            continue
+        if e.get("event") == "request":
+            mine = known_branch(e.get("branch"))
+            if branch and mine and mine != branch:
+                continue
+            by_digest[e.get("source_digest")] = newest = e
+            if e.get("claim_digest"):
+                survivor = e
+        elif e.get("event") == REQUEST_RETURN or (
+                e.get("event") == "ingest"
+                and e.get("source") == "handoff cache"):
+            survivor = by_digest.get(e.get("digest"), survivor)
+    return survivor or newest
+
+
+def _closure_words(ledger: Ledger, lineage: str) -> str:
+    """The marker that ended `lineage`, as a person reads it."""
+    last = ledger.closures_of_lineage(lineage)[-1]
+    return (f"lineage {lineage} is closed ({last.get('outcome', 'by decision')}"
+            f" at round {last.get('at_round', '?')}, by "
+            f"{last.get('authorized_by', 'an unrecorded actor')}: "
+            f"{last.get('reason', 'no reason recorded')})")
+
+
+def admit_verdict(ledger: Ledger, sha: str, lineage: str, source: str,
+                  round_no: int | None = None, door: str = "close") -> int:
+    """The round a verdict at `sha` rules in the existing review `lineage`, or
+    a `Refusal`: THE ONE ADMISSIBILITY, crossed by `close` and `ledger add`
+    before either records, so they agree on the terminal marker, the derived
+    round and the surviving emission. `door` says which command carried it
+    (`close` or `ledger add`), for the refusal an explicit round earns: run
+    that command again without the round.
+
+    Each door once held guards the other lacked: `ledger add` answered a
+    replaced emission and appended behind a closure (round 2 F1, lineage
+    Lfdedc11b17). `ledger add` alone records without crossing this, and only
+    what rules on no review: `Ledger.holds_review` and `ruling_refiled`.
+
+    NOT COVERED, by decision (round 4 F1): `take` holds no reservation. In a
+    ledger with no author emission, a reviewer's own, its write moves the
+    survivor, so a verdict filed there by hand during that instant can rule
+    on the replaced request. Nothing in the supported flow files one there,
+    and a reservation in `take` would refuse a reviewer for as long as a
+    hand-off holds the lock.
+    """
+    # Round 1 F1 (Blocker). The SHA binding is the tool's central invariant and
+    # a clean verdict is merge-authorizing evidence, so the round a verdict is
+    # filed under may never be taken on the caller's word: `round_no or
+    # round_for_sha(...)` let an explicit --round skip the lookup entirely, and
+    # a clean verdict for an unrequested commit then wrote a `clean at the exact
+    # reviewed SHA` lineage marker for a commit nobody reviewed. The derived
+    # round is now authoritative and an explicit one may only AGREE with it.
+    ambiguous = ledger.ambiguous_rounds_for_sha(sha, lineage)
+    if ambiguous:
+        raise Refusal(
+            f"sha {sha} is bound by more than one OPEN request in this "
+            f"lineage (rounds {ambiguous}), so which round this verdict "
+            f"answers cannot be derived and must not be guessed — a verdict "
+            f"closes the request that asked for it (round 2 F1)",
+            paths.command(*paths.lits(TOOL_NAME, "brief")))
+    derived = ledger.round_for_sha(sha, lineage)
+    if derived is None:
+        raise Refusal(f"no request in the current lineage binds sha "
+                      f"{sha}, so this verdict answers no round here — "
+                      f"a verdict is closed against the request that asked for "
+                      f"it, never against a round number supplied beside it",
+                      paths.command(*paths.lits(TOOL_NAME, "brief"),
+                                    source))
+    if round_no is not None and round_no != derived:
+        raise Refusal(f"--round {round_no} does not hold the request for sha "
+                      f"{sha}; that request is round {derived}. The "
+                      f"round is derived from the SHA and an explicit value "
+                      f"may only agree with it (round 1 F1)",
+                      paths.command(*paths.lits(TOOL_NAME, "ledger", "add"),
+                                    source) if door == "ledger add"
+                      else paths.command(*paths.lits(TOOL_NAME, "close",
+                                                     "--verdict"), source))
+    # A closed lineage holds no open round, whatever its request rows say. A
+    # verdict appended here would override a person's decision with a stale
+    # turn (clean), or print `lineage: open` for a finding `respond` refuses.
+    if ledger.is_closed(lineage):
+        raise Refusal(
+            f"{_closure_words(ledger, lineage)}, so this verdict has no open "
+            f"review to rule; nothing was recorded", "",
+            remedy=f"a person re-reads the record — "
+                   f"`{paths.command(*paths.lits(TOOL_NAME, 'brief'))}` — and "
+                   f"decides whether this ruling belongs to a review that is "
+                   f"still open; this tool appends nothing behind a terminal "
+                   f"marker")
+    # The other half of the concurrency stopgap, and the half the audit
+    # missed: the destruction happens at CLOSE, not at emission. A clean
+    # verdict appends `lineage_closed`, and every request still open when it
+    # lands is swallowed — never ruled, never refused, gone from the record.
+    # So a verdict may only close a lineage it actually rules on.
+    unruled = _unruled_open_requests(ledger, derived, sha, lineage)
+    if unruled:
+        raise Refusal(
+            f"this verdict rules round {derived} for {sha[:12]}, and "
+            f"this lineage holds an open request it does not rule — "
+            f"{_open_request_evidence(unruled)}. Recording it would close "
+            f"that request by omission: it would be neither answered nor "
+            f"refused, which is the one outcome the record exists to "
+            f"prevent",
+            "",
+            remedy=f"a person decides what becomes of the unruled round: it "
+                   f"is ruled by its own verdict first, or the lineage is "
+                   f"ended by recorded decision with "
+                   f"`{_close_lineage_command()}` — which states that the "
+                   f"open request was abandoned, and by whom. A verdict is "
+                   f"not that decision")
+    # The author replaced this commit: its round now asks about the survivor,
+    # and a verdict here would close or bind the round at code nobody is
+    # working on and swallow the survivor's request. (`guarded-merge` binds the
+    # exact SHA, so this was never a merge of the survivor; it is the record.)
+    survivor = _surviving_request(ledger, derived, lineage)
+    if survivor is not None and survivor.get("sha") != sha:
+        raise Refusal(
+            f"this verdict rules round {derived} at {sha[:12]}, and "
+            f"the author has since re-emitted that round at "
+            f"{str(survivor.get('sha'))[:12]}: the ruled commit is no longer "
+            f"what the round asks about, and recording this would swallow "
+            f"that request; nothing was recorded", "",
+            remedy=f"the reviewer takes the request at "
+                   f"{str(survivor.get('sha'))[:12]}, which "
+                   f"`{paths.command(*paths.lits(TOOL_NAME, 'brief'))}` names, "
+                   f"and rules that commit; or a person ends the review with "
+                   f"`{_close_lineage_command()}`")
+    return derived
+
+
 def close_round(cfg: Config, ledger: Ledger, verdict_text: str, source: str,
                 lineage: str, round_no: int | None = None,
                 tokens: int | None = None, validate_items=None) -> dict:
@@ -4908,59 +5145,7 @@ def close_round(cfg: Config, ledger: Ledger, verdict_text: str, source: str,
                       paths.command(paths.Lit(TOOL_NAME),
                                     paths.Lit("validate"), source,
                                     paths.Lit("--from-target")))
-    # Round 1 F1 (Blocker). The SHA binding is the tool's central invariant and
-    # a clean verdict is merge-authorizing evidence, so the round a verdict is
-    # filed under may never be taken on the caller's word: `round_no or
-    # round_for_sha(...)` let an explicit --round skip the lookup entirely, and
-    # a clean verdict for an unrequested commit then wrote a `clean at the exact
-    # reviewed SHA` lineage marker for a commit nobody reviewed. The derived
-    # round is now authoritative and an explicit one may only AGREE with it.
-    ambiguous = ledger.ambiguous_rounds_for_sha(parsed.sha, lineage)
-    if ambiguous:
-        raise Refusal(
-            f"sha {parsed.sha} is bound by more than one OPEN request in this "
-            f"lineage (rounds {ambiguous}), so which round this verdict "
-            f"answers cannot be derived and must not be guessed — a verdict "
-            f"closes the request that asked for it (round 2 F1)",
-            paths.command(*paths.lits(TOOL_NAME, "brief")))
-    derived = ledger.round_for_sha(parsed.sha, lineage)
-    if derived is None:
-        raise Refusal(f"no request in the current lineage binds sha "
-                      f"{parsed.sha}, so this verdict answers no round here — "
-                      f"a verdict is closed against the request that asked for "
-                      f"it, never against a round number supplied beside it",
-                      paths.command(*paths.lits(TOOL_NAME, "brief"),
-                                    source))
-    if round_no is not None and round_no != derived:
-        raise Refusal(f"--round {round_no} does not hold the request for sha "
-                      f"{parsed.sha}; that request is round {derived}. The "
-                      f"round is derived from the SHA and an explicit value "
-                      f"may only agree with it (round 1 F1)",
-                      paths.command(
-                          *paths.lits(TOOL_NAME, "close", "--verdict"),
-                          source))
-    round_no = derived
-    # The other half of the concurrency stopgap, and the half the audit
-    # missed: the destruction happens at CLOSE, not at emission. A clean
-    # verdict appends `lineage_closed`, and every request still open when it
-    # lands is swallowed — never ruled, never refused, gone from the record.
-    # So a verdict may only close a lineage it actually rules on.
-    unruled = _unruled_open_requests(ledger, round_no, parsed.sha, lineage)
-    if unruled:
-        raise Refusal(
-            f"this verdict rules round {round_no} for {parsed.sha[:12]}, and "
-            f"this lineage holds an open request it does not rule — "
-            f"{_open_request_evidence(unruled)}. Recording it would close "
-            f"that request by omission: it would be neither answered nor "
-            f"refused, which is the one outcome the record exists to "
-            f"prevent",
-            "",
-            remedy=f"a person decides what becomes of the unruled round: it "
-                   f"is ruled by its own verdict first, or the lineage is "
-                   f"ended by recorded decision with "
-                   f"`{_close_lineage_command()}` — which states that the "
-                   f"open request was abandoned, and by whom. A verdict is "
-                   f"not that decision")
+    round_no = admit_verdict(ledger, parsed.sha, lineage, source, round_no)
     digest = _digest_text(verdict_text)
     conflict = verdict_conflict(ledger, round_no, digest, lineage)
     if conflict is not None:
@@ -4977,21 +5162,27 @@ def close_round(cfg: Config, ledger: Ledger, verdict_text: str, source: str,
     kept = keep_bytes(cfg, round_no, "verdict", verdict_text,
                       lineage=ledger.carrier_lineage_for_sha(
                           parsed.sha, prefer=lineage) or lineage)
+    clean = parsed.verdict == "clean to advance"
+    # All of it in one write, the terminal marker included, so a close has no
+    # partial state to resume: a retry finds nothing written and redoes it, or
+    # finds it all written and is refused unchanged; a torn line is `events()`'s.
+    closure = ([{"event": Ledger.LINEAGE_CLOSED, "at_round": round_no,
+                 "sha": parsed.sha, "outcome": "clean",
+                 "reason": f"clean verdict on {parsed.sha} at round "
+                           f"{round_no}", "authorized_by": "reviewer"}]
+               if clean else [])
     added = ledger.add_all(verdict_events(
         parsed, round_no, digest, size, tokens,
         answering=ledger.standing_dispositions(lineage,
-                                               round_no=round_no - 1)),
-        lineage=lineage)
-    clean = parsed.verdict == "clean to advance"
+                                               round_no=round_no - 1))
+        + closure, lineage=lineage) - len(closure)
     record = {"round": round_no, "sha": parsed.sha, "verdict": parsed.verdict,
               "findings": len(parsed.findings), "closures": len(parsed.closures),
               "kept": kept, "digest": digest, "events_added": added}
+    if parsed.leads:
+        record["leads"] = [f"{lead.severity} {lead.confidence} {lead.where}: "
+                           f"{lead.why}" for lead in parsed.leads]
     if clean:
-        ledger.add({"event": Ledger.LINEAGE_CLOSED, "at_round": round_no,
-                    "sha": parsed.sha, "outcome": "clean",
-                    "reason": f"clean verdict on {parsed.sha} at round "
-                              f"{round_no}", "authorized_by": "reviewer"},
-                   lineage=lineage)
         record["lineage"] = ("closed: clean at the exact reviewed SHA. Merge "
                              "authority is the account allowlist and the "
                              "agents' standing rules; this tool does not "
@@ -5015,6 +5206,12 @@ def close_round(cfg: Config, ledger: Ledger, verdict_text: str, source: str,
             f"write one disposition per finding, then "
             f"`{respond_template}`, then "
             f"`{paths.command(*paths.lits(TOOL_NAME, 'handoff'))}`")
+        if asked := ledger.redesign_question(lineage):
+            # `next` stays empty: it is a command an agent runs verbatim, and
+            # the question has no command. It leads `then`, and the findings
+            # it is about ride beside it.
+            record["redesign"] = asked
+            record["then"] = f"{asked['question']} Then: {record['then']}"
     return _runnable(record, "next")
 
 
@@ -5087,12 +5284,17 @@ def waive(cfg: Config, ledger: Ledger, sha: str, reason: str, by: str,
                 if e.get("event") in ("request", "verdict")
                 and e.get("sha") == resolved]
     if reviewed:
+        said = ("so it is reviewed rather than waived; a waiver may not "
+                "overwrite a review that happened, in this lineage or any "
+                "closed one"
+                if any(e.get("event") == "verdict" for e in reviewed) else
+                "and no verdict rules it; a waiver may not stand beside a "
+                "hand-off on record, in this lineage or any closed one, so a "
+                "skip at this tip takes a new commit")
         raise Refusal(
             f"{resolved[:12]} was handed off for review (round "
             f"{reviewed[0].get('round', '?')}, lineage "
-            f"{ledger.lineage_of(reviewed[0])}), so it is reviewed rather "
-            f"than waived; a waiver may not overwrite a review that "
-            f"happened, in this lineage or any closed one",
+            f"{ledger.lineage_of(reviewed[0])}), {said}",
             paths.command(paths.Lit(TOOL_NAME), paths.Lit("ledger"),
                                     paths.Lit("report")))
     # Deliberately UNKEYED: a waiver is a decision about a COMMIT, not a
@@ -5385,13 +5587,13 @@ def authorize_advance(cfg: Config, ledger: Ledger, reason: str, by: str,
             "")
     kept = keep_bytes(cfg, round_no, "authorization", envelope,
                       lineage=lineage)
-    ledger.add({"event": vocab.ADVANCE_EVENT, "at_round": round_no,
-                "sha": sha, "reason": reason, "authorized_by": by,
-                "waived": len(records)}, lineage=lineage)
-    ledger.add({"event": Ledger.LINEAGE_CLOSED, "at_round": round_no,
-                "outcome": "authorization", "reason": reason,
-                "authorized_by": by, "open_request": False},
-               lineage=lineage)
+    ledger.add_all([{"event": vocab.ADVANCE_EVENT, "at_round": round_no,
+                     "sha": sha, "reason": reason, "authorized_by": by,
+                     "waived": len(records)},
+                    {"event": Ledger.LINEAGE_CLOSED, "at_round": round_no,
+                     "outcome": "authorization", "reason": reason,
+                     "authorized_by": by, "open_request": False}],
+                   lineage=lineage)
     return {"sha": sha, "round": round_no, "lineage": lineage,
             "authorized_by": by, "reason": reason,
             "waived": [r.get("finding_id") for r in records],

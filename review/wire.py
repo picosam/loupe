@@ -215,6 +215,36 @@ class Closure:
 
 
 @dataclass
+class Lead:
+    severity: str
+    confidence: str
+    where: str
+    why: str
+
+
+_LEAD_RE = re.compile(r"^[-*]\s+(?P<severity>\S+)\s+(?P<confidence>\S+)\s+"
+                      r"(?P<where>\S+?):\s+(?P<why>\S.*)$")
+
+
+def parse_leads(text: str) -> tuple[list, tuple]:
+    """(the section's leads, each line that is not one). `None` alone, the
+    word a clean verdict's findings use, states none."""
+    leads, defects = [], []
+    if re.fullmatch(r"None\.?", text.strip()):
+        return leads, ()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = _LEAD_RE.match(line)
+        if match:
+            leads.append(Lead(**match.groupdict()))
+        else:
+            defects.append(line)
+    return leads, tuple(defects)
+
+
+@dataclass
 class Verdict:
     verdict: str | None
     findings: list[Finding]
@@ -228,6 +258,8 @@ class Verdict:
     exact: bool = False  # the wrapper spans the whole document (F16)
     closures: list = field(default_factory=list)  # reviewer closures (F3)
     attr_defects: tuple = ()  # repeated / malformed wrapper attributes
+    leads: list = field(default_factory=list)  # `## leads`: costs no round
+    lead_defects: tuple = ()  # lines of that section that are not a lead
 
 
 @dataclass
@@ -725,6 +757,7 @@ def parse_verdict(text: str) -> Verdict:
         findings_src = body
     findings = parse_findings(findings_src)
     findings_none = bool(re.fullmatch(r"None\.?", sections.get("findings", "").strip()))
+    leads, lead_defects = parse_leads(sections.get(vocab.LEADS_SECTION, ""))
 
     unavailable = []
     unav = sections.get("unavailable references", "")
@@ -746,6 +779,8 @@ def parse_verdict(text: str) -> Verdict:
         exact=exact,
         closures=parse_closures(sections.get("closures", "")),
         attr_defects=wrapper_attr_defects(text),
+        leads=leads,
+        lead_defects=lead_defects,
     )
 
 

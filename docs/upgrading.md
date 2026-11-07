@@ -214,7 +214,8 @@ correct file.
 So derive it from what the file declares, key by key. `attested_by` on a
 gate row and `[limits] ci_timeout` need 0.20.0; the value
 `attested_by = "schedule"` needs 0.28.0; `[tool] commit_subject_check`
-needs 0.29.0; `heavy` on a gate row needs 0.30.0. `[roles]
+needs 0.29.0; `heavy` on a gate row needs 0.30.0; `[tool] impact_map`
+needs 0.34.0. `[roles]
 review_default` and `[roles] enforcement` need 0.16.0. A configuration
 that declares none of the newer keys needs no new floor at all, and
 raising it anyway is how a reviewing machine that was fine yesterday
@@ -353,6 +354,22 @@ install never has, and refused without `--dir`; that dependency is gone.
 `--dir <path>` still reads rendered files from a directory when that is
 exactly what you want.)
 
+**What `--install` writes, and what `--check-install` reads.** Each
+skill is one directory of seven files, the same names under
+`~/.claude/skills/loupe/` and `~/.agents/skills/loupe/`. `SKILL.md` holds
+the rules both sides share and routes the session: it names `author.md`
+and `reviewer.md`, and a session reads the one its stamp names, beside
+the `SKILL.md` it loaded. The other four are read only when their
+trigger applies: `decide.md`, `carrier.md` and `closure-authority.md`,
+whose triggers `SKILL.md` states, and `tool-feedback.md`, which the
+reviewer's procedure names for a debug round. `--install` writes all
+fourteen files and `--check-install` reads all fourteen, so the commands
+above do not change. Run before the install on a machine whose skills
+predate the four (see the CHANGELOG), `--check-install` reports each file
+the old install wrote `stale` and each it did not write `absent`, exits
+1, and names `--install` as the next command; after the install every
+row reads `in_sync`.
+
 **In most repositories there is nothing here to regenerate in the tree,
 and that is the normal case.** The adapters are installed
 machine-globally — `~/.claude/skills/loupe/`, `~/.agents/skills/loupe/` —
@@ -452,10 +469,18 @@ fenced example counts as one — indent the example. A symlinked file
 (`CLAUDE.md -> AGENTS.md`) is followed to its target for reading and
 writing, and the result says so: check each real file once.
 
-A vendored skill is whole rendered files, not a region: `SKILL.md` and,
-since the skill splits by role (see the CHANGELOG), `author.md` and
-`reviewer.md` beside it. Render into a scratch directory and compare the
-whole directory:
+A block has no directory beside it, so it carries in one region what a
+skill splits across its seven files: both sides' procedures, then the
+four trigger-only texts as sections headed by their file names, so a
+rule that names `closure-authority.md` leads to the section of that
+name. Nothing goes beside it, and its upgrade is the two commands above:
+a block rendered by an earlier version reads `stale`, and
+`--write-embedded` replaces it.
+
+A vendored skill is whole rendered files, not a region: all seven files
+of the skill directory, because `SKILL.md` and the reviewer's procedure
+send a session to each of the other six beside it. Render into a scratch
+directory and compare the whole directory:
 
 ```console
 $ tmp="$(mktemp -d)" && loupe render-adapters --dir "$tmp"
@@ -463,7 +488,8 @@ $ diff -ru <your vendored skill directory> "$tmp/claude"
 ```
 
 (`codex/` for a vendored Codex skill.) No output is the proof;
-any output is the patch you have not applied yet.
+any output is the patch you have not applied yet, and an `Only in` line
+naming the scratch directory is a file your copy lacks.
 
 **Check:** `loupe --version` prints the target on every machine, and
 `--check-install` exits 0 on every machine — under either install form,
@@ -684,13 +710,14 @@ substitute.
 | 0.22.0 | The hand-off preflight runs ahead of the commit. `scope_paths` is a new optional claim member — an exact path, a directory prefix ending in `/`, or a glob; `[]` is a declaration that this round sweeps nothing, and a claim that omits it sweeps as before. A swept file carrying the marker line `loupe-fixture:` followed by `corrupt-by-design` is refused outright, with no flag that overrides it. Two header lines, `Swept:` and `Env:`, which older readers ignore; `Env:` also reports whether the process ran as root, which is worth having where tests behave differently under root in a container. An interpreter below the floor now gets a sentence instead of a stack trace. **The one crossing in this span that asks your own tree to change — see step 3a.** | A repository whose suite writes fixtures into its real tree owes either that marker in the fixtures or a declared `scope_paths` on the claim. Owing neither, a hand-off run after an interrupted suite publishes a corrupt-by-design fixture under the author's envelope. |
 | 0.23.0 | Reporting and reading only; nothing a round binds changes. A `reclassified` closure may carry a `Residue:` continuation line naming the findings its narrowed claim went into, so convergence follows the thread instead of reading it as new. Generated paths get their own heading in the request's span — opt in by marking them `linguist-generated` in `.gitattributes` and committing it; a repository that marks nothing gets the span it always got, byte for byte. Upgraders: nothing to do, and no reader floor has to move. | Little, directly — a verdict carrying `Residue:` validates on 0.22.0 and on 0.16.0. The one exception: `import-legacy`'s closed event grammar on an older installation refuses a ledger row carrying the `residue` member. |
 | 0.25.0 | Three things move. Re-run `render-adapters --install` on every machine: the Codex skill moves to the documented `~/.agents/skills/loupe/`, and the install keeps a legacy `~/.codex/skills/loupe/` copy and moves it out of discovery. With no `--dir`, `--install` and `--check-install` render from the installed package, so no install form needs anything beside it. `[limits] git_timeout` is a new key: declare it only after every machine that authors or reviews the repository runs 0.25.0, and raise `[tool] requires` to 0.25.0 in the same commit. Five claim members are new: `carried_findings`, `objectives`, `observations`, `attestation_map` and `excluded_paths`. The hand-off now gates before it pushes. A red blocking gate refuses with the local commit named, for the author to amend. | A machine left at 0.24.x reads the Codex skill from the old path, and reports the migrated copy `absent`. A machine holding both paths lists the skill to Codex twice until a 0.25.0 `--install` runs. An older reader refuses a `review.toml` that declares `git_timeout`. An author at 0.24.x refuses a claim carrying any of the new members, while a reviewer at 0.24.x still takes the request. |
-| 0.26.0 | Two things move. Python 3.15 is the one supported interpreter (`>=3.15,<3.16`), and this release is published on the 3.15.0 release candidate: until 3.15.0 final ships, run `uv python install 3.15` before the pinned install, because uv provisions nothing from that range while only the rc exists, and an installed rc is used. Keep `review.toml` in TOML 1.0 while any author or reviewer runs a release below 0.26.0. An `objectives` entry of the claim gains two optional fields, `authority` and `covers`, declared together. | Under 3.14 the package refuses at its first statement, naming both versions. An earlier reader refuses a TOML 1.1-only `review.toml` as invalid TOML, naming the line. An author at 0.25.x refuses a claim whose objective carries either new field, while a reviewer at 0.25.0 still takes the request. |
+| 0.26.0 | Two things move. Python 3.15 is the one supported interpreter (`>=3.15,<3.16`), published on the 3.15.0 release candidate up to 0.29.0 and on 3.15.0 final since 0.30.0, which uv 0.13.0 or later provisions from that range with no step of yours: update an older uv first, since it still installs a release candidate, which that range refuses. Keep `review.toml` in TOML 1.0 while any author or reviewer runs a release below 0.26.0. An `objectives` entry of the claim gains two optional fields, `authority` and `covers`, declared together. | Under 3.14 the package refuses at its first statement, naming both versions. An earlier reader refuses a TOML 1.1-only `review.toml` as invalid TOML, naming the line. An author at 0.25.x refuses a claim whose objective carries either new field, while a reviewer at 0.25.0 still takes the request. |
 | 0.28.0 | One value joins the grammar: `attested_by = "schedule"` on a gate row, which a hand-off records deferred instead of running. An older reader refuses a configuration that uses it, naming the version skew; nothing else in an envelope, refusal or exit code changes. | Declaring it before the reviewing side runs 0.28.0 makes the target refuse there; raise `[tool] requires` with the value, not after it. |
 | 0.29.0 | Four things move. A gate record reads `unbound` whenever the index (assume-unchanged, skip-worktree, a sparse checkout) or a cache (a filesystem monitor, trusted stat data) hides an edit, so a hand-off refuses before its push; clear the flags first. A hand-off refuses a head another lineage targets, open or closed; commit first, or pass `--shared-target` when a second review of that commit is meant. While one hand-off of a commit is being admitted, another hand-off or `emit-request` of the same commit refuses before its gates unless both declared `--shared-target`; run it again once the first ends. Each skill is three files (`SKILL.md`, `author.md`, `reviewer.md`): re-run `render-adapters --install` everywhere, and a vendored skill vendors all three. `[tool] commit_subject_check` joins the grammar. | A flagged or cached edit makes every hand-off refuse until cleared. A script that re-hands-off an unchanged tip after closing its lineage refuses without the flag. A script running two hand-offs of one commit at once sees one refuse. A machine left on the old install reads a skill with no role files. An older reader refuses a configuration that declares the new key, naming the version skew. |
 | 0.30.0 | One key joins the grammar: `heavy` on a gate row, a boolean whose absence means `false`. The runner executes every other gate first and the heavy ones only when every blocking gate of the first group passed; otherwise each heavy gate is recorded not run, `blocked by <id>`, and a hand-off refuses naming the red gate first. A manifest with no heavy gate runs as before. The validator judges a blocked record's `blocked_by` against its reason, the manifest and the block (`A-BLOCKED-SHAPE`). A claim pattern (`scope_paths`, `excluded_paths`, an objective's `paths`) that names a directory at the target without its trailing `/` is refused before any gate runs, naming the member and the fix. The request's `Tree:` line reads as a notice naming the untracked paths when they are the only change at emission and nothing hides a tracked edit. | Declaring it before every authoring and reviewing machine runs 0.30.0 makes the target refuse there, naming the version skew; raise `[tool] requires` to 0.30.0 with the key, not after it. A script that read a red hand-off's refusal for the first gate in manifest order now finds the red gate first and the blocked ones after it. A claim that names a directory as `src` refuses until it says `src/`. A script that read `DIRTY` off the `Tree:` line for an untracked file now finds a line opening `clean at emission`. |
 | 0.31.0 | No key joins the grammar, so no floor moves. `handoff` and `emit-request` push a reviewed branch only to a branch of its own name: under every `[roles] enforcement` value, and before anything is committed, a push to a branch of another name is refused — the push a branch cut with `git switch -c <branch> origin/main` makes, since git sets `origin/main` as its upstream. The rule compares the two names and asks no remote anything. | A branch tracking a branch of another name, the default or not, refuses until it has a destination of its own name: `git branch --unset-upstream` (one remote) or `git push -u <remote> refs/heads/<branch>:refs/heads/<branch>`; cut new work with `--no-track`. A script that relied on the hand-off fast-forwarding the default branch gets a blocked exit. |
 | 0.32.0 | No key joins the grammar, so no floor moves. Three readers close: `respond --from-json` reads one grammar, printed by its `--help`, and refuses an unknown member, a null or wrong-kind optional member and a non-string payload text member, `blocked` with the member's JSON path; a disposition envelope's body is read through the same grammar by `validate`, `validate --against` and `ledger add` (`D-JSON-MALFORMED`, `D-JSON-SHAPE`, `D-JSON-DUPLICATE` with its path); and the JSON loader refuses an integer past the interpreter's digit limit, a number past a double's range, `NaN` and the infinities. A kept envelope stays as recorded: reports and convergence read the ledger's events, never its bytes. Every shape defect of a claim is refused in one refusal, each by its member path, and the claim-file remedy names the author. Each skill names its role files beside the `SKILL.md` that was loaded, never by an absolute path, and its respond step sends the author to the shape `respond --help` prints: re-run `render-adapters --install` everywhere. | A script that fed `respond` an extra member, a null optional member or an array `positions` gets exit 1 `blocked` where it got exit 0; one that read exit 2 and `next: loupe respond --help` for a malformed file reads exit 1 and `next` null. `ledger add` refuses a malformed body before it reads the ledger, with `next: loupe validate <file>`. `validate` on a kept envelope may now refuse it; its recorded events are unchanged. A script that parsed a claim refusal for one defect finds every defect, the first first. A machine left on the old install keeps a skill that names role files by an absolute path. |
 | 0.33.0 | No key joins the grammar, so no floor moves. Every claim path pattern (`scope_paths`, `excluded_paths`, an objective's `paths`) matches the path it spells and every path below it, as git's literal-first pathspec match does: `src` and `src/` admit the same files, and a glob also matches literally with everything below it. The refusal of a bare directory, new in 0.30.0, is gone. The author procedure's value grammar says so: re-run `render-adapters --install` everywhere. | A claim that names a directory as `src` is accepted where it was refused. A claim accepted before can match more where one of its patterns has paths below it it did not match (a bare name of a directory the span deleted or turned into a file, of a file turned into a directory, a glob that also spells a real directory): each such path is now swept, excluded or mapped. A pattern ending in `/`, and one with nothing below it, match what they did. |
+| 0.34.0 | One key joins the grammar: `[tool] impact_map`, an optional boolean whose absence means off; raise `[tool] requires` to 0.34.0 in the commit that declares it, and a configuration that does not declare it needs no new floor. Each skill is seven files where it was three: re-run `render-adapters --install` on every machine, and render a vendored skill into a scratch directory and compare the whole directory (step 4). Past a lineage's third `changes requested`, a further hand-off needs `redesign_answer` in its claim. | An older reader refuses a configuration declaring `impact_map`, naming the key. Before the install, `--check-install` reads each 0.33.0 file `stale` and the four new ones `absent` and exits 1; a vendored copy missing a file sends a session to a file that is not there. A request past the third `changes requested` without `redesign_answer` is refused before anything is committed or pushed. |
 
 ## What this page does not do
 

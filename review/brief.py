@@ -24,7 +24,7 @@ from .validate import parse_attestations
 # here while transport parsed them strictly, so the précis described a state
 # the envelope did not record; a second reading of the transport attribute
 # would be the same defect with a different field.
-from .transport import _REF_LINE_RE, declared_transport
+from .transport import _REF_LINE_RE, _surviving_request, declared_transport
 
 _HEADER = {
     "target": re.compile(r"^Target:\s+(\S+)", re.M),
@@ -278,17 +278,23 @@ def find_open_request(ledger, lineage: str):
     """`(event, superseded)` for the live request, or `(None, 0)`.
 
     The ledger is append-only, so re-emitting a round does not remove its
-    predecessor: both sit there as open requests at the same round. The last
-    one written is the live one and the earlier ones are superseded — reported
-    as a count rather than silently dropped, because a human who emitted twice
+    predecessor: both sit there as open requests at the same round. The live
+    one is the one `close` accepts, `transport._surviving_request`, and the
+    last one written need not be it: a warm return to an earlier emission
+    writes no request row and a reviewer's `take` writes one (round 2 F2,
+    lineage Lfdedc11b17). The other emissions are superseded — reported as a
+    count rather than silently dropped, because a human who emitted twice
     should be told which of the two they are about to carry.
     """
     candidates = open_requests(ledger, lineage)
     if not candidates:
         return None, 0
     top = max(e.get("round", 0) for e in candidates)
-    at_round = [e for e in candidates if e.get("round", 0) == top]
-    return at_round[-1], len(at_round) - 1
+    live = _surviving_request(ledger, top, lineage)
+    emissions = {(e.get("sha"), e.get("source_digest")) for e in candidates
+                 if e.get("round", 0) == top}
+    standing = (live.get("sha"), live.get("source_digest"))
+    return live, len(emissions - {standing})
 
 
 # ------------------------------------------------------------------ précis
@@ -303,7 +309,8 @@ def _first_sentence(text: str) -> str:
     return parts[0] if parts else text
 
 
-def request_precis(parsed, ledger=None, full: bool = False) -> str:
+def request_precis(parsed, ledger=None, full: bool = False,
+                   claim_shown: bool = False) -> str:
     """What this request asks, in prose. Derived from the envelope only.
 
     Brief `request-precis-legibility` (the user, 2026-09-05: "way too
@@ -319,6 +326,11 @@ def request_precis(parsed, ledger=None, full: bool = False) -> str:
     objective's first sentence with a pointer to `--full`, because a
     130-word objective is the author's to shorten, not this renderer's to
     reprint. `full=True` prints the claim's objective, risk and scope whole.
+
+    `claim_shown` is `take`'s default rendering, whose `judge_view` carries
+    the claim under its own heading: tool feedback named the repeat in most
+    rounds, and an unattributed first sentence ahead of the view was the
+    first thing a judge read.
     """
     body, sections = parsed.body, parsed.sections
     attrs = parsed.attrs
@@ -397,16 +409,18 @@ def request_precis(parsed, ledger=None, full: bool = False) -> str:
         changed += f"; in scope: {m.group(1)}"
     out.append(f"- {where}" + (f"; {changed}" if changed else ""))
     objective = (m.group(1) if (m := _OBJECTIVE.search(claim)) else "")
-    if objective:
+    if objective and not claim_shown:
         if full:
-            out.append("- **Asks** — " + _wrap(" ".join(objective.split())))
+            out.append("- **The author says** — "
+                       + _wrap(" ".join(objective.split())))
         else:
-            out.append("- **Asks** — " + _wrap(_first_sentence(objective)))
+            out.append("- **The author says** — "
+                       + _wrap(_first_sentence(objective)))
     if full:
         if m := _RISK.search(claim):
             out.append("- **Author risk** — " + _wrap(m.group(1)))
         if scope := sections.get("review scope", "").strip():
-            out.append("- **Scope** — " + _wrap(scope))
+            out.append("- **Author's scope** — " + _wrap(scope))
 
     # THE TALLIES, one sentence: what the reviewer will read, which the
     # person carrying the envelope cannot act on and need not count.
@@ -650,12 +664,12 @@ def _hoisted_name(pointer, log_dir: str | None) -> str | None:
     return None
 
 
-def _attestation_row(rec, request_sha: str | None,
-                     log_dir: str | None = None) -> str:
-    """One table row. Every column is a field of the record, shortened at
-    most; a field that is absent prints `-`, never a default. A log pointer
-    directly inside `log_dir` (named once above the table) prints `…/` and
-    its file name; any other prints whole."""
+def _attestation_cells(rec, request_sha: str | None,
+                       log_dir: str | None = None) -> list[str]:
+    """One table row's cells. Every column is a field of the record,
+    shortened at most; a field that is absent prints `-`, never a default. A
+    log pointer directly inside `log_dir` (named once above the table)
+    prints `…/` and its file name; any other prints whole."""
     def cell(value) -> str:
         return "-" if value is None else " ".join(str(value).split()).replace("|", "\\|")
 
@@ -684,7 +698,7 @@ def _attestation_row(rec, request_sha: str | None,
     output = rec.get("output") if isinstance(rec.get("output"), dict) else {}
     digest = output.get("sha256")
     pointer = _log_cell(output.get("pointer"), log_dir)
-    return "| " + " | ".join(cell(c) for c in (
+    return [cell(c) for c in (
         rec.get("id"), result, rec.get("binding"), rec.get("tree"), ran_at,
         "yes" if rec.get("blocking") is True
         else "no" if rec.get("blocking") is False else None,
@@ -694,11 +708,67 @@ def _attestation_row(rec, request_sha: str | None,
         # (asked for in two rounds' tool feedback): a shortened digest
         # names a log and cannot open it.
         pointer,
-    )) + " |"
+    )]
+
+
+def _attestation_row(rec, request_sha: str | None,
+                     log_dir: str | None = None) -> str:
+    return ("| " + " | ".join(_attestation_cells(rec, request_sha, log_dir))
+            + " |")
+
+
+#: The cells a row must carry to be said once above the rows rather than in
+#: each: columns 1 to 6 of `_attestation_cells`, in order.
+_PASSED_CELLS = ["exit 0", "bound", "clean", "= target", "yes", "this tool"]
+_DEFERRED_CELLS = ["DEFERRED to the schedule", "-", "-",
+                   "executed - / claims -", "yes",
+                   "the schedule, declared (not checked at hand-off)"]
+
+
+def _collapsed_table(records, request_sha: str | None,
+                     log_dir: str | None) -> list[str]:
+    """The attestation rows as `judge_view` prints them: what differs first.
+
+    Tool feedback named this table in most rounds of 2026-10 ("36 gate rows
+    ... still dominate the first read"). Of 33 rows measured on a real
+    request, all 33 said one of two things in six of their ten columns, so
+    those six are said once, and only for a row whose six cells are exactly
+    those. Every other row, a red gate or an advisory one or a CI-attested
+    one, keeps all ten and comes first. Nothing is summarised away: the kept
+    request holds every field.
+    """
+    rest, deferred, passed = [], [], []
+    for cells in (_attestation_cells(r, request_sha, log_dir)
+                  for r in records):
+        if cells[1:7] == _DEFERRED_CELLS and cells[7:] == ["-", "-", "-"]:
+            deferred.append(cells[0])
+        elif cells[1:7] == _PASSED_CELLS:
+            passed.append(cells)
+        else:
+            rest.append(cells)
+    out: list[str] = []
+    if rest:
+        out += ["| gate | result | binding | tree | ran at | blocking | "
+                "executed by | command | output | log |",
+                "|---|---|---|---|---|---|---|---|---|---|",
+                *("| " + " | ".join(c) + " |" for c in rest), ""]
+    if deferred:
+        out += [f"Deferred to the schedule, blocking, not run at this "
+                f"hand-off and not checked by it ({len(deferred)}): "
+                + ", ".join(deferred) + ".", ""]
+    if passed:
+        out += [f"Passed ({len(passed)}): each exit 0, bound, over a clean "
+                f"tree, at the target, blocking, run by this tool.", "",
+                "| gate | command | output | log |", "|---|---|---|---|",
+                *("| " + " | ".join((c[0], *c[7:])) + " |" for c in passed)]
+    while out and not out[-1]:
+        out.pop()
+    return out
 
 
 def compact_request(envelope: str, kept: str | None = None,
-                    tags: list[str] | None = None) -> str:
+                    tags: list[str] | None = None,
+                    collapse: bool = False) -> str:
     """The request as the reviewer reads it: every section verbatim, the
     attestation objects as one table.
 
@@ -766,12 +836,213 @@ def compact_request(envelope: str, kept: str | None = None,
            else "") + "; any other row prints both.",
         *logs_line,
         "",
-        "| gate | result | binding | tree | ran at | blocking | executed by "
-        "| command | output | log |",
-        "|---|---|---|---|---|---|---|---|---|---|",
-        *(_attestation_row(r, request_sha, log_dir) for r in records),
+        *(_collapsed_table(records, request_sha, log_dir) if collapse else (
+            "| gate | result | binding | tree | ran at | blocking | executed "
+            "by | command | output | log |",
+            "|---|---|---|---|---|---|---|---|---|---|",
+            *(_attestation_row(r, request_sha, log_dir) for r in records))),
     ])
     return envelope[:block.start()] + table + envelope[block.end():]
+
+
+#: The sections a tool wrote, by `wire.section_key`. Everything else is the
+#: author's, an unknown section included: a section this reader cannot place
+#: is never presented as attested.
+_MACHINE_SECTIONS = frozenset({"taxonomy", "evidence", "ledger", "convergence",
+                               "impact"})
+#: Lines of the Convergence section `judge_view` leaves to the kept request:
+#: the budget and the ledger's other lineages, which rule on nothing here.
+_CONVERGENCE_DROPPED = re.compile(
+    r"^(?:Rounds to clean:|Token budget:|Lineage:|Events:|Open lineages in "
+    r"this repository:|- `[^`]+` on .*round\(s\) )")
+#: A section of the author's that declares nothing prints nothing here.
+_NOTHING_DECLARED = re.compile(
+    r"^\s*$|^\s*(?:- )?\(none( declared)?\)$|^Scope paths: \(none declared")
+_FILE_LIST_SHOWN = 40
+_AUTHOR_HEADING = "# AUTHOR'S CLAIMS, NOT CHECKED"
+_AUTHOR_NOTE = (
+    "Everything from here to the verdict shape is the author's account: "
+    "objective, risk, objectives, observations, not-done list, references' "
+    "notes, scope, stop conditions, and the sentence in each disposition. No "
+    "tool checked it. Test it. Scope is the author's view and never a limit "
+    "on the search: a defect outside it, or one no claim mentions, is a "
+    "finding.")
+
+
+def _split_view(body: str) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """(the preamble's lines, [(heading line, its lines)]), by the same rule
+    `wire._split_sections` reads a heading."""
+    preamble: list[str] = []
+    chunks: list[tuple[str, list[str]]] = []
+    current = preamble
+    for line in body.splitlines():
+        if re.match(r"^## (.+?)\s*$", line):
+            current = []
+            chunks.append((line, current))
+        else:
+            current.append(line)
+    return preamble, chunks
+
+
+def _trim(lines: list[str]) -> list[str]:
+    lines = list(lines)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines
+
+
+def _claim_parts(lines: list[str]) -> tuple[list[str], list[str]]:
+    """(the machine's `What changed` block, the rest of the Claim).
+
+    Taken only when exactly one line opens the block: the emitter writes one,
+    so a second is author text posing as one and the whole Claim stays the
+    author's. Past `_FILE_LIST_SHOWN` paths the list is counted, not printed:
+    tool feedback named a 400-path list repeated ahead of the objectives, and
+    the diff command and the kept request both hold it.
+    """
+    opens = [i for i, ln in enumerate(lines) if ln.startswith("What changed (")]
+    if len(opens) != 1:
+        return [], lines
+    start = end = opens[0]
+    block = [lines[start]]
+    shown = 0
+    for end in range(start + 1, len(lines)):
+        line = lines[end]
+        if line.strip() and not line.startswith((
+                "  ", "In scope: ", "Generated by declaration — ")):
+            break
+        if line.startswith("  "):
+            shown += 1
+            if shown > _FILE_LIST_SHOWN:
+                continue
+        block.append(line)
+    else:
+        end = len(lines)
+    if shown > _FILE_LIST_SHOWN:
+        block.append(f"  … and {shown - _FILE_LIST_SHOWN} more: the diff "
+                     f"command, or the kept request")
+    return _trim(block), lines[:start] + lines[end:]
+
+
+def _convergence_kept(heading: str, lines: list[str],
+                      kept: str | None) -> tuple[str, list[str]]:
+    """The Convergence section without the state word, its reading, the
+    budget, the metrics table and the other lineages: the findings table and
+    the threads stay. The kept request holds all of it. Item 7 of the
+    independence inventory: 1 to 3 KB, and the word a judge reads before it
+    rules ("the loop is closing what it opens") is a prior it was handed."""
+    out: list[str] = []
+    in_metrics = seen_table = False
+    for line in lines:
+        if line.startswith("| metric |"):
+            in_metrics = True
+        if in_metrics:
+            if line.startswith("|"):
+                continue
+            in_metrics = False
+        if line.startswith("|"):
+            seen_table = True
+        elif not seen_table:
+            continue          # the reading, before the table
+        if _CONVERGENCE_DROPPED.match(line):
+            continue
+        out.append(line)
+    out = _trim(out)
+    out += ["", "The state word, budget and metrics of this report: "
+                + (kept if kept else "the request file itself") + "."]
+    return "## Convergence", out
+
+
+def judge_view(envelope: str, kept: str | None = None,
+               tags: list[str] | None = None) -> str:
+    """The request in the order a judge should meet it: the whole diff and
+    what a machine attested first, the author's account after, under a
+    heading that says whose it is.
+
+    Measured 2026-11-04: 163 of 167 reviewer sessions read the author's claim
+    before their first diff; objective, risk, not-done list, scope, stop
+    conditions and each disposition's sentence carried no mark; a scoped diff
+    was printed in 184 of 283 requests, and 42 of 167 sessions never ran the
+    whole one. So this reorders and marks. It decides nothing, and it is a
+    view: validation, the digest, the kept copy and the ledger read the
+    original bytes, as they do for `compact_request`. An envelope of any
+    older emitter renders through it unchanged in grammar.
+
+    What it cannot separate it does not guess at: a repeated machine heading
+    (an author's text can hold a `## Evidence` line) leaves the whole request
+    in its own order, under a line saying so.
+    """
+    from . import wire
+    compact = compact_request(envelope, kept=kept, tags=tags, collapse=True)
+    match = wire._WRAPPER_RE.search(compact)
+    if match is None or match.group("kind") != "review-request":
+        return compact
+    opening = compact[match.start():match.start("body")].rstrip()
+    closing = compact[match.end("body"):match.end()].strip()
+    preamble, chunks = _split_view(match.group("body"))
+    keys = [wire.section_key(h[3:]) for h, _ in chunks]
+    repeated = sorted(k for k in set(keys)
+                      if k in _MACHINE_SECTIONS and keys.count(k) > 1)
+    if repeated:
+        return "\n".join((
+            opening,
+            f"This request repeats a tool's heading ({', '.join(repeated)}), "
+            f"so nothing below can be told from the author's text: read all "
+            f"of it as the author's, and the whole diff first.",
+            match.group("body"), closing, ""))
+    diff = [ln for ln in preamble if ln.startswith("Diff:")]
+    author_stamp = [ln for ln in preamble
+                    if ln.startswith(("Scoped:", "Access:"))
+                    and ln != "Access: see reference manifest below"]
+    stamp = [ln for ln in preamble
+             if ln not in diff and ln not in author_stamp]
+    machine = [opening, *diff,
+               "Read the whole of that diff before the author's account "
+               "below.", *_trim(stamp)]
+    author: list[str] = []
+    shape: list[str] = []
+    impact_map: list[str] = []
+    for (heading, lines), key in zip(chunks, keys):
+        lines = _trim(lines)
+        if key == "convergence":
+            heading, lines = _convergence_kept(heading, lines, kept)
+        if key == "claim":
+            changed, lines = _claim_parts(lines)
+            if changed:
+                machine += ["", "## What changed", "", *changed]
+        elif key == "evidence":
+            # `NOT captured` is typed by the author, inside a machine section.
+            cut = next((i for i, ln in enumerate(lines)
+                        if ln.startswith("NOT captured")), None)
+            if cut is not None and lines[cut + 1:] != ["  - (none)"]:
+                author += ["", "## Evidence: what the author says was not "
+                               "captured", "", *_trim(lines[cut:])]
+            if cut is not None:
+                lines = _trim(lines[:cut])
+        elif key == "hand":
+            cut = [i for i, ln in enumerate(lines)
+                   if ln.startswith("Verdict shape: ")]
+            if cut:     # the emitter's is the last: nothing follows it
+                shape = lines[cut[-1]:]
+                lines = _trim(lines[:cut[-1]])
+        if key == "impact":
+            impact_map = ["", heading, "", *lines]
+        elif key in _MACHINE_SECTIONS:
+            machine += ["", heading, "", *lines]
+        elif not all(_NOTHING_DECLARED.match(ln) for ln in lines):
+            if key == "disposition":
+                heading = (heading.replace(", emitted by the tool", "")
+                           + " (the tool lists them; each sentence is the "
+                             "author's)")
+            author += ["", heading, "", *lines]
+    if author_stamp:
+        author = ["", "Author's stamp lines; a scoped diff is the author's "
+                      "view of the span:", *author_stamp, *author]
+    return "\n".join((
+        *machine, *impact_map, "", _AUTHOR_HEADING, "", _AUTHOR_NOTE, *author,
+        *(("", *shape) if shape else ()), closing, ""))
 
 
 def target_taxonomy(cfg, sha: str | None):

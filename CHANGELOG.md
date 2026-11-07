@@ -5,6 +5,127 @@ published, so `--version` discriminates publishes. Newest first. Sections
 addressed to upgraders say so; read them before upgrading across the version
 they name.
 
+## 0.34.0
+
+**For upgraders — read before crossing this version.** Three things move.
+Each skill is seven files where it was three, so re-run `render-adapters
+--install` on every machine (the last section below). One key joins the
+grammar: `[tool] impact_map`, an optional boolean whose absence means off.
+An older reader refuses a configuration that declares it, naming the key,
+so raise `[tool] requires` to 0.34.0 in the commit that declares it; a
+configuration that does not declare it needs no new floor. And past a
+lineage's third `changes requested`, a further hand-off refuses unless its
+claim carries `redesign_answer`.
+
+**The judge's stage.**
+
+- A verdict may carry a `## leads` section: one line per Low or Info
+  observation, with no falsification, legal on either verdict and recorded
+  for the author at `close`. Only the Low and Info severities, by name,
+  where the target's taxonomy declares them and does not call them
+  blocking. A clean verdict with leads closes the lineage as any clean
+  verdict does, so a lead holds no merge. `clean to advance` still carries
+  exactly `None` under findings. An older reader reads past the heading.
+- `take` opens on the whole diff. Its view prints the diff command and what
+  a machine attested first, then the author's account under a heading
+  saying that no tool checked it and that scope never limits the search.
+  The kept request, its digest and its validation do not change, and
+  `--full` still prints the kept bytes.
+- When a lineage's third or later verdict asks for changes, `close`,
+  `respond` and `ledger convergence` ask "should we redesign?" first, with
+  the lineage's findings by round, anchor, class and severity. The question
+  leads `then` and rides in a `redesign` field, and `next` is empty there.
+  A further request carries the answer in its claim's `redesign_answer`,
+  printed under the author's heading, and a hand-off without one refuses
+  before it commits or pushes. It counts verdicts, not the round cap, so
+  raising a cap does not silence it.
+- With `[tool] impact_map = true`, a request carries a machine-made `##
+  Impact map` ahead of the author's claims, computed at hand-off under one
+  30-second wall-clock limit; past it, a `Partial:` line says so and the
+  hand-off goes on. Off by default: on held-out reviews it was measured no
+  better at 1.2 times the tokens per read. Off, nothing is computed.
+- The reviewer's procedure asks for everything: the taxonomy classifies,
+  scope never limits the search, the diff comes before the author's
+  account, and the author's objective, risk, not-done list and
+  observations are claims to test. `docs/design.md`, boundary closure: the
+  proof that a test can fail is the one run with the defect back; neither
+  side asks for a mutation per guard or per bypass.
+
+**Fixed: records a crash or a race could lose, and verdicts that could
+close the wrong round.**
+
+- A `close` appends all its events, the terminal marker included, in one
+  write under the lock: a retry finds nothing written and redoes it, or
+  finds it all written and is refused with the ledger unchanged. A write
+  that fails or comes up short raises a refusal naming the file and saying
+  it may hold a partial batch; nothing is truncated, so a failed write can
+  no longer erase a record another worktree has just appended. A torn
+  line, and a complete last record with no newline, are refused by file
+  and line at every verb and never skipped, so nothing is appended after a
+  stopped write.
+- A verdict on a replaced emission is refused, so it can no longer close
+  the round at code the author has moved past. `close --verdict` refuses a
+  closed lineage, so a stale verdict cannot override a person's decision.
+  `ledger add` crosses the admissibility checks `close` crosses and holds
+  the same reservation from admission to append. A refusal at either
+  verdict door names its command as a literal.
+- The verdict validator refuses a repeated section
+  (`V-SECTION-DUPLICATE`), a near miss of a section's name
+  (`V-SECTION-SPELLING`), two findings with one fingerprint
+  (`V-FP-DUPLICATE`) and `changes requested` with no finding and no
+  closure (`V-CHANGES-NOTHING`). Any other unknown heading is a notice
+  (`V-SECTION-UNKNOWN`), and so is a closure of a fingerprint the ledger
+  holds no ruling of (`C-UNKNOWN-FINGERPRINT`).
+- A gate printing bytes that are not UTF-8 no longer kills the hand-off and
+  the other gates' results.
+- A warm hand-off keys on the standing answers, so `respond` run again no
+  longer serves the disposition it replaced, and each return to a cached
+  request is recorded in order. A reviewer's `take` on a shared ledger no
+  longer turns a re-handoff cold, and `take` reports a fetched ref that no
+  longer holds the target. Respelling a hosted remote is refused while the
+  old spelling holds the ledger, so a review no longer vanishes silently;
+  two local paths are not compared.
+- A request's in-scope count and unmapped list honour `scope_paths`, as its
+  scoped diff does, and a file an objective's tests or references column
+  lists is no longer called unmapped. The waiver refusal no longer calls a
+  handed-off commit that was never ruled on reviewed.
+
+**Each skill is seven files.** `render-adapters --install`
+writes seven files into each skill directory, `~/.claude/skills/loupe/`
+and `~/.agents/skills/loupe/`, where 0.33.0 wrote three. `SKILL.md` keeps
+the rules both sides share and routes the session: it names `author.md`
+and `reviewer.md`, and a session reads the one its stamp names, beside
+the `SKILL.md` it loaded. Text a session needs only on a trigger moved to
+four files beside them. From `SKILL.md`, with the trigger it states for
+each: `decide.md` (a result carries a non-empty `decide` list, or someone
+asks what the repository leaves undeclared), `carrier.md` (a round's
+carrier is disputed or looks wrong) and `closure-authority.md` (a claim's
+objective declares an authority, or one is about to be declared or
+narrowed). From `reviewer.md`: `tool-feedback.md`, which the reviewer's
+procedure names for a request stamped `debug="tool-feedback"`.
+
+Re-run `render-adapters --install` on every machine; the commands do not
+change. Run before the install, `--check-install` reads all fourteen
+files: on a 0.33.0 install it reports the three files of each skill
+`stale` and the four new ones `absent`, exits 1 and names `--install` as
+the next command, and after the install every row reads `in_sync`. A
+skill directory you place by other means, vendored in a repository or
+copied into a second profile's skills directory, needs all seven files,
+because a session is sent to each beside the `SKILL.md` it loaded: render
+into a scratch directory and compare the whole directory, as
+`docs/upgrading.md` step 4 says.
+
+An embedded instruction block stays one region with nothing beside it:
+it carries both sides' procedures, then the four texts as sections
+headed by their file names. `--check-embedded` reports a block rendered
+by 0.33.0 `stale`, and `--write-embedded` replaces it, as for any
+release.
+
+Measured on the rendered files, 2026-11-04: `SKILL.md` with one side's
+file comes to 10,902 to 11,535 bytes, where 0.33.0's came to 20,847 to
+22,355, and a trigger-only file adds 731 to 1,903 bytes when its trigger
+applies. The instruction block went from 26,390 bytes to 19,538.
+
 ## 0.33.0
 
 **For upgraders — read before crossing this version: a claim path now

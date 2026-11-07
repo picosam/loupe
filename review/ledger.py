@@ -237,6 +237,14 @@ def ruling_facts(event: dict) -> dict:
     return {**event, **{name: event[alt] for name, alt in missing}}
 
 
+class LedgerDefect(vocab.TransportDeclarationError, ValueError):
+    """The record itself is defective, and only a person can say what it held.
+    A blocked state with a remedy, by the boundary `cli.main` gives a defective
+    declaration: no `<verb> --help` repairs an append-only file. Still a
+    ValueError, what a bad line always raised: `bin/guarded-merge` and every
+    other reader of the ledger read that as "cannot be parsed"."""
+
+
 class Ledger:
     """Append-only event log, on disk or in memory.
 
@@ -260,12 +268,45 @@ class Ledger:
 
     def events(self) -> list[dict]:
         if self._events is None:
-            self._events = []
-            if self.path and self.path.is_file():
-                for line in self.path.read_text(encoding="utf-8").splitlines():
-                    if line.strip():
-                        self._events.append(json.loads(line))
+            # Assigned only whole: a refused read must not leave an empty
+            # list behind for the next call to read, and append after.
+            self._events = (self._read_file() if self.path
+                            and self.path.is_file() else [])
         return self._events
+
+    def _read_file(self) -> list[dict]:
+        """Every line an event, or a refusal naming the file and the line.
+        Split on the newline alone: `str.splitlines` also breaks on the
+        U+2028 a recorded text may hold, which `ensure_ascii=False` writes
+        raw. Never skipped: the line may be the record this tool exists to
+        keep, and what it held is not this tool's to guess."""
+        raw = self.path.read_bytes()
+        lines = raw.split(b"\n")
+        events = []
+        for number, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line.decode("utf-8"))
+                why = "" if isinstance(event, dict) else "it is no JSON object"
+            except ValueError as exc:   # undecodable, or not JSON
+                why = str(exc)
+            # A complete record with no newline is a stopped write too, and an
+            # append after it would join the two lines.
+            if not why and number == len(lines):
+                why = "it ends with no newline"
+            if why:
+                torn = (", the file's unterminated last line, the mark of a "
+                        "write that stopped," if number == len(lines) else "")
+                raise LedgerDefect(
+                    f"{self.path} line {number}{torn} is not a ledger event "
+                    f"({why}); nothing was read or written",
+                    f"a person reads that line and repairs the file: its "
+                    f"bytes are the owner's, since the ledger is append-only "
+                    f"and this tool neither skips nor rewrites a record. "
+                    f"Then re-run this command")
+            events.append(event)
+        return events
 
     def reload(self) -> "Ledger":
         """Drop the cached read so the NEXT selector sees the file as it is
@@ -296,25 +337,64 @@ class Ledger:
         and waivers — pass none and stay unkeyed, exactly as `lineage()`
         and `waivers()` read them.
         """
+        return self.add_all([event], lineage=lineage) == 1
+
+    @staticmethod
+    def _stamped(event: dict, lineage: str | None) -> dict:
         event = dict(event)
         if lineage and not declared_lineage(event):
             event[LINEAGE_FIELD] = str(lineage)
         event["uid"] = _uid(event)
-        if any(e.get("uid") == event["uid"] for e in self.events()):
-            return False
-        event.setdefault("ts", datetime.now(timezone.utc).isoformat(
-            timespec="seconds"))
-        if self.path is not None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(event, sort_keys=True,
-                                    ensure_ascii=False) + "\n")
-        self._events.append(event)
-        return True
+        return event
 
     def add_all(self, events: list[dict], *,
                 lineage: str | None = None) -> int:
-        return sum(1 for e in events if self.add(e, lineage=lineage))
+        """Append what is new of `events` in ONE write, and return how many.
+
+        One batch is one fact: a verdict and its findings, an answer and its
+        evidence. Written one line at a time, a process killed between lines
+        left a verdict row with its findings gone, and the next `handoff`
+        opened a round that had dropped them. Serialised first, so nothing
+        that cannot be encoded reaches the file either. A write that fails or
+        comes up short raises, naming the file; nothing is rolled back, since
+        worktrees share this ledger and a truncate could erase another review's
+        record.
+
+        NOT COVERED: a partial batch ending on a record boundary, after a failed
+        write or a power loss, reads as whole, shorter records. A failed close
+        reports it at the time; a power loss cannot. No write here has a
+        journal, and one is not worth adding for a personal ledger.
+        """
+        known = {e.get("uid") for e in self.events()}
+        fresh = []
+        for event in events:
+            event = self._stamped(event, lineage)
+            if event["uid"] in known:
+                continue
+            known.add(event["uid"])
+            event.setdefault("ts", datetime.now(timezone.utc).isoformat(
+                timespec="seconds"))
+            fresh.append(event)
+        if fresh and self.path is not None:
+            blob = "".join(json.dumps(e, sort_keys=True, ensure_ascii=False)
+                           + "\n" for e in fresh).encode("utf-8")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("ab", buffering=0) as fh:
+                try:
+                    written = fh.write(blob)
+                    failed = (None if written == len(blob) else
+                              f"{written} of {len(blob)} bytes written")
+                except OSError as exc:
+                    failed = str(exc)
+            if failed:
+                raise LedgerDefect(
+                    f"the write to {self.path} failed ({failed}), so the "
+                    f"ledger may hold a partial batch; nothing was rolled back",
+                    f"a person reads the end of that file before re-running "
+                    f"this command: a close may have recorded its verdict "
+                    f"without its findings")
+        self._events.extend(fresh)
+        return len(fresh)
 
     # ------------------------------------------------------------- selectors
 
@@ -1160,7 +1240,8 @@ class Ledger:
         # Cumulative-token half of the budget rule (§5.3d, round-3 F6,
         # round-4 F5). The budget comes from `[limits] token_budget` and is
         # passed through by every product report path; the counts come from
-        # `tokens` on request/verdict events, recorded by `ledger record-tokens`
+        # `tokens` on request/verdict events, recorded by `close --tokens` and
+        # `ledger add --tokens`
         # because nothing in a no-LLM code path can measure them. Three
         # distinct states, and the report names which one it is in: no budget
         # declared, budget with no counts, budget with counts.
@@ -1473,6 +1554,35 @@ class Ledger:
             return open_round
         bound = self.rounds_for_sha(sha, lineage)
         return max(bound) if bound else None
+
+    def redesign_question(self, lineage: str) -> dict | None:
+        """The question Osama ruled on 2026-11-04, when this lineage's latest
+        verdict is its third or later and asks for changes; else None.
+
+        A fact of the record and nothing else, so `close`, `respond`,
+        `ledger convergence` and the hand-off refusal can never disagree. It
+        counts ruled ROUNDS: `ledger add --tokens` files one ruling again as
+        a row of its own, and usage metadata is not another round coming back
+        (L29f7f0663a F1). A clean or an earlier verdict asks nothing.
+        """
+        events = self.current(lineage)
+        ruled = {}
+        for e in events:
+            if e.get("event") == "verdict":
+                ruled[e.get("round") or 0] = e
+        if (len(ruled) < vocab.REDESIGN_AFTER_VERDICTS
+                or ruled[max(ruled)].get("verdict") == vocab.VERDICT_CLEAN):
+            return None
+        findings = sorted(
+            ({"round": e.get("round"), "anchor": e.get("anchor_path") or "-",
+              "classification": e.get("classification") or "-",
+              "severity": e.get("severity") or "-",
+              "title": str(e.get("title") or "-")}
+             for e in events if e.get("event") == "finding"),
+            key=lambda f: (f["round"] or 0, f["anchor"]))
+        return {"question": vocab.REDESIGN_QUESTION.format(
+                    verdicts=len(ruled)),
+                "verdicts": len(ruled), "findings": findings}
 
     def convergence(self, lineage: str) -> dict:
         """Is this lineage closing its findings, or hunting the same
@@ -1985,6 +2095,14 @@ class Ledger:
         return [e for e in current
                 if e.get("event") == "request" and e.get("round") not in ruled]
 
+    def holds_review(self, lineage: str) -> bool:
+        """Whether `lineage` records a request or a terminal marker: a review
+        a verdict would be recorded INTO, as against a lineage holding only
+        what a historical `ledger add --round N` filed: rulings with no
+        request, nothing a verdict could override."""
+        return any(e.get("event") in ("request", self.LINEAGE_CLOSED)
+                   for e in self.current(lineage))
+
     def discarded_requests(self, lineage: str) -> list[dict]:
         """Requests in a CLOSED `lineage` that no verdict in it ever ruled —
         the third state `brief` must be able to name.
@@ -2000,11 +2118,15 @@ class Ledger:
         (brief `concurrent-round-refusal`, superseded 2026-09-06).
 
         Answered means a verdict of that lineage binds the request's OWN
-        round and sha. Superseded is not discarded: a later request at the
-        same round, from the same branch — or from an unknown one, which is
-        every pre-field ledger — is the amend-and-re-emit flow replacing
-        its own emission, and only the survivor of that chain is judged.
+        round and sha. Superseded is not discarded: an emission the author
+        replaced is not the request that stands for its branch — the same
+        branch or an unknown one, which is every pre-field ledger — and only
+        the survivor of that chain is judged. `_surviving_request` says which
+        that is, a return to an earlier emission included (round 2 F2, lineage
+        Lfdedc11b17): the newest row is not it.
         """
+        # At the call: `transport` imports this module.
+        from .transport import _surviving_request
         events = self.current(lineage)
         marks = [i for i, e in enumerate(events)
                  if e.get("event") == self.LINEAGE_CLOSED]
@@ -2013,18 +2135,13 @@ class Ledger:
         segment = events[:marks[-1]]
         ruled = {(e.get("round"), e.get("sha")) for e in segment
                  if e.get("event") == "verdict"}
-        requests = [e for e in segment if e.get("event") == "request"]
         out = []
-        for i, e in enumerate(requests):
-            if (e.get("round"), e.get("sha")) in ruled:
+        for e in segment:
+            if e.get("event") != "request" \
+                    or (e.get("round"), e.get("sha")) in ruled:
                 continue
-            mine = known_branch(e.get("branch"))
-            superseded = any(
-                later.get("round") == e.get("round")
-                and (not mine or not known_branch(later.get("branch"))
-                     or known_branch(later.get("branch")) == mine)
-                for later in requests[i + 1:])
-            if not superseded:
+            if _surviving_request(self, e.get("round"), lineage,
+                                  known_branch(e.get("branch"))) is e:
                 out.append(e)
         return out
 
@@ -2454,6 +2571,20 @@ def render_cross_lineage_md(notices: list[dict]) -> str:
                      f"{n['disposition']}")
     lines.append("")
     return "\n".join(lines)
+
+
+def render_redesign_md(asked: dict) -> str:
+    """The question, then the lineage's findings by round, anchor, class and
+    severity: what the answer has to be about."""
+    def cell(value) -> str:
+        return " ".join(str(value).split()).replace("|", "\\|")
+    return "\n".join([
+        asked["question"], "",
+        "| round | anchor | class | severity | title |",
+        "|---|---|---|---|---|",
+        *(f"| {f['round']} | {cell(f['anchor'])} | "
+          f"{cell(f['classification'])} | {cell(f['severity'])} | "
+          f"{cell(f['title'])[:100]} |" for f in asked["findings"])])
 
 
 def render_convergence_md(c: dict) -> str:

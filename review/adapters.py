@@ -7,10 +7,10 @@ exception: they carry the literal command lines (§9bis.3 rule 7) so an agent
 copies rather than improvises, and they install at USER level so no shared
 repository needs an instruction-file edit.
 
-One source renders every adapter: PROCEDURE below (what each side does, in
-order, and what it never does) plus the verb table read from the CLI's own
-parser, so an adapter cannot describe a verb the tool does not have or omit
-one it does. `render-adapters --check` byte-guards the rendered files and is
+One source renders every adapter: `procedure()` below (what each side does,
+in order, and what it never does) plus the verb names read from the CLI's own
+parser, so an adapter cannot name a verb the tool does not have or omit one
+it does. `render-adapters --check` byte-guards the rendered files and is
 a gate.
 
 Rendered kinds:
@@ -21,6 +21,8 @@ Rendered kinds:
                       (RR8: a skill's SKILL.md carries the rules that hold
                       on both sides and routes to its two role files, one
                       per stamp, read on demand; `SKILL_ROLE_KINDS`)
+  <skill>-<rare>      adapters/<agent>/<rare>.md → beside that SKILL.md, read
+                      only on the trigger the routing names; `RARE_FILES`
   instructions-block  adapters/instructions-block.md — an agent-neutral
                       block for a BEGIN/END GENERATED region in a project
                       instruction file, where a skill directory is not read
@@ -108,10 +110,28 @@ for _surface, _kinds in SKILL_ROLE_KINDS.items():
         INSTALL[_kind] = (_target.rsplit("/", 1)[0] + f"/{_role}.md", _why)
 del _surface, _kinds, _target, _why, _role, _kind
 
+#: 2026-11-04: what a reader needs only on a trigger leaves `SKILL.md` for a
+#: file of its own beside it, named in the routing section with its trigger
+#: (`tool-feedback` in the reviewer's `rule` step), so most sessions never
+#: load it. Each is its own kind with its own install target, as a role file
+#: is. The instruction block carries them as sections instead. These names
+#: are the keys of `procedure()["rare"]`.
+RARE_FILES = ("decide", "carrier", "closure-authority", "tool-feedback")
+SKILL_RARE_KINDS = {
+    surface: {name: f"{surface}-{name}" for name in RARE_FILES}
+    for surface in SKILL_ROLE_KINDS}
+for _surface, _kinds in SKILL_RARE_KINDS.items():
+    _target, _why = INSTALL[_surface]
+    for _name, _kind in _kinds.items():
+        INSTALL[_kind] = (_target.rsplit("/", 1)[0] + f"/{_name}.md", _why)
+del _surface, _kinds, _target, _why, _name, _kind
+
 #: Every surface an agent reads the procedure from, by its main kind.
 SURFACES = ("claude-skill", "codex-skill", "instructions-block")
 
 # Observed behaviour, dated, beside the documented path — never instead of it.
+# Held here for whoever changes the install path; since 2026-11-04 no adapter
+# prints it, because it is for people and `docs/upgrading.md` carries it.
 INSTALL_OBSERVED = {
     "codex-skill": (
         "observed 2026-09-21 with codex-cli 0.155.0-alpha.9.2 "
@@ -192,6 +212,15 @@ def _claim_values() -> str:
     return "Values — " + "; ".join(clauses) + "."
 
 
+def _judge_reading() -> list[str]:
+    """THE SLOT for how a reviewer first reads a round, which the code around
+    `take` decides: lines returned here open the `rule` step on every
+    surface, ahead of the reading order written there. It returns none, so
+    nothing renders; the change that alters that reading (track `om-judge`,
+    2026-11-04) fills it."""
+    return []
+
+
 # ONE source. Role-agnostic on purpose: an agent learns which side it holds
 # from the envelope's stamp (author=… reviewer=…), never from this text.
 #
@@ -204,267 +233,152 @@ def _claim_values() -> str:
 # `test_adapter_enumerations_are_derived` proves it by mutation.
 def procedure() -> dict:
     status_key, mutation_key = vocab.FALSIFICATION_RECORD
+    waive = paths.command(*paths.lits(TOOL_NAME, "waive"))
+    authorize = paths.command(*paths.lits(TOOL_NAME, "authorize-advance"))
+    required = ", ".join(
+        f"`{m}`" + (" (non-empty)" if m == vocab.CLAIM_REFERENCES_FIELD else "")
+        for m in vocab.CLAIM_REQUIRED)
+    optional_refs = sorted(set(vocab.CLAIM_REFERENCE_FIELDS)
+                           - set(vocab.CLAIM_REFERENCE_REQUIRED))
     return {
     "both": [
-        "Exit codes mean exactly one thing: 0 ok, 1 findings or refusal, "
-        "2 usage. Every non-zero exit carries `next_kind`: when it is "
-        "`command`, run the `next` command verbatim; when it is `blocked`, "
-        "`next` is null — stop, give the human the `remedy` field, and wait. "
-        "One exception: a refusal of the claim file, whose remedy names the "
-        "author, is yours when the stamp makes you the author — the claim is "
-        "your input, so correct the members it names in your claim file "
-        "and re-run. "
-        "Either way, do not diagnose and do not improvise a flag or a fix.",
-        "Output is JSON when stdout is not a TTY. Read fields; never parse "
-        "prose.",
-        "Never hand-type an envelope, never edit the ledger, never paste gate "
-        "output into Evidence — the tool runs gates and attests them.",
-        "Review is the default end of an implementation session, and the "
-        "relay to the reviewer is the human's. With `[roles] review_default "
-        "= \"on\"` (absent counts as on) the author runs `handoff` unasked "
-        "once the work is done — unless the user declined a review earlier "
-        "in this session or said it needs none, in which case say so in one "
-        "line and stop; a decline is per session and changes no config. "
-        "The commands of your own side are yours to run, `handoff` included "
-        "— it IS the author's emission step, never a step to hand back to "
-        "the human, and nothing is emitted or validated until it exits 0. "
-        "Whichever "
-        "side you hold, you stop where the procedure says stop; you do not "
-        "invoke the other side by any mechanism (CLI, subagent, hook, API). "
-        "One exception, and it is never this tool's to grant: where the "
-        "standing instructions you operate under allow an agent-relayed "
-        "window AND the operator granted one for this lineage, a harness "
-        "outside this tool carries the relay block to the reviewer, whole "
-        "and unedited, and the request's Roles line names that harness as "
-        "`relay=` instead of a person, which the author declares by setting "
-        "the claim's `relay` member to the harness's name. Nothing else "
-        "changes on either side: "
-        "the author never writes or edits what the reviewer is handed, the "
-        "reviewer takes a relay block that arrives that way exactly as one "
-        "a person pasted, and stops at the validated verdict. "
-        "Two verbs are never yours unless the standing instructions you "
-        "operate under say otherwise: "
-        f"`{paths.command(*paths.lits(TOOL_NAME, 'waive'))}` and "
-        f"`{paths.command(*paths.lits(TOOL_NAME, 'authorize-advance'))}` "
-        "record a HUMAN's decision that a commit goes unreviewed or a "
-        "finding stands unfixed, or that the lineage advances over findings "
-        "still open. The tool cannot tell your hand from theirs — it "
-        "carries the name you type — so running either on your own mints "
-        "exactly the authorization this checkpoint exists to require. Where "
-        "those instructions allow it, run either only to record exactly "
-        "what the human selected in an interactive prompt this session, "
-        "under their name; otherwise report what you would say and let the "
-        "human answer.",
-        "Boundary closure. When a finding is about a parser, a grammar, or a "
-        "lifecycle seam, the answer partitions the COMPLETE admitted domain: "
-        "every input kind the boundary accepts, every declared field and "
-        "nested shape, every ordering the seam can be reached by — with "
-        "paired VALID controls proving the check is live, and a mutation per "
-        "bypass proving it can fail. Making the named reproducer green is not "
-        "an answer, it is one point of a domain, and the next unpartitioned "
-        "point is the next round. This binds both sides: an acceptance and a "
-        "closure are judged by whether the domain is closed, never by whether "
-        "the example passes. One terminator, and only one: a domain whose "
-        "completeness cannot be established from inside the artifact — a set "
-        "that can be declared but never proven complete from within — may be "
-        "declared CLOSED RELATIVE TO A STATED AUTHORITY. An authority is a "
-        "machine-generated, separately gated artifact that derives the set; "
-        "a hand-maintained list is never one. The author declares it in the "
-        "claim, per anchor. From then on the reviewer attacks the authority "
-        "— its derivation and its coverage — and may still bring an "
-        "instance, but an instance against a declared-closed domain must "
-        "name the authority it escapes; one that names none is not a "
-        "completeness finding. Rejecting the authority is an ordinary "
-        "finding, anchored on the authority itself, and it is bounded, "
-        "because unbounded it restates one level down forever. The "
-        "author states the authority's DOMAIN beside it — what it is "
-        "claimed to cover, in the terms it enforces. THE REVIEWER RULES "
-        "ON THE DOMAIN BEFORE RULING UNDER IT: does it match the anchor's "
-        "declared purpose and every surface still relied on downstream? A "
-        "concrete escape outside the declaration is admissible evidence "
-        "that the domain is too narrow, and a domain narrower than its "
-        "anchor's purpose is a finding about the claim. Only once a "
-        "stated domain is ACCEPTED is coverage ruled against it, and only "
-        "then is a demand outside it scope for a backlog rather than a "
-        "finding for the round, however well it reproduces. Narrowing is "
-        "a complete answer only when the anchor's purpose and every "
-        "consumer claim narrow with it, leaving no wider reliance "
-        "implicit; a narrowing that leaves a wider promise standing is "
-        "not an answer, it is the defect. Where it is complete it is "
-        "preferred to widening the mechanism. The declaration is "
-        "not an "
-        "exemption: it moves the attackable surface from an unbounded hunt "
-        "onto a finite artifact, and an authority narrower than its own "
-        "STATED DOMAIN is itself the defect.",
-        "Trust model. The tool has ONE principal: the operator, and every "
-        "agent running a verb runs it for them. The ledger, the state "
-        "directory, the clone and the remote it pushes to are the "
-        "operator's own writable state, so a finding whose premise is that "
-        "a party holding that write access forges a row, a ref, a source "
-        "file or an envelope is OUTSIDE THE TAXONOMY: it describes the "
-        "owner attacking their own record, which no mechanism in this tool "
-        "can prevent and none is asked to. What the record is guarded "
-        "against is OMISSION and FATIGUE — a finding that dies unanswered, "
-        "an answer bound to the wrong ruling, a stale attestation, a stamp "
-        "that misdescribes who did what. Rule on those. A forgery finding "
-        "must name, in the finding, the party with LESS than operator "
+        "**Results.** Off a TTY, output is JSON: read its fields. Exit 0 is "
+        "ok, 1 is findings or a refusal, 2 is usage. Every non-zero exit "
+        "carries `next_kind`. `command`: run `next` verbatim. `blocked`: "
+        "read `remedy`. If it is yours to do, because it names your side or "
+        "a file or commit you wrote, do it and re-run. Otherwise give the "
+        "human the remedy and wait. Add no flag or fix those fields don't "
+        "name.",
+        "**The record.** The tool writes envelopes, the ledger and gate "
+        "attestations, so don't hand-type an envelope, edit the ledger or "
+        "paste gate output into Evidence.",
+        "**Ending a session.** With `[roles] review_default = \"on\"` "
+        "(absent counts as on), the author runs `handoff` unasked once the "
+        "work is done, unless the user declined a review this session or "
+        "said it needs none; then say so in one line and stop. A decline "
+        "changes no config. `handoff` is the author's to run, never the "
+        "human's, and nothing is emitted until it exits 0.",
+        "**The relay is the human's.** Stop where your side's procedure "
+        "says, and don't invoke the other side by any mechanism (CLI, "
+        "subagent, hook, API). One exception, never this tool's to grant: "
+        "the standing instructions you operate under allow an agent-relayed "
+        "window AND the operator granted one for this lineage. Then a "
+        "harness outside this tool carries the relay block to the reviewer, "
+        "whole and unedited, and the request's Roles line names that "
+        "harness as `relay=` instead of a person, which the author declares "
+        "by setting the claim's `relay` member to the harness's name. "
+        "Nothing else changes: the author never writes or edits what the "
+        "reviewer is handed, and the reviewer takes that block as one a "
+        "person pasted and stops at the validated verdict.",
+        "**Two verbs are never yours unless the standing instructions you "
+        f"operate under say otherwise.** `{waive}` and `{authorize}` record "
+        "a human's decision that a commit goes unreviewed, that a finding "
+        "stands unfixed, or that the lineage advances over open findings. "
+        "The tool carries whatever name you type, so running either on your "
+        "own mints the authorization this checkpoint exists to require. "
+        "Where those instructions allow it, run either only to record "
+        "exactly what the human selected in an interactive prompt this "
+        "session, under their name. Otherwise report what you would say and "
+        "let the human answer.",
+        "**Brief, then relay, exactly.** Every request and verdict result "
+        "carries `brief` and `relay`. Give the human both, in that order, "
+        "every time. `brief` is readable prose, never in a code block. "
+        "`relay` is the literal commands with the fences it already has: "
+        "add no fence around it and put nothing of yours inside it. Don't "
+        "merge, reorder, summarise or paraphrase either; both derive from "
+        "the envelope and yours would not. A relay may carry envelope bytes "
+        "as a heredoc in one fence; hand that over whole, since a chat "
+        "surface rewrites anything outside a fence. "
+        f"`{paths.command(*paths.lits(TOOL_NAME, 'brief'))}` reprints both, "
+        "and with no argument finds the open request.",
+        "**The carrier.** The relay prints the one carrier this round "
+        "declared. The tool resolves it from declarations, so don't detect "
+        "it, and don't rewrite a command for another carrier.",
+        "**Boundary closure.** When a finding is about a parser, a grammar "
+        "or a lifecycle seam, the answer partitions the complete admitted "
+        "domain: every input kind the boundary accepts, every declared "
+        "field and nested shape, every ordering the seam can be reached by, "
+        "with paired valid controls proving the check is live. The proof a "
+        "test can fail is the one run with the defect back; neither side "
+        "asks for a mutation per guard or per bypass. A green reproducer is "
+        "one point of that domain; both sides judge an acceptance or a closure "
+        "by whether the domain is closed. A gap no plausible input reaches "
+        "demands no partition: the reviewer reports it at Low and says so. "
+        "A domain that can't be shown "
+        "complete from inside the artifact has one terminator: "
+        "`closure-authority.md`.",
+        "**Trust model.** The tool has one principal, the operator, and "
+        "every agent runs its verbs for them. The ledger, state directory, "
+        "clone and remote are the operator's own writable state, so forging "
+        "a row, ref, source file or envelope with that access is outside "
+        "the taxonomy: it describes the owner attacking their own record. "
+        "The record guards against omission and fatigue: a finding that "
+        "dies unanswered, an answer bound to the wrong ruling, a stale "
+        "attestation, a stamp that misdescribes who did what. Rule on "
+        "those. A forgery finding names the party with less than operator "
         "access who could mount it; one that names none is not a finding "
-        "for the round, and the author answers it by citing this rule, "
-        "never by building a mechanism. Boundary closure above partitions "
-        "the domain of MISTAKES a boundary admits, not the domain of "
-        "adversaries.",
-        "Absent config asks once. A result carrying a `decide` list has "
-        "applied a built-in default for a key this repository never "
-        "declared; each entry names the key, its meaning, the value "
-        "applied, and the exact TOML line for `set` and for `unset`. Ask "
-        "the user once per session, per key, in plain language, whether "
-        "this project sets or unsets it, write their answer into "
-        "`review.toml` as the printed line and commit it. Never ask about "
-        "a declared key, never ask twice in a session, and never decide "
-        "it yourself. A key whose only off state is to stay undeclared "
-        "prints its `unset` as a comment line — `# decided: "
-        "limits.token_budget undeclared` — and that line IS the answer: "
-        "write it into `review.toml` under `[limits]` and the entry stops, "
-        "while the key stays undeclared and uncounted. "
-        f"`{paths.command(*paths.lits(TOOL_NAME, 'decide'))}` prints the "
-        "same list on demand, and is the ONLY way to read it without "
-        "emitting or recording anything: use it when nobody asked for a "
-        "round — after a version pin moves, or when the user asks what "
-        "this repository has left undeclared — and never run an emitting "
-        "verb to find out.",
-        "Every request and every verdict result carries TWO fields, and they "
-        "are two different kinds of text. `brief` is the plain-language "
-        "account of what is being asked or ruled — give it to the human as "
-        "readable prose, never inside a code block. `relay` is the literal "
-        "commands to run — reproduce it EXACTLY as given, and nothing else. "
-        "The relay already carries its own code fences around each command; "
-        "wrapping the whole block in another fence breaks at the first "
-        "inner fence and everything after travels as prose, so never add "
-        "fencing of your own in either direction. Emit them in that order, "
-        "both, every time, and do "
-        "not merge, reorder, summarise or paraphrase either: both are derived "
-        "from the envelope and yours would not be. Never put your own prose "
-        "inside the relay block and never bury a command inside the brief. "
-        f"`{paths.command(*paths.lits(TOOL_NAME, 'brief'))}` reproduces "
-        f"both at any time, and with no argument it "
-        "finds the open request itself.",
-        "The round declares whether the two sides share a filesystem, and "
-        "that is what decides which carrier the relay prints. You do not "
-        "decide it and you do not detect it: the tool resolves it from "
-        "declarations, strongest first — an explicit `--transport "
-        f"{'|'.join(vocab.TRANSPORTS)}`, "
-        "then `[roles] transport` in the repository's config, "
-        f"then the environment's own declaration (`{vocab.TRANSPORT_ENV}`, "
-        "set by a cloud environment's configuration) or a documented cloud "
-        "provider signal, and with none of those a new emission carries "
-        f"`{vocab.TRANSPORT_EMISSION_DEFAULT}`, "
-        "the workflow's steady case: author and reviewer on the "
-        "operator's machine. A cloud-authored round therefore reaches "
-        "`paste` through its environment's declaration, never through your "
-        "guess (a locally readable request file proves nothing about what "
-        "the other side can open). A human corrects a wrong stamp by an "
-        "explicit statement about THIS round's topology or an exact "
-        "command carrying `--transport` — to `handoff` if you are the "
-        "author, to `take` if you are the reviewer; a conversational "
-        "question is not a declaration, so ask rather than convert one "
-        "into an override. Never improvise the flag, and never substitute "
-        "a carrier the relay did not print: a round declared `path` whose "
-        "commands you rewrite for a paste is a round whose record no "
-        "longer describes it.",
-        "A paste-carried envelope travels INSIDE the one fenced block the "
-        "tool printed, as the stdin of the command that consumes it: the "
-        "request bytes ride under `take -` and the verdict bytes under "
-        "`close --verdict -`, each opened as a quoted heredoc whose "
-        "delimiter closes the block. The block IS the whole relay — "
-        "nothing to retype beside it, and pasting it into a shell runs "
-        "exactly the one command with the bytes as its input. Hand it "
-        "over whole; never re-send envelope bytes as loose prose — a chat "
-        "surface preserves a fenced region verbatim and rewrites "
-        "everything else (markdown headings included), and a mangled "
-        "envelope refuses validation on the other side.",
+        "for the round, and the author answers it by citing this rule, not "
+        "by building a mechanism. Boundary closure partitions the mistakes "
+        "a boundary admits, not adversaries.",
     ],
+    "finish": {
+        "author":
+        "A round is done on your side when `handoff` exits 0 and the human "
+        "has its `brief` and `relay`. A refusal is not that stop: follow "
+        "`next_kind`, as the both-sides rules say.",
+        "reviewer":
+        "You are done when `validate` exits 0 and the human has the `brief` "
+        "and the `relay`. Until then, keep going.",
+    },
     "author": [
         ("write the claim",
          None,
-         f"A JSON claim file, and a closed grammar: its members are "
-         f"{_claim_members()} — `{vocab.CLAIM_REFERENCES_FIELD}` is a list "
+         "A JSON file holding your judgment; the tool carries it and never "
+         "invents it. Its grammar is closed: every defect is refused by "
+         "member path before Git or a gate runs. Supplying no claim is legal "
+         "and recorded as its own state.\n"
+         f"Members: {_claim_members()}.\n"
+         f"Required: {required}. `{vocab.CLAIM_REFERENCES_FIELD}` is a list "
          f"of objects carrying a non-empty "
          f"{', '.join(f'`{m}`' for m in vocab.CLAIM_REFERENCE_REQUIRED)} "
          f"(the reviewer must read it; the tool digests it) and optionally "
-         f"{', '.join(f'`{m}`' for m in sorted(set(vocab.CLAIM_REFERENCE_FIELDS) - set(vocab.CLAIM_REFERENCE_REQUIRED)))}; "
+         f"{', '.join(f'`{m}`' for m in optional_refs)}; "
          f"{', '.join(f'`{m}`' for m in vocab.CLAIM_LIST_FIELDS)} are lists "
          f"of strings; "
          f"{', '.join(f'`{m}`' for m in vocab.CLAIM_OBJECT_LIST_FIELDS)} are "
-         f"non-empty lists of objects with the fields shown beside each; "
-         f"the rest are strings; required: "
-         f"{', '.join(f'`{m}`' for m in vocab.CLAIM_REQUIRED)}, and an "
-         f"empty `{vocab.CLAIM_REFERENCES_FIELD}` list is refused like a "
-         f"missing one. {_claim_values()} "
-         f"Malformed JSON, a top-level value that is not an object, a "
-         f"repeated member at any depth, a wrong type, and an unknown member "
-         f"are each refused by name before the tool reads the ledger, "
-         f"touches Git, runs a gate or records anything, every wrong type, "
-         f"grammar, unknown or missing field of one claim in one refusal "
-         f"by its member path; a carried "
-         f"fingerprint or attestation-map row that this machine's ledger "
-         f"contradicts is refused after the ledger is read and still before "
-         f"Git is touched, and a gate the target's manifest lacks at "
-         f"emission, before any gate runs — an unknown member "
-         f"is never ignored, so a misspelling cannot silently erase what it "
-         f"meant to declare. So are the states that are not in the JSON: the "
-         f"file must be UTF-8, every string must be encodable (a lone "
-         f"surrogate is valid JSON and not a value an envelope can carry), "
-         f"and `--claim-file \"\"` is refused rather than treated as an "
-         f"omitted option. Supplying no claim at all stays legal and is "
-         f"recorded as its own state. It is your judgment; the tool carries "
-         f"it and never invents it."),
+         f"non-empty lists of objects; the rest are strings.\n"
+         f"{_claim_values()}"),
         ("hand off",
          paths.command(*paths.lits(TOOL_NAME, "handoff", "--claim-file"),
                        paths.Ph("<claim.json>"),
                        paths.opt(paths.Lit("--base"), paths.Ph("<sha>"))),
-         "Under `[roles] enforcement = \"pr-approval\"` the work is on a "
-         "branch, never the default one, and an open pull request exists "
-         "for it before this step — open one with the forge's CLI if none "
-         "does; the tool touches no forge and refuses the default branch. "
-         "Under every value it pushes a reviewed branch only to its own "
-         "name, so a branch cut from `origin/main`, which tracks the "
-         "default branch, is refused: cut work with `--no-track`, or give "
-         "it its own upstream with "
-         f"`{paths.command(*paths.lits('git', 'push', '-u', 'origin'), paths.Ph('<ref>:<ref>'))}`, "
-         "`<ref>` being `refs/heads/<branch>` on both sides: an explicit "
-         "refspec, which no push mapping can redirect. "
          "Commits outstanding tracked work, runs the local gates at that "
-         "commit (a red blocking gate stops it there: nothing is pushed, "
-         "and the local commit is named for you to amend), pushes the "
-         "reviewed branch, awaits any CI-attested gates on the pushed "
-         "commit, emits and validates the request, records it, "
-         "keeps the bytes under the state directory, and prints the "
-         "reviewer's command. `--base` is needed only for round 1 of a "
-         "lineage. Re-running on an unchanged tip is a no-op that returns "
-         "the same envelope. A debug round asks the reviewer to also "
-         "critique the tool's own performance this round (efficiency, "
-         "cost, accuracy) in a `## "
-         f"{vocab.TOOL_FEEDBACK_SECTION}` verdict section, recorded at "
-         "close — advisory, never a gate. It is declared, strongest "
-         "first: `--debug`/`--no-debug` for this invocation, else a "
-         "standing `[roles] debug = true` in the repository's config, "
-         "else off. THEN STOP: hand the human the fenced block "
-         "under `## How to carry it`, whole and unedited. It is "
-         "self-contained — every live line in it runs exactly as printed, "
-         "and it carries the ONE carrier this round declared, never a "
-         "choice for the reader to make. Add no prose of your own around "
-         "it: a relay that gets reworded in transit is the failure this "
-         "shape exists to end. Refusals (untracked files, detached HEAD, "
-         "unreachable remote, unassigned roles, no taxonomy) name the fix."),
+         "commit, pushes the reviewed branch to its own name, awaits any "
+         "CI-attested gates, emits, validates and records the request, and "
+         "prints the reviewer's command. `--base` is needed only for round 1 "
+         "of a lineage. Re-running on an unchanged tip returns the same "
+         "envelope.\n"
+         "Under `[roles] enforcement = \"pr-approval\"`, the work must be on "
+         "a non-default branch with an open pull request before this step; "
+         "open it with the forge's CLI, since the tool touches no forge.\n"
+         "`--debug`/`--no-debug`, else `[roles] debug = true`, else off, "
+         "decides whether the reviewer also critiques the tool in a `## "
+         f"{vocab.TOOL_FEEDBACK_SECTION}` section: advisory, never a gate.\n"
+         "Then stop, with the `brief` and `relay`."),
         ("close the round",
          paths.command(*paths.lits(TOOL_NAME, "close", "--verdict"),
                        paths.Ph("<verdict.md>")),
-         f"Validates and records the verdict. `{vocab.VERDICT_CHANGES}` → "
-         f"the lineage stays open and the next command is `respond`; "
-         f"`{vocab.VERDICT_CLEAN}` → the lineage is closed at the exact "
-         f"reviewed SHA. Merge "
-         "authority is the account allowlist and the standing rules you "
-         "operate under, not this tool."),
+         f"Validates and records the verdict. `{vocab.VERDICT_CHANGES}`: "
+         f"the lineage stays open and the next command is `respond`. "
+         f"`{vocab.VERDICT_CLEAN}`: the lineage is closed at the exact "
+         f"reviewed SHA. Merge authority is the account allowlist and the "
+         f"standing rules you operate under, not this tool.\n"
+         f"When round 3 of a lineage comes back `{vocab.VERDICT_CHANGES}`, "
+         f"stop before `respond` and answer \"should we redesign?\" for the "
+         f"user: read the lineage's findings, say why the reviewer keeps "
+         f"coming back, whether any are lexical or perfection with no real "
+         f"consequence, and whether the design is the problem, with a "
+         f"recommendation. A fourth round waits for their answer."),
         ("respond",
          paths.command(*paths.lits(TOOL_NAME, "respond", "--verdict"),
                        paths.Ph("<verdict.md>"), paths.Lit("--from-json"),
@@ -476,28 +390,24 @@ def procedure() -> dict:
          f"{' or '.join(f'`{d}`' for d in vocab.BLOCKING_ILLEGAL)}. "
          f"Write `<d.json>` in the shape "
          f"`{paths.command(*paths.lits(TOOL_NAME, 'respond', '--help'))}` "
-         "prints: its payload text members are strings, never lists — an "
-         "escalation's positions go in one string — and a top-level or "
-         "record member it does not name is refused. "
+         "prints; its payload text members are strings, an escalation's "
+         "positions included.\n"
          "An `accepted` disposition follows this order, and only this "
          "order: (1) make the fix; (2) run the finding's named "
          "falsification test on the fixed head, which records "
          f"`payload.falsification.{status_key}` "
          f"({' | '.join(vocab.FALSIFICATION_STATUSES)}); (3) run the "
-         "mutation — the same test with the defect reintroduced — and "
+         "mutation, the same test with the defect reintroduced, and "
          f"restore, which records `.{mutation_key}` "
          f"({' | '.join(vocab.MUTATION_OUTCOMES)}), the proof the test "
-         "can fail at all; (4) THEN write the disposition record with "
-         "`--out`; (5) hand off again. A test that still fails, or one "
-         "that passes without the fix, is refused as an acceptance; "
-         "`cannot_execute` and `not_run` need a `note` saying why. A fix "
-         "proposed but not made is `deferred` or `escalated`, never "
-         "`accepted` — and a blocking finding cannot take `deferred`. "
-         "`--out` records and keeps it; the next request carries the "
-         "disposition ledger."),
+         "can fail at all; (4) write the disposition record with `--out`; "
+         "(5) hand off again.\n"
+         "A fix proposed but not made is `deferred` or `escalated`, never "
+         "`accepted`, and a blocking finding cannot take `deferred`."),
         ("close a lineage by decision",
          paths.command(*paths.lits(TOOL_NAME, "close", "--lineage",
-                                   "--reason"), paths.qph("<why>")),
+                                   "--reason"), paths.qph("<why>"),
+                       paths.Lit("--by"), paths.Ph("<who decided>")),
          "Only when the human decides a review is over without a clean "
          "verdict. Recorded with the reason; the next handoff opens round 1 "
          "with the repository's default cap."),
@@ -507,109 +417,186 @@ def procedure() -> dict:
          paths.command(*paths.lits(TOOL_NAME, "take"),
                        paths.Ph("<request.md>"), paths.Lit("--as"),
                        paths.Ph("<your id>")),
-         "`--as` is MANDATORY and names you: the tool cannot observe who is "
-         "running it, so it records the identity you declare and refuses "
-         "rather than assume one. Declaring an identity that is not yours "
-         "puts a false actor in an append-only record. Validates the request, "
-         "checks that you are the stamped reviewer, fetches the target and "
-         "resolves base and head in this clone, labels every reference "
+         "`--as` names you. The tool can't observe who is running it, so it "
+         "records what you declare in an append-only record: declare only "
+         "your own identity. `take` validates the request, checks you are "
+         "the stamped reviewer, fetches the target, labels every reference "
          "checked / mismatch / unavailable, records the take, and prints the "
-         "request with the exact diff command. `--compact` returns "
-         "pointers only instead — the kept path, its digest and byte size, "
-         "lineage, round, target SHA, whether your checkout is that target, "
-         "the précis, the target's `decide` list and the next command, with "
-         "no request prose and no attestation table — for a reviewer that "
-         "reads the kept file itself; its `decide` list is the default "
-         "take's, and the ask-once rule applies to it the same way. The "
-         "request's `Swept:` line "
-         "names every path the author's hand-off committed and whether it "
-         "sat inside the claim's `scope_paths`: a path swept OUTSIDE the "
-         "declared scope, or an intent-to-add entry, is work the author may "
-         "not have inspected — read it first. The request is printed with "
-         "its attestation objects as ONE TABLE (gate, result, binding, tree, "
-         "where it ran, who executed it, command, output digest); every "
-         "other section is verbatim. `--full` prints the exact bytes instead, "
-         "and the `kept` path always holds them — read that file when a "
-         "finding turns on a field the table does not carry. The `head:` "
-         "line says whether YOUR working tree is the target: when it reads "
-         "NOT the target, files you open from the working tree are not the "
-         "reviewed bytes — read the target through the diff command it "
-         "prints. If it refuses, return its output to the human — "
-         "never review a defective or unreachable envelope."),
+         "request with the exact diff command. A defective or unreachable "
+         "envelope isn't reviewed: return a refusal that isn't yours to fix "
+         "to the human.\n"
+         "Three lines to read in what it prints. `head:` reading NOT the "
+         "target means your working tree isn't the reviewed bytes, so read "
+         "through the diff command it prints. `Swept:` naming a path outside "
+         "the claim's `scope_paths`, or an intent-to-add entry, is work the "
+         "author may not have inspected, so read it first. The attestation "
+         "table condenses each object; the `kept` path (or `--full`) holds "
+         "the exact bytes, for a finding that turns on a field the table "
+         "doesn't carry.\n"
+         "`--compact` returns pointers instead of the request, for a "
+         "reviewer that reads the kept file itself."),
         ("rule",
          None,
-         "Read the diff with the printed command and rule by the declared "
-         "taxonomy only. Findings ordered by severity, atomic (one claim per "
-         "ID), each with every required field and a FALSIFICATION. Anchor "
-         "the falsification test in the reviewed tree wherever the defect "
-         "admits it; where the defect genuinely lives in a mutable artifact "
-         "outside the tree — a PR body, an issue, a dashboard — say so in "
-         "the finding itself, so a later `cannot_execute` reads as the "
-         "anticipated outcome of a stated dependency rather than an author "
-         "evasion, and the human deciding the `unverifiable` breaker has "
-         "your own words that the dependency was known. Prior "
-         "dispositions are answered under `## closures` by fingerprint. "
-         "When a closure is `reclassified` and a finding of THIS verdict "
-         "carries what remains of it, add a `Residue: <finding id>` line "
-         "under that closure, so convergence counts the thread once instead "
-         "of reading your narrowed residue as a new finding on the same "
-         "anchor. "
-         "Material you could not retrieve goes under `## unavailable "
-         "references` and forbids a clean verdict. If the request stamps "
-         f"`{vocab.DEBUG_ATTR}=\"{vocab.DEBUG_TOOL_FEEDBACK}\"`, this is a "
-         "debug round: ALSO add a `## "
-         f"{vocab.TOOL_FEEDBACK_SECTION}` section after `## evidence "
-         "checked` — a self-critical account of how the TOOL could have "
-         "served this round better, under three headings: efficiency "
-         "(steps, reads or re-derivations the procedure wasted), cost "
-         "(bytes, tokens and wall time you observed, against what the "
-         "round needed), accuracy (anywhere an envelope, a gate result, a "
-         "brief or a refusal misled you or made you check something twice). "
-         "Critique the tool, never the diff — findings stay findings, and "
-         "nothing in this section may soften or substitute for one. The "
-         "section is advisory prose about the tool, recorded in the "
-         "author's ledger at close; you may volunteer it on any round, and "
-         "the stamp is what asks for it."),
+         "\n".join([
+             *_judge_reading(),
+             "Read the full diff first, with the printed command, before you "
+             "weigh the author's account. `scope_paths` and a `Scoped:` diff "
+             "say where the author worked and never limit your search.",
+             "The author's objective, risk, not-done list and observations "
+             "are claims to test.",
+             "Report everything you find rather than filtering, and rank by "
+             "consequence: each finding's Why names the real input or "
+             "situation a user or agent would meet and what goes wrong for "
+             "them. Severity orders the findings and is no bar to reporting "
+             "one. Mark a low-confidence finding `unconfirmed` in its Why. "
+             "Claim a finding as blocking only when you reproduced it or can "
+             "show it in the reviewed bytes; report the rest as unconfirmed, "
+             "at a severity that doesn't block.",
+             "A boundary's domain gap with no plausible input goes at Low, "
+             "with that said. A Low doesn't by itself ask for changes; "
+             "`validate` decides the verdict string a round of only Lows "
+             "must carry.",
+             "What the trust model or an accepted authority puts outside the "
+             "round (a forgery naming no lesser party, a demand outside an "
+             "accepted domain) stays out of `## findings`: name it in a line "
+             "under `## evidence checked`.",
+             "Write the verdict in the request's own `Verdict shape` and "
+             "classify each finding by its `## Taxonomy`; the validator "
+             "holds both.",
+             "A FALSIFICATION names one test and asks for no mutation table. "
+             "Anchor each FALSIFICATION test in the reviewed tree wherever "
+             "the defect admits it. Where the defect lives in a mutable "
+             "artifact outside the tree (a PR body, an issue, a dashboard), "
+             "say so in the finding, so a later `cannot_execute` reads as "
+             "the outcome of a stated dependency and the human deciding the "
+             "`unverifiable` breaker has your words that it was known.",
+             f"A request stamped `{vocab.DEBUG_ATTR}="
+             f"\"{vocab.DEBUG_TOOL_FEEDBACK}\"` also asks for "
+             "`tool-feedback.md`, beside this procedure; you may volunteer "
+             "that section on any round.",
+         ])),
         ("validate, then stop",
          paths.command(*paths.lits(TOOL_NAME, "validate"),
                        paths.Ph("<verdict.md>"),
                        paths.Lit("--from-target")),
-         # This paragraph described `governing_for` as it stood between
-         # rounds 2 and 5 — resolving from a RECORD and falling back to
-         # "whatever governed the take". Round 6 F1 deleted that machinery
-         # entirely, and both this text and the function's own docstring
-         # kept describing it, which shipped in 0.9.0. There is no
-         # "otherwise": the target carries its rules or the verb refuses.
-         "`--from-target` judges your verdict against the target commit's "
-         "OWN review.toml, read straight out of that commit — the same "
-         "bytes `take` read, resolved the same way, with no record "
-         "consulted and nothing to fall back to. A target that carries no "
-         "review.toml refuses here exactly as it refuses at `take` and at "
-         "`handoff`: rules that live on one machine cannot be shown to a "
-         "second, and a review is the act of showing them. Without the "
-         "flag the "
-         "envelope is judged against whatever YOUR checkout holds, which on "
-         "a detached worktree or a second machine is routinely no config at "
-         "all, and the step the procedure requires of you cannot complete. "
-         "Repeat until it exits 0. Then STOP: hand the human the block "
-         "under `## Verdict`, whole and unedited — it is the author's to "
-         "run, and it is the whole relay. On a paste round it is ONE "
-         "fence in which the close command consumes the verdict bytes as "
-         "its own stdin; hand it over as one piece and never restate the "
-         "bytes as loose prose (a chat surface rewrites unfenced text). "
-         "On a path round hand the kept file's path with it. Add no "
-         "prose around it. You do not start the next round, do not send "
-         "it back for fix-and-resubmit, and do not decide whether it "
-         "enters the record. One conditional coda, where the standing "
-         "rules you operate under grant a clean-verdict approval: after "
-         "your verdict validates as `clean to advance` and the reviewed "
-         "branch has an open pull request, if the operator's approval "
-         "credentials for the project's approval tooling are present on "
-         "this machine, that grant covers recording the approving review "
-         "through that tooling; if they are absent, say so once and point "
-         "at the project's approval setup instead. The relay comes first "
-         "either way and is never blocked on it."),
+         "`--from-target` judges the verdict against the target commit's own "
+         "`review.toml`, the bytes `take` read. Without it the verdict is "
+         "judged against your checkout, which on a detached worktree or a "
+         "second machine is often no config at all. A refusal of the "
+         "verdict's content is yours: correct it and re-run until it exits "
+         "0.\n"
+         "Then stop, with the `brief` and `relay`. The relay, under "
+         "`## Verdict`, is the author's to run: on a paste round one fence "
+         "with the verdict bytes as the command's stdin, on a path round "
+         "with the kept file's path. You don't start the next round, send it "
+         "back for fix-and-resubmit, or decide whether it enters the "
+         "record.\n"
+         "Where the standing rules you operate under grant a clean-verdict "
+         f"approval: after a validated `{vocab.VERDICT_CLEAN}` on a branch "
+         "with an open pull request, that grant covers recording the "
+         "approving review through the project's approval tooling if the "
+         "operator's credentials for it are on this machine. If they are "
+         "absent, say so once and point at the project's approval setup. "
+         "The relay comes first and is never blocked on it."),
     ],
+    # What a reader needs only on a trigger, each its own file on a skill
+    # surface and its own section in the instruction block: name -> (title,
+    # the trigger the routing states or None where a role step names it,
+    # the paragraphs). Keys are `RARE_FILES`.
+    "rare": {
+        "decide": (
+            "absent config asks once",
+            "a result carries a non-empty `decide` list, or someone asks "
+            "what this repository leaves undeclared.",
+            ["Absent config asks once. A result carrying a `decide` list has "
+             "applied a built-in default for a key this repository never "
+             "declared. Each entry names the key, its meaning, the value "
+             "applied, and the exact TOML line for `set` and for `unset`.",
+             "Ask the user once per session, per key, in plain language, "
+             "whether this project sets or unsets it; write their answer "
+             "into `review.toml` as the printed line and commit it. Ask only "
+             "about undeclared keys, and leave the decision to them.",
+             "A key whose only off state is to stay undeclared prints its "
+             "`unset` as a comment line, `# decided: limits.token_budget "
+             "undeclared`. That line is the answer: write it into "
+             "`review.toml` under `[limits]` and the entry stops, while the "
+             "key stays undeclared and uncounted.",
+             f"`{paths.command(*paths.lits(TOOL_NAME, 'decide'))}` prints "
+             "the same list and is the only way to read it without emitting "
+             "or recording anything. Use it when nobody asked for a round, "
+             "such as after a version pin moves, instead of running an "
+             "emitting verb to find out."]),
+        "carrier": (
+            "correcting a round's carrier",
+            "someone disputes the round's transport, or a relay's carrier "
+            "looks wrong for where the other side runs.",
+            ["A round declares whether the two sides share a filesystem, and "
+             "that decides which carrier the relay prints. The tool resolves "
+             f"it from declarations (`"
+             f"{paths.command(*paths.lits(TOOL_NAME, 'handoff', '--help'))}` "
+             "lists their order); with none, a new emission carries "
+             f"`{vocab.TRANSPORT_EMISSION_DEFAULT}`. A locally readable "
+             "request file proves nothing about what the other side can "
+             "open.",
+             "A human corrects a wrong stamp by an explicit statement about "
+             "this round's topology, or an exact command carrying "
+             f"`--transport {'|'.join(vocab.TRANSPORTS)}`: to `handoff` if "
+             "you are the author, to `take` if you are the reviewer. A "
+             "conversational question isn't a declaration, so ask rather "
+             f"than turn one into an override. A "
+             f"`{vocab.TRANSPORT_EMISSION_DEFAULT}` round whose commands you "
+             "rewrite for a paste is a round whose record no longer "
+             "describes it."]),
+        "closure-authority": (
+            "closing a domain relative to an authority",
+            "a claim's objective declares `authority` and `covers`, or you "
+            "are about to declare or narrow one.",
+            ["A domain whose completeness can't be established from inside "
+             "the artifact, a set that can be declared but never proven "
+             "complete from within, may be declared closed relative to a "
+             "stated authority. It is the only terminator. An authority is a "
+             "machine-generated, separately gated artifact that derives the "
+             "set; a hand-maintained list never is. The declaration is no "
+             "exemption: it moves the attackable surface from an unbounded "
+             "hunt onto a finite artifact, and an authority narrower than "
+             "its own stated domain is itself the defect.",
+             "**Author.** Declare it in the claim, per anchor "
+             "(`objectives[].authority`, `covers`), and state its domain: "
+             "what it is claimed to cover, in the terms it enforces.",
+             "**Reviewer.** Rule on the domain before ruling under it: does "
+             "it match the anchor's declared purpose and every surface still "
+             "relied on downstream? A concrete escape outside the declaration "
+             "is admissible evidence that the domain is too narrow, and a "
+             "domain narrower than its anchor's purpose is a finding about "
+             "the claim. Once a stated domain is accepted, rule coverage "
+             "against it; a demand outside it then goes to a backlog, however "
+             "well it reproduces.",
+             "**Attacking it.** Attack the authority's derivation and "
+             "coverage. You may still bring an instance, naming the authority "
+             "it escapes; one that names none is not a completeness finding. "
+             "Rejecting the authority is an ordinary finding anchored on the "
+             "authority itself, and it is bounded, because unbounded it "
+             "restates one level down forever.",
+             "**Narrowing.** A narrowing is a complete answer only when the "
+             "anchor's purpose and every consumer claim narrow with it, "
+             "leaving no wider reliance implicit; one that leaves a wider "
+             "promise standing is the defect. Where it is complete it is "
+             "preferred to widening the mechanism."]),
+        "tool-feedback": (
+            "a debug round's tool feedback",
+            None,
+            [f"Add a `## {vocab.TOOL_FEEDBACK_SECTION}` section after "
+             "`## evidence checked`: a self-critical account of how the tool "
+             "could have served this round better, under three headings. "
+             "Efficiency: steps, reads or re-derivations the procedure "
+             "wasted. Cost: bytes, tokens and wall time you observed, against "
+             "what the round needed. Accuracy: anywhere an envelope, a gate "
+             "result, a brief or a refusal misled you or made you check "
+             "something twice.",
+             "Critique the tool, never the diff. Findings stay findings, and "
+             "nothing here softens or substitutes for one. The section is "
+             "advisory prose, recorded in the author's ledger at close."]),
+    },
     }
 
 
@@ -634,30 +621,28 @@ def _help_of(action, name: str) -> str:
     return ""
 
 
+def _generated_line() -> str:
+    render_verb = paths.command(*paths.lits(TOOL_NAME, "render-adapters"))
+    return (f"GENERATED by `{render_verb}` at tool version {TOOL_VERSION}; "
+            f"do not edit, regenerate.")
+
+
 def _head_sections() -> list[str]:
     """What this is, and the rules that hold on both sides: the part of the
     procedure every surface carries first."""
     L = []
-    L.append(f"## What this is")
+    L.append("## What this is")
     L.append("")
-    L.append(f"`{TOOL_NAME}` is a deterministic review tool: request → "
-             f"verdict → disposition envelopes bound to SHAs, a gate manifest "
-             f"the tool runs itself, fingerprinted findings, an append-only "
-             f"ledger with breakers. No model runs inside it. You are either "
-             f"the **author** or the **reviewer** of a given envelope — the "
-             f"envelope's stamp (`author=… reviewer=…`) says which, per "
-             f"invocation, and this text does not.")
+    L.append(f"`{TOOL_NAME}` runs the mechanical half of a review: request, "
+             f"verdict and disposition envelopes bound to SHAs, gates it runs "
+             f"and attests itself, an append-only ledger with breakers. No "
+             f"model runs inside it. The envelope's stamp (`author=… "
+             f"reviewer=…`) says which side you hold, per envelope.")
     L.append("")
-    # SL-B10 (2026-10-03): these two sentences were the skill's description,
-    # loaded into every session on both skill surfaces; the description now
-    # carries only the trigger and the stamp clause, and the rule lives
-    # here, read when the skill is.
-    L.append(f"A REVIEWED commit must carry `review.toml` in the repo root: "
-             f"`handoff` and `take` both refuse a target that tracks none, "
-             f"because rules living on one machine cannot be shown to a "
-             f"second. A user-level `~/.config/{TOOL_NAME}/<repo-id>.toml` "
-             f"still governs every LOCAL verb, so do not require an in-tree "
-             f"file before acting locally.")
+    L.append(f"A reviewed commit must carry `review.toml`; `handoff` and "
+             f"`take` refuse one that doesn't. A user-level "
+             f"`~/.config/{TOOL_NAME}/<repo-id>.toml` still governs every "
+             f"local verb, so acting locally needs no in-tree file.")
     L.append("")
     steps = procedure()
     L.append("## Rules that hold on both sides")
@@ -670,11 +655,13 @@ def _head_sections() -> list[str]:
 
 def _role_section(role: str) -> list[str]:
     """One side's procedure, steps in order: the same lines whether the
-    instruction block carries it inline or a role file carries it alone."""
-    L = [f"## If you hold the {role} stamp", ""]
-    for i, (title, cmd, what) in enumerate(procedure()[role], 1):
+    instruction block carries it inline or a role file carries it alone. A
+    step's text may run to several lines, each indented under it."""
+    steps = procedure()
+    L = [f"## If you hold the {role} stamp", "", steps["finish"][role], ""]
+    for i, (title, cmd, what) in enumerate(steps[role], 1):
         L.append(f"{i}. **{title}**" + (f" — `{cmd}`" if cmd else ""))
-        L.append(f"   {what}")
+        L.extend(f"   {line}" for line in what.split("\n"))
     L.append("")
     return L
 
@@ -691,64 +678,68 @@ _SKILL_DIR_HINT = {
 }
 
 
+def _rare_index() -> list[str]:
+    """The rare files a reader finds by a trigger the routing states, one
+    line each. `tool-feedback` has no line: the reviewer's `rule` step names
+    it where its stamp applies."""
+    return [f"- `{name}.md`: {trigger}"
+            for name, (_title, trigger, _body) in procedure()["rare"].items()
+            if trigger is not None]
+
+
 def _routing_section(surface: str) -> list[str]:
-    """RR8: where a skill surface's two procedures are. Names each role
-    file by its file name alone, from `INSTALL`, and places it beside this
-    `SKILL.md` wherever the copy is, never by an absolute path: a copy
-    deployed outside `INSTALL`'s target (a Team profile's own
-    `skills/loupe/`) that named the personal path sent its reader to a
-    directory that profile denies (Osama, 2026-11-01)."""
+    """RR8: where a skill surface's side files are. Names each by its file
+    name alone, from `INSTALL`, and places it beside this `SKILL.md` wherever
+    the copy is, never by an absolute path: a copy deployed outside
+    `INSTALL`'s target (a Team profile's own `skills/loupe/`) that named the
+    personal path sent its reader to a directory that profile denies (Osama,
+    2026-11-01)."""
     L = ["## Your side's procedure", "",
-         "This file carries what holds on both sides. Before you act on an "
-         "envelope, read your side's procedure — the envelope's stamp says "
-         "which side you hold:", ""]
+         "Before you act on an envelope, read your side's file:", ""]
     for role, kind in SKILL_ROLE_KINDS[surface].items():
         L.append(f"- the **{role}** stamp: "
                  f"`{INSTALL[kind][0].rsplit('/', 1)[1]}`")
     L += ["",
           f"Both sit beside this `SKILL.md`, {_SKILL_DIR_HINT[surface]}; "
-          f"read them there, never from another install of this skill.",
+          f"read them there, never from another install of this skill. Act "
+          f"from that file's text, not from memory of an earlier read.",
           "",
-          "Each is that side's whole procedure, steps in order. Read it "
-          "again for every envelope; never act on a step from memory of an "
-          "earlier read.", ""]
+          "Beside them, read only when it applies:", "",
+          *_rare_index(), ""]
+    return L
+
+
+def _rare_block_sections() -> list[str]:
+    """The rare files as the instruction block carries them: the block has no
+    directory, so each is a section under its file's name, and the names the
+    rules use lead to it."""
+    L = ["## Read only when it applies", "", *_rare_index(), ""]
+    for name, (title, _trigger, body) in procedure()["rare"].items():
+        L += [f"## `{name}.md`: {title}", ""]
+        for paragraph in body:
+            L += [paragraph, ""]
     return L
 
 
 def _tail_sections() -> list[str]:
-    L = []
-    L.append("## Verbs (from the CLI itself)")
-    L.append("")
-    L.append("| verb | what |")
-    L.append("|---|---|")
-    for verb, help_ in verb_table():
-        L.append(f"| `{paths.command(paths.Lit(TOOL_NAME), paths.token(verb))}` | {help_} |")
-    L.append("")
-    L.append("## Where things are")
-    L.append("")
-    L.append("- Config: `review.toml` at the repo root (taxonomy, roles, "
-             "limits, gates). Absent taxonomy → the tool refuses to emit and "
-             "the reviewer refuses to rule.")
-    L.append(f"- State: `~/.local/state/{TOOL_NAME}/<repo-id>/` — the ledger, "
-             f"gate output, and `exchange/` with every kept envelope. "
-             f"Override with `--ledger-dir` or `{TOOL_NAME.upper()}_STATE_DIR`.")
-    L.append("- The reviewed SHA is pushed before emission and stamped with "
-             "the observed remote ref; `take` verifies it. A SHA that cannot "
-             "be fetched is not a review target.")
-    L.append("")
-    return L
+    verbs = ", ".join(
+        f"`{paths.command(paths.Lit(TOOL_NAME), paths.token(verb))}`"
+        for verb, _help in verb_table())
+    return ["## Verbs (from the CLI itself)", "",
+            f"{verbs}. `{TOOL_NAME} <verb> --help` has each.", ""]
 
 
 def _body() -> list[str]:
-    """The whole procedure, both sides inline: the instruction block's."""
+    """The whole procedure, both sides and the rare sections inline: the
+    instruction block's."""
     return (_head_sections() + [line for role in ROLES
                                 for line in _role_section(role)]
-            + _tail_sections())
+            + _rare_block_sections() + _tail_sections())
 
 
 def _skill_body(surface: str) -> list[str]:
-    """A skill's `SKILL.md`: both-sides rules and the routing line in place
-    of the two procedures, which are its role files (RR8)."""
+    """A skill's `SKILL.md`: both-sides rules and the routing section in
+    place of the two procedures and the rare files (RR8)."""
     return _head_sections() + _routing_section(surface) + _tail_sections()
 
 
@@ -756,33 +747,17 @@ def _frontmatter(surface: str) -> list[str]:
     return [
         "---",
         f"name: {TOOL_NAME}",
-        # This sentence was false in 0.9.0 and shipped that way. Round 6 F1
-        # removed the external-configuration ORIGIN for reviewed commits,
-        # and the body of this document was updated while the description
-        # was not — so the field an agent reads FIRST, and the field that
-        # decides whether the skill loads at all, told every session not to
-        # require the very thing `handoff` and `take` refuse without. The
-        # drift gate compares generated bytes to their generator; it cannot
-        # notice that the generator describes a rule that changed.
-        #
-        # SL-B10 (the determinism and efficiency pass, 2026-10-03): the
-        # description is loaded into every session on both skill surfaces,
-        # whether or not the skill fires, so it carries only what decides
-        # the firing — the trigger — and the stamp clause. The two config
-        # sentences moved into the body (`_head_sections`, "What this is"),
-        # which every surface carries and an agent reads when the skill
-        # fires: 549 bytes became 228.
-        f"description: Use when asked to hand off work for review, take a "
-        f"review request, respond to a verdict, or close a round with "
-        f"`{TOOL_NAME}`. Carries the literal commands for the author and "
-        f"reviewer sides; the envelope stamp says which side you hold.",
+        # Loaded into every session on both skill surfaces, whether or not
+        # the skill fires, so it holds only the trigger (SL-B10, 2026-10-03;
+        # narrowed 2026-11-04). No colon: it would break the YAML.
+        f"description: Use when handing off work for review through "
+        f"`{TOOL_NAME}`, or when a `{TOOL_NAME}` command, request or verdict "
+        f"reaches you.",
         "---",
         "",
-        f"# {TOOL_NAME} — review procedure ({surface} adapter, GENERATED)",
+        f"# {TOOL_NAME} — review procedure ({surface} adapter)",
         "",
-        f"GENERATED by `{paths.command(*paths.lits(TOOL_NAME, 'render-adapters'))}` from one source "
-        f"(review/adapters.py) at tool version {TOOL_VERSION} — do not edit; "
-        f"regenerate. `{TOOL_NAME} render-adapters --check` guards it.",
+        _generated_line(),
         "",
     ]
 
@@ -795,37 +770,35 @@ def _role_file(surface: str, role: str) -> str:
     as a skill of its own; it is read from the routing line in `SKILL.md`."""
     return "\n".join([
         f"# {TOOL_NAME} — {role} procedure ({_SURFACE_NAMES[surface]} "
-        f"adapter, GENERATED)",
+        f"adapter)",
         "",
-        f"GENERATED by `{paths.command(*paths.lits(TOOL_NAME, 'render-adapters'))}` from one source "
-        f"(review/adapters.py) at tool version {TOOL_VERSION} — do not edit; "
-        f"regenerate. `{TOOL_NAME} render-adapters --check` guards it.",
-        "",
-        f"Read it with `SKILL.md` beside it, whose rules hold on both "
-        f"sides.",
+        _generated_line(),
         "",
         *_role_section(role)])
 
 
+def _rare_file(name: str) -> str:
+    """A skill's rare file: no frontmatter either, and read only on its
+    trigger. The same bytes on each skill surface."""
+    title, _trigger, body = procedure()["rare"][name]
+    lines = [f"# {TOOL_NAME} — {title}", "", _generated_line(), ""]
+    for paragraph in body:
+        lines += [paragraph, ""]
+    return "\n".join(lines)
+
+
 def surface_text(surface: str) -> str:
     """Everything an agent on `surface` can read of the procedure: the
-    instruction block, or a skill's `SKILL.md` followed by its role files.
-    What a check of the procedure's CONTENT reads, so a rule moved between
-    a skill's files is still found."""
+    instruction block, or a skill's `SKILL.md` followed by its role files
+    and rare files. What a check of the procedure's CONTENT reads, so a rule
+    moved between a skill's files is still found."""
     if surface not in SKILL_ROLE_KINDS:
         return render(surface)
-    return "\n".join([render(surface), *(render(kind) for kind in
-                                         SKILL_ROLE_KINDS[surface].values())])
-
-
-def _install_line(kind: str) -> str:
-    """Where the install verb writes this skill, and on what authority:
-    a statement about `--install`, not about where the copy being read
-    is (a Team profile's is elsewhere), so it names the verb."""
-    install = paths.command(*paths.lits(TOOL_NAME, "render-adapters",
-                                        "--install"))
-    return (f"Install: `{INSTALL[kind][0]}`, written by `{install}` "
-            f"({INSTALL[kind][1]}).")
+    return "\n".join([render(surface),
+                      *(render(kind) for kind in
+                        SKILL_ROLE_KINDS[surface].values()),
+                      *(render(kind) for kind in
+                        SKILL_RARE_KINDS[surface].values())])
 
 
 def render(kind: str) -> str:
@@ -833,17 +806,13 @@ def render(kind: str) -> str:
         for role, role_kind in kinds.items():
             if kind == role_kind:
                 return _role_file(surface, role)
-    if kind == "claude-skill":
-        head = _frontmatter("Claude Code")
-        head.append(_install_line(kind))
-        head.append("")
-        return "\n".join(head + _skill_body(kind))
-    if kind == "codex-skill":
-        head = _frontmatter("Codex")
-        head.append(_install_line(kind))
-        head.append(f"Observed, separately: {INSTALL_OBSERVED[kind]}.")
-        head.append("")
-        return "\n".join(head + _skill_body(kind))
+    for kinds in SKILL_RARE_KINDS.values():
+        for name, rare_kind in kinds.items():
+            if kind == rare_kind:
+                return _rare_file(name)
+    if kind in _SURFACE_NAMES:
+        return "\n".join(_frontmatter(_SURFACE_NAMES[kind])
+                         + _skill_body(kind))
     if kind == "instructions-block":
         head = [
             f"<!-- BEGIN GENERATED: {TOOL_NAME} adapter — do not edit; "
@@ -860,17 +829,21 @@ def render(kind: str) -> str:
     raise ValueError(f"unknown adapter kind {kind!r}")
 
 
+_SKILL_OUTPUT_DIRS = {"claude-skill": Path("claude"),
+                      "codex-skill": Path("codex")}
+
 OUTPUTS = {
     "claude-skill": Path("claude") / "SKILL.md",
     "codex-skill": Path("codex") / "SKILL.md",
     "instructions-block": Path("instructions-block.md"),
     # RR8: each skill's role files, beside its SKILL.md.
-    **{kind: OUTPUTS_DIR / f"{role}.md"
-       for OUTPUTS_DIR, kinds in ((Path("claude"),
-                                   SKILL_ROLE_KINDS["claude-skill"]),
-                                  (Path("codex"),
-                                   SKILL_ROLE_KINDS["codex-skill"]))
+    **{kind: _SKILL_OUTPUT_DIRS[surface] / f"{role}.md"
+       for surface, kinds in SKILL_ROLE_KINDS.items()
        for role, kind in kinds.items()},
+    # 2026-11-04: and its rare files, read on a trigger.
+    **{kind: _SKILL_OUTPUT_DIRS[surface] / f"{name}.md"
+       for surface, kinds in SKILL_RARE_KINDS.items()
+       for name, kind in kinds.items()},
 }
 
 

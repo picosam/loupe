@@ -68,7 +68,7 @@ from unittest import mock
 
 from review import cli, config, emit, env_var, transport, vocab
 from review.config import GIT_TIMEOUT_DEFAULT_S, git_ceiling, git_timeout
-from review.tests._transport_fixtures import verdict_text
+from review.tests._transport_fixtures import copy_fixture, verdict_text
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -148,39 +148,62 @@ class Scratch:
                  remote_dir: str = "remote.git", url_form: str = "path"):
         self.case = case
         try:
-            self.root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+            root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
         except OSError as exc:  # pragma: no cover - read-only pass
             case.skipTest(f"filesystem writes denied ({exc})")
-        case.addCleanup(shutil.rmtree, self.root, True)
-        self.repo = self.root / "author"
-        self.remote = self.root / remote_dir
-        self.state = self.root / "state-author"
-        self.hooks = self.root / "hooks-author"
-        self.hooks.mkdir()
-        git(self.root, "init", "-q", "-b", "main", str(self.repo))
-        for key, value in self.IDENTITY + (("core.hooksPath",
-                                            str(self.hooks)),):
-            git(self.repo, "config", key, value)
-        self.write_config(git_timeout=git_timeout, gates=gates,
-                          transport=transport)
-        (self.repo / "f.txt").write_text("one\n", encoding="utf-8")
-        git(self.repo, "add", ".")
-        git(self.repo, "commit", "-q", "-m", "init")
-        self.base = git(self.repo, "rev-parse", "HEAD")
-        self.remote.parent.mkdir(parents=True, exist_ok=True)
-        git(self.root, "init", "-q", "--bare", "-b", "main", str(self.remote))
+        case.addCleanup(shutil.rmtree, root, True)
+        self._named(root, remote_dir, url_form)
+        shape = {"git_timeout": git_timeout, "gates": gates,
+                 "transport": transport, "remote_dir": remote_dir,
+                 "url_form": url_form}
+        self.base, self.head = copy_fixture(
+            self.template_key(shape),
+            lambda troot: Scratch._build(Path(troot).resolve(), shape), root)
+
+    @staticmethod
+    def template_key(shape: dict) -> tuple:
+        return ("Scratch", *sorted((k, repr(v)) for k, v in shape.items()))
+
+    def _named(self, root: Path, remote_dir: str, url_form: str) -> None:
+        self.root = root
+        self.repo = root / "author"
+        self.remote = root / remote_dir
+        self.state = root / "state-author"
+        self.hooks = root / "hooks-author"
         self.url = (str(self.remote) if url_form == "path"
                     else f"file://{self.remote}")
-        git(self.repo, "remote", "add", "origin", self.url)
-        git(self.repo, "push", "-q", "-u", "origin", "main")
-        (self.repo / "f.txt").write_text("two\n", encoding="utf-8")
-        git(self.repo, "commit", "-qam", "change")
-        self.head = git(self.repo, "rev-parse", "HEAD")
-        self.claim = self.root / "claim.json"
-        self.claim.write_text(json.dumps({
+        self.claim = root / "claim.json"
+
+    @staticmethod
+    def _build(root: Path, shape: dict) -> tuple[str, str]:
+        """The repository of `shape` at `root`, once per process: every other
+        `Scratch` of that shape is a copy, its commits this one's (`copy_fixture`):
+        13 git launches a scratch, 256 scratches and 3,328 launches in the suite
+        run counted 2026-11-05. Returns (base, head)."""
+        s = Scratch.__new__(Scratch)
+        s._named(root, shape["remote_dir"], shape["url_form"])
+        s.hooks.mkdir()
+        git(root, "init", "-q", "-b", "main", str(s.repo))
+        for key, value in s.IDENTITY + (("core.hooksPath", str(s.hooks)),):
+            git(s.repo, "config", key, value)
+        s.write_config(git_timeout=shape["git_timeout"], gates=shape["gates"],
+                       transport=shape["transport"])
+        (s.repo / "f.txt").write_text("one\n", encoding="utf-8")
+        git(s.repo, "add", ".")
+        git(s.repo, "commit", "-q", "-m", "init")
+        base = git(s.repo, "rev-parse", "HEAD")
+        s.remote.parent.mkdir(parents=True, exist_ok=True)
+        git(root, "init", "-q", "--bare", "-b", "main", str(s.remote))
+        git(s.repo, "remote", "add", "origin", s.url)
+        git(s.repo, "push", "-q", "-u", "origin", "main")
+        (s.repo / "f.txt").write_text("two\n", encoding="utf-8")
+        git(s.repo, "commit", "-qam", "change")
+        head = git(s.repo, "rev-parse", "HEAD")
+        s.claim.write_text(json.dumps({
             "objective": "git ceiling test",
             "references": [{"path": "review.toml", "required": True}]}),
             encoding="utf-8")
+        return base, head
 
     # ------------------------------------------------------------ config
 
@@ -286,12 +309,25 @@ class Scratch:
                         "--refresh"], capture_output=True, timeout=60)
 
     @staticmethod
+    def _refs(git_dir: Path) -> dict:
+        """HEAD, `packed-refs` and every loose ref, as bytes: what a
+        `for-each-ref` and a `rev-parse HEAD` are read from, for none of their
+        launches: about 1,170 of the 1,563 `snapshot` made in the suite run
+        counted 2026-11-05; its `status` stays. Stricter than either: a ref only
+        moved into `packed-refs` counts as a change. A lock is no ref."""
+        found = {name: (git_dir / name).read_bytes()
+                 for name in ("HEAD", "packed-refs")
+                 if (git_dir / name).is_file()}
+        for path in (git_dir / "refs").rglob("*"):
+            if path.is_file() and path.suffix != ".lock":
+                found[path.relative_to(git_dir).as_posix()] = path.read_bytes()
+        return found
+
+    @staticmethod
     def snapshot(repo: Path, bare: bool = False) -> dict:
-        state = {"refs": git(repo, "for-each-ref",
-                             "--format=%(refname) %(objectname)")}
+        state = {"refs": Scratch._refs(repo if bare else repo / ".git")}
         if bare:
             return state
-        state["head"] = git(repo, "rev-parse", "HEAD")
         state["index"] = (repo / ".git" / "index").read_bytes()
         state["status"] = git(repo, "status", "--porcelain=v2", "-z",
                               "--untracked-files=all")

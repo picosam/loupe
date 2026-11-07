@@ -26,12 +26,14 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
-from . import (TOOL_NAME, TOOL_VERSION, env_var, paths, refs,
+from . import (TOOL_NAME, TOOL_VERSION, env_var, impact, paths, refs,
                shape_identity, tool_identity, vocab, wire)
 from .config import (SUBJECT_CHECK_KEY, Config, GitCeiling,
-                     built_in_git_ceiling, caller_env, git_ceiling)
+                     built_in_git_ceiling, caller_env, git_ceiling,
+                     impact_map_enabled)
 from .digest import sha256_text
-from .ledger import Ledger, render_cross_lineage_md, render_report_md
+from .ledger import (Ledger, render_cross_lineage_md, render_redesign_md,
+                     render_report_md)
 
 
 
@@ -433,7 +435,7 @@ def _ci_target(repo: Path, git=None) -> tuple[str, str]:
     """`(repository slug, remote branch)` — where a push of this branch
     lands, which is the only place a CI run about it can exist.
 
-    The same derivation `ensure_pushed` and `bin/loupe-ci-evidence` use, for
+    The same derivation `ensure_pushed` uses, for
     the same reason: the LOCAL branch name is not necessarily the name the
     branch has on the remote, and `git remote get-url <name>` is the FETCH
     url while `remote.<name>.pushurl` can send the push somewhere else
@@ -900,6 +902,7 @@ def check_commit_subject(cfg: Config, repo: Path, subject: str) -> None:
         try:
             proc = subprocess.run([*argv, str(message)], cwd=str(repo),
                                   capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace",
                                   stdin=subprocess.DEVNULL,
                                   timeout=ceiling.seconds, env=caller_env())
         except subprocess.TimeoutExpired:
@@ -2840,9 +2843,13 @@ def run_gates(cfg: Config, target_sha: str,
     def run_one(gate: dict) -> dict:
         started = time.monotonic()
         try:
+            # What a gate prints is evidence, and its exit code is the
+            # verdict: bytes that are not UTF-8 (Latin-1 data in a client's
+            # repository) must not cost the hand-off the other gates' results.
             proc = subprocess.run(gate["command"], cwd=cfg.repo_root,
-                                  capture_output=True, text=True, timeout=600,
-                                  env=env)
+                                  capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace",
+                                  timeout=600, env=env)
         except (OSError, subprocess.SubprocessError) as exc:
             return {"id": gate["id"],
                     "blocking": gate.get("blocking", False),
@@ -3019,6 +3026,11 @@ def _verdict_shape_block(cfg: Config, sha: str) -> str:
         "secondary citation such as `design:102`",
         "and therefore splits its identity when the line moves.",
         f"`{vocab.VERDICT_CLEAN}` carries exactly `None` under findings.",
+        f"A Low or an Info that should not cost a round: an optional "
+        f"`## {vocab.LEADS_SECTION}`, one line each, "
+        f"`{vocab.LEAD_GRAMMAR}` (confidence "
+        f"{'|'.join(vocab.LEAD_CONFIDENCES)}). It needs no falsification, "
+        f"either verdict may carry it, and it reaches the author.",
         "",
         f"Reviewer closure events, where a prior finding is answered: put "
         f"them under `## closures`,",
@@ -3118,6 +3130,34 @@ def _base_line(base: str, round_no: int, ledger: Ledger) -> str:
     return (f"Base:   {base}   (round 1 opens this lineage: the base is the "
             f"one the author declared, ruled on by no round of this "
             f"lineage{elsewhere})")
+
+
+def _lineage_base(cfg: Config, ledger: Ledger, lineage: str,
+                  round_no: int) -> str | None:
+    """Round 1's `Base:`, from its kept request, on a later round; else None.
+
+    The record names the bytes (`source_digest`) and not the base, so the
+    kept copy is read; no copy, or none that names a commit, is None and the
+    map covers this round's span, which is what it can honestly say.
+    """
+    if round_no < 2:
+        return None
+    from . import transport
+    first = min((e for e in ledger.current(lineage)
+                 if e.get("event") == "request"
+                 and isinstance(e.get("round"), int)
+                 and e.get("source_digest")),
+                key=lambda e: e["round"], default=None)
+    if first is None:
+        return None
+    kept = transport.kept_path(cfg, first["round"], "request", lineage=lineage,
+                               digest=first["source_digest"])
+    try:
+        text = kept.read_text(encoding="utf-8") if kept else ""
+    except (OSError, UnicodeError):
+        return None
+    match = re.search(r"^Base:\s+([0-9a-f]{40})\b", text, re.M)
+    return match.group(1) if match else None
 
 
 def _ruling_pointer(cfg: Config, ledger: Ledger, round_no: int,
@@ -3982,6 +4022,16 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
     generated = generated_at_target(repo, head, [e["target_path"]
                                                  for e in shape["entries"]])
     generated_suffix, generated_lines = _generated_span(shape, generated)
+    # `[tool] impact_map` (2026-11-05): off unless the repository turns it on,
+    # and then the section is neither computed nor carried. The eval measured
+    # it not better on held-out work at 1.2 times the tokens
+    # (`research/operating-model-2026-11-03/replay-2/results.md`).
+    impact_lines = (impact.section(
+        repo, base, head,
+        skip=lambda found: generated_at_target(repo, head, list(found)),
+        seconds=git_ceiling(cfg).seconds,
+        lineage_base=_lineage_base(cfg, ledger, lineage, round_no))
+        if impact_map_enabled(cfg) else [])
     shown_paths = ([e["path"] for e in shape["entries"]
                     if e["target_path"] not in generated]
                    if generated_lines else shape["file_list"])
@@ -4049,12 +4099,21 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
         "",
         _taxonomy_block(cfg),
         "",
+        # After the stamp's attested facts and before the author's account;
+        # a section the required grammar does not name, so an older reader
+        # reads past it. `take`'s view moves it after the Evidence.
+        *([*impact_lines, ""] if impact_lines else []),
         "## Claim",
         "",
         f"Objective / decision boundary: {claim.get('objective', '').strip()}",
         "",
         f"Self-assessed risk: {claim.get('risk', 'not stated').strip()}",
         "",
+        *([f"Why this goes on past {vocab.REDESIGN_AFTER_VERDICTS} verdicts "
+           f"asking for changes: "
+           f"{claim[vocab.REDESIGN_ANSWER_FIELD].strip()}", ""]
+          if str(claim.get(vocab.REDESIGN_ANSWER_FIELD) or "").strip()
+          else []),
         f"What changed ({shape_line(shape)} — machine-computed"
         f"{generated_suffix}):",
         "",
@@ -4066,10 +4125,12 @@ def emit_request(cfg: Config, ledger: Ledger, claim: dict,
         # author's section — because each is the author's declaration; the
         # machine values some of them quote are read from this envelope.
         *(["", in_scope_line] if (in_scope_line := _in_scope_line(
-            shape, generated, claim.get("excluded_paths") or ())) else []),
+            shape, generated, claim.get("excluded_paths") or (),
+            claim.get("scope_paths"))) else []),
         *(_objectives_block(claim["objectives"], shape, generated,
                             claim.get("excluded_paths") or (),
-                            read_authority=_authority_reader(repo, head))
+                            read_authority=_authority_reader(repo, head),
+                            scope=claim.get("scope_paths"))
           if claim.get("objectives") else []),
         *(_carried_block(record, repo, base, head)
           if claim.get("carried_findings") else []),
@@ -4697,6 +4758,24 @@ def check_map_gates(claim, cfg: Config, head: str) -> None:
                        "declared in review.toml) and re-runs the hand-off")
 
 
+def check_redesign_answer(claim, ledger: Ledger, lineage: str,
+                          path: Path | None) -> None:
+    """A request past the third `changes requested` carries the answer to the
+    redesign question (Osama, 2026-11-04). Author's door only: `take` and
+    `validate` read every older envelope as they did, so nothing kept stops
+    being valid, and a reviewer never rules on whether the answer is good."""
+    asked = ledger.redesign_question(lineage)
+    if asked is None or str(claim.get(vocab.REDESIGN_ANSWER_FIELD)
+                            or "").strip():
+        return
+    raise ClaimDefective(
+        path, f"{render_redesign_md(asked)}\n\nThis request opens round "
+              f"{next_round(ledger, lineage)} and its claim states no "
+              f"`{vocab.REDESIGN_ANSWER_FIELD}`: answer the question there, "
+              f"in a sentence or two, or stop and redesign",
+        defect="missing", member=vocab.REDESIGN_ANSWER_FIELD)
+
+
 def check_claim_record(claim, ledger: Ledger, lineage: str, cfg: Config,
                        path: Path | None = None) -> dict:
     """The claim's record-bound members judged against THIS machine's ledger
@@ -4939,25 +5018,46 @@ def _span_rows(shape: dict) -> list[dict]:
             for p in shape.get("file_list", [])]
 
 
-def _in_scope_line(shape: dict, generated: set, excluded) -> str | None:
+def _scoped_rows(shape: dict, generated: set, excluded, scope=None) -> dict:
+    """The span's rows sorted the one way the request counts and maps
+    them: outside the claim's `scope_paths` (when it declares any), then
+    generated by declaration, then matched by `excluded_paths`; `kept` is
+    what is left. The scoped diff (`_scoped_stamp`) shows exactly the rows
+    `scope_paths` match, so the count, the objectives' unmapped list and
+    that diff now share one path semantics (2026-11-01: a 30-path scoped
+    diff sat beside "In scope: 454 files")."""
+    sorted_ = {"outside": [], "generated": [], "excluded": [], "kept": []}
+    for r in _span_rows(shape):
+        if scope is not None and not in_scope(r["raw"], scope):
+            sorted_["outside"].append(r)
+        elif r["raw"] in generated:
+            sorted_["generated"].append(r)
+        elif excluded and in_scope(r["raw"], excluded):
+            sorted_["excluded"].append(r)
+        else:
+            sorted_["kept"].append(r)
+    return sorted_
+
+
+def _in_scope_line(shape: dict, generated: set, excluded,
+                   scope=None) -> str | None:
     """`In scope: N files, I insertions, D deletions (...)` — the span less
-    the paths generated by declaration and those `excluded_paths` matches —
-    or None when nothing is subtracted, so a round that declares and marks
-    nothing renders exactly as before."""
-    rows = _span_rows(shape)
-    gen = [r for r in rows if r["raw"] in generated]
-    excl = [r for r in rows if r["raw"] not in generated
-            and excluded and in_scope(r["raw"], excluded)]
-    if not gen and not excl:
+    the paths outside `scope_paths`, those generated by declaration and
+    those `excluded_paths` matches — or None when nothing is subtracted,
+    so a round that declares and marks nothing renders exactly as before."""
+    rows = _scoped_rows(shape, generated, excluded, scope)
+    outside, gen, excl = rows["outside"], rows["generated"], rows["excluded"]
+    if not outside and not gen and not excl:
         return None
-    kept = [r for r in rows if r["raw"] not in generated
-            and not (excluded and in_scope(r["raw"], excluded))]
+    kept = rows["kept"]
     ins = sum(r["insertions"] or 0 for r in kept)
     dels = sum(r["deletions"] or 0 for r in kept)
     return (f"In scope: {len(kept)} files, {ins} insertions, {dels} "
-            f"deletions (machine-computed: the span less {len(gen)} path(s) "
-            f"generated by declaration and {len(excl)} matched by "
-            f"excluded_paths)")
+            f"deletions (machine-computed: the span less "
+            + (f"{len(outside)} path(s) outside scope_paths, "
+               if scope is not None else "")
+            + f"{len(gen)} path(s) generated by declaration and {len(excl)} "
+              f"matched by excluded_paths)")
 
 
 def _cell(value) -> str:
@@ -5100,10 +5200,10 @@ def _authority_block(objectives, read_authority) -> tuple[list[str],
 
 
 def _objectives_block(objectives, shape: dict, generated: set,
-                      excluded, read_authority=None) -> list[str]:
+                      excluded, read_authority=None,
+                      scope=None) -> list[str]:
     rows = _span_rows(shape)
-    scoped = [r for r in rows if r["raw"] not in generated
-              and not (excluded and in_scope(r["raw"], excluded))]
+    scoped = _scoped_rows(shape, generated, excluded, scope)["kept"]
     out = ["", "Objectives — the author's map; the changed files are "
                "computed by the tool from the span, matching each "
                "objective's paths (a path and everything below it, or a "
@@ -5121,8 +5221,15 @@ def _objectives_block(objectives, shape: dict, generated: set,
             ", ".join(hits) or "(none)",
             ", ".join(obj.get("tests") or ()) or "-",
             ", ".join(obj.get("references") or ()) or "-")) + " |")
+    # A file an objective's tests or references column lists IS mapped: the
+    # notice said otherwise in 70 rounds of reviewer feedback. A test entry may
+    # name a test inside the file (`path::Name`, `path (why)`).
+    listed = [entry.split("::")[0].split(" (")[0].strip()
+              for o in objectives
+              for entry in [*(o.get("tests") or ()), *(o.get("references") or ())]]
     unmapped = [r["path"] for r in scoped
-                if not any(in_scope(r["raw"], o["paths"]) for o in objectives)]
+                if not any(in_scope(r["raw"], o["paths"]) for o in objectives)
+                and not in_scope(r["raw"], listed)]
     notices = []
     if unmapped:
         notices.append(_notice_line(
